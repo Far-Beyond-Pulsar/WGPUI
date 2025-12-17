@@ -91,7 +91,7 @@ bitflags = { workspace = true, optional = true }
 blade-graphics = { workspace = true, optional = true }
 blade-macros = { workspace = true, optional = true }
 blade-util = { workspace = true, optional = true }
-bytemuck = { version = "1", optional = true }
+bytemuck = { version = "1" }
 collections.workspace = true
 ctor.workspace = true
 derive_more.workspace = true
@@ -181,6 +181,7 @@ ashpd = { workspace = true, optional = true }
 blade-graphics = { workspace = true, optional = true }
 blade-macros = { workspace = true, optional = true }
 blade-util = { workspace = true, optional = true }
+wgpu = { workspace = true }
 bytemuck = { version = "1", optional = true }
 cosmic-text = { version = "0.14.0", optional = true }
 # WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io

@@ -76,6 +76,7 @@ bitflags = "2.6.0"
 blade-graphics = { version = "0.7.0" }
 blade-macros = { version = "0.3.0" }
 blade-util = { version = "0.3.0" }
+wgpu = { version = "25" }
 brotli = "8.0.2"
 bytes = "1.0"
 cfg-if = "1.0.3"
@@ -113,7 +114,7 @@ log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
 mach2 = "0.5"
 markup5ever_rcdom = "0.3.0"
 metal = "0.29"
-naga = { version = "25.0", features = ["wgsl-in"] }
+naga = { version = "25.0.1", features = ["wgsl-in"] }
 nix = "0.29"
 objc = "0.2"
 objc2-foundation = { version = "=0.3.1", default-features = false, features = [
@@ -139,7 +140,7 @@ objc2-foundation = { version = "=0.3.1", default-features = false, features = [
     "NSUndoManager",
     "NSValue",
     "objc2-core-foundation",
-    "std"
+    "std",
 ] }
 open = "5.0.0"
 ordered-float = "2.1.1"
@@ -206,7 +207,10 @@ time = { version = "0.3", features = [
 ] }
 tokio = { version = "1" }
 tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
-tokio-socks = { version = "0.5.2", default-features = false, features = ["futures-io", "tokio"] }
+tokio-socks = { version = "0.5.2", default-features = false, features = [
+    "futures-io",
+    "tokio",
+] }
 tracing = "0.1.40"
 unicase = "2.6"
 unicode-segmentation = "1.10"
@@ -358,8 +362,4 @@ large_enum_variant = "allow"
 nonminimal_bool = "allow"
 
 [workspace.metadata.cargo-machete]
-ignored = [
-    "bindgen",
-    "cbindgen",
-    "serde",
-]
+ignored = ["bindgen", "cbindgen", "serde"]
