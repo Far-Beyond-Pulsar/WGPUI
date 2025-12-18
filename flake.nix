@@ -24,7 +24,11 @@
           ];
         };
 
-        naersk' = pkgs.callPackage naersk { };
+        toolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml);
+        naersk' = pkgs.callPackage naersk {
+          cargo = toolchain;
+          rustc = toolchain;
+        };
 
         buildInputs = with pkgs; [
           libxkbcommon
@@ -47,13 +51,7 @@
         ];
 
         nativeBuildInputs = with pkgs; [
-          (pkgs.rust-bin.stable.latest.default.override {
-            extensions = [
-              "rust-src"
-              "cargo"
-              "rustc"
-            ];
-          })
+          toolchain
           pkg-config
           cmake
           perl
@@ -61,7 +59,7 @@
         ];
       in
       rec {
-        defaultPackage = packages.isofs-cli;
+        defaultPackage = packages.gpui-ce;
         packages = {
           gpui-ce = naersk'.buildPackage {
             src = ./.;
@@ -76,12 +74,6 @@
         };
 
         devShell = pkgs.mkShell {
-          RUST_SRC_PATH = "${
-            pkgs.rust-bin.stable.latest.default.override {
-              extensions = [ "rust-src" ];
-            }
-          }/lib/rustlib/src/rust/library";
-
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
           XDG_SESSION_TYPE = "wayland";
           shellHook = ''
@@ -94,11 +86,6 @@
             [
               nixfmt
               cmake
-              rustc
-              rustfmt
-              cargo
-              clippy
-              rust-analyzer
             ]
             ++ buildInputs
             ++ nativeBuildInputs;
