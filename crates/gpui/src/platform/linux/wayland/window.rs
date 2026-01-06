@@ -301,14 +301,14 @@ impl WaylandWindowState {
                     .display_ptr()
                     .cast::<c_void>(),
             };
-            let config = BladeSurfaceConfig {
-                size: gpu::Extent {
-                    width: options.bounds.size.width.0 as u32,
-                    height: options.bounds.size.height.0 as u32,
-                    depth: 1,
-                },
-                transparent: true,
-            };
+            // let config = BladeSurfaceConfig {
+            //     size: gpu::Extent {
+            //         width: options.bounds.size.width.0 as u32,
+            //         height: options.bounds.size.height.0 as u32,
+            //         depth: 1,
+            //     },
+            //     transparent: true,
+            // };
             // TODO(mdeand): Configuration of sample count
             WgpuRenderer::new(
                 gpu_context,
