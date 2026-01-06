@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::{
     DevicePixels, GpuSpecs, LinearColorStop, PlatformAtlas, PrimitiveBatch, Quad, ScaledPixels,
-    Scene, color, geometry, platform::wgpu_backend::WgpuContext,
+    Scene, color, geometry,
+    platform::wgpu_backend::{WgpuAtlas, WgpuContext},
 };
 
 const fn map_attributes<const N: usize>(
@@ -829,7 +830,7 @@ pub struct WgpuRenderer {
     context: Arc<WgpuContext>,
     surface: wgpu::Surface<'static>,
     surface_configuration: wgpu::SurfaceConfiguration,
-    command_encoder: wgpu::CommandEncoder,
+    atlas: Arc<WgpuAtlas>,
     pipelines: WgpuPipelines,
 }
 
@@ -865,13 +866,6 @@ impl WgpuRenderer {
             desired_maximum_frame_latency: 2,
         };
 
-        let command_encoder =
-            context
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("main"),
-                });
-
         let pipelines =
             WgpuPipelines::new(context.as_ref(), &surface_configuration, path_sample_count);
 
@@ -879,21 +873,29 @@ impl WgpuRenderer {
             context: context.clone(),
             surface,
             surface_configuration,
-            command_encoder,
+            atlas: Arc::new(WgpuAtlas::new(context)),
             pipelines,
         })
     }
 
     pub fn draw(&mut self, scene: &Scene) {
-        let mut pass = self
-            .command_encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut command_encoder =
+            self.context
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("main"),
+                });
+
+        let surface_texture = self
+            .surface
+            .get_current_texture()
+            .expect("Failed to acquire next swap chain texture");
+
+        {
+            let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self
-                        .surface
-                        .get_current_texture()
-                        .expect("Failed to acquire next swap chain texture")
+                    view: &surface_texture
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default()),
                     ops: wgpu::Operations {
@@ -907,45 +909,51 @@ impl WgpuRenderer {
                 occlusion_query_set: None,
             });
 
-        let globals = GlobalParams {
-            viewport_size: [
-                self.surface_configuration.width as f32,
-                self.surface_configuration.height as f32,
-            ],
-            premultimated_alpha: match self.surface_configuration.alpha_mode {
-                wgpu::CompositeAlphaMode::PreMultiplied => 1,
-                _ => 0,
-            },
-            pad: 0,
-        };
+            let globals = GlobalParams {
+                viewport_size: [
+                    self.surface_configuration.width as f32,
+                    self.surface_configuration.height as f32,
+                ],
+                premultimated_alpha: match self.surface_configuration.alpha_mode {
+                    wgpu::CompositeAlphaMode::PreMultiplied => 1,
+                    _ => 0,
+                },
+                pad: 0,
+            };
 
-        self.context.queue.write_buffer(
-            &self.context.globals_buffer,
-            0,
-            bytemuck::bytes_of(&globals),
-        );
+            self.context.queue.write_buffer(
+                &self.context.globals_buffer,
+                0,
+                bytemuck::bytes_of(&globals),
+            );
 
-        for batch in scene.batches() {
-            match batch {
-                PrimitiveBatch::Quads(quads) => {
-                    self.context
-                        .queue
-                        .write_buffer(&self.context.quads_buffer, 0, unsafe {
-                            std::slice::from_raw_parts(
-                                quads.as_ptr() as *const u8,
-                                quads.len() * std::mem::size_of::<Quad>(),
-                            )
-                        });
+            for batch in scene.batches() {
+                match batch {
+                    PrimitiveBatch::Quads(quads) => {
+                        self.context
+                            .queue
+                            .write_buffer(&self.context.quads_buffer, 0, unsafe {
+                                std::slice::from_raw_parts(
+                                    quads.as_ptr() as *const u8,
+                                    quads.len() * std::mem::size_of::<Quad>(),
+                                )
+                            });
 
-                    pass.set_pipeline(&self.pipelines.quads);
-                    pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
-                    pass.set_bind_group(1, &self.pipelines.quads_bind_group, &[]);
-                    pass.draw(0..4, 0..quads.len() as u32);
+                        pass.set_pipeline(&self.pipelines.quads);
+                        pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
+                        pass.set_bind_group(1, &self.pipelines.quads_bind_group, &[]);
+                        pass.set_vertex_buffer(0, self.context.quads_buffer.slice(..));
+                        pass.draw(0..4, 0..quads.len() as u32);
+                    }
+                    // TODO(mdeand): Implement other batch types.
+                    _ => {}
                 }
-                // TODO(mdeand): Implement other batch types.
-                _ => {}
             }
         }
+
+        self.context.queue.submit(Some(command_encoder.finish()));
+
+        surface_texture.present();
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
@@ -954,31 +962,47 @@ impl WgpuRenderer {
         self.surface
             .configure(&self.context.device, &self.surface_configuration);
 
-        todo!()
+        // todo!()
     }
 
     pub fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        todo!()
+        self.atlas.clone()
     }
 
     pub fn gpu_specs(&self) -> GpuSpecs {
-        todo!()
+        GpuSpecs {
+            is_software_emulated: true,
+            device_name: "gpu 9000".to_owned(),
+            driver_name: "gpu 9000 driver".to_owned(),
+            driver_info: "gpu 9000 driver info".to_owned(),
+        }
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
         self.surface_configuration.alpha_mode = if transparent {
             wgpu::CompositeAlphaMode::PreMultiplied
         } else {
-            wgpu::CompositeAlphaMode::Opaque
+            // TODO(mdeand): Support for non-X11?
+            // wgpu::CompositeAlphaMode::Opaque
+            wgpu::CompositeAlphaMode::Inherit
         };
         self.surface
             .configure(&self.context.device, &self.surface_configuration);
 
-        todo!()
+        // todo!()
     }
 
     pub fn destroy(&mut self) {
-       println!("WgpuRenderer destroyed"); 
-       // TODO(mdeand): Implement proper destruction logic.
+        println!("WgpuRenderer destroyed");
+        // TODO(mdeand): Implement proper destruction logic.
+    }
+
+    pub fn viewport_size(&self) -> wgpu::Extent3d {
+        // TODO(mdeand): Hack
+        wgpu::Extent3d {
+            width: 500,
+            height: 500,
+            depth_or_array_layers: 1,
+        }
     }
 }

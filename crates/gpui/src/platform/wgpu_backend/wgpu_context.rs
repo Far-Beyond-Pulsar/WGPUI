@@ -5,6 +5,8 @@ pub struct WgpuContext {
     pub(super) instance: wgpu::Instance,
     pub(super) globals_buffer: wgpu::Buffer,
     pub(super) quads_buffer: wgpu::Buffer,
+    // pub(super) mono_sprites_buffer: wgpu::Buffer,
+    // pub(super) poly_sprites_buffer: wgpu::Buffer,
 }
 
 impl WgpuContext {
@@ -20,7 +22,6 @@ impl WgpuContext {
             force_fallback_adapter: false,
         }))?;
 
-        // Request device and queue
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: None,
