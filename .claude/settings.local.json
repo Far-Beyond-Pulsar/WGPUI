@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo run:*)",
+      "Bash(set:*)",
+      "Bash(Select-String -Pattern \"Helio render loop|animation_time|Renderer::draw\")",
+      "Bash(Select-Object -First 30)",
+      "Bash(cargo doc:*)",
+      "Bash(grep:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo check:*)"
+    ]
+  }
+}
