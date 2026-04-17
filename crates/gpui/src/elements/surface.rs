@@ -10,7 +10,11 @@ use refineable::Refineable;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::sync::Arc;
 
-/// A source of a surface's content.
+/// A source of a [`Surface`] element's content.
+///
+/// Variants are platform-specific:
+/// - macOS uses CoreVideo pixel buffers.
+/// - Linux/FreeBSD use type-erased GPU textures.
 pub enum SurfaceSource {
     /// A macOS image buffer from CoreVideo
     #[cfg(target_os = "macos")]
@@ -19,6 +23,10 @@ pub enum SurfaceSource {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     Texture {
         /// Type-erased GPU texture handle.
+        ///
+        /// GPUI keeps this as `Any` to avoid a hard dependency on `wgpu` in this crate.
+        /// Callers should pass an `Arc<wgpu::Texture>` from the renderer's device context.
+        /// Renderers that don't recognize the concrete type will skip drawing this surface.
         texture: Arc<dyn std::any::Any + Send + Sync>,
         /// Dimensions of the texture in device pixels.
         size: Size<DevicePixels>,

@@ -3557,8 +3557,20 @@ impl Window {
     /// Paint a GPU texture into the scene for the next frame at the current z-index.
     pub fn paint_gpu_texture(
         &mut self,
+        #[cfg_attr(
+            not(any(target_os = "linux", target_os = "freebsd")),
+            allow(unused_variables)
+        )]
         bounds: Bounds<Pixels>,
+        #[cfg_attr(
+            not(any(target_os = "linux", target_os = "freebsd")),
+            allow(unused_variables)
+        )]
         texture_handle: crate::GpuTextureHandle,
+        #[cfg_attr(
+            not(any(target_os = "linux", target_os = "freebsd")),
+            allow(unused_variables)
+        )]
         object_fit: crate::ObjectFit,
     ) {
         self.invalidator.debug_assert_paint();
@@ -3579,9 +3591,8 @@ impl Window {
                 DevicePixels(texture_handle.width as i32),
                 DevicePixels(texture_handle.height as i32),
             );
-            let texture: Arc<dyn Any + Send + Sync> = Arc::new(texture_handle);
             let source = SurfaceSource::Texture {
-                texture,
+                texture: Arc::new(texture_handle),
                 size: texture_size,
             };
 
@@ -3592,11 +3603,6 @@ impl Window {
                 object_fit,
                 source,
             });
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        {
-            let _ = (bounds, texture_handle, object_fit, content_mask);
         }
     }
 
