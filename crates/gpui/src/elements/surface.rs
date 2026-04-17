@@ -2,36 +2,55 @@ use crate::{
     App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
 };
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use crate::{DevicePixels, Size};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use refineable::Refineable;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use std::sync::Arc;
 
 /// A source of a surface's content.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SurfaceSource {
     /// A macOS image buffer from CoreVideo
     #[cfg(target_os = "macos")]
-    ImageBuffer(CVPixelBuffer),
-    /// Windows shared texture handle
-    #[cfg(target_os = "windows")]
-    SharedTexture {
-        /// Native handle to the shared texture
-        nt_handle: isize,
-        /// Width of the texture in pixels
-        width: u32,
-        /// Height of the texture in pixels
-        height: u32,
+    Surface(CVPixelBuffer),
+    /// A GPU texture handle (expected to be `Arc<wgpu::Texture>`).
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    Texture {
+        /// Type-erased GPU texture handle.
+        texture: Arc<dyn std::any::Any + Send + Sync>,
+        /// Dimensions of the texture in device pixels.
+        size: Size<DevicePixels>,
     },
-    /// Linux DMA-BUF file descriptor
-    #[cfg(target_os = "linux")]
-    DmaBuf {
-        /// File descriptor for the DMA-BUF
-        fd: i32,
-        /// Width of the texture in pixels
-        width: u32,
-        /// Height of the texture in pixels
-        height: u32,
-    },
+}
+
+impl Clone for SurfaceSource {
+    fn clone(&self) -> Self {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Surface(surface) => Self::Surface(surface.clone()),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            Self::Texture { texture, size } => Self::Texture {
+                texture: Arc::clone(texture),
+                size: *size,
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for SurfaceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Surface(surface) => f.debug_tuple("Surface").field(surface).finish(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            Self::Texture { size, .. } => f
+                .debug_struct("Texture")
+                .field("size", size)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -105,10 +124,10 @@ impl Element for Surface {
         &mut self,
         _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] window: &mut Window,
+        window: &mut Window,
         _: &mut App,
     ) {
         match &self.source {
@@ -119,8 +138,11 @@ impl Element for Surface {
                 // TODO: Add support for corner_radii
                 window.paint_surface(new_bounds, surface.clone());
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            SurfaceSource::Texture { texture, size } => {
+                let new_bounds = self.object_fit.get_bounds(bounds, *size);
+                window.paint_surface(new_bounds, Arc::clone(texture), *size);
+            }
         }
     }
 }
@@ -136,5 +158,26 @@ impl IntoElement for Surface {
 impl Styled for Surface {
     fn style(&mut self) -> &mut StyleRefinement {
         &mut self.style
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
+mod tests {
+    use super::SurfaceSource;
+    use crate::{DevicePixels, size};
+    use std::sync::Arc;
+
+    #[test]
+    fn texture_source_is_cloneable_and_debuggable() {
+        let source = SurfaceSource::Texture {
+            texture: Arc::new(123_u32),
+            size: size(DevicePixels(64), DevicePixels(32)),
+        };
+
+        let cloned = source.clone();
+        let debug_output = format!("{cloned:?}");
+
+        assert!(debug_output.contains("Texture"));
+        assert!(debug_output.contains("size"));
     }
 }

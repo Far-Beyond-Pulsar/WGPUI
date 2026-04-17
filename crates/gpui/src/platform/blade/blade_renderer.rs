@@ -4,7 +4,7 @@
 use super::{BladeAtlas, BladeContext};
 use crate::{
     Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point, PolychromeSprite,
-    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Underline,
+    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SurfaceSource, Underline,
     get_gamma_correction_ratios,
 };
 use blade_graphics as gpu;
@@ -826,34 +826,37 @@ impl BladeRenderer {
 
                         #[cfg(target_os = "macos")]
                         {
+                            let SurfaceSource::Surface(image_buffer) = &surface.source else {
+                                continue;
+                            };
                             let (t_y, t_cb_cr) = unsafe {
                                 use core_foundation::base::TCFType as _;
                                 use std::ptr;
 
                                 assert_eq!(
-                                        surface.image_buffer.get_pixel_format(),
+                                        image_buffer.get_pixel_format(),
                                         core_video::pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
                                     );
 
                                 let y_texture = self
                                     .core_video_texture_cache
                                     .create_texture_from_image(
-                                        surface.image_buffer.as_concrete_TypeRef(),
+                                        image_buffer.as_concrete_TypeRef(),
                                         ptr::null(),
                                         metal::MTLPixelFormat::R8Unorm,
-                                        surface.image_buffer.get_width_of_plane(0),
-                                        surface.image_buffer.get_height_of_plane(0),
+                                        image_buffer.get_width_of_plane(0),
+                                        image_buffer.get_height_of_plane(0),
                                         0,
                                     )
                                     .unwrap();
                                 let cb_cr_texture = self
                                     .core_video_texture_cache
                                     .create_texture_from_image(
-                                        surface.image_buffer.as_concrete_TypeRef(),
+                                        image_buffer.as_concrete_TypeRef(),
                                         ptr::null(),
                                         metal::MTLPixelFormat::RG8Unorm,
-                                        surface.image_buffer.get_width_of_plane(1),
-                                        surface.image_buffer.get_height_of_plane(1),
+                                        image_buffer.get_width_of_plane(1),
+                                        image_buffer.get_height_of_plane(1),
                                         1,
                                     )
                                     .unwrap();

@@ -3561,49 +3561,43 @@ impl Window {
         texture_handle: crate::GpuTextureHandle,
         object_fit: crate::ObjectFit,
     ) {
+        self.invalidator.debug_assert_paint();
+
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         use crate::{PaintSurface, SurfaceSource};
 
-        self.invalidator.debug_assert_paint();
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        use std::sync::Arc;
 
         let scale_factor = self.scale_factor();
         let bounds = bounds.scale(scale_factor);
         let content_mask = self.content_mask().scale(scale_factor);
 
-        // Convert universal GpuTextureHandle to platform-specific SurfaceSource
-        // All platforms use the same RGBA8 byte format - just different OS handles
-        #[cfg(target_os = "windows")]
-        let source = SurfaceSource::SharedTexture {
-            nt_handle: texture_handle.native_handle,
-            width: texture_handle.width,
-            height: texture_handle.height,
-        };
-
-        #[cfg(target_os = "macos")]
-        let source = {
-            // On macOS, native_handle is an IOSurface ID
-            // Create IOSurface from the handle
-            use metal::IOSurface;
-            let io_surface = unsafe {
-                // IOSurface::from_id creates an IOSurface from its integer ID
-                IOSurface::from_id(texture_handle.native_handle as u32)
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            let texture_size = size(
+                DevicePixels(texture_handle.width as i32),
+                DevicePixels(texture_handle.height as i32),
+            );
+            let texture: Arc<dyn Any + Send + Sync> = Arc::new(texture_handle);
+            let source = SurfaceSource::Texture {
+                texture,
+                size: texture_size,
             };
-            SurfaceSource::ImageBuffer(io_surface)
-        };
 
-        #[cfg(target_os = "linux")]
-        let source = SurfaceSource::DmaBuf {
-            fd: texture_handle.native_handle as i32,
-            width: texture_handle.width,
-            height: texture_handle.height,
-        };
+            self.next_frame.scene.insert_primitive(PaintSurface {
+                order: 0,
+                bounds,
+                content_mask,
+                object_fit,
+                source,
+            });
+        }
 
-        self.next_frame.scene.insert_primitive(PaintSurface {
-            order: 0,
-            bounds,
-            content_mask,
-            object_fit,
-            source,
-        });
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        {
+            let _ = (bounds, texture_handle, object_fit, content_mask);
+        }
     }
 
     /// Paint a surface into the scene for the next frame at the current z-index.
@@ -3611,7 +3605,7 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
-        use crate::PaintSurface;
+        use crate::{PaintSurface, SurfaceSource};
 
         self.invalidator.debug_assert_paint();
 
@@ -3622,7 +3616,37 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            object_fit: crate::ObjectFit::Contain,
+            source: SurfaceSource::Surface(image_buffer),
+        });
+    }
+
+    /// Paint a surface into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        texture: Arc<dyn Any + Send + Sync>,
+        texture_size: Size<DevicePixels>,
+    ) {
+        use crate::{PaintSurface, SurfaceSource};
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            object_fit: crate::ObjectFit::Contain,
+            source: SurfaceSource::Texture {
+                texture,
+                size: texture_size,
+            },
         });
     }
 
