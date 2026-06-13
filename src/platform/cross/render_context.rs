@@ -1,6 +1,14 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::surface_registry::SurfaceRegistry;
+
+/// Process-wide shared context, lazily created on first use.
+///
+/// All platforms within a process (e.g. a visible [`CrossPlatform`] window and a
+/// [`HeadlessPlatform`] used to render an offscreen overlay) must share a single
+/// `wgpu::Device`/`Instance` so that textures exposed via `WgpuOutputHandle` and
+/// `WgpuSurfaceHandle` can be sampled across windows without CPU readback.
+static SHARED_CONTEXT: OnceLock<Mutex<Option<Arc<WgpuContext>>>> = OnceLock::new();
 
 pub struct WgpuContext {
     pub(super) adapter: wgpu::Adapter,
@@ -28,6 +36,20 @@ impl WgpuContext {
 
     pub(crate) fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    /// Returns the process-wide shared `WgpuContext`, creating it on first use.
+    ///
+    /// See [`SHARED_CONTEXT`] for why a single context must be shared across platforms.
+    pub(crate) fn shared() -> anyhow::Result<Arc<Self>> {
+        let slot = SHARED_CONTEXT.get_or_init(|| Mutex::new(None));
+        let mut guard = slot.lock().unwrap();
+        if let Some(context) = guard.as_ref() {
+            return Ok(context.clone());
+        }
+        let context = Arc::new(Self::new()?);
+        *guard = Some(context.clone());
+        Ok(context)
     }
 
     pub fn new() -> anyhow::Result<Self> {

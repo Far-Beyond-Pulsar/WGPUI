@@ -127,7 +127,7 @@ impl CrossPlatform {
             background_executor,
             foreground_executor,
             text_system: Arc::new(CosmicTextSystem::new()),
-            wgpu_context: Arc::new(WgpuContext::new()?),
+            wgpu_context: WgpuContext::shared()?,
             main_rx,
             event_loop: Cell::new(Some(event_loop)),
             event_loop_proxy,

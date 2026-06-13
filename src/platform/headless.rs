@@ -582,7 +582,7 @@ impl HeadlessPlatform {
             return Ok(wgpu_context);
         }
 
-        let wgpu_context = Arc::new(WgpuContext::new()?);
+        let wgpu_context = WgpuContext::shared()?;
         self.wgpu_context.borrow_mut().replace(wgpu_context.clone());
         Ok(wgpu_context)
     }
