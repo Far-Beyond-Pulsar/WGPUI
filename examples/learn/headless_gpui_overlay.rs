@@ -162,19 +162,26 @@ const PLANE_VERTICES: &[Vertex] = &[
 #[rustfmt::skip]
 const PLANE_INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
 
+static DEBUG_FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DEBUG_OVERLAY_FRAME_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct HeadlessOverlay {
     start_time: Instant,
 }
 
 impl Render for HeadlessOverlay {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let n = DEBUG_OVERLAY_FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % 60 == 0 {
+            eprintln!("[overlay] render #{n}");
+        }
         let elapsed_seconds = self.start_time.elapsed().as_secs_f32();
         let progress = ((elapsed_seconds * 0.85).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
         let pulse = ((elapsed_seconds * 2.4).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
         let progress_width = px(280.0 * progress.max(0.08));
         let pulse_color = Hsla::from(rgb(0x67d4ff)).opacity(0.35 + pulse * 0.55);
 
-        cx.notify();
+        window.request_animation_frame();
 
         div()
             .size_full()
@@ -721,6 +728,15 @@ impl Render for HeadlessOverlayExample {
             }
 
             let overlay_view = self.overlay_output.front_buffer_view();
+            DEBUG_FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if DEBUG_FRAME_COUNT.load(std::sync::atomic::Ordering::Relaxed) % 60 == 1 {
+                eprintln!(
+                    "[main] overlay_view.is_some()={} has_pending_frame={} size={:?}",
+                    overlay_view.is_some(),
+                    self.overlay_output.has_pending_frame(),
+                    self.overlay_output.size(),
+                );
+            }
             let submission_index = state.render(&view, overlay_view.as_ref());
             drop(overlay_view);
             drop(view);

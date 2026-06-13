@@ -2191,6 +2191,14 @@ impl WgpuRenderer {
                 }],
             });
 
+        // Transparent windows (and offscreen render targets, which are always
+        // composited by another renderer) must clear to zero alpha so the
+        // content beneath shows through; opaque windows clear to black.
+        let clear_color = match self.surface_configuration.alpha_mode {
+            wgpu::CompositeAlphaMode::PreMultiplied => wgpu::Color::TRANSPARENT,
+            _ => wgpu::Color::BLACK,
+        };
+
         {
             // Render to swapchain directly for now (TODO: render to framebuffer, then blit)
             let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2198,7 +2206,7 @@ impl WgpuRenderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: frame.view(),
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                     resolve_target: None,
