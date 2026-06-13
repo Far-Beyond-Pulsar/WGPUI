@@ -204,6 +204,10 @@ name = "blur_showcase"
 path = "examples/learn/blur_showcase.rs"
 
 [[example]]
+name = "headless_gpui_overlay"
+path = "examples/learn/headless_gpui_overlay.rs"
+
+[[example]]
 name = "smooth_scrolling"
 path = "examples/learn/smooth_scrolling.rs"
 
