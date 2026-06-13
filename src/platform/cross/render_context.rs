@@ -22,6 +22,14 @@ pub struct WgpuContext {
 }
 
 impl WgpuContext {
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),

@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use refineable::Refineable as _;
 
@@ -11,6 +11,110 @@ use crate::{
 
 /// Inner state shared across clones of `WgpuSurfaceHandle`.
 /// When the last clone is dropped, the surface is removed from the registry.
+struct WgpuOutputHandleInner {
+    surface_id: SurfaceId,
+    registry: Arc<SurfaceRegistry>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    size: Mutex<(u32, u32)>,
+    format: wgpu::TextureFormat,
+}
+
+impl Drop for WgpuOutputHandleInner {
+    fn drop(&mut self) {
+        self.registry.remove(self.surface_id);
+    }
+}
+
+/// A handle to a triple-buffered GPU output produced by a headless GPUI window.
+///
+/// GPUI renders into the back buffer and publishes completed frames into the ready slot.
+/// Consumers call [`front_buffer_view()`](Self::front_buffer_view) to atomically promote the
+/// latest completed frame into the display slot and retrieve a texture view that can be sampled
+/// directly by another GPU renderer with no CPU readback.
+#[derive(Clone)]
+pub struct WgpuOutputHandle {
+    inner: Arc<WgpuOutputHandleInner>,
+}
+
+impl WgpuOutputHandle {
+    pub(crate) fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        surface_id: SurfaceId,
+        registry: Arc<SurfaceRegistry>,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            inner: Arc::new(WgpuOutputHandleInner {
+                surface_id,
+                registry,
+                device,
+                queue,
+                size: Mutex::new((width, height)),
+                format,
+            }),
+        }
+    }
+
+    /// The wgpu `Device` used by the headless window output.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.inner.device
+    }
+
+    /// The wgpu `Queue` used by the headless window output.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.inner.queue
+    }
+
+    /// Returns a texture view of the front buffer.
+    ///
+    /// If GPUI has produced a newer frame since the last call, this first promotes the ready
+    /// buffer into the display slot, then returns the display view.
+    pub fn front_buffer_view(&self) -> Option<wgpu::TextureView> {
+        if self.inner.registry.is_redraw_pending(self.inner.surface_id) {
+            let _ = self
+                .inner
+                .registry
+                .swap_ready_display(&self.inner.device, self.inner.surface_id);
+            self.inner
+                .registry
+                .clear_redraw_pending(self.inner.surface_id);
+        }
+
+        self.inner.registry.front_view(self.inner.surface_id)
+    }
+
+    /// Returns true when GPUI has completed a newer frame since the last consumption.
+    pub fn has_pending_frame(&self) -> bool {
+        self.inner.registry.is_redraw_pending(self.inner.surface_id)
+    }
+
+    /// Current size in device pixels.
+    pub fn size(&self) -> (u32, u32) {
+        *self.inner.size.lock().unwrap()
+    }
+
+    /// The texture format used by this output.
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.inner.format
+    }
+
+    pub(crate) fn update_size(&self, width: u32, height: u32) {
+        *self.inner.size.lock().unwrap() = (width, height);
+    }
+
+    pub(crate) fn id(&self) -> SurfaceId {
+        self.inner.surface_id
+    }
+
+    pub(crate) fn registry(&self) -> &Arc<SurfaceRegistry> {
+        &self.inner.registry
+    }
+}
+
 struct WgpuSurfaceHandleInner {
     surface_id: SurfaceId,
     registry: Arc<SurfaceRegistry>,
@@ -298,7 +402,16 @@ impl WgpuSurfaceHandle {
                             inner.is_resizing.store(false, Ordering::Release);
                             if inner.pending_resize.lock().unwrap().is_some() {
                                 // A new resize request arrived after we last checked.
-                                if inner.is_resizing.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                                if inner
+                                    .is_resizing
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                                {
                                     continue;
                                 }
                             }
@@ -347,10 +460,7 @@ impl WgpuSurface {
     /// Register a callback invoked when the element's layout bounds change.
     /// The surface textures are automatically resized; use this to recreate
     /// any external resources that depend on the size.
-    pub fn on_resize(
-        mut self,
-        callback: impl Fn(u32, u32, &WgpuSurfaceHandle) + 'static,
-    ) -> Self {
+    pub fn on_resize(mut self, callback: impl Fn(u32, u32, &WgpuSurfaceHandle) + 'static) -> Self {
         self.on_resize = Some(Box::new(callback));
         self
     }

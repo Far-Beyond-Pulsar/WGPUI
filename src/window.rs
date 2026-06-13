@@ -11,13 +11,14 @@ use crate::{
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    RenderImageParams, RenderSvgParams, Replay, RequestFrameOptions, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextColor, TextStyle,
-    TextStyleRefinement, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
+    TextStyleRefinement, TransformationMatrix, Underline, UnderlineStyle, WgpuOutputHandle,
+    WgpuSurfaceHandle, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -1501,6 +1502,10 @@ impl Window {
         if self.invalidator.not_drawing() {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
+            self.platform_window.request_frame(RequestFrameOptions {
+                require_presentation: true,
+                force_render: false,
+            });
         }
     }
 
@@ -1803,6 +1808,11 @@ impl Window {
         } else {
             self.on_next_frame(|window, _| window.refresh());
         }
+
+        self.platform_window.request_frame(RequestFrameOptions {
+            require_presentation: true,
+            force_render: false,
+        });
     }
 
     /// Spawn the future returned by the given closure on the application thread pool.
@@ -2473,10 +2483,10 @@ impl Window {
                 let prepaint_start = self.prepaint_index();
                 if let Some(element) = deferred_draw.element.as_mut() {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
-                        window.with_absolute_element_offset(
-                            deferred_draw.absolute_offset,
-                            |window| element.prepaint(window, cx),
-                        )
+                        window
+                            .with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
+                                element.prepaint(window, cx)
+                            })
                     });
                 }
                 let prepaint_end = self.prepaint_index();
@@ -3587,9 +3597,14 @@ impl Window {
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
-    ) -> Option<crate::WgpuSurfaceHandle> {
+    ) -> Option<WgpuSurfaceHandle> {
         self.platform_window
             .create_wgpu_surface(width, height, format)
+    }
+
+    /// Returns the triple-buffered GPU output for a headless window.
+    pub fn wgpu_output(&self) -> Option<WgpuOutputHandle> {
+        self.platform_window.wgpu_output()
     }
 
     /// Removes an image from the sprite atlas.
@@ -5240,6 +5255,14 @@ impl<V: 'static + Render> WindowHandle<V> {
         cx.update_window(self.any_handle, |_, window, _| window.is_window_active())
             .ok()
     }
+
+    /// Returns the triple-buffered GPU output for this window when available.
+    pub fn wgpu_output<C>(&self, cx: &mut C) -> Result<Option<WgpuOutputHandle>>
+    where
+        C: AppContext,
+    {
+        cx.update_window(self.any_handle, |_, window, _| window.wgpu_output())
+    }
 }
 
 impl<V> Copy for WindowHandle<V> {}
@@ -5323,6 +5346,14 @@ impl AnyWindowHandle {
             .context("the type of the window's root view has changed")?;
 
         cx.read_window(&view, read)
+    }
+
+    /// Returns the triple-buffered GPU output for this window when available.
+    pub fn wgpu_output<C>(self, cx: &mut C) -> Result<Option<WgpuOutputHandle>>
+    where
+        C: AppContext,
+    {
+        cx.update_window(self, |_, window, _| window.wgpu_output())
     }
 }
 
@@ -5609,52 +5640,55 @@ pub fn outline(
 
 #[cfg(test)]
 mod test {
-    use crate::{prelude::*, px, size, TestAppContext, Window};
+    use crate::{TestAppContext, Window, prelude::*, px, size};
 
     struct EmptyView;
     impl crate::Render for EmptyView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl crate::IntoElement {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
             crate::Empty
         }
     }
 
     #[gpui::test]
     fn test_set_app_id_via_options(cx: &mut TestAppContext) {
-        let window = cx.open_window(
-            size(px(800.), px(600.)),
-            |_, _| EmptyView,
-        );
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.test-app");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.test-app");
+            })
+            .ok();
     }
 
     #[gpui::test]
     fn test_set_app_id_via_method(cx: &mut TestAppContext) {
-        let window = cx.open_window(
-            size(px(800.), px(600.)),
-            |_, _| EmptyView,
-        );
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.another-app");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.another-app");
+            })
+            .ok();
     }
 
     #[gpui::test]
     fn test_set_app_id_update(cx: &mut TestAppContext) {
-        let window = cx.open_window(
-            size(px(800.), px(600.)),
-            |_, _| EmptyView,
-        );
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.initial");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.initial");
+            })
+            .ok();
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.updated");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.updated");
+            })
+            .ok();
     }
 }

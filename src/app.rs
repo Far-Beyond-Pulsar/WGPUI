@@ -1350,18 +1350,34 @@ impl App {
                     }
                 }
             } else {
-                #[cfg(any(test, feature = "test-support"))]
-                for window in self
+                let dirty_windows = self
                     .windows
                     .values()
                     .filter_map(|window| {
                         let window = window.as_deref()?;
                         window.invalidator.is_dirty().then_some(window.handle)
                     })
-                    .collect::<Vec<_>>()
-                {
-                    self.update_window(window, |_, window, cx| window.draw(cx).clear())
+                    .collect::<Vec<_>>();
+
+                #[cfg(any(test, feature = "test-support"))]
+                for window in &dirty_windows {
+                    self.update_window(*window, |_, window, cx| window.draw(cx).clear())
                         .unwrap();
+                }
+
+                for window in dirty_windows {
+                    if let Some(window) = self
+                        .windows
+                        .get(window.id)
+                        .and_then(|window| window.as_deref())
+                    {
+                        window
+                            .platform_window
+                            .request_frame(crate::RequestFrameOptions {
+                                require_presentation: true,
+                                force_render: false,
+                            });
+                    }
                 }
 
                 if self.pending_effects.is_empty() {

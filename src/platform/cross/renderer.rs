@@ -7,7 +7,7 @@ use wgpu::util::DeviceExt;
 use crate::{
     AtlasTextureId, AtlasTile, DevicePixels, GpuSpecs, GradientStop, LinearColorStop,
     MonochromeSprite, Pixels, PlatformAtlas, PrimitiveBatch, Quad, ScaledPixels, Scene,
-    TransformationMatrix, color, geometry,
+    TransformationMatrix, WgpuOutputHandle, color, geometry,
     platform::cross::{
         atlas::WgpuAtlas,
         render_context::{WgpuContext, ensure_buffer_size},
@@ -1427,9 +1427,64 @@ struct SurfaceBoundsEntry {
     layout_version: u64,
 }
 
+enum RenderTarget {
+    Onscreen {
+        surface: ManuallyDrop<wgpu::Surface<'static>>,
+    },
+    Offscreen {
+        output: WgpuOutputHandle,
+    },
+}
+
+enum AcquiredFrame {
+    Onscreen {
+        surface_texture: wgpu::SurfaceTexture,
+        view: wgpu::TextureView,
+    },
+    Offscreen {
+        output: WgpuOutputHandle,
+        texture: wgpu::Texture,
+        texture_view: wgpu::TextureView,
+    },
+}
+
+impl AcquiredFrame {
+    fn view(&self) -> &wgpu::TextureView {
+        match self {
+            AcquiredFrame::Onscreen { view, .. } => view,
+            AcquiredFrame::Offscreen { texture_view, .. } => texture_view,
+        }
+    }
+
+    fn texture(&self) -> &wgpu::Texture {
+        match self {
+            AcquiredFrame::Onscreen {
+                surface_texture, ..
+            } => &surface_texture.texture,
+            AcquiredFrame::Offscreen { texture, .. } => texture,
+        }
+    }
+
+    fn complete(self, submission_index: wgpu::SubmissionIndex) {
+        match self {
+            AcquiredFrame::Onscreen {
+                surface_texture, ..
+            } => {
+                surface_texture.present();
+            }
+            AcquiredFrame::Offscreen { output, .. } => {
+                output
+                    .registry()
+                    .swap_rendering_ready(output.id(), submission_index);
+                output.registry().set_redraw_pending(output.id());
+            }
+        }
+    }
+}
+
 pub struct WgpuRenderer {
     context: Arc<WgpuContext>,
-    surface: ManuallyDrop<wgpu::Surface<'static>>,
+    target: RenderTarget,
     surface_configuration: wgpu::SurfaceConfiguration,
     atlas_sampler: wgpu::Sampler,
     surface_sampler: wgpu::Sampler,
@@ -1601,7 +1656,9 @@ impl WgpuRenderer {
 
         Ok(Self {
             context: context.clone(),
-            surface: ManuallyDrop::new(surface),
+            target: RenderTarget::Onscreen {
+                surface: ManuallyDrop::new(surface),
+            },
             surface_configuration,
             atlas,
             atlas_sampler,
@@ -1617,6 +1674,180 @@ impl WgpuRenderer {
             surface_bounds_cache: Arc::new(Mutex::new(HashMap::new())),
             layout_version: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    pub fn new_offscreen(
+        context: Arc<WgpuContext>,
+        atlas: Arc<WgpuAtlas>,
+        width: u32,
+        height: u32,
+        path_sample_count: u32,
+    ) -> anyhow::Result<(Self, WgpuOutputHandle)> {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let surface_configuration = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            format,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+
+        let atlas_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("atlas_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let surface_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("surface_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let backdrop_blur_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("backdrop_blur_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let pipelines =
+            WgpuPipelines::new(context.as_ref(), &surface_configuration, path_sample_count);
+
+        let persistent_framebuffer = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("persistent_framebuffer"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        let persistent_framebuffer_view =
+            persistent_framebuffer.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let backdrop_blur_texture = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("backdrop_blur_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let backdrop_blur_texture_view =
+            backdrop_blur_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let surface_id = context
+            .surface_registry
+            .create(&context.device, width, height, format);
+        let output = WgpuOutputHandle::new(
+            context.device.clone(),
+            context.queue.clone(),
+            surface_id,
+            context.surface_registry.clone(),
+            width,
+            height,
+            format,
+        );
+
+        Ok((
+            Self {
+                context: context.clone(),
+                target: RenderTarget::Offscreen {
+                    output: output.clone(),
+                },
+                surface_configuration,
+                atlas,
+                atlas_sampler,
+                surface_sampler,
+                backdrop_blur_sampler,
+                pipelines,
+                rendering_parameters: RenderingParameters::from_env(),
+                surface_bind_groups: Mutex::new(HashMap::new()),
+                persistent_framebuffer: Some(persistent_framebuffer),
+                persistent_framebuffer_view: Some(persistent_framebuffer_view),
+                backdrop_blur_texture: Some(backdrop_blur_texture),
+                backdrop_blur_texture_view: Some(backdrop_blur_texture_view),
+                surface_bounds_cache: Arc::new(Mutex::new(HashMap::new())),
+                layout_version: Arc::new(AtomicU64::new(0)),
+            },
+            output,
+        ))
+    }
+
+    fn acquire_frame(&mut self) -> Option<AcquiredFrame> {
+        match &mut self.target {
+            RenderTarget::Onscreen { surface } => {
+                let surface_texture = {
+                    let first = surface.get_current_texture();
+                    match first {
+                        Ok(texture) => texture,
+                        Err(wgpu::SurfaceError::Outdated)
+                        | Err(wgpu::SurfaceError::Lost)
+                        | Err(wgpu::SurfaceError::Other) => {
+                            surface.configure(&self.context.device, &self.surface_configuration);
+                            match surface.get_current_texture() {
+                                Ok(texture) => texture,
+                                Err(error) => {
+                                    log::warn!(
+                                        "Skipping frame: failed to acquire swap chain texture after reconfigure: {:?}",
+                                        error
+                                    );
+                                    return None;
+                                }
+                            }
+                        }
+                        Err(wgpu::SurfaceError::Timeout) => {
+                            log::warn!("Skipping frame: swap chain acquire timed out");
+                            return None;
+                        }
+                        Err(wgpu::SurfaceError::OutOfMemory) => {
+                            log::warn!("Skipping frame: out of memory");
+                            return None;
+                        }
+                    }
+                };
+
+                let view = surface_texture
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                Some(AcquiredFrame::Onscreen {
+                    surface_texture,
+                    view,
+                })
+            }
+            RenderTarget::Offscreen { output } => {
+                let texture = output.registry().back_texture(output.id())?;
+                let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                Some(AcquiredFrame::Offscreen {
+                    output: output.clone(),
+                    texture,
+                    texture_view,
+                })
+            }
+        }
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -1810,41 +2041,8 @@ impl WgpuRenderer {
             );
         }
 
-        // Acquire the next swapchain image.  On the first frame after window
-        // creation (or after a resize races with the GPU) the surface can be
-        // reported as `Outdated` or `Other`.  Rather than panicking we
-        // reconfigure and retry once; if the second attempt also fails we
-        // simply drop this frame.
-        let surface_texture = {
-            let first = self.surface.get_current_texture();
-            match first {
-                Ok(t) => t,
-                Err(wgpu::SurfaceError::Outdated)
-                | Err(wgpu::SurfaceError::Lost)
-                | Err(wgpu::SurfaceError::Other) => {
-                    // Reconfigure with the current known size and retry.
-                    self.surface
-                        .configure(&self.context.device, &self.surface_configuration);
-                    match self.surface.get_current_texture() {
-                        Ok(t) => t,
-                        Err(e) => {
-                            log::warn!(
-                                "Skipping frame: failed to acquire swap chain texture after reconfigure: {:?}",
-                                e
-                            );
-                            return;
-                        }
-                    }
-                }
-                Err(wgpu::SurfaceError::Timeout) => {
-                    log::warn!("Skipping frame: swap chain acquire timed out");
-                    return;
-                }
-                Err(wgpu::SurfaceError::OutOfMemory) => {
-                    log::warn!("Skipping frame: out of memory");
-                    return;
-                }
-            }
+        let Some(frame) = self.acquire_frame() else {
+            return;
         };
 
         // Increment layout version - all bounds caches are now fresh
@@ -1998,9 +2196,7 @@ impl WgpuRenderer {
             let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_texture
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default()),
+                    view: frame.view(),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -2128,15 +2324,15 @@ impl WgpuRenderer {
 
                         // Copy surface texture to backdrop_blur_texture for sampling
                         if let Some(ref blur_texture) = self.backdrop_blur_texture {
-                            // Use actual surface texture size (may differ from configured size)
-                            let surface_size = surface_texture.texture.size();
+                            // Use actual render target size (may differ from configured size)
+                            let surface_size = frame.texture().size();
 
                             // Only copy if sizes match (otherwise skip to avoid validation error)
                             if surface_size.width == blur_texture.width()
                                 && surface_size.height == blur_texture.height()
                             {
                                 command_encoder.copy_texture_to_texture(
-                                    surface_texture.texture.as_image_copy(),
+                                    frame.texture().as_image_copy(),
                                     blur_texture.as_image_copy(),
                                     surface_size,
                                 );
@@ -2147,9 +2343,7 @@ impl WgpuRenderer {
                         pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("main_resumed"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &surface_texture
-                                    .texture
-                                    .create_view(&wgpu::TextureViewDescriptor::default()),
+                                view: frame.view(),
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Load,
                                     store: wgpu::StoreOp::Store,
@@ -2342,15 +2536,19 @@ impl WgpuRenderer {
         // TODO: Blit persistent framebuffer to swapchain (needs proper pipeline)
 
         log::debug!("Renderer::draw: submitting command buffer");
-        self.context.queue.submit(Some(command_encoder.finish()));
+        let submission_index = self.context.queue.submit(Some(command_encoder.finish()));
         log::debug!("Renderer::draw: presenting surface");
-        surface_texture.present();
+        frame.complete(submission_index);
         log::debug!("Renderer::draw: frame complete");
     }
 
     /// Fast path: blit all visible surfaces in a single swapchain pass.
     /// Returns true if successful, false if compositor should run.
     pub fn blit_surfaces_direct(&self, pending_surfaces: &[SurfaceId]) -> bool {
+        let RenderTarget::Onscreen { surface } = &self.target else {
+            return false;
+        };
+
         if pending_surfaces.is_empty() {
             return false;
         }
@@ -2397,14 +2595,13 @@ impl WgpuRenderer {
         }
 
         // Acquire swapchain (handle retryable surface errors the same as regular draw).
-        let surface_texture = match self.surface.get_current_texture() {
+        let surface_texture = match surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Outdated)
             | Err(wgpu::SurfaceError::Lost)
             | Err(wgpu::SurfaceError::Other) => {
-                self.surface
-                    .configure(&self.context.device, &self.surface_configuration);
-                match self.surface.get_current_texture() {
+                surface.configure(&self.context.device, &self.surface_configuration);
+                match surface.get_current_texture() {
                     Ok(t) => t,
                     Err(e) => {
                         log::warn!(
@@ -2551,8 +2748,23 @@ impl WgpuRenderer {
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
         self.surface_configuration.width = size.width.0 as u32;
         self.surface_configuration.height = size.height.0 as u32;
-        self.surface
-            .configure(&self.context.device, &self.surface_configuration);
+        match &mut self.target {
+            RenderTarget::Onscreen { surface } => {
+                surface.configure(&self.context.device, &self.surface_configuration);
+            }
+            RenderTarget::Offscreen { output } => {
+                output.registry().resize(
+                    &self.context.device,
+                    output.id(),
+                    self.surface_configuration.width,
+                    self.surface_configuration.height,
+                );
+                output.update_size(
+                    self.surface_configuration.width,
+                    self.surface_configuration.height,
+                );
+            }
+        }
 
         // Recreate persistent framebuffer at new size
         let persistent_framebuffer = self
@@ -2633,8 +2845,10 @@ impl WgpuRenderer {
             // wgpu::CompositeAlphaMode::Opaque
             wgpu::CompositeAlphaMode::Inherit
         };
-        self.surface
-            .configure(&self.context.device, &self.surface_configuration);
+
+        if let RenderTarget::Onscreen { surface } = &mut self.target {
+            surface.configure(&self.context.device, &self.surface_configuration);
+        }
     }
 
     pub fn viewport_size(&self) -> geometry::Size<DevicePixels> {
@@ -2647,13 +2861,11 @@ impl WgpuRenderer {
 
 impl Drop for WgpuRenderer {
     fn drop(&mut self) {
-        // SAFETY: This is the only Drop impl and `surface` has not been dropped yet.
-        // We take it manually so we can drop it inside catch_unwind, suppressing the Vulkan
-        // panic that occurs when a SurfaceTexture's Arc still holds a swapchain semaphore
-        // reference at the time the surface is destroyed (e.g. window closed mid-frame).
-        let surface = unsafe { ManuallyDrop::take(&mut self.surface) };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drop(surface);
-        }));
+        if let RenderTarget::Onscreen { surface } = &mut self.target {
+            let surface = unsafe { ManuallyDrop::take(surface) };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                drop(surface);
+            }));
+        }
     }
 }

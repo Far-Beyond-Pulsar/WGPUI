@@ -1,13 +1,14 @@
 mod app_menu;
+pub(crate) mod cross;
+mod headless;
 mod keyboard;
 mod keystroke;
 
 #[cfg(any(test, feature = "test-support"))]
 mod test;
 
-pub(crate) mod cross;
-
 use crate::platform::cross::platform::CrossPlatform;
+use crate::platform::headless::HeadlessPlatform;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
@@ -57,10 +58,12 @@ pub fn background_executor() -> BackgroundExecutor {
     current_platform(true).background_executor()
 }
 
-pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
-    // TODO(mdeand): Support headless
-    // TODO(mdeand): Monomorphize Platform and its associated types.
-    Rc::new(CrossPlatform::new().expect("Failed to initialize platform"))
+pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
+    if headless {
+        HeadlessPlatform::new().expect("Failed to initialize headless platform")
+    } else {
+        Rc::new(CrossPlatform::new().expect("Failed to initialize platform"))
+    }
 }
 
 pub(crate) trait Platform: 'static {
@@ -372,6 +375,7 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
+    fn request_frame(&self, _options: RequestFrameOptions) {}
     fn draw(&self, scene: &Scene);
     fn present_framebuffer_only(&self);
     fn completed_frame(&self) {}
@@ -444,6 +448,10 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         _height: u32,
         _format: wgpu::TextureFormat,
     ) -> Option<crate::WgpuSurfaceHandle> {
+        None
+    }
+
+    fn wgpu_output(&self) -> Option<crate::WgpuOutputHandle> {
         None
     }
 

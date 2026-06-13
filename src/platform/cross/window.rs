@@ -400,6 +400,10 @@ impl PlatformWindow for CrossWindow {
             .set(Some(callback));
     }
 
+    fn request_frame(&self, _options: crate::RequestFrameOptions) {
+        self.window().request_redraw();
+    }
+
     fn draw(&self, scene: &crate::Scene) {
         if let Some(renderer) = self.0.renderer.get() {
             renderer.borrow_mut().draw(scene);

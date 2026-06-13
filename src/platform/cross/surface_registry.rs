@@ -182,6 +182,15 @@ impl SurfaceRegistry {
         })
     }
 
+    /// Get the rendering buffer's texture handle.
+    pub fn back_texture(&self, id: SurfaceId) -> Option<wgpu::Texture> {
+        let surfaces = self.surfaces.lock().unwrap();
+        surfaces.get(&id).map(|tb| {
+            let (rendering, _, _) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
+            tb.textures[rendering as usize].clone()
+        })
+    }
+
     /// Get the display buffer's `TextureView` (what the compositor reads from).
     pub fn front_view(&self, id: SurfaceId) -> Option<wgpu::TextureView> {
         let surfaces = self.surfaces.lock().unwrap();
@@ -274,6 +283,15 @@ impl SurfaceRegistry {
         if let Some(tb) = self.surfaces.lock().unwrap().get(&id) {
             tb.redraw_pending.store(false, Ordering::Relaxed);
         }
+    }
+
+    /// Returns whether the given surface has a new frame pending consumption.
+    pub fn is_redraw_pending(&self, id: SurfaceId) -> bool {
+        self.surfaces
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|tb| tb.redraw_pending.load(Ordering::Relaxed))
     }
 
     /// Get all surfaces that have pending redraws.
