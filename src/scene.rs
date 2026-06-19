@@ -377,7 +377,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 ))
             }
             PrimitiveKind::MonochromeSprite => {
-                let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
+                let Some(first) = self.monochrome_sprites_iter.peek() else {
+                    return None;
+                };
+                let texture_id = first.tile.texture_id;
                 let sprites_start = self.monochrome_sprites_start;
                 let mut sprites_end = sprites_start + 1;
                 self.monochrome_sprites_iter.next();
@@ -398,7 +401,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 })
             }
             PrimitiveKind::PolychromeSprite => {
-                let texture_id = self.polychrome_sprites_iter.peek().unwrap().tile.texture_id;
+                let Some(first) = self.polychrome_sprites_iter.peek() else {
+                    return None;
+                };
+                let texture_id = first.tile.texture_id;
                 let sprites_start = self.polychrome_sprites_start;
                 let mut sprites_end = self.polychrome_sprites_start + 1;
                 self.polychrome_sprites_iter.next();
