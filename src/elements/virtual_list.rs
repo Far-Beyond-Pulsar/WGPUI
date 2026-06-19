@@ -118,7 +118,7 @@ where
         heights,
         offsets,
         content_height: sum,
-        scroll_state: controller.state.clone(),
+        scroll_state: controller.state,
         render: Box::new(render),
         overscan: 16,
     }

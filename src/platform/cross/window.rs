@@ -82,7 +82,7 @@ impl CrossWindow {
             winit_window: OnceCell::new(),
             wgpu_context: wgpu_context.clone(),
             renderer: OnceCell::new(),
-            sprite_atlas: Arc::new(WgpuAtlas::new(wgpu_context.clone())),
+            sprite_atlas: Arc::new(WgpuAtlas::new(wgpu_context)),
             event_loop_proxy,
             state: CrossWindowState::default(),
         }))

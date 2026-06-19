@@ -121,7 +121,7 @@ impl CrossPlatform {
 
         let dispatcher = Arc::new(Dispatcher::new(main_tx, event_loop_proxy.clone()));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
-        let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
+        let foreground_executor = ForegroundExecutor::new(dispatcher);
 
         Ok(Self {
             background_executor,
@@ -181,7 +181,7 @@ fn acquire_single_instance_lock(
                 listener.set_nonblocking(true)?;
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread_stop = stop.clone();
-                let thread_proxy = event_loop_proxy.clone();
+                let thread_proxy = event_loop_proxy;
                 let thread_lock_path = lock_path.clone();
                 let listener_thread = thread::spawn(move || {
                     while !thread_stop.load(Ordering::SeqCst) {
@@ -1744,7 +1744,7 @@ fn winit_key_to_keystroke(
                     && !modifiers.alt
                 {
                     if modifiers.shift {
-                        Some(ch.to_uppercase().to_string())
+                        Some(ch.to_uppercase())
                     } else {
                         Some(ch.to_string())
                     }
