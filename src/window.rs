@@ -913,6 +913,7 @@ pub struct Window {
     layout_cache: FxHashMap<EntityId, CachedLayout>,
     layout_available_space_stack: SmallVec<[Size<AvailableSpace>; 8]>,
     frame_number: u64,
+    frame_metrics: Option<crate::FrameMetrics>,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
@@ -1361,6 +1362,7 @@ impl Window {
             layout_cache: FxHashMap::default(),
             layout_available_space_stack: SmallVec::new(),
             frame_number: 0,
+            frame_metrics: None,
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
@@ -1480,6 +1482,11 @@ impl Window {
 
     pub(crate) fn should_skip_view(&self, entity_id: EntityId) -> bool {
         !self.dirty_views.contains(&entity_id) && !self.dirty_descendants.contains(&entity_id)
+    }
+
+    /// Metrics collected during the most recent [`Window::draw`] (Phase 0).
+    pub fn frame_metrics(&self) -> Option<&crate::FrameMetrics> {
+        self.frame_metrics.as_ref()
     }
 
     /// Registers a callback to be invoked when the window appearance changes.
@@ -2187,6 +2194,7 @@ impl Window {
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
         self.frame_number += 1;
+        let draw_timer = crate::PhaseTimer::start();
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -2213,6 +2221,7 @@ impl Window {
         if !cx.mode.skip_drawing() {
             self.draw_roots(cx);
         }
+        let dirty_view_count = self.dirty_views.len() as u32;
         self.dirty_views.clear();
         self.dirty_descendants.clear();
         self.next_frame.window_active = self.active.get();
@@ -2241,6 +2250,26 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+
+        let scene = &self.rendered_frame.scene;
+        self.frame_metrics = Some(crate::FrameMetrics {
+            frame_number: self.frame_number,
+            total_draw_duration: draw_timer.elapsed(),
+            dirty_view_count,
+            total_view_count: scene.chunks.len() as u32,
+            batch_count: scene.batch_count(),
+            primitive_count: crate::PrimitiveCounts {
+                shadows: scene.shadows.len() as u32,
+                backdrop_blurs: scene.backdrop_blurs.len() as u32,
+                quads: scene.quads.len() as u32,
+                paths: scene.paths.len() as u32,
+                underlines: scene.underlines.len() as u32,
+                monochrome_sprites: scene.monochrome_sprites.len() as u32,
+                polychrome_sprites: scene.polychrome_sprites.len() as u32,
+                surfaces: scene.surfaces.len() as u32,
+            },
+        });
+
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
 

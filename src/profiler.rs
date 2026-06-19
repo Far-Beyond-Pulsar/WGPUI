@@ -232,3 +232,49 @@ pub(crate) fn add_task_timing(timing: TaskTiming) {
         timings.push_back(timing);
     });
 }
+
+/// Per-primitive-type counts for a finished frame's scene (Phase 0 metrics).
+#[expect(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PrimitiveCounts {
+    pub shadows: u32,
+    pub backdrop_blurs: u32,
+    pub quads: u32,
+    pub paths: u32,
+    pub underlines: u32,
+    pub monochrome_sprites: u32,
+    pub polychrome_sprites: u32,
+    pub surfaces: u32,
+}
+
+/// Metrics collected during the most recent window draw. Surfaced via
+/// `Window::frame_metrics` for benchmarking the rendering-perf work.
+#[expect(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameMetrics {
+    pub frame_number: u64,
+    pub total_draw_duration: std::time::Duration,
+    pub dirty_view_count: u32,
+    pub total_view_count: u32,
+    pub batch_count: u32,
+    pub primitive_count: PrimitiveCounts,
+}
+
+/// A simple start/elapsed timer for a draw phase.
+pub struct PhaseTimer {
+    start: std::time::Instant,
+}
+
+impl PhaseTimer {
+    /// Start a new timer.
+    pub fn start() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+        }
+    }
+
+    /// Time elapsed since [`PhaseTimer::start`].
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.start.elapsed()
+    }
+}
