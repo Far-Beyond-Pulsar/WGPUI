@@ -314,6 +314,14 @@ impl TextSystem {
         } else {
             let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
             let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
+            // This cache keys on (font, size, subpixel, scale) glyph variants
+            // and was otherwise never cleared, growing without bound under heavy
+            // font/size variation. It's a pure cache (entries re-rasterize on
+            // demand), so cap it with a cheap clear.
+            const MAX_RASTER_BOUNDS: usize = 8192;
+            if raster_bounds.len() >= MAX_RASTER_BOUNDS {
+                raster_bounds.clear();
+            }
             raster_bounds.insert(params.clone(), bounds);
             Ok(bounds)
         }
