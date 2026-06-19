@@ -493,7 +493,9 @@ impl<E: Element> Drawable<E> {
         cx: &mut App,
     ) -> Size<Pixels> {
         if matches!(&self.phase, ElementDrawPhase::Start) {
-            self.request_layout(window, cx);
+            window.with_layout_available_space(available_space, |window| {
+                self.request_layout(window, cx);
+            });
         }
 
         let layout_id = match mem::take(&mut self.phase) {

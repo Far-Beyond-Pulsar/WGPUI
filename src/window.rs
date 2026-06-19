@@ -910,6 +910,9 @@ pub struct Window {
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
+    layout_cache: FxHashMap<EntityId, CachedLayout>,
+    layout_available_space_stack: SmallVec<[Size<AvailableSpace>; 8]>,
+    frame_number: u64,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
@@ -927,6 +930,7 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    pub(crate) dirty_descendants: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -957,6 +961,14 @@ pub struct Window {
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
 }
+
+struct CachedLayout {
+    available_space: Size<AvailableSpace>,
+    layout_id: LayoutId,
+    generation: u64,
+}
+
+const LAYOUT_CACHE_STALE_GENERATIONS: u64 = 10;
 
 #[derive(Clone, Debug, Default)]
 struct ModifierState {
@@ -1346,6 +1358,9 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
+            layout_cache: FxHashMap::default(),
+            layout_available_space_stack: SmallVec::new(),
+            frame_number: 0,
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
@@ -1362,6 +1377,7 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            dirty_descendants: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -1437,17 +1453,33 @@ impl ContentMask<Pixels> {
 
 impl Window {
     fn mark_view_dirty(&mut self, view_id: EntityId) {
-        // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
-        // should already be dirty.
-        for view_id in self
+        // The view itself is directly dirty; its ancestors are marked as having a
+        // dirty descendant (so a subtree can be skipped iff it is neither dirty
+        // nor an ancestor of a dirty view). Invalidating a view drops its layout
+        // cache entry so a changed view is always re-laid-out.
+        self.layout_cache.remove(&view_id);
+        self.dirty_views.insert(view_id);
+        self.dirty_descendants.remove(&view_id);
+
+        for ancestor_id in self
             .rendered_frame
             .dispatch_tree
             .view_path_reversed(view_id)
         {
-            if !self.dirty_views.insert(view_id) {
+            if ancestor_id == view_id {
+                continue;
+            }
+            if self.dirty_views.contains(&ancestor_id) {
+                continue;
+            }
+            if !self.dirty_descendants.insert(ancestor_id) {
                 break;
             }
         }
+    }
+
+    pub(crate) fn should_skip_view(&self, entity_id: EntityId) -> bool {
+        !self.dirty_views.contains(&entity_id) && !self.dirty_descendants.contains(&entity_id)
     }
 
     /// Registers a callback to be invoked when the window appearance changes.
@@ -2154,6 +2186,7 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
+        self.frame_number += 1;
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -2181,6 +2214,7 @@ impl Window {
             self.draw_roots(cx);
         }
         self.dirty_views.clear();
+        self.dirty_descendants.clear();
         self.next_frame.window_active = self.active.get();
 
         // Register requested input handler with the platform window.
@@ -2198,7 +2232,7 @@ impl Window {
             self.platform_window.set_input_handler(input_handler);
         }
 
-        self.layout_engine.as_mut().unwrap().clear();
+        self.finish_layout_frame();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
@@ -3651,6 +3685,82 @@ impl Window {
 
     /// Add a node to the layout tree for the current frame. Instead of taking a `Style` and children,
     /// this variant takes a function that is invoked during layout so you can use arbitrary logic to
+    /// Reuse a view's cached layout when it can be skipped (not dirty, no dirty
+    /// descendant) and the available space is unchanged. Returns `None` (and
+    /// drops any stale entry) otherwise, forcing a fresh layout.
+    pub(crate) fn cached_layout_for_view(&mut self, view_id: EntityId) -> Option<LayoutId> {
+        self.invalidator.debug_assert_prepaint();
+
+        if !self.should_skip_view(view_id) {
+            self.layout_cache.remove(&view_id);
+            return None;
+        }
+
+        let available_space = self.current_layout_available_space()?;
+        let generation = self.layout_cache_generation();
+        let cached = self.layout_cache.get_mut(&view_id)?;
+        if cached.available_space == available_space {
+            cached.generation = generation;
+            Some(cached.layout_id)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn cache_layout_for_view(&mut self, view_id: EntityId, layout_id: LayoutId) {
+        self.invalidator.debug_assert_prepaint();
+
+        let Some(available_space) = self.current_layout_available_space() else {
+            return;
+        };
+        let generation = self.layout_cache_generation();
+
+        self.layout_cache.insert(
+            view_id,
+            CachedLayout {
+                available_space,
+                layout_id,
+                generation,
+            },
+        );
+    }
+
+    pub(crate) fn with_layout_available_space<R>(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.layout_available_space_stack.push(available_space);
+        let result = f(self);
+        self.layout_available_space_stack.pop();
+        result
+    }
+
+    fn current_layout_available_space(&self) -> Option<Size<AvailableSpace>> {
+        self.layout_available_space_stack.last().copied()
+    }
+
+    fn layout_cache_generation(&self) -> u64 {
+        self.rendered_frame
+            .scene
+            .scene_generation()
+            .max(self.next_frame.scene.scene_generation())
+    }
+
+    fn finish_layout_frame(&mut self) {
+        let generation = self.layout_cache_generation();
+        self.layout_cache.retain(|_, cached| {
+            generation.saturating_sub(cached.generation) <= LAYOUT_CACHE_STALE_GENERATIONS
+        });
+
+        if self.layout_cache.is_empty() || self.frame_number % LAYOUT_CACHE_STALE_GENERATIONS == 0 {
+            self.layout_cache.clear();
+            if let Some(layout_engine) = self.layout_engine.as_mut() {
+                layout_engine.clear();
+            }
+        }
+    }
+
     /// determine the element's size. One place this is used internally is when measuring text.
     ///
     /// The given closure is invoked at layout time with the known dimensions and available space and

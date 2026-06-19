@@ -167,7 +167,13 @@ impl Element for AnyView {
         window.with_rendered_view(self.entity_id(), |window| {
             // Disable caching when inspecting so that mouse_hit_test has all hitboxes.
             let caching_disabled = window.is_inspector_picking(cx);
-            match self.cached_style.as_ref() {
+            if !caching_disabled
+                && let Some(layout_id) = window.cached_layout_for_view(self.entity_id())
+            {
+                return (layout_id, None);
+            }
+
+            let (layout_id, element) = match self.cached_style.as_ref() {
                 Some(style) if !caching_disabled => {
                     let mut root_style = Style::default();
                     root_style.refine(style);
@@ -179,7 +185,11 @@ impl Element for AnyView {
                     let layout_id = element.request_layout(window, cx);
                     (layout_id, Some(element))
                 }
+            };
+            if !caching_disabled {
+                window.cache_layout_for_view(self.entity_id(), layout_id);
             }
+            (layout_id, element)
         })
     }
 
