@@ -3356,11 +3356,6 @@ impl Window {
             };
             let content_mask = self.content_mask().scale(scale_factor);
 
-            // Debug: Print glyph info
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static GLYPH_COUNT: AtomicU32 = AtomicU32::new(0);
-            let count = GLYPH_COUNT.fetch_add(1, Ordering::Relaxed);
-
             self.next_frame.scene.insert_primitive(MonochromeSprite {
                 order: 0,
                 pad: 0,

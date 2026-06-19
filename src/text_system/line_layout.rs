@@ -150,7 +150,13 @@ impl LineLayout {
             .enumerate()
             .flat_map(move |(run_ix, run)| {
                 run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
+                    // `glyph.index` can fall on a non-char boundary or past the
+                    // end with ligature/cluster remapping or fallback fonts;
+                    // degrade to U+FFFD instead of panicking the renderer.
+                    let character = text
+                        .get(glyph.index..)
+                        .and_then(|rest| rest.chars().next())
+                        .unwrap_or('\u{fffd}');
                     (
                         WrapBoundary { run_ix, glyph_ix },
                         character,
