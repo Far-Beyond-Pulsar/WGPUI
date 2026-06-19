@@ -7,17 +7,47 @@
 //!
 //! If all of your elements are the same height, see [`crate::UniformList`] for a simpler API
 
-use crate::elements::smooth_scroll::{SmoothScrollMode, SmoothScrollState};
-use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
-    FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
-};
+use std::cell::RefCell;
+use std::ops::Range;
+use std::rc::Rc;
+
 use collections::VecDeque;
 use refineable::Refineable as _;
-use std::{cell::RefCell, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
+
+use crate::elements::smooth_scroll::{SmoothScrollMode, SmoothScrollState};
+use crate::{
+    AnyElement,
+    App,
+    AvailableSpace,
+    Bounds,
+    ContentMask,
+    DispatchPhase,
+    Edges,
+    Element,
+    ElementId,
+    EntityId,
+    FocusHandle,
+    GlobalElementId,
+    Hitbox,
+    HitboxBehavior,
+    InspectorElementId,
+    IntoElement,
+    LayoutId,
+    Overflow,
+    Pixels,
+    Point,
+    ScrollDelta,
+    ScrollWheelEvent,
+    Size,
+    Style,
+    StyleRefinement,
+    Styled,
+    Window,
+    point,
+    px,
+    size,
+};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
 
@@ -67,6 +97,7 @@ struct StateInner {
     logical_scroll_top: Option<ListOffset>,
     alignment: ListAlignment,
     overdraw: Pixels,
+    next_item_cache_id: u64,
     reset: bool,
     #[allow(clippy::type_complexity)]
     scroll_handler: Option<Box<dyn FnMut(&ListScrollEvent, &mut Window, &mut App)>>,
@@ -154,12 +185,23 @@ pub struct ListPrepaintState {
     layout: LayoutItemsResponse,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ListItemCacheId(u64);
+
+impl ListItemCacheId {
+    fn element_id(self) -> ElementId {
+        ("list-item", self.0).into()
+    }
+}
+
 #[derive(Clone)]
 enum ListItem {
     Unmeasured {
+        cache_id: ListItemCacheId,
         focus_handle: Option<FocusHandle>,
     },
     Measured {
+        cache_id: ListItemCacheId,
         size: Size<Pixels>,
         focus_handle: Option<FocusHandle>,
     },
@@ -174,9 +216,17 @@ impl ListItem {
         }
     }
 
+    fn cache_id(&self) -> ListItemCacheId {
+        match self {
+            ListItem::Unmeasured { cache_id, .. } | ListItem::Measured { cache_id, .. } => {
+                *cache_id
+            }
+        }
+    }
+
     fn focus_handle(&self) -> Option<FocusHandle> {
         match self {
-            ListItem::Unmeasured { focus_handle } | ListItem::Measured { focus_handle, .. } => {
+            ListItem::Unmeasured { focus_handle, .. } | ListItem::Measured { focus_handle, .. } => {
                 focus_handle.clone()
             }
         }
@@ -184,12 +234,79 @@ impl ListItem {
 
     fn contains_focused(&self, window: &Window, cx: &App) -> bool {
         match self {
-            ListItem::Unmeasured { focus_handle } | ListItem::Measured { focus_handle, .. } => {
+            ListItem::Unmeasured { focus_handle, .. } | ListItem::Measured { focus_handle, .. } => {
                 focus_handle
                     .as_ref()
                     .is_some_and(|handle| handle.contains_focused(window, cx))
             }
         }
+    }
+}
+
+struct KeyedListItemElement {
+    cache_id: ListItemCacheId,
+    element: AnyElement,
+}
+
+impl KeyedListItemElement {
+    fn new(cache_id: ListItemCacheId, element: AnyElement) -> Self {
+        Self { cache_id, element }
+    }
+}
+
+impl Element for KeyedListItemElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.cache_id.element_id())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (self.element.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.element.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.element.paint(window, cx);
+    }
+}
+
+impl IntoElement for KeyedListItemElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
     }
 }
 
@@ -223,6 +340,7 @@ impl ListState {
             logical_scroll_top: None,
             alignment,
             overdraw,
+            next_item_cache_id: 0,
             scroll_handler: None,
             reset: false,
             scrollbar_drag_start_height: None,
@@ -279,18 +397,23 @@ impl ListState {
     ) {
         let state = &mut *self.0.borrow_mut();
 
+        let mut spliced_count = 0;
+        let spliced_items = focus_handles
+            .into_iter()
+            .map(|focus_handle| {
+                spliced_count += 1;
+                ListItem::Unmeasured {
+                    cache_id: state.next_item_cache_id(),
+                    focus_handle,
+                }
+            })
+            .collect::<Vec<_>>();
+
         let mut old_items = state.items.cursor::<Count>(());
         let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);
         old_items.seek_forward(&Count(old_range.end), Bias::Right);
 
-        let mut spliced_count = 0;
-        new_items.extend(
-            focus_handles.into_iter().map(|focus_handle| {
-                spliced_count += 1;
-                ListItem::Unmeasured { focus_handle }
-            }),
-            (),
-        );
+        new_items.extend(spliced_items, ());
         new_items.append(old_items.suffix(), ());
         drop(old_items);
         state.items = new_items;
@@ -451,11 +574,19 @@ impl ListState {
     }
 
     /// Update smooth scrolling state and return whether the visual offset changed, indicating that a re-render is needed.
+    #[expect(
+        dead_code,
+        reason = "list smooth-scroll helpers are staged for display validation"
+    )]
     fn update_smooth_scroll(&mut self) -> bool {
         self.0.borrow_mut().smooth_scroll.update()
     }
 
     /// Get the current visual scroll offset, which may be different from the logical scroll offset if smooth scrolling is enabled.
+    #[expect(
+        dead_code,
+        reason = "list smooth-scroll helpers are staged for display validation"
+    )]
     fn visual_scroll_offset(&self) -> Pixels {
         self.0.borrow().smooth_scroll.current()
     }
@@ -513,6 +644,22 @@ impl ListState {
 }
 
 impl StateInner {
+    fn next_item_cache_id(&mut self) -> ListItemCacheId {
+        let id = ListItemCacheId(self.next_item_cache_id);
+        self.next_item_cache_id = self.next_item_cache_id.wrapping_add(1);
+        id
+    }
+
+    fn render_cached_item(
+        item_index: usize,
+        cache_id: ListItemCacheId,
+        render_item: &mut RenderItemFn,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        KeyedListItemElement::new(cache_id, render_item(item_index, window, cx)).into_any()
+    }
+
     fn visible_range(&self, height: Pixels, scroll_top: &ListOffset) -> Range<usize> {
         let mut cursor = self.items.cursor::<ListItemSummary>(());
         cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
@@ -559,9 +706,9 @@ impl StateInner {
             window.request_animation_frame();
         }
 
-        if self.scroll_handler.is_some() {
-            let visible_range = self.visible_range(height, scroll_top);
-            self.scroll_handler.as_mut().unwrap()(
+        let visible_range = self.visible_range(height, scroll_top);
+        if let Some(scroll_handler) = &mut self.scroll_handler {
+            scroll_handler(
                 &ListScrollEvent {
                     visible_range,
                     count: self.items.summary().count,
@@ -627,11 +774,13 @@ impl StateInner {
 
         for (ix, item) in cursor.enumerate() {
             let size = item.size().unwrap_or_else(|| {
-                let mut element = render_item(ix, window, cx);
+                let mut element =
+                    Self::render_cached_item(ix, item.cache_id(), render_item, window, cx);
                 element.layout_as_root(available_item_space, window, cx)
             });
 
             measured_items.push(ListItem::Measured {
+                cache_id: item.cache_id(),
                 size,
                 focus_handle: item.focus_handle(),
             });
@@ -680,7 +829,8 @@ impl StateInner {
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
             if visible_height < available_height || size.is_none() {
                 let item_index = scroll_top.item_ix + ix;
-                let mut element = render_item(item_index, window, cx);
+                let mut element =
+                    Self::render_cached_item(item_index, item.cache_id(), render_item, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
                 size = Some(element_size);
                 if visible_height < available_height {
@@ -699,6 +849,7 @@ impl StateInner {
             rendered_height += size.height;
             max_item_width = max_item_width.max(size.width);
             measured_items.push_back(ListItem::Measured {
+                cache_id: item.cache_id(),
                 size,
                 focus_handle: item.focus_handle(),
             });
@@ -715,11 +866,18 @@ impl StateInner {
                 cursor.prev();
                 if let Some(item) = cursor.item() {
                     let item_index = cursor.start().0;
-                    let mut element = render_item(item_index, window, cx);
+                    let mut element = Self::render_cached_item(
+                        item_index,
+                        item.cache_id(),
+                        render_item,
+                        window,
+                        cx,
+                    );
                     let element_size = element.layout_as_root(available_item_space, window, cx);
                     let focus_handle = item.focus_handle();
                     rendered_height += element_size.height;
                     measured_items.push_front(ListItem::Measured {
+                        cache_id: item.cache_id(),
                         size: element_size,
                         focus_handle,
                     });
@@ -764,12 +922,19 @@ impl StateInner {
                 let size = if let ListItem::Measured { size, .. } = item {
                     *size
                 } else {
-                    let mut element = render_item(cursor.start().0, window, cx);
+                    let mut element = Self::render_cached_item(
+                        cursor.start().0,
+                        item.cache_id(),
+                        render_item,
+                        window,
+                        cx,
+                    );
                     element.layout_as_root(available_item_space, window, cx)
                 };
 
                 leading_overdraw += size.height;
                 measured_items.push_front(ListItem::Measured {
+                    cache_id: item.cache_id(),
                     size,
                     focus_handle: item.focus_handle(),
                 });
@@ -797,7 +962,13 @@ impl StateInner {
             while let Some(item) = cursor.item() {
                 if item.contains_focused(window, cx) {
                     let item_index = cursor.start().0;
-                    let mut element = render_item(cursor.start().0, window, cx);
+                    let mut element = Self::render_cached_item(
+                        item_index,
+                        item.cache_id(),
+                        render_item,
+                        window,
+                        cx,
+                    );
                     let size = element.layout_as_root(available_item_space, window, cx);
                     item_layouts.push_back(ItemLayout {
                         index: item_index,
@@ -1076,6 +1247,7 @@ impl Element for List {
         {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
+                    cache_id: item.cache_id(),
                     focus_handle: item.focus_handle(),
                 }),
                 (),
@@ -1173,7 +1345,7 @@ impl sum_tree::Item for ListItem {
 
     fn summary(&self, _: ()) -> Self::Summary {
         match self {
-            ListItem::Unmeasured { focus_handle } => ListItemSummary {
+            ListItem::Unmeasured { focus_handle, .. } => ListItemSummary {
                 count: 1,
                 rendered_count: 0,
                 unrendered_count: 1,
@@ -1246,11 +1418,62 @@ mod test {
 
     use crate::{self as gpui, TestAppContext};
 
+    fn item_cache_ids(state: &crate::ListState) -> Vec<super::ListItemCacheId> {
+        state
+            .0
+            .borrow()
+            .items
+            .iter()
+            .map(super::ListItem::cache_id)
+            .collect()
+    }
+
+    #[test]
+    fn splice_preserves_unaffected_item_cache_ids() {
+        let state = crate::ListState::new(5, crate::ListAlignment::Top, crate::px(10.));
+        let original_ids = item_cache_ids(&state);
+
+        state.splice(1..3, 2);
+        let spliced_ids = item_cache_ids(&state);
+
+        assert_eq!(spliced_ids.len(), 5);
+        assert_eq!(spliced_ids[0], original_ids[0]);
+        assert_ne!(spliced_ids[1], original_ids[1]);
+        assert_ne!(spliced_ids[2], original_ids[2]);
+        assert_eq!(spliced_ids[3], original_ids[3]);
+        assert_eq!(spliced_ids[4], original_ids[4]);
+    }
+
+    #[test]
+    fn reset_replaces_all_item_cache_ids() {
+        let state = crate::ListState::new(3, crate::ListAlignment::Top, crate::px(10.));
+        let original_ids = item_cache_ids(&state);
+
+        state.reset(3);
+        let reset_ids = item_cache_ids(&state);
+
+        assert_eq!(reset_ids.len(), original_ids.len());
+        for reset_id in reset_ids {
+            assert!(!original_ids.contains(&reset_id));
+        }
+    }
+
     #[gpui::test]
     fn test_reset_after_paint_before_scroll(cx: &mut TestAppContext) {
         use crate::{
-            AppContext, Context, Element, IntoElement, ListState, Render, Styled, Window, div,
-            list, point, px, size,
+            AppContext,
+            Context,
+            Element,
+            IntoElement,
+            ListState,
+            Render,
+            Styled,
+            Window,
+            div,
+            list,
+            point,
+            px,
+            size,
         };
 
         let cx = cx.add_empty_window();
@@ -1297,8 +1520,19 @@ mod test {
     #[gpui::test]
     fn test_scroll_by_positive_and_negative_distance(cx: &mut TestAppContext) {
         use crate::{
-            AppContext, Context, Element, IntoElement, ListState, Render, Styled, Window, div,
-            list, point, px, size,
+            AppContext,
+            Context,
+            Element,
+            IntoElement,
+            ListState,
+            Render,
+            Styled,
+            Window,
+            div,
+            list,
+            point,
+            px,
+            size,
         };
 
         let cx = cx.add_empty_window();

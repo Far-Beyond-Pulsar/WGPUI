@@ -1,29 +1,26 @@
-use crate::{App, PlatformDispatcher, RunnableMeta, RunnableVariant, TaskTiming, profiler};
+use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::mem::{self, ManuallyDrop};
+use std::num::NonZeroUsize;
+use std::panic::Location;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+use std::thread::{self, ThreadId};
+use std::time::{Duration, Instant};
+
 use async_task::Runnable;
 use futures::channel::mpsc;
 use parking_lot::{Condvar, Mutex};
+#[cfg(any(test, feature = "test-support"))]
+use rand::rngs::StdRng;
 use smol::prelude::*;
-use std::{
-    fmt::Debug,
-    marker::PhantomData,
-    mem::{self, ManuallyDrop},
-    num::NonZeroUsize,
-    panic::Location,
-    pin::Pin,
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    task::{Context, Poll},
-    thread::{self, ThreadId},
-    time::{Duration, Instant},
-};
 use util::TryFutureExt;
 use waker_fn::waker_fn;
 
-#[cfg(any(test, feature = "test-support"))]
-use rand::rngs::StdRng;
+use crate::{App, PlatformDispatcher, RunnableMeta, RunnableVariant, TaskTiming, profiler};
 
 /// A pointer to the executor that is currently running,
 /// for spawning background tasks.

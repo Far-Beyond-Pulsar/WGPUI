@@ -2,20 +2,18 @@
 //! can be used to describe common units, concepts, and the relationships
 //! between them.
 
-use anyhow::{Context as _, anyhow};
 use core::fmt::Debug;
+use std::borrow::Cow;
+use std::cmp::{self, PartialOrd};
+use std::fmt::{self, Display};
+use std::hash::Hash;
+use std::ops::{Add, Div, Mul, MulAssign, Neg, Range, Sub};
+
+use anyhow::{Context as _, anyhow};
 use derive_more::{Add, AddAssign, Div, DivAssign, Mul, Neg, Sub, SubAssign};
 use refineable::Refineable;
 use schemars::{JsonSchema, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::borrow::Cow;
-use std::ops::Range;
-use std::{
-    cmp::{self, PartialOrd},
-    fmt::{self, Display},
-    hash::Hash,
-    ops::{Add, Div, Mul, MulAssign, Neg, Sub},
-};
 use taffy::prelude::{TaffyGridLine, TaffyGridSpan};
 
 use crate::{App, DisplayId};
@@ -200,9 +198,18 @@ impl Point<Pixels> {
     ///
     /// ```
     /// # use gpui::{Point, Pixels, ScaledPixels};
-    /// let p = Point { x: Pixels::from(10.0), y: Pixels::from(20.0) };
+    /// let p = Point {
+    ///     x: Pixels::from(10.0),
+    ///     y: Pixels::from(20.0),
+    /// };
     /// let scaled_p = p.scale(1.5);
-    /// assert_eq!(scaled_p, Point { x: ScaledPixels::from(15.0), y: ScaledPixels::from(30.0) });
+    /// assert_eq!(
+    ///     scaled_p,
+    ///     Point {
+    ///         x: ScaledPixels::from(15.0),
+    ///         y: ScaledPixels::from(30.0)
+    ///     }
+    /// );
     /// ```
     pub fn scale(&self, factor: f32) -> Point<ScaledPixels> {
         Point {
@@ -217,7 +224,10 @@ impl Point<Pixels> {
     ///
     /// ```
     /// # use gpui::{Pixels, Point};
-    /// let p = Point { x: Pixels::from(3.0), y: Pixels::from(4.0) };
+    /// let p = Point {
+    ///     x: Pixels::from(3.0),
+    ///     y: Pixels::from(4.0),
+    /// };
     /// assert_eq!(p.magnitude(), 5.0);
     /// ```
     pub fn magnitude(&self) -> f64 {
@@ -450,9 +460,18 @@ where
     ///
     /// ```
     /// # use gpui::Size;
-    /// let my_size = Size { width: 10, height: 20 };
+    /// let my_size = Size {
+    ///     width: 10,
+    ///     height: 20,
+    /// };
     /// let my_new_size = my_size.map(|dimension| dimension as f32 * 1.5);
-    /// assert_eq!(my_new_size, Size { width: 15.0, height: 30.0 });
+    /// assert_eq!(
+    ///     my_new_size,
+    ///     Size {
+    ///         width: 15.0,
+    ///         height: 30.0
+    ///     }
+    /// );
     /// ```
     pub fn map<U>(&self, f: impl Fn(T) -> U) -> Size<U>
     where
@@ -493,9 +512,18 @@ impl Size<Pixels> {
     ///
     /// ```
     /// # use gpui::{Size, Pixels, ScaledPixels};
-    /// let size = Size { width: Pixels::from(100.0), height: Pixels::from(50.0) };
+    /// let size = Size {
+    ///     width: Pixels::from(100.0),
+    ///     height: Pixels::from(50.0),
+    /// };
     /// let scaled_size = size.scale(2.0);
-    /// assert_eq!(scaled_size, Size { width: ScaledPixels::from(200.0), height: ScaledPixels::from(100.0) });
+    /// assert_eq!(
+    ///     scaled_size,
+    ///     Size {
+    ///         width: ScaledPixels::from(200.0),
+    ///         height: ScaledPixels::from(100.0)
+    ///     }
+    /// );
     /// ```
     pub fn scale(&self, factor: f32) -> Size<ScaledPixels> {
         Size {
@@ -547,10 +575,22 @@ where
     ///
     /// ```
     /// # use gpui::Size;
-    /// let size1 = Size { width: 30, height: 40 };
-    /// let size2 = Size { width: 50, height: 20 };
+    /// let size1 = Size {
+    ///     width: 30,
+    ///     height: 40,
+    /// };
+    /// let size2 = Size {
+    ///     width: 50,
+    ///     height: 20,
+    /// };
     /// let max_size = size1.max(&size2);
-    /// assert_eq!(max_size, Size { width: 50, height: 40 });
+    /// assert_eq!(
+    ///     max_size,
+    ///     Size {
+    ///         width: 50,
+    ///         height: 40
+    ///     }
+    /// );
     /// ```
     pub fn max(&self, other: &Self) -> Self {
         Size {
@@ -577,10 +617,22 @@ where
     ///
     /// ```
     /// # use gpui::Size;
-    /// let size1 = Size { width: 30, height: 40 };
-    /// let size2 = Size { width: 50, height: 20 };
+    /// let size1 = Size {
+    ///     width: 30,
+    ///     height: 40,
+    /// };
+    /// let size2 = Size {
+    ///     width: 50,
+    ///     height: 20,
+    /// };
     /// let min_size = size1.min(&size2);
-    /// assert_eq!(min_size, Size { width: 30, height: 20 });
+    /// assert_eq!(
+    ///     min_size,
+    ///     Size {
+    ///         width: 30,
+    ///         height: 20
+    ///     }
+    /// );
     /// ```
     pub fn min(&self, other: &Self) -> Self {
         Size {
@@ -742,7 +794,10 @@ impl Size<Length> {
 /// ```
 /// # use gpui::{Bounds, Point, Size};
 /// let origin = Point { x: 0, y: 0 };
-/// let size = Size { width: 10, height: 20 };
+/// let size = Size {
+///     width: 10,
+///     height: 20,
+/// };
 /// let bounds = Bounds::new(origin, size);
 ///
 /// assert_eq!(bounds.origin, origin);
@@ -918,15 +973,24 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds1 = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     /// let bounds2 = Bounds {
     ///     origin: Point { x: 5, y: 5 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     /// let bounds3 = Bounds {
     ///     origin: Point { x: 20, y: 20 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     ///
     /// assert_eq!(bounds1.intersects(&bounds2), true); // Overlapping bounds
@@ -963,7 +1027,10 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 20 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 20,
+    ///     },
     /// };
     /// let center = bounds.center();
     /// assert_eq!(center, Point { x: 5, y: 10 });
@@ -993,7 +1060,10 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 20 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 20,
+    ///     },
     /// };
     /// let half_perimeter = bounds.half_perimeter();
     /// assert_eq!(half_perimeter, 30);
@@ -1025,13 +1095,22 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let mut bounds = Bounds {
     ///     origin: Point { x: 10, y: 10 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     /// let expanded_bounds = bounds.dilate(5);
-    /// assert_eq!(expanded_bounds, Bounds {
-    ///     origin: Point { x: 5, y: 5 },
-    ///     size: Size { width: 20, height: 20 },
-    /// });
+    /// assert_eq!(
+    ///     expanded_bounds,
+    ///     Bounds {
+    ///         origin: Point { x: 5, y: 5 },
+    ///         size: Size {
+    ///             width: 20,
+    ///             height: 20
+    ///         },
+    ///     }
+    /// );
     /// ```
     #[must_use]
     pub fn dilate(&self, amount: T) -> Bounds<T> {
@@ -1097,18 +1176,30 @@ impl<T: PartialOrd + Add<T, Output = T> + Sub<Output = T> + Clone + Debug + Defa
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds1 = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     /// let bounds2 = Bounds {
     ///     origin: Point { x: 5, y: 5 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     /// let intersection = bounds1.intersect(&bounds2);
     ///
-    /// assert_eq!(intersection, Bounds {
-    ///     origin: Point { x: 5, y: 5 },
-    ///     size: Size { width: 5, height: 5 },
-    /// });
+    /// assert_eq!(
+    ///     intersection,
+    ///     Bounds {
+    ///         origin: Point { x: 5, y: 5 },
+    ///         size: Size {
+    ///             width: 5,
+    ///             height: 5
+    ///         },
+    ///     }
+    /// );
     /// ```
     pub fn intersect(&self, other: &Self) -> Self {
         let upper_left = self.origin.max(&other.origin);
@@ -1136,18 +1227,30 @@ impl<T: PartialOrd + Add<T, Output = T> + Sub<Output = T> + Clone + Debug + Defa
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds1 = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     /// let bounds2 = Bounds {
     ///     origin: Point { x: 5, y: 5 },
-    ///     size: Size { width: 15, height: 15 },
+    ///     size: Size {
+    ///         width: 15,
+    ///         height: 15,
+    ///     },
     /// };
     /// let union_bounds = bounds1.union(&bounds2);
     ///
-    /// assert_eq!(union_bounds, Bounds {
-    ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 20, height: 20 },
-    /// });
+    /// assert_eq!(
+    ///     union_bounds,
+    ///     Bounds {
+    ///         origin: Point { x: 0, y: 0 },
+    ///         size: Size {
+    ///             width: 20,
+    ///             height: 20
+    ///         },
+    ///     }
+    /// );
     /// ```
     pub fn union(&self, other: &Self) -> Self {
         let top_left = self.origin.min(&other.origin);
@@ -1294,7 +1397,10 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 20 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 20,
+    ///     },
     /// };
     /// let top_right = bounds.top_right();
     /// assert_eq!(top_right, Point { x: 10, y: 0 });
@@ -1318,7 +1424,10 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 20 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 20,
+    ///     },
     /// };
     /// let bottom_right = bounds.bottom_right();
     /// assert_eq!(bottom_right, Point { x: 10, y: 20 });
@@ -1342,7 +1451,10 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 20 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 20,
+    ///     },
     /// };
     /// let bottom_left = bounds.bottom_left();
     /// assert_eq!(bottom_left, Point { x: 0, y: 20 });
@@ -1366,7 +1478,10 @@ where
     /// use gpui::{Bounds, Corner, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 20 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 20,
+    ///     },
     /// };
     /// let bottom_left = bounds.corner(Corner::BottomLeft);
     /// assert_eq!(bottom_left, Point { x: 0, y: 20 });
@@ -1406,7 +1521,10 @@ where
     /// # use gpui::{Point, Bounds, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     /// let inside_point = Point { x: 5, y: 5 };
     /// let outside_point = Point { x: 15, y: 15 };
@@ -1441,15 +1559,24 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let outer_bounds = Bounds {
     ///     origin: Point { x: 0, y: 0 },
-    ///     size: Size { width: 20, height: 20 },
+    ///     size: Size {
+    ///         width: 20,
+    ///         height: 20,
+    ///     },
     /// };
     /// let inner_bounds = Bounds {
     ///     origin: Point { x: 5, y: 5 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     /// let overlapping_bounds = Bounds {
     ///     origin: Point { x: 15, y: 15 },
-    ///     size: Size { width: 10, height: 10 },
+    ///     size: Size {
+    ///         width: 10,
+    ///         height: 10,
+    ///     },
     /// };
     ///
     /// assert!(inner_bounds.is_contained_within(&outer_bounds));
@@ -1479,14 +1606,23 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 10.0, y: 10.0 },
-    ///     size: Size { width: 10.0, height: 20.0 },
+    ///     size: Size {
+    ///         width: 10.0,
+    ///         height: 20.0,
+    ///     },
     /// };
     /// let new_bounds = bounds.map(|value| value as f64 * 1.5);
     ///
-    /// assert_eq!(new_bounds, Bounds {
-    ///     origin: Point { x: 15.0, y: 15.0 },
-    ///     size: Size { width: 15.0, height: 30.0 },
-    /// });
+    /// assert_eq!(
+    ///     new_bounds,
+    ///     Bounds {
+    ///         origin: Point { x: 15.0, y: 15.0 },
+    ///         size: Size {
+    ///             width: 15.0,
+    ///             height: 30.0
+    ///         },
+    ///     }
+    /// );
     /// ```
     pub fn map<U>(&self, f: impl Fn(T) -> U) -> Bounds<U>
     where
@@ -1506,14 +1642,23 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 10.0, y: 10.0 },
-    ///     size: Size { width: 10.0, height: 20.0 },
+    ///     size: Size {
+    ///         width: 10.0,
+    ///         height: 20.0,
+    ///     },
     /// };
     /// let new_bounds = bounds.map_origin(|value| value * 1.5);
     ///
-    /// assert_eq!(new_bounds, Bounds {
-    ///     origin: Point { x: 15.0, y: 15.0 },
-    ///     size: Size { width: 10.0, height: 20.0 },
-    /// });
+    /// assert_eq!(
+    ///     new_bounds,
+    ///     Bounds {
+    ///         origin: Point { x: 15.0, y: 15.0 },
+    ///         size: Size {
+    ///             width: 10.0,
+    ///             height: 20.0
+    ///         },
+    ///     }
+    /// );
     /// ```
     pub fn map_origin(self, f: impl Fn(T) -> T) -> Bounds<T> {
         Bounds {
@@ -1530,14 +1675,23 @@ where
     /// # use gpui::{Bounds, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 10.0, y: 10.0 },
-    ///     size: Size { width: 10.0, height: 20.0 },
+    ///     size: Size {
+    ///         width: 10.0,
+    ///         height: 20.0,
+    ///     },
     /// };
     /// let new_bounds = bounds.map_size(|value| value * 1.5);
     ///
-    /// assert_eq!(new_bounds, Bounds {
-    ///     origin: Point { x: 10.0, y: 10.0 },
-    ///     size: Size { width: 15.0, height: 30.0 },
-    /// });
+    /// assert_eq!(
+    ///     new_bounds,
+    ///     Bounds {
+    ///         origin: Point { x: 10.0, y: 10.0 },
+    ///         size: Size {
+    ///             width: 15.0,
+    ///             height: 30.0
+    ///         },
+    ///     }
+    /// );
     /// ```
     pub fn map_size(self, f: impl Fn(T) -> T) -> Bounds<T> {
         Bounds {
@@ -1628,21 +1782,30 @@ impl Bounds<Pixels> {
     /// ```
     /// # use gpui::{Bounds, Point, Size, Pixels, ScaledPixels, DevicePixels};
     /// let bounds = Bounds {
-    ///     origin: Point { x: Pixels::from(10.0), y: Pixels::from(20.0) },
-    ///     size: Size { width: Pixels::from(30.0), height: Pixels::from(40.0) },
+    ///     origin: Point {
+    ///         x: Pixels::from(10.0),
+    ///         y: Pixels::from(20.0),
+    ///     },
+    ///     size: Size {
+    ///         width: Pixels::from(30.0),
+    ///         height: Pixels::from(40.0),
+    ///     },
     /// };
     /// let display_scale_factor = 2.0;
     /// let scaled_bounds = bounds.scale(display_scale_factor);
-    /// assert_eq!(scaled_bounds, Bounds {
-    ///     origin: Point {
-    ///         x: ScaledPixels::from(20.0),
-    ///         y: ScaledPixels::from(40.0),
-    ///     },
-    ///     size: Size {
-    ///         width: ScaledPixels::from(60.0),
-    ///         height: ScaledPixels::from(80.0)
-    ///     },
-    /// });
+    /// assert_eq!(
+    ///     scaled_bounds,
+    ///     Bounds {
+    ///         origin: Point {
+    ///             x: ScaledPixels::from(20.0),
+    ///             y: ScaledPixels::from(40.0),
+    ///         },
+    ///         size: Size {
+    ///             width: ScaledPixels::from(60.0),
+    ///             height: ScaledPixels::from(80.0)
+    ///         },
+    ///     }
+    /// );
     /// ```
     pub fn scale(&self, factor: f32) -> Bounds<ScaledPixels> {
         Bounds {
@@ -1793,9 +1956,22 @@ impl<T: Clone + Debug + Default + PartialEq> Edges<T> {
     ///
     /// ```
     /// # use gpui::Edges;
-    /// let edges = Edges { top: 10, right: 20, bottom: 30, left: 40 };
+    /// let edges = Edges {
+    ///     top: 10,
+    ///     right: 20,
+    ///     bottom: 30,
+    ///     left: 40,
+    /// };
     /// let edges_float = edges.map(|&value| value as f32 * 1.1);
-    /// assert_eq!(edges_float, Edges { top: 11.0, right: 22.0, bottom: 33.0, left: 44.0 });
+    /// assert_eq!(
+    ///     edges_float,
+    ///     Edges {
+    ///         top: 11.0,
+    ///         right: 22.0,
+    ///         bottom: 33.0,
+    ///         left: 44.0
+    ///     }
+    /// );
     /// ```
     pub fn map<U>(&self, f: impl Fn(&T) -> U) -> Edges<U>
     where
@@ -1886,10 +2062,22 @@ impl Edges<Length> {
     /// ```
     /// # use gpui::{DefiniteLength, Edges, Length, Pixels};
     /// let no_edges = Edges::<Length>::zero();
-    /// assert_eq!(no_edges.top, Length::Definite(DefiniteLength::from(Pixels::ZERO)));
-    /// assert_eq!(no_edges.right, Length::Definite(DefiniteLength::from(Pixels::ZERO)));
-    /// assert_eq!(no_edges.bottom, Length::Definite(DefiniteLength::from(Pixels::ZERO)));
-    /// assert_eq!(no_edges.left, Length::Definite(DefiniteLength::from(Pixels::ZERO)));
+    /// assert_eq!(
+    ///     no_edges.top,
+    ///     Length::Definite(DefiniteLength::from(Pixels::ZERO))
+    /// );
+    /// assert_eq!(
+    ///     no_edges.right,
+    ///     Length::Definite(DefiniteLength::from(Pixels::ZERO))
+    /// );
+    /// assert_eq!(
+    ///     no_edges.bottom,
+    ///     Length::Definite(DefiniteLength::from(Pixels::ZERO))
+    /// );
+    /// assert_eq!(
+    ///     no_edges.left,
+    ///     Length::Definite(DefiniteLength::from(Pixels::ZERO))
+    /// );
     /// ```
     pub fn zero() -> Self {
         Self {
@@ -2240,7 +2428,7 @@ where
     ///     top_left: 1,
     ///     top_right: 2,
     ///     bottom_left: 3,
-    ///     bottom_right: 4
+    ///     bottom_right: 4,
     /// };
     /// assert_eq!(corners.corner(Corner::BottomLeft), 3);
     /// ```
@@ -2395,12 +2583,15 @@ impl<T: Clone + Debug + Default + PartialEq> Corners<T> {
     ///     bottom_left: Pixels::from(40.0),
     /// };
     /// let corners_in_rems = corners.map(|&px| Rems(f32::from(px) / 16.0));
-    /// assert_eq!(corners_in_rems, Corners {
-    ///     top_left: Rems(0.625),
-    ///     top_right: Rems(1.25),
-    ///     bottom_right: Rems(1.875),
-    ///     bottom_left: Rems(2.5),
-    /// });
+    /// assert_eq!(
+    ///     corners_in_rems,
+    ///     Corners {
+    ///         top_left: Rems(0.625),
+    ///         top_right: Rems(1.25),
+    ///         bottom_right: Rems(1.875),
+    ///         bottom_left: Rems(2.5),
+    ///     }
+    /// );
     /// ```
     #[must_use]
     pub fn map<U>(&self, f: impl Fn(&T) -> U) -> Corners<U>
@@ -3349,9 +3540,18 @@ impl DefiniteLength {
     /// let base_size = AbsoluteLength::Pixels(px(100.0));
     /// let rem_size = px(16.0);
     ///
-    /// assert_eq!(length_in_pixels.to_pixels(base_size, rem_size), Pixels::from(42.0));
-    /// assert_eq!(length_in_rems.to_pixels(base_size, rem_size), Pixels::from(32.0));
-    /// assert_eq!(length_as_fraction.to_pixels(base_size, rem_size), Pixels::from(50.0));
+    /// assert_eq!(
+    ///     length_in_pixels.to_pixels(base_size, rem_size),
+    ///     Pixels::from(42.0)
+    /// );
+    /// assert_eq!(
+    ///     length_in_rems.to_pixels(base_size, rem_size),
+    ///     Pixels::from(32.0)
+    /// );
+    /// assert_eq!(
+    ///     length_as_fraction.to_pixels(base_size, rem_size),
+    ///     Pixels::from(50.0)
+    /// );
     /// ```
     pub fn to_pixels(self, base_size: AbsoluteLength, rem_size: Pixels) -> Pixels {
         match self {

@@ -12,9 +12,22 @@ mod example_prelude;
 
 use std::time::Duration;
 
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Colors, Context, Entity, Render, Task, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size,
+    App,
+    Application,
+    Bounds,
+    Colors,
+    Context,
+    Entity,
+    Render,
+    Task,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    px,
+    size,
 };
 
 // Example 1: Simple Foreground Task

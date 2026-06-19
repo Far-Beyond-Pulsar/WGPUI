@@ -67,6 +67,9 @@ mod seal {
     pub trait Sealed {}
 }
 
+use std::any::Any;
+use std::future::Future;
+
 pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
@@ -97,7 +100,6 @@ pub use scene::*;
 pub use shared_string::*;
 pub use shared_uri::*;
 pub use smol::Timer;
-use std::{any::Any, future::Future};
 pub use style::*;
 pub use styled::*;
 pub use subscription::*;
@@ -108,9 +110,10 @@ pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
+pub use util::arc_cow::ArcCow;
 #[cfg(any(test, feature = "test-support"))]
 pub use util::smol_timeout;
-pub use util::{FutureExt, Timeout, arc_cow::ArcCow};
+pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;
 

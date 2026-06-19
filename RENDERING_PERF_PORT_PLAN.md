@@ -1,5 +1,43 @@
 # WGPUI Rendering-Perf Port Plan (single-crate Pulsar)
 
+> ## PORT PROGRESS (live)
+> **Committed to `main` (build + clippy green, behavior unchanged unless noted):**
+> - Phase 1 — SceneChunk tracking + incremental sort (`ac56f89`)
+> - Phase 2 — scene-side damage computation (`5f9fc50`, dormant)
+> - Phase 4 — per-view layout caching (`13e8ce73`, **active perf win**, unvalidated)
+> - Phase 6 — scene batch counting (`1f13dd73`, metric)
+> - Phase 0 — frame-metrics collection (`39f0332`, slim; perf crate recreated)
+>
+> **Implemented in this working tree (safe path, still needs downstream visual validation):**
+> - Phase 3 — conservative per-type upload skipping via scene generation + byte
+>   length guards. This avoids unchanged full-buffer uploads, but is **not** the
+>   full dirty-range diff-upload system.
+> - Phase 5 — safe row element identity cache for `list` + `uniform_list`
+>   without reusing painted `AnyElement` handles.
+> - Phase 7 — conservative buffer compaction by recreating buffers when more
+>   than 30% of the current allocation is unused.
+>
+> **Remaining — requires real display/downstream validation:**
+> - **Phase 4 layout cache validation:** normal draw, resize, scroll, typing,
+>   animation, focus, and IME paths need real-window confidence because this is
+>   the active cache most likely to cause stale visuals.
+> - **Phase 5 inspector/transcript validation:** run initial render, append,
+>   insert/remove, reset/reload, smooth scroll, and focus-retention checks. Look
+>   for stale, duplicated, or missing rows.
+> - **`uniform_list` validation:** check normal and y-flipped rendering for wrong
+>   row identity, flicker, or inverted reuse.
+>
+> **Deferred risky/future work:** full dirty-range GPU diff uploads, default-on
+> damage scissor / partial redraw, persistent-framebuffer swapchain blit, and
+> Wayland-specific `damage_buffer` remain gated until display validation proves
+> the chunk/damage invariants.
+>
+> Next step to unblock: run the inspector/downstream app on a display against
+> this working tree and confirm correct draw + scroll before committing the
+> Phase 5/3/7 safe-path changes.
+
+
+
 Plan to bring the fiber / partial-redraw / persistent-GPU-buffer work that was
 prototyped in **coleleavitt/WGPUI** (a 14-crate workspace fork) into
 **Far-Beyond-Pulsar/WGPUI** (this repo — a single `gpui-ce` crate), **keeping
@@ -7,9 +45,10 @@ Pulsar's single-crate structure**. Reference issue: Far-Beyond-Pulsar/WGPUI#4
 ("Perf improvements via fiber rendering"). Maintainer's stated bottleneck:
 *"the whole UI must refresh each time"* (canvas/full-frame refresh).
 
-> Status: PLAN. No renderer changes landed yet. The phase tasks (#16–#23) track
-> the work. A background analysis is producing a finer per-file port map to
-> append to §5.
+> Status: LIVE PORT. The safe path is implemented in stages: committed phases are
+> listed above; current working-tree changes cover conservative Phase 3 upload
+> skipping, Phase 5 row identity caching, and Phase 7 compaction. Display-backed
+> inspector validation is still required before calling the port fully done.
 
 ---
 
@@ -167,9 +206,12 @@ validation is yours** on the ThinkPad. Per phase:
   example), compare Phase-0 frame-time / upload-byte counters before vs after,
   and check visual correctness (esp. when toggling the Phase-4 flag).
 
-Definition of done for the issue: Phases 0,3,5+6 landed + measured win; Phases
-1/2 landed and validated; Phase 4 present but off-by-default with a documented
-toggle and a green light only after chunk tracking proves reliable.
+Definition of done for the safe path: Phases 0/1/6 committed; Phase 2 damage
+data present but renderer scissor/skip gated; Phase 3 conservative upload skip,
+Phase 5 row identity cache, and Phase 7 compaction compile/test clean; and the
+downstream inspector confirms correct draw/scroll/list behavior on a real
+display. Full dirty-range uploads and partial redraw/scissor are separate,
+future gated work.
 
 ---
 
@@ -194,13 +236,14 @@ toggle and a green light only after chunk tracking proves reliable.
 ### Structural reality
 - Core gpui files port ~1:1: `scene.rs`, `window.rs`, `view.rs`, `element.rs`
   line up symbol-for-symbol (cole `gpui/src/*` → Pulsar `src/*`).
-- **Renderer diverged.** Pulsar already has, in `src/platform/cross/`:
+- **Renderer diverged.** Pulsar already had, in `src/platform/cross/`:
   per-type persistent buffers in `render_context.rs` (`quads_buffer`,
   `shadows_buffer`, `underlines_buffer`, `mono_sprites_buffer`,
   `poly_sprites_buffer`, `backdrop_blurs_buffer`, `paths_vertices_buffer`, each
-  `Mutex<wgpu::Buffer>`) doing **full reupload** via `ensure_buffer_size` +
-  `write_buffer(..,0,data)`; and a `persistent_framebuffer` (+`_view`) offscreen
-  target whose **swapchain blit is a TODO** (`renderer.rs:2342`, `:2547`).
+  `Mutex<wgpu::Buffer>`). The current safe path adds generation/length upload
+  skips and compaction to that infrastructure, but still binds full buffers and
+  does not implement dirty-range writes. `persistent_framebuffer` (`+_view`)
+  remains an offscreen target whose swapchain blit is deferred.
 - **Primitive-set delta (applies to every per-type change):** source has
   `subpixel_sprites` and NO `backdrop_blurs`; Pulsar has `backdrop_blurs` and NO
   `subpixel_sprites`. When porting `SceneChunk` fields / `ChangedRanges` /
@@ -218,10 +261,10 @@ toggle and a green light only after chunk tracking proves reliable.
 | 0 `d233746` Instrumentation | `perf/`, `gpui/window.rs`, `gpui_wgpu/wgpu_renderer.rs`, `perf_overlay.rs`, `examples/bench_render.rs` | `src/profiler.rs`, `src/window.rs`, `src/platform/cross/renderer.rs`, `src/elements/perf_overlay.rs`(new) | NEEDS-ADAPTATION | Stable |
 | 1 `74edbb0` SceneChunk+incr sort | `gpui/scene.rs`,`view.rs`,`window.rs` | `src/scene.rs`,`src/view.rs`,`src/window.rs` | CLEAN→ADAPT (prim-set) | DS stable; dirty-tracking = HEAD-bug root |
 | 2 `c7285ff` Damage+scissor | `gpui/scene.rs`,`gpui_wgpu/wgpu_renderer.rs` | `src/scene.rs`,`src/platform/cross/renderer.rs` | NEEDS-ADAPTATION | Renderer path UNSTABLE — gate OFF |
-| 3 `2cc240e` Persistent buf+diff upload | `gpui_wgpu/wgpu_renderer.rs` | `src/platform/cross/render_context.rs`+`renderer.rs` (buffers EXIST) | RISKY | Build stable; correctness ∝ Phase 1 |
+| 3 `2cc240e` Persistent buf+diff upload | `gpui_wgpu/wgpu_renderer.rs` | `src/platform/cross/render_context.rs`+`renderer.rs` (buffers EXIST) | ADAPTED SAFE SUBSET | Conservative generation/length skip only; dirty-range writes deferred |
 | 4 `803e921` Fiber skip+layout cache | `gpui/window.rs`,`view.rs`,`element.rs` | same `src/*` | NEEDS-ADAPTATION | High-risk (cache invalidation; subtree skip) |
 | 5+6 `88b2aa7` List cache+batch merge | `gpui/scene.rs`,`elements/uniform_list.rs`,`list.rs`,`window.rs`,`wgpu_renderer.rs` | same-named `src/*` | NEEDS-ADAPTATION (uniform_list sig; prim-set) | **Stable, safest wins** |
-| `604c0d0` Compaction | `gpui_wgpu/wgpu_renderer.rs` | `render_context.rs`+`renderer.rs` | RISKY (after P3) | Stable; defer |
+| `604c0d0` Compaction | `gpui_wgpu/wgpu_renderer.rs` | `render_context.rs`+`renderer.rs` | ADAPTED SAFE SUBSET | Recreate buffers when more than 30% unused |
 | `fc12`/`2b11` Wayland damage | `gpui_linux/wayland/window.rs` | **NO TARGET** (winit) | SKIP | Churned (revert+reapply) |
 | `66eea08` Persistent frame tex | `gpui_wgpu/wgpu_renderer.rs` | `renderer.rs` (`persistent_framebuffer` partly exists; blit stubbed) | RISKY | Infra sound; policy was the bug |
 | `561980f` (HEAD) Disable partial redraw | `gpui_wgpu/wgpu_renderer.rs` | `renderer.rs` | CLEAN | **Canonical safe config** |
@@ -239,8 +282,8 @@ toggle and a green light only after chunk tracking proves reliable.
   (bind full buffer + `draw(0..4, range)`); enable **generation-skip +
   full-reupload-on-len-change** only; per-range upload stays gated.
 - **Gate OFF / defer:** Phase **2** renderer scissor/skip (scene-side APIs only),
-  `66ee` blit + `561980f` together with `partial_redraw_enabled=false`,
-  `604c0d0` compaction (after P3 verified), **SKIP** Wayland.
+  full dirty-range Phase **3** uploads, `66ee` blit + `561980f` together with
+  `partial_redraw_enabled=false`, and **SKIP** Wayland.
 
 ### Why partial redraw was disabled at HEAD (and the safe config)
 Root cause: **`dirty_views` (window) desyncs from `SceneChunk.dirty` (scene).**

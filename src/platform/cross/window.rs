@@ -1,24 +1,34 @@
-use crate::{
-    Bounds, Capslock, Decorations, Modifiers, Pixels, PlatformInputHandler, PlatformWindow, Point,
-    ResizeEdge, Size, WgpuSurfaceHandle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds,
-    platform::cross::{
-        atlas::WgpuAtlas, dispatcher::CrossEvent, render_context::WgpuContext,
-        renderer::WgpuRenderer, resize_detector::ResizeDetector,
-    },
-};
-use std::{
-    cell::{Cell, OnceCell, RefCell},
-    sync::Arc,
-};
-use winit::event_loop::EventLoopProxy;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::sync::Arc;
 
+use winit::event_loop::EventLoopProxy;
 // NOTE (axon-mind local patch): `winit::platform::linux::WindowExtLinux` does not
 // exist in winit 0.30 (Linux split into wayland/x11) and the trait was unused
 // here, so the import is dropped to let the crate build on Linux.
-
 #[cfg(target_os = "windows")]
 use winit::platform::windows::{BackdropType, WindowExtWindows};
+
+use crate::platform::cross::atlas::WgpuAtlas;
+use crate::platform::cross::dispatcher::CrossEvent;
+use crate::platform::cross::render_context::WgpuContext;
+use crate::platform::cross::renderer::WgpuRenderer;
+use crate::platform::cross::resize_detector::ResizeDetector;
+use crate::{
+    Bounds,
+    Capslock,
+    Decorations,
+    Modifiers,
+    Pixels,
+    PlatformInputHandler,
+    PlatformWindow,
+    Point,
+    ResizeEdge,
+    Size,
+    WgpuSurfaceHandle,
+    WindowAppearance,
+    WindowBackgroundAppearance,
+    WindowBounds,
+};
 
 #[derive(Clone)]
 pub struct CrossWindow(pub(crate) Arc<CrossWindowInner>);
@@ -74,6 +84,10 @@ impl Callbacks {
 }
 
 impl CrossWindow {
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "cross windows are foreground-thread objects but share ownership with winit callbacks"
+    )]
     pub(crate) fn new(
         wgpu_context: Arc<WgpuContext>,
         event_loop_proxy: EventLoopProxy<CrossEvent>,
@@ -129,8 +143,7 @@ impl CrossWindow {
     }
 
     pub(crate) fn window(&self) -> &winit::window::Window {
-        &*self
-            .0
+        self.0
             .winit_window
             .get()
             .expect("winit_window should be initialized")

@@ -1,13 +1,19 @@
-use crate::{
-    AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
-    swap_rgba_pa_to_bgra,
-};
+use std::hash::Hash;
+use std::sync::{Arc, LazyLock};
+
 use image::Frame;
 use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
-use std::{
-    hash::Hash,
-    sync::{Arc, LazyLock},
+
+use crate::{
+    AssetSource,
+    DevicePixels,
+    IsZero,
+    RenderImage,
+    Result,
+    SharedString,
+    Size,
+    swap_rgba_pa_to_bgra,
 };
 
 /// When rendering SVGs, we render them at twice the size to get a higher-quality result.

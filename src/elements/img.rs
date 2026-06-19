@@ -1,30 +1,54 @@
-use crate::{
-    AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
-};
-use anyhow::{Context as _, Result};
+use std::fs;
+use std::io::{self, Cursor};
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use anyhow::{Context as _, Result};
 use futures::{AsyncReadExt, Future};
-use image::{
-    AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba,
-    codecs::{gif::GifDecoder, webp::WebPDecoder},
-};
+use image::codecs::gif::GifDecoder;
+use image::codecs::webp::WebPDecoder;
+use image::{AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba};
 use smallvec::SmallVec;
-use std::{
-    fs,
-    io::{self, Cursor},
-    ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
 use thiserror::Error;
 use util::ResultExt;
 
 use super::{Stateful, StatefulInteractiveElement};
+use crate::{
+    AnyElement,
+    AnyImageCache,
+    App,
+    Asset,
+    AssetLogger,
+    Bounds,
+    DefiniteLength,
+    Element,
+    ElementId,
+    Entity,
+    GlobalElementId,
+    Hitbox,
+    Image,
+    ImageCache,
+    InspectorElementId,
+    InteractiveElement,
+    Interactivity,
+    IntoElement,
+    LayoutId,
+    Length,
+    ObjectFit,
+    Pixels,
+    RenderImage,
+    Resource,
+    SharedString,
+    SharedUri,
+    StyleRefinement,
+    Styled,
+    Task,
+    Window,
+    px,
+};
 
 /// The delay before showing the loading state.
 pub const LOADING_DELAY: Duration = Duration::from_millis(200);

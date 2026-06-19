@@ -1,8 +1,18 @@
 use refineable::Refineable as _;
 
 use crate::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, Pixels,
-    Style, StyleRefinement, Styled, Window,
+    App,
+    Bounds,
+    Element,
+    ElementId,
+    GlobalElementId,
+    InspectorElementId,
+    IntoElement,
+    Pixels,
+    Style,
+    StyleRefinement,
+    Styled,
+    Window,
 };
 
 /// Construct a canvas element with the given paint callback.

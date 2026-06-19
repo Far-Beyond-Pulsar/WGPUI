@@ -1,15 +1,39 @@
-use crate::{
-    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
-    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle, WeakEntity,
-};
-use crate::{Empty, Window};
+use std::any::TypeId;
+use std::ops::Range;
+use std::rc::Rc;
+use std::{fmt, mem};
+
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
-use std::mem;
-use std::rc::Rc;
-use std::{any::TypeId, fmt, ops::Range};
+
+use crate::{
+    AnyElement,
+    AnyEntity,
+    AnyWeakEntity,
+    App,
+    Bounds,
+    ContentMask,
+    Context,
+    Element,
+    ElementId,
+    Empty,
+    Entity,
+    EntityId,
+    GlobalElementId,
+    InspectorElementId,
+    IntoElement,
+    LayoutId,
+    PaintIndex,
+    Pixels,
+    PrepaintStateIndex,
+    Render,
+    Style,
+    StyleRefinement,
+    TextStyle,
+    WeakEntity,
+    Window,
+};
 
 struct AnyViewState {
     prepaint_range: Range<PrepaintStateIndex>,

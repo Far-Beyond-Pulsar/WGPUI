@@ -1,9 +1,24 @@
 use std::rc::Rc;
 
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Context, MouseButton, Render, ScrollHandle,
-    VirtualListScrollController, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
-    rgba, size, vlist,
+    App,
+    Application,
+    Bounds,
+    Context,
+    MouseButton,
+    Render,
+    ScrollHandle,
+    VirtualListScrollController,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    px,
+    rgb,
+    rgba,
+    size,
+    vlist,
 };
 
 struct VirtualListExample {

@@ -1,14 +1,19 @@
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
-
-use crate::{
-    AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, Window,
-};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 pub use easing::*;
 use smallvec::SmallVec;
+
+use crate::{
+    AnyElement,
+    App,
+    Element,
+    ElementId,
+    GlobalElementId,
+    InspectorElementId,
+    IntoElement,
+    Window,
+};
 
 /// An animation that can be applied to an element.
 #[derive(Clone)]

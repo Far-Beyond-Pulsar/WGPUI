@@ -1,28 +1,27 @@
-use crate::{App, AppContext, GpuiBorrow, VisualContext, Window, seal::Sealed};
+use std::any::{Any, TypeId, type_name};
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::fmt::{self, Display};
+use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
+use std::num::NonZeroU64;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::{Arc, Weak};
+use std::thread::panicking;
+
 use anyhow::{Context as _, Result};
 use collections::FxHashSet;
+#[cfg(any(test, feature = "leak-detection"))]
+use collections::HashMap;
 use derive_more::{Deref, DerefMut};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use slotmap::{KeyData, SecondaryMap, SlotMap};
-use std::{
-    any::{Any, TypeId, type_name},
-    cell::RefCell,
-    cmp::Ordering,
-    fmt::{self, Display},
-    hash::{Hash, Hasher},
-    marker::PhantomData,
-    num::NonZeroU64,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
-    },
-    thread::panicking,
-};
 
 use super::Context;
+use crate::seal::Sealed;
 use crate::util::atomic_incr_if_not_zero;
-#[cfg(any(test, feature = "leak-detection"))]
-use collections::HashMap;
+use crate::{App, AppContext, GpuiBorrow, VisualContext, Window};
 
 slotmap::new_key_type! {
     /// A unique identifier for a entity across the application.

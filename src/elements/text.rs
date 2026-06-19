@@ -1,21 +1,47 @@
-use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, WhiteSpace, Window, WrappedLine, WrappedLineLayout,
-    register_tooltip_mouse_handlers, set_tooltip_on_window,
-};
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::mem;
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
+
 use anyhow::Context as _;
 use smallvec::SmallVec;
-use std::{
-    borrow::Cow,
-    cell::{Cell, RefCell},
-    mem,
-    ops::Range,
-    rc::Rc,
-    sync::Arc,
-};
 use util::ResultExt;
+
+use crate::{
+    ActiveTooltip,
+    AnyView,
+    App,
+    Bounds,
+    DispatchPhase,
+    Element,
+    ElementId,
+    GlobalElementId,
+    HighlightStyle,
+    Hitbox,
+    HitboxBehavior,
+    InspectorElementId,
+    IntoElement,
+    LayoutId,
+    MouseDownEvent,
+    MouseMoveEvent,
+    MouseUpEvent,
+    Pixels,
+    Point,
+    SharedString,
+    Size,
+    TextOverflow,
+    TextRun,
+    TextStyle,
+    TooltipId,
+    WhiteSpace,
+    Window,
+    WrappedLine,
+    WrappedLineLayout,
+    register_tooltip_mouse_handlers,
+    set_tooltip_on_window,
+};
 
 impl Element for &'static str {
     type RequestLayoutState = TextLayout;

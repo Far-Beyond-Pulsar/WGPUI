@@ -13,9 +13,26 @@
 mod example_prelude;
 
 use example_prelude::init_example;
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Colors, Context, FontStyle, FontWeight, Hsla, Render, StyledText,
-    TextOverflow, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, size,
+    App,
+    Application,
+    Bounds,
+    Colors,
+    Context,
+    FontStyle,
+    FontWeight,
+    Hsla,
+    Render,
+    StyledText,
+    TextOverflow,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    px,
+    relative,
+    size,
 };
 
 // Text Styling Examples

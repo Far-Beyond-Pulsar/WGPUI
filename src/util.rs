@@ -1,13 +1,13 @@
-use crate::{BackgroundExecutor, Task};
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering::SeqCst},
-    task,
-    time::Duration,
-};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
+use std::task;
+use std::time::Duration;
 
 pub use util::*;
+
+use crate::{BackgroundExecutor, Task};
 
 /// A helper trait for building complex objects with imperative conditionals in a fluent style.
 pub trait FluentBuilder {
@@ -144,9 +144,8 @@ pub(crate) fn atomic_incr_if_not_zero(counter: &AtomicUsize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::TestAppContext;
-
     use super::*;
+    use crate::TestAppContext;
 
     #[gpui::test]
     async fn test_with_timeout(cx: &mut TestAppContext) {

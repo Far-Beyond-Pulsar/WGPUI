@@ -1,14 +1,11 @@
+use std::borrow::Cow;
+use std::fmt::{self, Display, Formatter};
+use std::hash::{Hash, Hasher};
+
 use anyhow::{Context as _, bail};
 use schemars::{JsonSchema, json_schema};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, Visitor},
-};
-use std::borrow::Cow;
-use std::{
-    fmt::{self, Display, Formatter},
-    hash::{Hash, Hasher},
-};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Convert an RGB hex color code number to a color type
 pub fn rgb(hex: u32) -> Rgba {
@@ -545,7 +542,6 @@ impl Hsla {
     ///
     /// This will return a blue color with around ~10% opacity,
     /// suitable for an element's hover or selected state.
-    ///
     pub fn opacity(&self, factor: f32) -> Self {
         Hsla {
             h: self.h,
@@ -990,7 +986,9 @@ impl std::hash::Hash for TextColor {
         self.tag.hash(state);
         self.color_space.hash(state);
         self.solid.hash(state);
-        state.write_u32(u32::from_be_bytes(self.gradient_angle_or_reserved.to_be_bytes()));
+        state.write_u32(u32::from_be_bytes(
+            self.gradient_angle_or_reserved.to_be_bytes(),
+        ));
         self.colors[0].hash(state);
         self.colors[1].hash(state);
         self.pad.hash(state);

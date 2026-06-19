@@ -23,7 +23,7 @@
 //!     ...
 //!    }
 //! }
-//!```
+//! ```
 //!
 //! The keybindings themselves are managed independently by calling cx.bind_keys().
 //! (Though mostly when developing Zed itself, you just need to add a new line to
@@ -49,18 +49,28 @@
 //!
 //!  KeyBinding::new("cmd-k left", pane::SplitLeft, Some("Pane"))
 
-use crate::{
-    Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
-    Keystroke, ModifiersChangedEvent, Window,
-};
+use std::any::{Any, TypeId};
+use std::cell::RefCell;
+use std::mem;
+use std::ops::Range;
+use std::rc::Rc;
+
 use collections::FxHashMap;
 use smallvec::SmallVec;
-use std::{
-    any::{Any, TypeId},
-    cell::RefCell,
-    mem,
-    ops::Range,
-    rc::Rc,
+
+use crate::{
+    Action,
+    ActionRegistry,
+    App,
+    DispatchPhase,
+    EntityId,
+    FocusId,
+    KeyBinding,
+    KeyContext,
+    Keymap,
+    Keystroke,
+    ModifiersChangedEvent,
+    Window,
 };
 
 /// ID of a node within `DispatchTree`. Note that these are **not** stable between frames, and so a
@@ -199,8 +209,8 @@ impl DispatchTree {
                 if let Some(context) = node.context.clone() {
                     self.context_stack.push(context);
                 }
-                if node.view_id.is_some() {
-                    self.view_stack.push(node.view_id.unwrap());
+                if let Some(view_id) = node.view_id {
+                    self.view_stack.push(view_id);
                 }
                 self.node_stack.push(node_id);
                 current_node_id = node.parent;
@@ -609,18 +619,41 @@ impl DispatchTree {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        self as gpui, DispatchResult, Element, ElementId, GlobalElementId, InspectorElementId,
-        Keystroke, LayoutId, Style,
-    };
     use core::panic;
+    use std::cell::RefCell;
+    use std::ops::Range;
+    use std::rc::Rc;
+
     use smallvec::SmallVec;
-    use std::{cell::RefCell, ops::Range, rc::Rc};
 
     use crate::{
-        Action, ActionRegistry, App, Bounds, Context, DispatchTree, FocusHandle, InputHandler,
-        IntoElement, KeyBinding, KeyContext, Keymap, Pixels, Point, Render, TestAppContext,
-        UTF16Selection, Window,
+        self as gpui,
+        Action,
+        ActionRegistry,
+        App,
+        Bounds,
+        Context,
+        DispatchResult,
+        DispatchTree,
+        Element,
+        ElementId,
+        FocusHandle,
+        GlobalElementId,
+        InputHandler,
+        InspectorElementId,
+        IntoElement,
+        KeyBinding,
+        KeyContext,
+        Keymap,
+        Keystroke,
+        LayoutId,
+        Pixels,
+        Point,
+        Render,
+        Style,
+        TestAppContext,
+        UTF16Selection,
+        Window,
     };
 
     #[derive(PartialEq, Eq)]

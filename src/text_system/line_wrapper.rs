@@ -1,8 +1,20 @@
-use crate::{
-    FontId, FontRun, FontStyle, FontWeight, Pixels, PlatformTextSystem, SharedString, TextRun, px,
-};
+use std::borrow::Cow;
+use std::iter;
+use std::sync::Arc;
+
 use collections::HashMap;
-use std::{borrow::Cow, iter, sync::Arc};
+
+use crate::{
+    FontId,
+    FontRun,
+    FontStyle,
+    FontWeight,
+    Pixels,
+    PlatformTextSystem,
+    SharedString,
+    TextRun,
+    px,
+};
 
 /// The GPUI line wrapper, used to wrap lines of text to a given width.
 pub struct LineWrapper {
@@ -324,9 +336,10 @@ impl Boundary {
 
 #[cfg(test)]
 mod tests {
+    use rand::prelude::*;
+
     use super::*;
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
-    use rand::prelude::*;
 
     fn build_wrapper() -> LineWrapper {
         let dispatcher = TestDispatcher::new(StdRng::seed_from_u64(0));

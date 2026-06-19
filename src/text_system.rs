@@ -4,32 +4,42 @@ mod line;
 mod line_layout;
 mod line_wrapper;
 
+use core::fmt;
+use std::borrow::Cow;
+use std::cmp;
+use std::fmt::{Debug, Display, Formatter};
+use std::hash::{Hash, Hasher};
+use std::ops::{Deref, DerefMut, Range};
+use std::sync::Arc;
+
+use anyhow::{Context as _, anyhow};
+use collections::FxHashMap;
+use derive_more::{Add, Deref, FromStr, Sub};
 pub use font_fallbacks::*;
 pub use font_features::*;
+use itertools::Itertools;
 pub use line::*;
 pub use line_layout::*;
 pub use line_wrapper::*;
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use smallvec::{SmallVec, smallvec};
 
 use crate::{
-    Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
-    StrikethroughStyle, TextColor, UnderlineStyle, px,
-};
-use anyhow::{Context as _, anyhow};
-use collections::FxHashMap;
-use core::fmt;
-use derive_more::{Add, Deref, FromStr, Sub};
-use itertools::Itertools;
-use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
-use smallvec::{SmallVec, smallvec};
-use std::{
-    borrow::Cow,
-    cmp,
-    fmt::{Debug, Display, Formatter},
-    hash::{Hash, Hasher},
-    ops::{Deref, DerefMut, Range},
-    sync::Arc,
+    Bounds,
+    DevicePixels,
+    Hsla,
+    Pixels,
+    PlatformTextSystem,
+    Point,
+    Result,
+    SharedString,
+    Size,
+    StrikethroughStyle,
+    TextColor,
+    UnderlineStyle,
+    px,
 };
 
 /// An opaque identifier for a specific font.
@@ -386,7 +396,7 @@ impl WindowTextSystem {
         let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
         for run in runs {
             if let Some(last_run) = decoration_runs.last_mut()
-                && last_run.color == run.color.into()
+                && last_run.color == run.color
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.background_color == run.background_color
@@ -396,7 +406,7 @@ impl WindowTextSystem {
             }
             decoration_runs.push(DecorationRun {
                 len: run.len as u32,
-                color: run.color.into(),
+                color: run.color,
                 background_color: run.background_color,
                 underline: run.underline,
                 strikethrough: run.strikethrough,
@@ -444,7 +454,7 @@ impl WindowTextSystem {
                 let run_len_within_line = cmp::min(line_end - run_start, run.len);
 
                 let decoration_changed = if let Some(last_run) = decoration_runs.last_mut()
-                    && last_run.color == run.color.into()
+                    && last_run.color == run.color
                     && last_run.underline == run.underline
                     && last_run.strikethrough == run.strikethrough
                     && last_run.background_color == run.background_color
@@ -454,7 +464,7 @@ impl WindowTextSystem {
                 } else {
                     decoration_runs.push(DecorationRun {
                         len: run_len_within_line as u32,
-                        color: run.color.into(),
+                        color: run.color,
                         background_color: run.background_color,
                         underline: run.underline,
                         strikethrough: run.strikethrough,

@@ -15,6 +15,10 @@ pub struct SurfaceId(pub(crate) u64);
 ///
 /// This allows external thread and compositor to run independently without blocking.
 struct TripleBuffer {
+    #[expect(
+        dead_code,
+        reason = "textures keep triple-buffer resources alive for their views"
+    )]
     textures: [wgpu::Texture; 3],
     views: [wgpu::TextureView; 3],
 
@@ -242,12 +246,20 @@ impl SurfaceRegistry {
     }
 
     /// Get the current size of a surface.
+    #[expect(
+        dead_code,
+        reason = "surface metadata accessors are retained for external surface integration"
+    )]
     pub fn size(&self, id: SurfaceId) -> Option<(u32, u32)> {
         let surfaces = self.surfaces.lock().unwrap();
         surfaces.get(&id).map(|tb| (tb.width, tb.height))
     }
 
     /// Get the texture format for a surface.
+    #[expect(
+        dead_code,
+        reason = "surface metadata accessors are retained for external surface integration"
+    )]
     pub fn format(&self, id: SurfaceId) -> Option<wgpu::TextureFormat> {
         let surfaces = self.surfaces.lock().unwrap();
         surfaces.get(&id).map(|tb| tb.format)

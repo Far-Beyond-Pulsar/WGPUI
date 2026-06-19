@@ -1,23 +1,54 @@
-use crate::{
-    Bounds, DevicePixels, Font, FontFeatures, FontId, FontMetrics, FontRun, FontStyle, FontWeight,
-    GlyphId, LineLayout, Pixels, PlatformTextSystem, Point, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, point, size,
-};
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
-    Attrs, AttrsList, CacheKey, Ellipsize, Family, Font as CosmicTextFont,
-    FontFeatures as CosmicFontFeatures, FontSystem, Hinting, ShapeBuffer, ShapeLine, SwashCache,
+    Attrs,
+    AttrsList,
+    CacheKey,
+    Ellipsize,
+    Family,
+    Font as CosmicTextFont,
+    FontFeatures as CosmicFontFeatures,
+    FontSystem,
+    Hinting,
+    ShapeBuffer,
+    ShapeLine,
+    SwashCache,
     SwashContent,
 };
 use itertools::Itertools;
 use parking_lot::RwLock;
-use pathfinder_geometry::{
-    rect::{RectF, RectI},
-    vector::{Vector2F, Vector2I},
-};
+use pathfinder_geometry::rect::{RectF, RectI};
+use pathfinder_geometry::vector::{Vector2F, Vector2I};
 use smallvec::SmallVec;
-use std::{borrow::Cow, sync::Arc};
+
+use crate::{
+    Bounds,
+    DevicePixels,
+    Font,
+    FontFeatures,
+    FontId,
+    FontMetrics,
+    FontRun,
+    FontStyle,
+    FontWeight,
+    GlyphId,
+    LineLayout,
+    Pixels,
+    PlatformTextSystem,
+    Point,
+    RenderGlyphParams,
+    SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y,
+    ShapedGlyph,
+    ShapedRun,
+    SharedString,
+    Size,
+    point,
+    size,
+};
 
 pub(crate) struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 

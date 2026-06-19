@@ -345,7 +345,7 @@ fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
 
                 // Clamp UV to valid range
                 if sample_uv.x >= 0.0 && sample_uv.x <= 1.0 && sample_uv.y >= 0.0 && sample_uv.y <= 1.0 {
-                    // Use explicit LOD in dynamic loops (FXC can't derive gradients reliably here).
+                    // Use explicit level-of-detail in dynamic loops (FXC can't derive gradients reliably here).
                     let sample_color = textureSampleLevel(backdrop_texture, backdrop_sampler, sample_uv, 0.0);
                     blurred_color += sample_color * weight;
                     total_weight += weight;

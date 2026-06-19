@@ -4,16 +4,44 @@
 //! measurement. This is much faster than the full layout system, but only works for
 //! elements with uniform height.
 
+use std::cell::RefCell;
+use std::ops::Range;
+use std::rc::Rc;
+use std::{cmp, usize};
+
+use smallvec::SmallVec;
+
 use super::ListHorizontalSizingBehavior;
 use crate::elements::smooth_scroll::SmoothScrollState;
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
-    GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
-    IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, size,
+    AnyElement,
+    App,
+    AvailableSpace,
+    Bounds,
+    ContentMask,
+    Element,
+    ElementId,
+    Entity,
+    GlobalElementId,
+    Hitbox,
+    InspectorElementId,
+    InteractiveElement,
+    Interactivity,
+    IntoElement,
+    IsZero,
+    LayoutId,
+    ListSizingBehavior,
+    Overflow,
+    Pixels,
+    Point,
+    ScrollHandle,
+    Size,
+    StyleRefinement,
+    Styled,
+    Window,
+    point,
+    size,
 };
-use smallvec::SmallVec;
-use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
 
 /// uniform_list provides lazy rendering for a set of items that are of uniform height.
 /// When rendered into a container with overflow-y: hidden and a fixed (or max) height,
@@ -72,6 +100,88 @@ pub struct UniformList {
 pub struct UniformListFrameState {
     items: SmallVec<[AnyElement; 32]>,
     decorations: SmallVec<[AnyElement; 2]>,
+}
+
+struct KeyedUniformListItemElement {
+    item_index: usize,
+    element: AnyElement,
+}
+
+impl KeyedUniformListItemElement {
+    fn new(item_index: usize, element: AnyElement) -> Self {
+        Self {
+            item_index,
+            element,
+        }
+    }
+}
+
+fn uniform_list_item_cache_index(
+    item_count: usize,
+    visible_item_index: usize,
+    y_flipped: bool,
+) -> usize {
+    if y_flipped {
+        item_count.saturating_sub(visible_item_index.saturating_add(1))
+    } else {
+        visible_item_index
+    }
+}
+
+impl Element for KeyedUniformListItemElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(("uniform-list-item", self.item_index).into())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (self.element.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.element.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.element.paint(window, cx);
+    }
+}
+
+impl IntoElement for KeyedUniformListItemElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
 }
 
 /// A handle for controlling the scroll position of a uniform list.
@@ -359,7 +469,6 @@ impl Element for UniformList {
         };
 
         let shared_scroll_offset = self.interactivity.scroll_offset.clone().unwrap();
-        let mut logical_scroll_offset = *shared_scroll_offset.borrow();
         let item_height = longest_item_size.height;
         let shared_scroll_to_item = self.scroll_handle.as_mut().and_then(|handle| {
             let mut handle = handle.0.borrow_mut();
@@ -504,6 +613,9 @@ impl Element for UniformList {
                     let content_mask = ContentMask { bounds };
                     window.with_content_mask(Some(content_mask), |window| {
                         for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
+                            let item_index =
+                                uniform_list_item_cache_index(self.item_count, ix, y_flipped);
+                            item = KeyedUniformListItemElement::new(item_index, item).into_any();
                             let item_origin = padded_bounds.origin
                                 + visual_scroll_offset
                                 + point(Pixels::ZERO, item_height * ix);
@@ -733,15 +845,37 @@ impl InteractiveElement for UniformList {
 
 #[cfg(test)]
 mod test {
+    use super::uniform_list_item_cache_index;
     use crate::TestAppContext;
+
+    #[test]
+    fn uniform_list_item_cache_index_tracks_logical_item_index() {
+        assert_eq!(uniform_list_item_cache_index(5, 0, false), 0);
+        assert_eq!(uniform_list_item_cache_index(5, 3, false), 3);
+        assert_eq!(uniform_list_item_cache_index(5, 0, true), 4);
+        assert_eq!(uniform_list_item_cache_index(5, 3, true), 1);
+    }
+
+    #[test]
+    fn uniform_list_item_cache_index_saturates_out_of_range_flipped_indices() {
+        assert_eq!(uniform_list_item_cache_index(5, 5, true), 0);
+    }
 
     #[gpui::test]
     fn test_scroll_strategy_nearest(cx: &mut TestAppContext) {
-        use crate::{
-            Context, FocusHandle, ScrollStrategy, UniformListScrollHandle, Window, actions, div,
-            prelude::*, px, uniform_list,
-        };
         use std::ops::Range;
+
+        use crate::prelude::*;
+        use crate::{
+            Context,
+            FocusHandle,
+            ScrollStrategy,
+            UniformListScrollHandle,
+            Window,
+            div,
+            px,
+            uniform_list,
+        };
 
         actions!(example, [SelectNext, SelectPrev]);
 

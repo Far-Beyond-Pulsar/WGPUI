@@ -1,6 +1,17 @@
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px,
-    rgb, size, uniform_list,
+    App,
+    Application,
+    Bounds,
+    Context,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    px,
+    rgb,
+    size,
+    uniform_list,
 };
 
 struct UniformListExample {}

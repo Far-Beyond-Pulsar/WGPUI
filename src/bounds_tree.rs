@@ -1,9 +1,8 @@
+use std::cmp;
+use std::fmt::Debug;
+use std::ops::{Add, Sub};
+
 use crate::{Bounds, Half};
-use std::{
-    cmp,
-    fmt::Debug,
-    ops::{Add, Sub},
-};
 
 #[derive(Debug)]
 pub(crate) struct BoundsTree<U>
@@ -237,9 +236,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use rand::{RngExt, SeedableRng};
+
     use super::*;
     use crate::{Bounds, Point, Size};
-    use rand::{RngExt, SeedableRng};
 
     #[test]
     fn test_insert() {

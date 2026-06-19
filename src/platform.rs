@@ -7,50 +7,85 @@ mod test;
 
 pub(crate) mod cross;
 
-use crate::platform::cross::platform::CrossPlatform;
-use crate::{
-    Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
-    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, Priority, RealtimePriority, RenderGlyphParams, RenderImage, RenderImageParams,
-    RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
-    SystemWindowTab, Task, TaskLabel, TaskTiming, ThreadTaskTimings, Window, WindowControlArea,
-    hash, point, px, size,
-};
+use std::borrow::Cow;
+use std::fmt::{self, Debug};
+use std::hash::{Hash, Hasher};
+use std::io::Cursor;
+use std::ops;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
+pub use app_menu::*;
 use async_task::Runnable;
 use futures::channel::oneshot;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, Frame};
+pub use keyboard::*;
+pub use keystroke::*;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use schemars::JsonSchema;
 use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use std::borrow::Cow;
-use std::hash::{Hash, Hasher};
-use std::io::Cursor;
-use std::ops;
-use std::time::{Duration, Instant};
-use std::{
-    fmt::{self, Debug},
-    ops::Range,
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::Arc,
-};
 use strum::EnumIter;
-use uuid::Uuid;
-
-pub use app_menu::*;
-pub use keyboard::*;
-pub use keystroke::*;
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use test::*;
-
 #[cfg(any(test, feature = "test-support"))]
 pub use test::TestDispatcher;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use test::*;
+use uuid::Uuid;
+
+use crate::platform::cross::platform::CrossPlatform;
+use crate::{
+    Action,
+    AnyWindowHandle,
+    App,
+    AsyncWindowContext,
+    BackgroundExecutor,
+    Bounds,
+    DEFAULT_WINDOW_SIZE,
+    DevicePixels,
+    DispatchEventResult,
+    Font,
+    FontId,
+    FontMetrics,
+    FontRun,
+    ForegroundExecutor,
+    GlyphId,
+    GpuSpecs,
+    ImageSource,
+    Keymap,
+    LineLayout,
+    Pixels,
+    PlatformInput,
+    Point,
+    Priority,
+    RealtimePriority,
+    RenderGlyphParams,
+    RenderImage,
+    RenderImageParams,
+    RenderSvgParams,
+    Scene,
+    ShapedGlyph,
+    ShapedRun,
+    SharedString,
+    Size,
+    SvgRenderer,
+    SystemWindowTab,
+    Task,
+    TaskLabel,
+    TaskTiming,
+    ThreadTaskTimings,
+    Window,
+    WindowControlArea,
+    hash,
+    point,
+    px,
+    size,
+};
 
 /// Returns a background executor for the current platform.
 pub fn background_executor() -> BackgroundExecutor {
@@ -89,6 +124,10 @@ pub(crate) trait Platform: 'static {
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>>;
 
+    #[expect(
+        dead_code,
+        reason = "platform attach hooks are retained for backend-specific window integration"
+    )]
     fn attach_window(
         &self,
         _handle: AnyWindowHandle,
@@ -1137,6 +1176,10 @@ impl WindowIcon {
 
 /// The variables that can be configured when creating a new window
 #[derive(Debug)]
+#[expect(
+    dead_code,
+    reason = "window parameters mirror cross-platform backend options"
+)]
 pub(crate) struct WindowParams {
     pub bounds: Bounds<Pixels>,
 
@@ -1829,6 +1872,10 @@ impl ClipboardString {
             .and_then(|m| serde_json::from_str(m).ok())
     }
 
+    #[expect(
+        dead_code,
+        reason = "clipboard text hashing is retained for clipboard change detection"
+    )]
     pub(crate) fn text_hash(text: &str) -> u64 {
         let mut hasher = SeaHasher::new();
         text.hash(&mut hasher);

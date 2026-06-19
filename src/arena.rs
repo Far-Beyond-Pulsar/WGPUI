@@ -1,11 +1,9 @@
-use std::{
-    alloc::{self, handle_alloc_error},
-    cell::Cell,
-    num::NonZeroUsize,
-    ops::{Deref, DerefMut},
-    ptr::{self, NonNull},
-    rc::Rc,
-};
+use std::alloc::{self, handle_alloc_error};
+use std::cell::Cell;
+use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
+use std::ptr::{self, NonNull};
+use std::rc::Rc;
 
 struct ArenaElement {
     value: *mut u8,
@@ -205,7 +203,8 @@ impl<T: ?Sized> DerefMut for ArenaBox<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     use super::*;
 

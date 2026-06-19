@@ -1,24 +1,17 @@
-#[cfg(any(feature = "inspector", debug_assertions))]
-use crate::Inspector;
-use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
-    DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
-    ExternalWindowHandle, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla,
-    InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextColor, TextStyle,
-    TextStyleRefinement, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
-};
+use std::any::{Any, TypeId};
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
+use std::ops::{DerefMut, Range};
+use std::rc::Rc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+use std::{cmp, mem};
+
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -31,31 +24,131 @@ use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
 use slotmap::SlotMap;
 use smallvec::SmallVec;
-use std::{
-    any::{Any, TypeId},
-    borrow::Cow,
-    cell::{Cell, RefCell},
-    cmp,
-    fmt::{Debug, Display},
-    hash::{Hash, Hasher},
-    marker::PhantomData,
-    mem,
-    ops::{DerefMut, Range},
-    rc::Rc,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicUsize, Ordering::SeqCst},
-    },
-    time::{Duration, Instant},
-};
-use util::post_inc;
-use util::{ResultExt, measure};
+use util::{ResultExt, measure, post_inc};
 use uuid::Uuid;
+
+#[cfg(any(feature = "inspector", debug_assertions))]
+use crate::Inspector;
+use crate::prelude::*;
+use crate::{
+    Action,
+    AnyDrag,
+    AnyElement,
+    AnyImageCache,
+    AnyTooltip,
+    AnyView,
+    App,
+    AppContext,
+    Arena,
+    Asset,
+    AsyncWindowContext,
+    AvailableSpace,
+    Background,
+    BorderStyle,
+    Bounds,
+    BoxShadow,
+    Capslock,
+    Context,
+    Corners,
+    CursorStyle,
+    Decorations,
+    DevicePixels,
+    DispatchActionListener,
+    DispatchNodeId,
+    DispatchTree,
+    DisplayId,
+    Edges,
+    Effect,
+    Entity,
+    EntityId,
+    EventEmitter,
+    FileDropEvent,
+    FontId,
+    Global,
+    GlobalElementId,
+    GlyphId,
+    GpuSpecs,
+    Hsla,
+    InputHandler,
+    IsZero,
+    KeyBinding,
+    KeyContext,
+    KeyDownEvent,
+    KeyEvent,
+    Keystroke,
+    KeystrokeEvent,
+    LayoutId,
+    LineLayoutIndex,
+    Modifiers,
+    ModifiersChangedEvent,
+    MonochromeSprite,
+    MouseButton,
+    MouseEvent,
+    MouseMoveEvent,
+    MouseUpEvent,
+    Path,
+    Pixels,
+    PlatformAtlas,
+    PlatformDisplay,
+    PlatformInput,
+    PlatformInputHandler,
+    PlatformWindow,
+    Point,
+    PolychromeSprite,
+    Priority,
+    PromptButton,
+    PromptLevel,
+    Quad,
+    Render,
+    RenderGlyphParams,
+    RenderImage,
+    RenderImageParams,
+    RenderSvgParams,
+    Replay,
+    ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y,
+    ScaledPixels,
+    Scene,
+    Shadow,
+    SharedString,
+    Size,
+    StrikethroughStyle,
+    Style,
+    SubscriberSet,
+    Subscription,
+    SystemWindowTab,
+    SystemWindowTabController,
+    TabStopMap,
+    TaffyLayoutEngine,
+    Task,
+    TextColor,
+    TextStyle,
+    TextStyleRefinement,
+    TransformationMatrix,
+    Underline,
+    UnderlineStyle,
+    WindowAppearance,
+    WindowBackgroundAppearance,
+    WindowBounds,
+    WindowControls,
+    WindowDecorations,
+    WindowOptions,
+    WindowParams,
+    WindowTextSystem,
+    point,
+    px,
+    rems,
+    size,
+    transparent_black,
+};
 
 mod prompts;
 
-use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
+
+use crate::util::atomic_incr_if_not_zero;
 
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
@@ -151,6 +244,10 @@ impl WindowInvalidator {
         self.inner.borrow_mut().draw_phase = phase
     }
 
+    #[expect(
+        dead_code,
+        reason = "window invalidation metrics are kept for rendering diagnostics"
+    )]
     pub fn update_count(&self) -> usize {
         self.inner.borrow().update_count
     }
@@ -2536,10 +2633,10 @@ impl Window {
                 let prepaint_start = self.prepaint_index();
                 if let Some(element) = deferred_draw.element.as_mut() {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
-                        window.with_absolute_element_offset(
-                            deferred_draw.absolute_offset,
-                            |window| element.prepaint(window, cx),
-                        )
+                        window
+                            .with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
+                                element.prepaint(window, cx)
+                            })
                     });
                 }
                 let prepaint_end = self.prepaint_index();
@@ -3640,7 +3737,8 @@ impl Window {
         bounds: Bounds<Pixels>,
         surface_id: crate::platform::cross::surface_registry::SurfaceId,
     ) {
-        use crate::{PaintSurface, scene::SurfaceContent};
+        use crate::PaintSurface;
+        use crate::scene::SurfaceContent;
 
         self.invalidator.debug_assert_paint();
 
@@ -3782,7 +3880,11 @@ impl Window {
             generation.saturating_sub(cached.generation) <= LAYOUT_CACHE_STALE_GENERATIONS
         });
 
-        if self.layout_cache.is_empty() || self.frame_number % LAYOUT_CACHE_STALE_GENERATIONS == 0 {
+        if self.layout_cache.is_empty()
+            || self
+                .frame_number
+                .is_multiple_of(LAYOUT_CACHE_STALE_GENERATIONS)
+        {
             self.layout_cache.clear();
             if let Some(layout_engine) = self.layout_engine.as_mut() {
                 layout_engine.clear();
@@ -5764,52 +5866,56 @@ pub fn outline(
 
 #[cfg(test)]
 mod test {
-    use crate::{prelude::*, px, size, TestAppContext, Window};
+    use crate::prelude::*;
+    use crate::{TestAppContext, Window, px, size};
 
     struct EmptyView;
     impl crate::Render for EmptyView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl crate::IntoElement {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
             crate::Empty
         }
     }
 
     #[gpui::test]
     fn test_set_app_id_via_options(cx: &mut TestAppContext) {
-        let window = cx.open_window(
-            size(px(800.), px(600.)),
-            |_, _| EmptyView,
-        );
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.test-app");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.test-app");
+            })
+            .ok();
     }
 
     #[gpui::test]
     fn test_set_app_id_via_method(cx: &mut TestAppContext) {
-        let window = cx.open_window(
-            size(px(800.), px(600.)),
-            |_, _| EmptyView,
-        );
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.another-app");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.another-app");
+            })
+            .ok();
     }
 
     #[gpui::test]
     fn test_set_app_id_update(cx: &mut TestAppContext) {
-        let window = cx.open_window(
-            size(px(800.), px(600.)),
-            |_, _| EmptyView,
-        );
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.initial");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.initial");
+            })
+            .ok();
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.updated");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.updated");
+            })
+            .ok();
     }
 }

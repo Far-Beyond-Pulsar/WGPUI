@@ -1,9 +1,29 @@
-use std::{fs, path::PathBuf};
+use std::fs;
+use std::path::PathBuf;
 
 use anyhow::Result;
+use gpui::prelude::*;
 use gpui::{
-    App, Application, AssetSource, Bounds, BoxShadow, ClickEvent, Context, SharedString, Task,
-    Window, WindowBounds, WindowOptions, div, hsla, img, point, prelude::*, px, rgb, size, svg,
+    App,
+    Application,
+    AssetSource,
+    Bounds,
+    BoxShadow,
+    ClickEvent,
+    Context,
+    SharedString,
+    Task,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    hsla,
+    img,
+    point,
+    px,
+    rgb,
+    size,
+    svg,
 };
 
 struct Assets {

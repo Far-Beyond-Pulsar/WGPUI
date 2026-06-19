@@ -1,6 +1,7 @@
-use device_query::{DeviceQuery, DeviceState};
 use std::cell::Cell;
 use std::time::{Duration, Instant};
+
+use device_query::{DeviceQuery, DeviceState};
 
 /// Detects whether a window is actively being resized by watching the stream
 /// of [`winit::event::WindowEvent::Resized`] events.

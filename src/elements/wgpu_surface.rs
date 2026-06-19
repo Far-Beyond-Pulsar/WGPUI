@@ -1,12 +1,24 @@
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use refineable::Refineable as _;
 
+use crate::platform::cross::surface_registry::{SurfaceId, SurfaceRegistry};
 use crate::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, Pixels, Style, StyleRefinement, Styled, Window,
-    platform::cross::surface_registry::{SurfaceId, SurfaceRegistry},
+    App,
+    Bounds,
+    Element,
+    ElementId,
+    GlobalElementId,
+    InspectorElementId,
+    IntoElement,
+    LayoutId,
+    MouseButton,
+    Pixels,
+    Style,
+    StyleRefinement,
+    Styled,
+    Window,
 };
 
 /// Inner state shared across clones of `WgpuSurfaceHandle`.
@@ -245,6 +257,10 @@ impl WgpuSurfaceHandle {
     }
 
     /// Resize the surface's triple buffers. Called by the element when bounds change.
+    #[expect(
+        dead_code,
+        reason = "surface resizing is kept for external wgpu surface integration"
+    )]
     pub(crate) fn resize(&self, width: u32, height: u32) {
         let mut size = self.inner.size.lock().unwrap();
         if size.0 == width && size.1 == height {
@@ -298,7 +314,16 @@ impl WgpuSurfaceHandle {
                             inner.is_resizing.store(false, Ordering::Release);
                             if inner.pending_resize.lock().unwrap().is_some() {
                                 // A new resize request arrived after we last checked.
-                                if inner.is_resizing.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                                if inner
+                                    .is_resizing
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                                {
                                     continue;
                                 }
                             }
@@ -347,10 +372,7 @@ impl WgpuSurface {
     /// Register a callback invoked when the element's layout bounds change.
     /// The surface textures are automatically resized; use this to recreate
     /// any external resources that depend on the size.
-    pub fn on_resize(
-        mut self,
-        callback: impl Fn(u32, u32, &WgpuSurfaceHandle) + 'static,
-    ) -> Self {
+    pub fn on_resize(mut self, callback: impl Fn(u32, u32, &WgpuSurfaceHandle) + 'static) -> Self {
         self.on_resize = Some(Box::new(callback));
         self
     }

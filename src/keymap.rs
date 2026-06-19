@@ -1,13 +1,14 @@
 mod binding;
 mod context;
 
+use std::any::TypeId;
+
 pub use binding::*;
+use collections::{HashMap, HashSet};
 pub use context::*;
+use smallvec::SmallVec;
 
 use crate::{Action, AsKeystroke, Keystroke, is_no_action};
-use collections::{HashMap, HashSet};
-use smallvec::SmallVec;
-use std::any::TypeId;
 
 /// An opaque identifier of which version of the keymap is currently active.
 /// The keymap's version is changed whenever bindings are added or removed.
@@ -219,9 +220,10 @@ impl Keymap {
 
 #[cfg(test)]
 mod tests {
+    use gpui::NoAction;
+
     use super::*;
     use crate as gpui;
-    use gpui::NoAction;
 
     actions!(
         test_only,

@@ -1,14 +1,35 @@
+use std::sync::Arc;
+
 /// Example: WgpuSurface with Helio Sky Renderer
 /// Demonstrates integration of helio's scene-driven renderer with a gpui WgpuSurface.
 use gpui::{
-    App, Application, Context, Render, WgpuSurfaceHandle, Window, WindowOptions, div, prelude::*,
-    rgb, wgpu_surface,
+    App,
+    Application,
+    Context,
+    Render,
+    WgpuSurfaceHandle,
+    Window,
+    WindowOptions,
+    div,
+    prelude::*,
+    rgb,
+    wgpu_surface,
 };
-use std::sync::Arc;
-
 use helio::{
-    Camera, GpuLight, GpuMaterial, LightId, LightType, MaterialId, MeshId, MeshUpload,
-    ObjectDescriptor, ObjectId, PackedVertex, Renderer, RendererConfig, SceneActor,
+    Camera,
+    GpuLight,
+    GpuMaterial,
+    LightId,
+    LightType,
+    MaterialId,
+    MeshId,
+    MeshUpload,
+    ObjectDescriptor,
+    ObjectId,
+    PackedVertex,
+    Renderer,
+    RendererConfig,
+    SceneActor,
 };
 
 // ── Mesh helpers ────────────────────────────────────────────────────────────

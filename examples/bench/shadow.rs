@@ -1,6 +1,22 @@
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, BoxShadow, Context, Div, SharedString, Window, WindowBounds,
-    WindowOptions, div, hsla, point, prelude::*, px, relative, rgb, size,
+    App,
+    Application,
+    Bounds,
+    BoxShadow,
+    Context,
+    Div,
+    SharedString,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    hsla,
+    point,
+    px,
+    relative,
+    rgb,
+    size,
 };
 
 struct Shadow {}

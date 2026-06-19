@@ -1,10 +1,37 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
+use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt, App, Application, Asset, AssetLogger, AssetSource, Bounds, Context,
-    Hsla, ImageAssetLoader, ImageCacheError, ImgResourceLoader, LOADING_DELAY, Length, RenderImage,
-    Resource, SharedString, Window, WindowBounds, WindowOptions, black, div, img, prelude::*,
-    pulsating_between, px, red, size,
+    Animation,
+    AnimationExt,
+    App,
+    Application,
+    Asset,
+    AssetLogger,
+    AssetSource,
+    Bounds,
+    Context,
+    Hsla,
+    ImageAssetLoader,
+    ImageCacheError,
+    ImgResourceLoader,
+    LOADING_DELAY,
+    Length,
+    RenderImage,
+    Resource,
+    SharedString,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    black,
+    div,
+    img,
+    pulsating_between,
+    px,
+    red,
+    size,
 };
 
 struct Assets {}

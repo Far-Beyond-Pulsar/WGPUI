@@ -1,31 +1,27 @@
-use std::{
-    any::{TypeId, type_name},
-    cell::{BorrowMutError, Ref, RefCell, RefMut},
-    marker::PhantomData,
-    mem,
-    ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
-    rc::{Rc, Weak},
-    sync::{Arc, atomic::Ordering::SeqCst},
-    time::{Duration, Instant},
-};
+use std::any::{TypeId, type_name};
+use std::cell::{BorrowMutError, Ref, RefCell, RefMut};
+use std::marker::PhantomData;
+use std::mem;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
+use std::sync::atomic::Ordering::SeqCst;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
-use derive_more::{Deref, DerefMut};
-use futures::{
-    Future, FutureExt,
-    channel::oneshot,
-    future::{LocalBoxFuture, Shared},
-};
-use itertools::Itertools;
-use parking_lot::RwLock;
-use slotmap::SlotMap;
-
 pub use async_context::*;
 use collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
 pub use context::*;
+use derive_more::{Deref, DerefMut};
 pub use entity_map::*;
+use futures::channel::oneshot;
+use futures::future::{LocalBoxFuture, Shared};
+use futures::{Future, FutureExt};
 use http_client::{HttpClient, Url};
+use itertools::Itertools;
+use parking_lot::RwLock;
+use slotmap::SlotMap;
 use smallvec::SmallVec;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
@@ -34,15 +30,68 @@ use util::{ResultExt, debug_panic};
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::InspectorElementRegistry;
 use crate::{
-    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, Colors, CursorStyle,
-    DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global,
-    GlobalColors, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
-    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
-    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, SharedString,
-    SubscriberSet, Subscription, SvgRenderer, Task, TextSystem, Window, WindowAppearance,
-    WindowHandle, WindowId, WindowInvalidator, current_platform, hash, init_app_menus,
+    Action,
+    ActionBuildError,
+    ActionRegistry,
+    Any,
+    AnyView,
+    AnyWindowHandle,
+    AppContext,
+    Arena,
+    ArenaBox,
+    Asset,
+    AssetSource,
+    BackgroundExecutor,
+    Bounds,
+    ClipboardItem,
+    Colors,
+    CursorStyle,
+    DispatchPhase,
+    DisplayId,
+    EventEmitter,
+    FocusHandle,
+    FocusMap,
+    ForegroundExecutor,
+    Global,
+    GlobalColors,
+    KeyBinding,
+    KeyContext,
+    Keymap,
+    Keystroke,
+    LayoutId,
+    Menu,
+    MenuItem,
+    OwnedMenu,
+    PathPromptOptions,
+    Pixels,
+    Platform,
+    PlatformDisplay,
+    PlatformKeyboardLayout,
+    PlatformKeyboardMapper,
+    Point,
+    Priority,
+    PromptBuilder,
+    PromptButton,
+    PromptHandle,
+    PromptLevel,
+    Render,
+    RenderImage,
+    RenderablePromptHandle,
+    Reservation,
+    SharedString,
+    SubscriberSet,
+    Subscription,
+    SvgRenderer,
+    Task,
+    TextSystem,
+    Window,
+    WindowAppearance,
+    WindowHandle,
+    WindowId,
+    WindowInvalidator,
+    current_platform,
+    hash,
+    init_app_menus,
 };
 
 mod async_context;
@@ -666,6 +715,10 @@ pub struct App {
     pub(crate) mode: GpuiMode,
     /// Whether the app was created by [`Application::new_inaccessible`]. No
     /// accesskit APIs will be called when this flag is set.
+    #[expect(
+        dead_code,
+        reason = "inaccessible app mode keeps this flag for backend integration"
+    )]
     pub(crate) accessibility_force_disabled: bool,
     flushing_effects: bool,
     pending_updates: usize,
@@ -2639,7 +2692,8 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::RefCell, rc::Rc};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use crate::{AppContext, TestAppContext};
 

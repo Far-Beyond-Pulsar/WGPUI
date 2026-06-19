@@ -1,13 +1,26 @@
+#![expect(
+    dead_code,
+    reason = "atlas keeps staged render-target fields for texture lifecycle work"
+)]
+
 use std::sync::Arc;
 
 use collections::FxHashMap;
 use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
 
+use crate::platform::AtlasTextureList;
+use crate::platform::cross::render_context::WgpuContext;
 use crate::{
-    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, DevicePixels, PlatformAtlas,
-    Point, Size,
-    platform::{AtlasTextureList, cross::render_context::WgpuContext},
+    AtlasKey,
+    AtlasTextureId,
+    AtlasTextureKind,
+    AtlasTile,
+    Bounds,
+    DevicePixels,
+    PlatformAtlas,
+    Point,
+    Size,
 };
 
 pub(crate) struct WgpuAtlas(Mutex<WgpuAtlasState>);
@@ -237,7 +250,7 @@ impl WgpuAtlasState {
         let bytes_per_pixel = texture.bytes_per_pixel();
         let unpadded_bytes_per_row = bounds.size.width.to_bytes(bytes_per_pixel) as usize;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-        let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) / align * align;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
         let height = bounds.size.height.0 as usize;
 
         let padded_data = if padded_bytes_per_row != unpadded_bytes_per_row {

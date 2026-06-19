@@ -1,12 +1,53 @@
 use std::ops::Range;
 
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, Keystroke,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, WindowBounds,
-    WindowOptions, actions, black, div, fill, hsla, opaque_grey, point, prelude::*, px, relative,
-    rgb, rgba, size, white, yellow,
+    App,
+    Application,
+    Bounds,
+    ClipboardItem,
+    Context,
+    CursorStyle,
+    ElementId,
+    ElementInputHandler,
+    Entity,
+    EntityInputHandler,
+    FocusHandle,
+    Focusable,
+    GlobalElementId,
+    KeyBinding,
+    Keystroke,
+    LayoutId,
+    MouseButton,
+    MouseDownEvent,
+    MouseMoveEvent,
+    MouseUpEvent,
+    PaintQuad,
+    Pixels,
+    Point,
+    ShapedLine,
+    SharedString,
+    Style,
+    TextRun,
+    UTF16Selection,
+    UnderlineStyle,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    actions,
+    black,
+    div,
+    fill,
+    hsla,
+    opaque_grey,
+    point,
+    px,
+    relative,
+    rgb,
+    rgba,
+    size,
+    white,
+    yellow,
 };
 use unicode_segmentation::*;
 
@@ -444,7 +485,7 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), hsla(0., 0., 0., 0.2))
+            (input.placeholder.clone(), hsla(0., 0., 0., 0.2).into())
         } else {
             (content, style.color)
         };
@@ -736,7 +777,7 @@ fn main() {
 
         window
             .update(cx, |view, window, cx| {
-                window.focus(&view.text_input.focus_handle(cx));
+                window.focus(&view.text_input.focus_handle(cx), cx);
                 cx.activate(true);
             })
             .unwrap();

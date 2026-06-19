@@ -2,10 +2,8 @@
 //! handle deep hierarchies (even though it cannot just yet!).
 use std::sync::LazyLock;
 
-use gpui::{
-    App, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px,
-    size,
-};
+use gpui::prelude::*;
+use gpui::{App, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div, px, size};
 
 struct Tree {}
 

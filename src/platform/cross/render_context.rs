@@ -93,7 +93,7 @@ impl WgpuContext {
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Globals Buffer"),
             // FIXME(mdeand): Hack
-            size: 16 as u64,
+            size: 16_u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -191,8 +191,27 @@ impl WgpuContext {
     }
 }
 
+const BUFFER_MIN_GROWTH: u64 = 1024 * 1024;
+
+fn resized_buffer_size(current_size: u64, required_size: u64) -> Option<u64> {
+    let is_too_small = current_size < required_size;
+    let is_fragmented =
+        required_size > 0 && required_size.saturating_mul(10) < current_size.saturating_mul(7);
+
+    if is_too_small {
+        Some(
+            (required_size.saturating_mul(3) / 2)
+                .max(required_size.saturating_add(BUFFER_MIN_GROWTH)),
+        )
+    } else if is_fragmented {
+        Some((required_size.saturating_mul(3) / 2).max(BUFFER_MIN_GROWTH))
+    } else {
+        None
+    }
+}
+
 /// Ensures a buffer is large enough to hold the required size.
-/// If the buffer is too small, it will be recreated with the new size.
+/// If the buffer is too small, or more than 30% unused, it will be recreated.
 pub(super) fn ensure_buffer_size(
     device: &wgpu::Device,
     buffer: &Mutex<wgpu::Buffer>,
@@ -202,14 +221,46 @@ pub(super) fn ensure_buffer_size(
 ) {
     let mut buffer_guard = buffer.lock().unwrap();
     let current_size = buffer_guard.size();
-    if current_size < required_size {
-        // Recreate buffer with new size (add some headroom to avoid frequent reallocations)
-        let new_size = (required_size * 3 / 2).max(required_size + 1024 * 1024);
+    if let Some(new_size) = resized_buffer_size(current_size, required_size) {
         *buffer_guard = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: new_size,
             usage,
             mapped_at_creation: false,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resized_buffer_size_grows_small_buffers_with_headroom() {
+        assert_eq!(
+            resized_buffer_size(BUFFER_MIN_GROWTH, BUFFER_MIN_GROWTH * 2),
+            Some(BUFFER_MIN_GROWTH * 3)
+        );
+    }
+
+    #[test]
+    fn resized_buffer_size_keeps_buffers_under_fragmentation_threshold() {
+        assert_eq!(
+            resized_buffer_size(BUFFER_MIN_GROWTH * 10, BUFFER_MIN_GROWTH * 7),
+            None
+        );
+    }
+
+    #[test]
+    fn resized_buffer_size_compacts_buffers_with_more_than_thirty_percent_unused() {
+        assert_eq!(
+            resized_buffer_size(BUFFER_MIN_GROWTH * 10, BUFFER_MIN_GROWTH * 6),
+            Some(BUFFER_MIN_GROWTH * 9)
+        );
+    }
+
+    #[test]
+    fn resized_buffer_size_never_compacts_for_empty_required_size() {
+        assert_eq!(resized_buffer_size(BUFFER_MIN_GROWTH * 10, 0), None);
     }
 }

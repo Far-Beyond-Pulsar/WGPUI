@@ -1,18 +1,18 @@
-use crate::{PlatformDispatcher, Priority, RunnableVariant, TaskLabel};
+use std::future::Future;
+use std::ops::RangeInclusive;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
 use backtrace::Backtrace;
 use collections::{HashMap, HashSet, VecDeque};
 use parking::Unparker;
 use parking_lot::Mutex;
 use rand::prelude::*;
-use std::{
-    future::Future,
-    ops::RangeInclusive,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::{Duration, Instant},
-};
 use util::post_inc;
+
+use crate::{PlatformDispatcher, Priority, RunnableVariant, TaskLabel};
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 struct TestDispatcherId(usize);

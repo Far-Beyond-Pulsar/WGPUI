@@ -7,9 +7,20 @@
 mod example_prelude;
 
 use example_prelude::init_example;
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    App,
+    Application,
+    Bounds,
+    Context,
+    Render,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    px,
+    rgb,
+    size,
 };
 
 struct EmojiDisplay;

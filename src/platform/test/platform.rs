@@ -1,18 +1,33 @@
-use crate::{
-    AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
-    ForegroundExecutor, Keymap, NoopTextSystem, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, PlatformTextSystem, PromptButton, Task, TestDisplay, TestWindow,
-    WindowAppearance, WindowParams,
-};
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
+
 use anyhow::Result;
 use collections::VecDeque;
 use futures::channel::oneshot;
 use parking_lot::Mutex;
-use std::{
-    cell::RefCell,
-    path::{Path, PathBuf},
-    rc::{Rc, Weak},
-    sync::Arc,
+
+use crate::{
+    AnyWindowHandle,
+    BackgroundExecutor,
+    ClipboardItem,
+    CursorStyle,
+    DummyKeyboardMapper,
+    ForegroundExecutor,
+    Keymap,
+    NoopTextSystem,
+    Platform,
+    PlatformDisplay,
+    PlatformKeyboardLayout,
+    PlatformKeyboardMapper,
+    PlatformTextSystem,
+    PromptButton,
+    Task,
+    TestDisplay,
+    TestWindow,
+    WindowAppearance,
+    WindowParams,
 };
 
 /// TestPlatform implements the Platform trait for use in tests.

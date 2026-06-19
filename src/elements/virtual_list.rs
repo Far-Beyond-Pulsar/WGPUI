@@ -1,12 +1,38 @@
-use crate::elements::smooth_scroll::SmoothScrollState;
-use gpui::{
-    AnyElement, App, Bounds, ContentMask, Context, Div, Element, ElementId, Entity,
-    GlobalElementId, Hitbox, InteractiveElement, IntoElement, Pixels, Render, ScrollHandle, Size,
-    Stateful, StatefulInteractiveElement, Styled, Window, div, point, px, size,
-};
-use std::{cell::RefCell, cmp, ops::Range, rc::Rc};
+use std::cell::RefCell;
+use std::cmp;
+use std::ops::Range;
+use std::rc::Rc;
 
+use gpui::{
+    AnyElement,
+    App,
+    Bounds,
+    ContentMask,
+    Context,
+    Div,
+    Element,
+    ElementId,
+    Entity,
+    GlobalElementId,
+    Hitbox,
+    InteractiveElement,
+    IntoElement,
+    Pixels,
+    Render,
+    ScrollHandle,
+    Size,
+    Stateful,
+    StatefulInteractiveElement,
+    Styled,
+    Window,
+    div,
+    point,
+    px,
+    size,
+};
 use smallvec::SmallVec;
+
+use crate::elements::smooth_scroll::SmoothScrollState;
 
 /// A deferred request to scroll the virtual list to a specific item.
 #[derive(Clone, Copy, Debug)]

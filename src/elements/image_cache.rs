@@ -1,14 +1,40 @@
-use crate::{
-    AnyElement, AnyEntity, App, AppContext, Asset, AssetLogger, Bounds, Element, ElementId, Entity,
-    GlobalElementId, ImageAssetLoader, ImageCacheError, InspectorElementId, IntoElement, LayoutId,
-    ParentElement, Pixels, RenderImage, Resource, Style, StyleRefinement, Styled, Task, Window,
-    hash,
-};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
 
-use futures::{FutureExt, future::Shared};
+use futures::FutureExt;
+use futures::future::Shared;
 use refineable::Refineable;
 use smallvec::SmallVec;
-use std::{collections::HashMap, fmt, sync::Arc};
+
+use crate::{
+    AnyElement,
+    AnyEntity,
+    App,
+    AppContext,
+    Asset,
+    AssetLogger,
+    Bounds,
+    Element,
+    ElementId,
+    Entity,
+    GlobalElementId,
+    ImageAssetLoader,
+    ImageCacheError,
+    InspectorElementId,
+    IntoElement,
+    LayoutId,
+    ParentElement,
+    Pixels,
+    RenderImage,
+    Resource,
+    Style,
+    StyleRefinement,
+    Styled,
+    Task,
+    Window,
+    hash,
+};
 
 /// An image cache element, all its child img elements will use the cache specified by this element.
 /// Note that this could as simple as passing an `Entity<T: ImageCache>`

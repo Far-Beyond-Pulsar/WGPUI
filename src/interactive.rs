@@ -1,9 +1,25 @@
-use crate::{
-    Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render,
-    Window, point, seal::Sealed,
-};
+use std::any::Any;
+use std::fmt::Debug;
+use std::ops::Deref;
+use std::path::PathBuf;
+
 use smallvec::SmallVec;
-use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
+
+use crate::seal::Sealed;
+use crate::{
+    Bounds,
+    Capslock,
+    Context,
+    Empty,
+    IntoElement,
+    Keystroke,
+    Modifiers,
+    Pixels,
+    Point,
+    Render,
+    Window,
+    point,
+};
 
 /// An event from a platform input source.
 pub trait InputEvent: Sealed + 'static {
@@ -615,8 +631,19 @@ impl PlatformInput {
 mod test {
 
     use crate::{
-        self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
-        KeyBinding, Keystroke, ParentElement, Render, TestAppContext, Window, div,
+        self as gpui,
+        AppContext as _,
+        Context,
+        FocusHandle,
+        InteractiveElement,
+        IntoElement,
+        KeyBinding,
+        Keystroke,
+        ParentElement,
+        Render,
+        TestAppContext,
+        Window,
+        div,
     };
 
     struct TestView {

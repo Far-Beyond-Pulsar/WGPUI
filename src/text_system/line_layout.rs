@@ -1,18 +1,26 @@
-use crate::{
-    FontId, FontStyle, FontWeight, GlyphId, Pixels, PlatformTextSystem, Point, SharedString,
-    Size, point, px,
-};
+use std::borrow::Borrow;
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
+use std::sync::Arc;
+
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
-use std::{
-    borrow::Borrow,
-    hash::{Hash, Hasher},
-    ops::Range,
-    sync::Arc,
-};
 
 use super::LineWrapper;
+use crate::{
+    FontId,
+    FontStyle,
+    FontWeight,
+    GlyphId,
+    Pixels,
+    PlatformTextSystem,
+    Point,
+    SharedString,
+    Size,
+    point,
+    px,
+};
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]

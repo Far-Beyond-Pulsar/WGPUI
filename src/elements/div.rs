@@ -15,34 +15,79 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
-use crate::{
-    AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
-    DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
-    Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
-    KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
-    MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
-};
+use std::any::{Any, TypeId};
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::mem;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
 use collections::HashMap;
 use refineable::Refineable;
 use smallvec::SmallVec;
 use stacksafe::{StackSafe, stacksafe};
-use std::{
-    any::{Any, TypeId},
-    cell::RefCell,
-    cmp::Ordering,
-    fmt::Debug,
-    marker::PhantomData,
-    mem,
-    rc::Rc,
-    sync::Arc,
-    time::Duration,
-};
 use util::ResultExt;
 
 use super::ImageCacheProvider;
+use crate::{
+    AbsoluteLength,
+    Action,
+    AnyDrag,
+    AnyElement,
+    AnyTooltip,
+    AnyView,
+    App,
+    Bounds,
+    ClickEvent,
+    DispatchPhase,
+    Display,
+    Element,
+    ElementId,
+    Entity,
+    FocusHandle,
+    Global,
+    GlobalElementId,
+    Hitbox,
+    HitboxBehavior,
+    HitboxId,
+    InspectorElementId,
+    IntoElement,
+    IsZero,
+    KeyContext,
+    KeyDownEvent,
+    KeyUpEvent,
+    KeyboardButton,
+    KeyboardClickEvent,
+    LayoutId,
+    ModifiersChangedEvent,
+    MouseButton,
+    MouseClickEvent,
+    MouseDownEvent,
+    MouseMoveEvent,
+    MouseUpEvent,
+    Overflow,
+    ParentElement,
+    Pixels,
+    Point,
+    Render,
+    ScrollWheelEvent,
+    SharedString,
+    Size,
+    Style,
+    StyleRefinement,
+    Styled,
+    Task,
+    TooltipId,
+    Visibility,
+    Window,
+    WindowControlArea,
+    point,
+    px,
+    size,
+};
 
 const DRAG_THRESHOLD: f64 = 2.;
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
@@ -1834,67 +1879,74 @@ impl Interactivity {
                 window.with_element_opacity(style.opacity, |window| {
                     window.with_element_blur(style.blur, |window| {
                         style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
-                        window.with_text_style(style.text_style().cloned(), |window| {
-                            window.with_content_mask(
-                                style.overflow_mask(bounds, window.rem_size()),
-                                |window| {
-                                    window.with_tab_group(tab_group, |window| {
-                                        if let Some(hitbox) = hitbox {
-                                            #[cfg(debug_assertions)]
-                                            self.paint_debug_info(
-                                                global_id, hitbox, &style, window, cx,
-                                            );
+                            window.with_text_style(style.text_style().cloned(), |window| {
+                                window.with_content_mask(
+                                    style.overflow_mask(bounds, window.rem_size()),
+                                    |window| {
+                                        window.with_tab_group(tab_group, |window| {
+                                            if let Some(hitbox) = hitbox {
+                                                #[cfg(debug_assertions)]
+                                                self.paint_debug_info(
+                                                    global_id, hitbox, &style, window, cx,
+                                                );
 
-                                            if let Some(drag) = cx.active_drag.as_ref() {
-                                                if let Some(mouse_cursor) = drag.cursor_style {
-                                                    window.set_window_cursor_style(mouse_cursor);
+                                                if let Some(drag) = cx.active_drag.as_ref() {
+                                                    if let Some(mouse_cursor) = drag.cursor_style {
+                                                        window
+                                                            .set_window_cursor_style(mouse_cursor);
+                                                    }
+                                                } else {
+                                                    if let Some(mouse_cursor) = style.mouse_cursor {
+                                                        window
+                                                            .set_cursor_style(mouse_cursor, hitbox);
+                                                    }
                                                 }
-                                            } else {
-                                                if let Some(mouse_cursor) = style.mouse_cursor {
-                                                    window.set_cursor_style(mouse_cursor, hitbox);
+
+                                                if let Some(group) = self.group.clone() {
+                                                    GroupHitboxes::push(group, hitbox.id, cx);
                                                 }
-                                            }
 
-                                            if let Some(group) = self.group.clone() {
-                                                GroupHitboxes::push(group, hitbox.id, cx);
-                                            }
+                                                if let Some(area) = self.window_control {
+                                                    window.insert_window_control_hitbox(
+                                                        area,
+                                                        hitbox.clone(),
+                                                    );
+                                                }
 
-                                            if let Some(area) = self.window_control {
-                                                window.insert_window_control_hitbox(
-                                                    area,
-                                                    hitbox.clone(),
+                                                self.paint_mouse_listeners(
+                                                    hitbox,
+                                                    element_state.as_mut(),
+                                                    window,
+                                                    cx,
+                                                );
+                                                self.paint_scroll_listener(
+                                                    hitbox, &style, window, cx,
                                                 );
                                             }
 
-                                            self.paint_mouse_listeners(
-                                                hitbox,
-                                                element_state.as_mut(),
-                                                window,
-                                                cx,
-                                            );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
-                                        }
+                                            self.paint_keyboard_listeners(window, cx);
+                                            f(&style, window, cx);
 
-                                        self.paint_keyboard_listeners(window, cx);
-                                        f(&style, window, cx);
+                                            if let Some(_hitbox) = hitbox {
+                                                #[cfg(any(
+                                                    feature = "inspector",
+                                                    debug_assertions
+                                                ))]
+                                                window.insert_inspector_hitbox(
+                                                    _hitbox.id,
+                                                    _inspector_id,
+                                                    cx,
+                                                );
 
-                                        if let Some(_hitbox) = hitbox {
-                                            #[cfg(any(feature = "inspector", debug_assertions))]
-                                            window.insert_inspector_hitbox(
-                                                _hitbox.id,
-                                                _inspector_id,
-                                                cx,
-                                            );
-
-                                            if let Some(group) = self.group.as_ref() {
-                                                GroupHitboxes::pop(group, cx);
+                                                if let Some(group) = self.group.as_ref() {
+                                                    GroupHitboxes::pop(group, cx);
+                                                }
                                             }
-                                        }
-                                    })
-                                },
-                            );
+                                        })
+                                    },
+                                );
+                            });
                         });
-                    });
                     });
                 });
 

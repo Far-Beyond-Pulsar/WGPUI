@@ -1,7 +1,22 @@
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Context, MouseButton, Render, ScrollStrategy,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, rgba,
-    size, uniform_list,
+    App,
+    Application,
+    Bounds,
+    Context,
+    MouseButton,
+    Render,
+    ScrollStrategy,
+    UniformListScrollHandle,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    px,
+    rgb,
+    rgba,
+    size,
+    uniform_list,
 };
 
 struct SmoothScrollingExample {

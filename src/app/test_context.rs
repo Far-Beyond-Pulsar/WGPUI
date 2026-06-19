@@ -1,17 +1,65 @@
-use crate::{
-    Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AsyncApp, AvailableSpace,
-    BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DrawPhase, Drawable,
-    Element, Empty, EntityId, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform, TestWindow,
-    TextSystem, VisualContext, Window, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
-    window::ElementArenaScope,
-};
+use std::cell::RefCell;
+use std::future::Future;
+use std::ops::Deref;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{anyhow, bail};
-use futures::{Stream, StreamExt, channel::oneshot};
-use rand::{SeedableRng, rngs::StdRng};
-use std::{
-    cell::RefCell, future::Future, ops::Deref, path::PathBuf, rc::Rc, sync::Arc, time::Duration,
+use futures::channel::oneshot;
+use futures::{Stream, StreamExt};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
+use crate::app::GpuiMode;
+use crate::window::ElementArenaScope;
+use crate::{
+    Action,
+    AnyView,
+    AnyWindowHandle,
+    App,
+    AppCell,
+    AppContext,
+    AsyncApp,
+    AvailableSpace,
+    BackgroundExecutor,
+    BorrowAppContext,
+    Bounds,
+    Capslock,
+    ClipboardItem,
+    DrawPhase,
+    Drawable,
+    Element,
+    Empty,
+    EntityId,
+    EventEmitter,
+    ForegroundExecutor,
+    Global,
+    InputEvent,
+    Keystroke,
+    Modifiers,
+    ModifiersChangedEvent,
+    MouseButton,
+    MouseDownEvent,
+    MouseMoveEvent,
+    MouseUpEvent,
+    Pixels,
+    Platform,
+    Point,
+    Render,
+    Result,
+    Size,
+    Task,
+    TestDispatcher,
+    TestPlatform,
+    TestWindow,
+    TextSystem,
+    VisualContext,
+    Window,
+    WindowBounds,
+    WindowHandle,
+    WindowOptions,
 };
 
 /// A TestAppContext is provided to tests created with `#[gpui::test]`, it provides

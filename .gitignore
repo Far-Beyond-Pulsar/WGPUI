@@ -31,3 +31,5 @@ xcuserdata/
 # Misc
 **/*.db
 .build
+MEMORY.md
+.claude/settings.local.json

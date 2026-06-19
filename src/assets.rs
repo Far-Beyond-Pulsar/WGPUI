@@ -1,13 +1,13 @@
-use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
-use smallvec::SmallVec;
+use std::borrow::Cow;
+use std::fmt;
+use std::hash::Hash;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
 
 use image::{Delay, Frame};
-use std::{
-    borrow::Cow,
-    fmt,
-    hash::Hash,
-    sync::atomic::{AtomicUsize, Ordering::SeqCst},
-};
+use smallvec::SmallVec;
+
+use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
 
 /// A source of assets for this app to use.
 pub trait AssetSource: 'static + Send + Sync {

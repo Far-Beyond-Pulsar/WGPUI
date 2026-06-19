@@ -7,10 +7,34 @@
 //! 3. `window.paint_*` methods - Drawing quads, paths, and more
 //! 4. Interactive drawing - Responding to mouse events
 
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Colors, Context, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Path, PathBuilder, Pixels, Point, Render, Rgba, Window, WindowBounds,
-    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    App,
+    Application,
+    Bounds,
+    Colors,
+    Context,
+    Hsla,
+    MouseButton,
+    MouseDownEvent,
+    MouseMoveEvent,
+    MouseUpEvent,
+    Path,
+    PathBuilder,
+    Pixels,
+    Point,
+    Render,
+    Rgba,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    canvas,
+    div,
+    fill,
+    point,
+    px,
+    rgb,
+    size,
 };
 
 #[path = "../prelude.rs"]

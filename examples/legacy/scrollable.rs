@@ -1,7 +1,5 @@
-use gpui::{
-    App, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px,
-    size,
-};
+use gpui::prelude::*;
+use gpui::{App, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div, px, size};
 
 struct Scrollable {}
 

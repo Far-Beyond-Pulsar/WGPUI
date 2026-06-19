@@ -1,14 +1,18 @@
 use anyhow::Error;
 use etagere::euclid::{Point2D, Vector2D};
 use lyon::geom::Angle;
+pub use lyon::math::Transform;
 use lyon::math::{Vector, vector};
 use lyon::path::traits::SvgPathBuilder;
 use lyon::path::{ArcFlags, Polygon};
 use lyon::tessellation::{
-    BuffersBuilder, FillTessellator, FillVertex, StrokeTessellator, StrokeVertex, VertexBuffers,
+    BuffersBuilder,
+    FillTessellator,
+    FillVertex,
+    StrokeTessellator,
+    StrokeVertex,
+    VertexBuffers,
 };
-
-pub use lyon::math::Transform;
 pub use lyon::tessellation::{FillOptions, FillRule, StrokeOptions};
 
 use crate::{Path, Pixels, Point, point, px};

@@ -1,21 +1,39 @@
-use crate::{
-    BackgroundExecutor, Capslock, DevicePixels, DummyKeyboardMapper, ExternalPaths, FileDropEvent,
-    ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Platform,
-    PlatformInput, PlatformWindow as _, PriorityQueueReceiver, RunnableVariant, ScrollWheelEvent,
-    Size,
-    platform::cross::{
-        dispatcher::{CrossEvent, Dispatcher},
-        keyboard::CrossKeyboardLayout,
-        render_context::WgpuContext,
-        text_system::CosmicTextSystem,
-        window::CrossWindow,
-    },
-    point,
-};
-
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
+
+use crate::platform::cross::dispatcher::{CrossEvent, Dispatcher};
+use crate::platform::cross::keyboard::CrossKeyboardLayout;
+use crate::platform::cross::render_context::WgpuContext;
+use crate::platform::cross::text_system::CosmicTextSystem;
+use crate::platform::cross::window::CrossWindow;
+use crate::{
+    BackgroundExecutor,
+    Capslock,
+    DevicePixels,
+    DummyKeyboardMapper,
+    ExternalPaths,
+    FileDropEvent,
+    ForegroundExecutor,
+    KeyDownEvent,
+    KeyUpEvent,
+    Keystroke,
+    Modifiers,
+    ModifiersChangedEvent,
+    MouseButton,
+    MouseDownEvent,
+    MouseExitEvent,
+    MouseMoveEvent,
+    MouseUpEvent,
+    Pixels,
+    Platform,
+    PlatformInput,
+    PlatformWindow as _,
+    PriorityQueueReceiver,
+    RunnableVariant,
+    ScrollWheelEvent,
+    Size,
+    point,
+};
 
 fn device_button_to_gpui(button: u32) -> Option<MouseButton> {
     match button {
@@ -27,28 +45,25 @@ fn device_button_to_gpui(button: u32) -> Option<MouseButton> {
         _ => None,
     }
 }
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use arboard::Clipboard;
 use collections::FxHashMap;
-use std::{
-    cell::{Cell, RefCell},
-    collections::HashSet,
-    fs::{self, OpenOptions},
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
-    path::PathBuf,
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
-    time::{Duration, Instant},
-};
 use winit::event_loop::ActiveEventLoop;
 
 thread_local! {
-    static ACTIVE_CONTEXT: Cell<Option<(*const ActiveEventLoop, *mut AppState)>> = Cell::new(None);
+    static ACTIVE_CONTEXT: Cell<Option<(*const ActiveEventLoop, *mut AppState)>> = const { Cell::new(None) };
 }
 
 // Helper to access the context
@@ -1678,8 +1693,7 @@ fn winit_key_to_keystroke(
     modifiers: Modifiers,
     text: &Option<winit::keyboard::SmolStr>,
 ) -> Option<Keystroke> {
-    use winit::keyboard::Key as WKey;
-    use winit::keyboard::NamedKey;
+    use winit::keyboard::{Key as WKey, NamedKey};
 
     let (key, key_char) = match logical_key {
         WKey::Named(named) => {
@@ -1766,9 +1780,10 @@ fn winit_key_to_keystroke(
 
 #[cfg(test)]
 mod tests {
+    use winit::keyboard::{Key, NamedKey};
+
     use super::winit_key_to_keystroke;
     use crate::Modifiers;
-    use winit::keyboard::{Key, NamedKey};
 
     #[test]
     fn translates_space_to_text_input() {

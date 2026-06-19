@@ -1,20 +1,56 @@
-use std::{
-    hash::{Hash, Hasher},
-    iter, mem,
-    ops::Range,
-};
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
+use std::{iter, mem};
 
-use crate::{
-    AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
-    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextColor, TextRun, Window,
-    black, phi, point, quad, rems, size, solid_text_color, transparent_black, transparent_white,
-};
 use collections::HashSet;
 use refineable::Refineable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    AbsoluteLength,
+    App,
+    Background,
+    BackgroundTag,
+    BorderStyle,
+    Bounds,
+    ContentMask,
+    Corners,
+    CornersRefinement,
+    CursorStyle,
+    DefiniteLength,
+    DevicePixels,
+    Edges,
+    EdgesRefinement,
+    Font,
+    FontFallbacks,
+    FontFeatures,
+    FontStyle,
+    FontWeight,
+    GridLocation,
+    Hsla,
+    Length,
+    Pixels,
+    Point,
+    PointRefinement,
+    Rgba,
+    SharedString,
+    Size,
+    SizeRefinement,
+    Styled,
+    TextColor,
+    TextRun,
+    Window,
+    black,
+    phi,
+    point,
+    quad,
+    rems,
+    size,
+    solid_text_color,
+    transparent_black,
+    transparent_white,
+};
 
 /// Use this struct for interfacing with the 'debug_below' styling from your own elements.
 /// If a parent element has this style set on it, then this struct will be set as a global in
@@ -1335,11 +1371,10 @@ impl From<Position> for taffy::style::Position {
 
 #[cfg(test)]
 mod tests {
-    use crate::{blue, green, px, red, yellow};
+    use util_macros::perf;
 
     use super::*;
-
-    use util_macros::perf;
+    use crate::{blue, green, px, red, yellow};
 
     #[perf]
     fn test_basic_highlight_style_combination() {

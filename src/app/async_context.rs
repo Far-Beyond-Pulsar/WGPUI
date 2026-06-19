@@ -1,16 +1,38 @@
-use crate::{
-    AnyView, AnyWindowHandle, App, AppCell, AppContext, BackgroundExecutor, BorrowAppContext,
-    Entity, EntityId, EventEmitter, Focusable, ForegroundExecutor, Global, GpuiBorrow,
-    PromptButton, PromptLevel, Render, Reservation, Result, Subscription, Task, VisualContext,
-    Window, WindowHandle,
-};
+use std::future::Future;
+use std::rc::Weak;
+
 use anyhow::{Context as _, bail};
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use futures::future::FutureExt;
-use std::{future::Future, rc::Weak};
 
 use super::{Context, WeakEntity};
+use crate::{
+    AnyView,
+    AnyWindowHandle,
+    App,
+    AppCell,
+    AppContext,
+    BackgroundExecutor,
+    BorrowAppContext,
+    Entity,
+    EntityId,
+    EventEmitter,
+    Focusable,
+    ForegroundExecutor,
+    Global,
+    GpuiBorrow,
+    PromptButton,
+    PromptLevel,
+    Render,
+    Reservation,
+    Result,
+    Subscription,
+    Task,
+    VisualContext,
+    Window,
+    WindowHandle,
+};
 
 /// An async-friendly version of [App] with a static lifetime so it can be held across `await` points in async code.
 /// You're provided with an instance when calling [App::spawn], and you can also create one with [App::to_async].

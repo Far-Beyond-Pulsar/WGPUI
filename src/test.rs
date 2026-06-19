@@ -17,23 +17,23 @@
 //!
 //! #[gpui::test]
 //! async fn test_example(cx: &TestAppContext) {
-//!   assert!(true)
+//!     assert!(true)
 //! }
 //!
 //! #[gpui::test]
 //! async fn test_collaboration_example(cx_a: &TestAppContext, cx_b: &TestAppContext) {
-//!   assert!(true)
+//!     assert!(true)
 //! }
 //! ```
-use crate::{Entity, Subscription, TestAppContext, TestDispatcher};
+use std::env;
+use std::panic::{self, RefUnwindSafe};
+use std::pin::Pin;
+
 use futures::StreamExt as _;
 use rand::prelude::*;
 use smol::channel;
-use std::{
-    env,
-    panic::{self, RefUnwindSafe},
-    pin::Pin,
-};
+
+use crate::{Entity, Subscription, TestAppContext, TestDispatcher};
 
 /// Run the given test function with the configured parameters.
 /// This is intended for use with the `gpui::test` macro

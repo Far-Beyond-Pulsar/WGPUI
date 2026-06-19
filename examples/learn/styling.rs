@@ -6,9 +6,28 @@
 //! 2. Conditional styling - when, when_some, map
 //! 3. Theming patterns - using Colors for consistent styling
 
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Colors, Context, FocusHandle, Hsla, KeyBinding, Menu, MenuItem,
-    Render, Rgba, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    App,
+    Application,
+    Bounds,
+    Colors,
+    Context,
+    FocusHandle,
+    Hsla,
+    KeyBinding,
+    Menu,
+    MenuItem,
+    Render,
+    Rgba,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    actions,
+    div,
+    px,
+    rgb,
+    size,
 };
 
 actions!(styling_example, [Quit, Tab, TabPrev]);
@@ -292,7 +311,7 @@ struct StylingExample {
 impl StylingExample {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle);
+        window.focus(&focus_handle, cx);
 
         let buttons = vec![
             cx.focus_handle().tab_index(1).tab_stop(true),
@@ -306,12 +325,12 @@ impl StylingExample {
         }
     }
 
-    fn on_tab(&mut self, _: &Tab, window: &mut Window, _: &mut Context<Self>) {
-        window.focus_next();
+    fn on_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_next(cx);
     }
 
-    fn on_tab_prev(&mut self, _: &TabPrev, window: &mut Window, _: &mut Context<Self>) {
-        window.focus_prev();
+    fn on_tab_prev(&mut self, _: &TabPrev, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_prev(cx);
     }
 }
 
@@ -491,7 +510,7 @@ fn main() {
             name: "Styling".into(),
             items: vec![MenuItem::action("Quit", Quit)],
         }]);
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }

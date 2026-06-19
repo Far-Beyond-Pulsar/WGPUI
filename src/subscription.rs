@@ -1,10 +1,9 @@
+use std::cell::{Cell, RefCell};
+use std::fmt::Debug;
+use std::mem;
+use std::rc::Rc;
+
 use collections::{BTreeMap, BTreeSet};
-use std::{
-    cell::{Cell, RefCell},
-    fmt::Debug,
-    mem,
-    rc::Rc,
-};
 use util::post_inc;
 
 pub(crate) struct SubscriberSet<EmitterKey, Callback>(

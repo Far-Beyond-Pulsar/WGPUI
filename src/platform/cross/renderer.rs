@@ -1,18 +1,35 @@
+#![expect(
+    dead_code,
+    reason = "renderer keeps pipeline layouts and feature scaffolding for active and staged rendering paths"
+)]
+
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
 use wgpu::util::DeviceExt;
 
+use crate::platform::cross::atlas::WgpuAtlas;
+use crate::platform::cross::render_context::{WgpuContext, ensure_buffer_size};
+use crate::platform::cross::surface_registry::SurfaceId;
 use crate::{
-    AtlasTextureId, AtlasTile, DevicePixels, GpuSpecs, GradientStop, LinearColorStop,
-    MonochromeSprite, Pixels, PlatformAtlas, PrimitiveBatch, Quad, ScaledPixels, Scene,
-    TransformationMatrix, color, geometry,
-    platform::cross::{
-        atlas::WgpuAtlas,
-        render_context::{WgpuContext, ensure_buffer_size},
-        surface_registry::SurfaceId,
-    },
+    AtlasTextureId,
+    AtlasTile,
+    DevicePixels,
+    GpuSpecs,
+    GradientStop,
+    LinearColorStop,
+    MonochromeSprite,
+    Pixels,
+    PlatformAtlas,
+    PrimitiveBatch,
+    Quad,
+    ScaledPixels,
+    Scene,
+    TransformationMatrix,
+    color,
+    geometry,
 };
 
 const fn map_attributes<const N: usize>(
@@ -1427,6 +1444,61 @@ struct SurfaceBoundsEntry {
     layout_version: u64,
 }
 
+#[derive(Default)]
+struct PrimitiveUploadState {
+    generation: u64,
+    byte_len: usize,
+}
+
+impl PrimitiveUploadState {
+    fn needs_upload(&self, generation: u64, byte_len: usize) -> bool {
+        self.generation != generation || self.byte_len != byte_len
+    }
+
+    fn record(&mut self, generation: u64, byte_len: usize) {
+        self.generation = generation;
+        self.byte_len = byte_len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primitive_upload_state_skips_only_unchanged_generation_and_size() {
+        let mut state = PrimitiveUploadState::default();
+
+        assert!(state.needs_upload(1, 64));
+        state.record(1, 64);
+
+        assert!(!state.needs_upload(1, 64));
+        assert!(state.needs_upload(2, 64));
+        assert!(state.needs_upload(1, 128));
+    }
+
+    #[test]
+    fn primitive_upload_state_can_record_empty_uploads() {
+        let mut state = PrimitiveUploadState::default();
+
+        state.record(4, 0);
+
+        assert!(!state.needs_upload(4, 0));
+        assert!(state.needs_upload(5, 0));
+    }
+}
+
+#[derive(Default)]
+struct PrimitiveUploadStates {
+    quads: PrimitiveUploadState,
+    shadows: PrimitiveUploadState,
+    backdrop_blurs: PrimitiveUploadState,
+    underlines: PrimitiveUploadState,
+    monochrome_sprites: PrimitiveUploadState,
+    polychrome_sprites: PrimitiveUploadState,
+    paths_vertices: PrimitiveUploadState,
+}
+
 pub struct WgpuRenderer {
     context: Arc<WgpuContext>,
     surface: ManuallyDrop<wgpu::Surface<'static>>,
@@ -1455,6 +1527,8 @@ pub struct WgpuRenderer {
 
     // Layout version counter (incremented when compositor runs)
     layout_version: Arc<AtomicU64>,
+
+    primitive_uploads: PrimitiveUploadStates,
 }
 
 impl WgpuRenderer {
@@ -1616,7 +1690,31 @@ impl WgpuRenderer {
             backdrop_blur_texture_view: Some(backdrop_blur_texture_view),
             surface_bounds_cache: Arc::new(Mutex::new(HashMap::new())),
             layout_version: Arc::new(AtomicU64::new(0)),
+            primitive_uploads: PrimitiveUploadStates::default(),
         })
+    }
+
+    fn upload_primitive_buffer(
+        context: &WgpuContext,
+        upload_state: &mut PrimitiveUploadState,
+        scene_generation: u64,
+        buffer: &Mutex<wgpu::Buffer>,
+        label: &str,
+        usage: wgpu::BufferUsages,
+        data: &[u8],
+    ) {
+        if data.is_empty() {
+            upload_state.record(scene_generation, 0);
+            return;
+        }
+
+        if !upload_state.needs_upload(scene_generation, data.len()) {
+            return;
+        }
+
+        ensure_buffer_size(&context.device, buffer, data.len() as u64, label, usage);
+        context.queue.write_buffer(&buffer.lock().unwrap(), 0, data);
+        upload_state.record(scene_generation, data.len());
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -1675,107 +1773,67 @@ impl WgpuRenderer {
             unsafe {
                 std::slice::from_raw_parts(
                     slice.as_ptr() as *const u8,
-                    slice.len() * std::mem::size_of::<T>(),
+                    std::mem::size_of_val(slice),
                 )
             }
         }
 
-        if !scene.quads.is_empty() {
-            let data = unsafe { as_bytes(&scene.quads) };
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.quads_buffer,
-                data.len() as u64,
-                "Quads Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context
-                .queue
-                .write_buffer(&self.context.quads_buffer.lock().unwrap(), 0, data);
-        }
-        if !scene.shadows.is_empty() {
-            let data = unsafe { as_bytes(&scene.shadows) };
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.shadows_buffer,
-                data.len() as u64,
-                "Shadows Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context
-                .queue
-                .write_buffer(&self.context.shadows_buffer.lock().unwrap(), 0, data);
-        }
-        if !scene.backdrop_blurs.is_empty() {
-            let data = unsafe { as_bytes(&scene.backdrop_blurs) };
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.backdrop_blurs_buffer,
-                data.len() as u64,
-                "Backdrop Blurs Buffer",
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            );
-            self.context.queue.write_buffer(
-                &self.context.backdrop_blurs_buffer.lock().unwrap(),
-                0,
-                data,
-            );
-        }
-        if !scene.underlines.is_empty() {
-            let data = unsafe { as_bytes(&scene.underlines) };
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.underlines_buffer,
-                data.len() as u64,
-                "Underlines Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context.queue.write_buffer(
-                &self.context.underlines_buffer.lock().unwrap(),
-                0,
-                data,
-            );
-        }
-        if !scene.monochrome_sprites.is_empty() {
-            let data = unsafe { as_bytes(&scene.monochrome_sprites) };
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.mono_sprites_buffer,
-                data.len() as u64,
-                "Monosprites Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context.queue.write_buffer(
-                &self.context.mono_sprites_buffer.lock().unwrap(),
-                0,
-                data,
-            );
-        }
-        if !scene.polychrome_sprites.is_empty() {
-            let data = unsafe { as_bytes(&scene.polychrome_sprites) };
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.poly_sprites_buffer,
-                data.len() as u64,
-                "Poly Sprites Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context.queue.write_buffer(
-                &self.context.poly_sprites_buffer.lock().unwrap(),
-                0,
-                data,
-            );
-        }
+        let scene_generation = scene.scene_generation();
+
+        Self::upload_primitive_buffer(
+            &self.context,
+            &mut self.primitive_uploads.quads,
+            scene_generation,
+            &self.context.quads_buffer,
+            "Quads Buffer",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            unsafe { as_bytes(&scene.quads) },
+        );
+        Self::upload_primitive_buffer(
+            &self.context,
+            &mut self.primitive_uploads.shadows,
+            scene_generation,
+            &self.context.shadows_buffer,
+            "Shadows Buffer",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            unsafe { as_bytes(&scene.shadows) },
+        );
+        Self::upload_primitive_buffer(
+            &self.context,
+            &mut self.primitive_uploads.backdrop_blurs,
+            scene_generation,
+            &self.context.backdrop_blurs_buffer,
+            "Backdrop Blurs Buffer",
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            unsafe { as_bytes(&scene.backdrop_blurs) },
+        );
+        Self::upload_primitive_buffer(
+            &self.context,
+            &mut self.primitive_uploads.underlines,
+            scene_generation,
+            &self.context.underlines_buffer,
+            "Underlines Buffer",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            unsafe { as_bytes(&scene.underlines) },
+        );
+        Self::upload_primitive_buffer(
+            &self.context,
+            &mut self.primitive_uploads.monochrome_sprites,
+            scene_generation,
+            &self.context.mono_sprites_buffer,
+            "Monosprites Buffer",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            unsafe { as_bytes(&scene.monochrome_sprites) },
+        );
+        Self::upload_primitive_buffer(
+            &self.context,
+            &mut self.primitive_uploads.polychrome_sprites,
+            scene_generation,
+            &self.context.poly_sprites_buffer,
+            "Poly Sprites Buffer",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            unsafe { as_bytes(&scene.polychrome_sprites) },
+        );
 
         // Build flat vertex array for all paths (color + content mask baked per-vertex)
         let mut flat_path_vertices: Vec<GpuPathVertex> = Vec::new();
@@ -1794,21 +1852,15 @@ impl WgpuRenderer {
                 });
             }
         }
-        if !flat_path_vertices.is_empty() {
-            let data = bytemuck::cast_slice(&flat_path_vertices);
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.paths_vertices_buffer,
-                data.len() as u64,
-                "Path Vertices Buffer",
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            );
-            self.context.queue.write_buffer(
-                &self.context.paths_vertices_buffer.lock().unwrap(),
-                0,
-                data,
-            );
-        }
+        Self::upload_primitive_buffer(
+            &self.context,
+            &mut self.primitive_uploads.paths_vertices,
+            scene_generation,
+            &self.context.paths_vertices_buffer,
+            "Path Vertices Buffer",
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            bytemuck::cast_slice(&flat_path_vertices),
+        );
 
         // Acquire the next swapchain image.  On the first frame after window
         // creation (or after a resize races with the GPU) the surface can be
@@ -2188,136 +2240,127 @@ impl WgpuRenderer {
                     PrimitiveBatch::Surfaces(surfaces) => {
                         log::debug!("Renderer: processing {} surface(s)", surfaces.len());
                         for surface in surfaces {
-                            if let crate::SurfaceContent::Wgpu(surface_id) = &surface.content {
-                                // Atomically swap ready ↔ display buffers with GPU sync
-                                let _swapped = self
-                                    .context
+                            let crate::SurfaceContent::Wgpu(surface_id) = &surface.content;
+                            // Atomically swap ready ↔ display buffers with GPU sync
+                            let _swapped = self
+                                .context
+                                .surface_registry
+                                .swap_ready_display(&self.context.device, *surface_id);
+
+                            if let Some(view) =
+                                self.context.surface_registry.front_view(*surface_id)
+                            {
+                                let params = SurfaceParams {
+                                    bounds: Bounds {
+                                        origin: [
+                                            surface.bounds.origin.x.0,
+                                            surface.bounds.origin.y.0,
+                                        ],
+                                        size: [
+                                            surface.bounds.size.width.0,
+                                            surface.bounds.size.height.0,
+                                        ],
+                                    },
+                                    content_mask: Bounds {
+                                        origin: [
+                                            surface.content_mask.bounds.origin.x.0,
+                                            surface.content_mask.bounds.origin.y.0,
+                                        ],
+                                        size: [
+                                            surface.content_mask.bounds.size.width.0,
+                                            surface.content_mask.bounds.size.height.0,
+                                        ],
+                                    },
+                                };
+
+                                // Cache bounds for fast surface blitting
+                                // Surface bounds are in ScaledPixels (f32), store as Pixels for caching
+                                self.surface_bounds_cache.lock().unwrap().insert(
+                                    *surface_id,
+                                    SurfaceBoundsEntry {
+                                        screen_bounds: geometry::Bounds {
+                                            origin: geometry::Point {
+                                                x: Pixels(surface.bounds.origin.x.0),
+                                                y: Pixels(surface.bounds.origin.y.0),
+                                            },
+                                            size: geometry::Size {
+                                                width: Pixels(surface.bounds.size.width.0),
+                                                height: Pixels(surface.bounds.size.height.0),
+                                            },
+                                        },
+                                        content_mask: geometry::Bounds {
+                                            origin: geometry::Point {
+                                                x: Pixels(surface.content_mask.bounds.origin.x.0),
+                                                y: Pixels(surface.content_mask.bounds.origin.y.0),
+                                            },
+                                            size: geometry::Size {
+                                                width: Pixels(
+                                                    surface.content_mask.bounds.size.width.0,
+                                                ),
+                                                height: Pixels(
+                                                    surface.content_mask.bounds.size.height.0,
+                                                ),
+                                            },
+                                        },
+                                        layout_version: self.layout_version.load(Ordering::Acquire),
+                                    },
+                                );
+
+                                let params_buffer = self.context.device.create_buffer_init(
+                                    &wgpu::util::BufferInitDescriptor {
+                                        label: Some("surface_params_buffer"),
+                                        contents: bytemuck::bytes_of(&params),
+                                        usage: wgpu::BufferUsages::UNIFORM,
+                                    },
+                                );
+
+                                let surface_bind_group = self.context.device.create_bind_group(
+                                    &wgpu::BindGroupDescriptor {
+                                        label: Some("surface_bind_group"),
+                                        layout: &self.pipelines.surfaces_bind_group_layout,
+                                        entries: &[
+                                            wgpu::BindGroupEntry {
+                                                binding: 0,
+                                                resource: wgpu::BindingResource::Buffer(
+                                                    wgpu::BufferBinding {
+                                                        buffer: &params_buffer,
+                                                        offset: 0,
+                                                        size: None,
+                                                    },
+                                                ),
+                                            },
+                                            wgpu::BindGroupEntry {
+                                                binding: 1,
+                                                resource: wgpu::BindingResource::TextureView(&view),
+                                            },
+                                            wgpu::BindGroupEntry {
+                                                binding: 2,
+                                                resource: wgpu::BindingResource::Sampler(
+                                                    &self.surface_sampler,
+                                                ),
+                                            },
+                                        ],
+                                    },
+                                );
+
+                                pass.set_pipeline(&self.pipelines.surfaces_pipeline);
+                                pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
+                                pass.set_bind_group(1, &surface_bind_group, &[]);
+                                pass.draw(0..4, 0..1);
+
+                                // CRITICAL: Keep view alive until after render pass ends
+                                // The bind_group holds a reference to it
+                                surface_views.push(view);
+                                surface_param_buffers.push(params_buffer);
+
+                                // Clear redraw pending AFTER we're done with the view
+                                // This prevents the external thread from triggering another compositor
+                                // pass while we're still using this view
+                                self.context
                                     .surface_registry
-                                    .swap_ready_display(&self.context.device, *surface_id);
+                                    .clear_redraw_pending(*surface_id);
 
-                                if let Some(view) =
-                                    self.context.surface_registry.front_view(*surface_id)
-                                {
-                                    let params = SurfaceParams {
-                                        bounds: Bounds {
-                                            origin: [
-                                                surface.bounds.origin.x.0,
-                                                surface.bounds.origin.y.0,
-                                            ],
-                                            size: [
-                                                surface.bounds.size.width.0,
-                                                surface.bounds.size.height.0,
-                                            ],
-                                        },
-                                        content_mask: Bounds {
-                                            origin: [
-                                                surface.content_mask.bounds.origin.x.0,
-                                                surface.content_mask.bounds.origin.y.0,
-                                            ],
-                                            size: [
-                                                surface.content_mask.bounds.size.width.0,
-                                                surface.content_mask.bounds.size.height.0,
-                                            ],
-                                        },
-                                    };
-
-                                    // Cache bounds for fast surface blitting
-                                    // Surface bounds are in ScaledPixels (f32), store as Pixels for caching
-                                    self.surface_bounds_cache.lock().unwrap().insert(
-                                        *surface_id,
-                                        SurfaceBoundsEntry {
-                                            screen_bounds: geometry::Bounds {
-                                                origin: geometry::Point {
-                                                    x: Pixels(surface.bounds.origin.x.0),
-                                                    y: Pixels(surface.bounds.origin.y.0),
-                                                },
-                                                size: geometry::Size {
-                                                    width: Pixels(surface.bounds.size.width.0),
-                                                    height: Pixels(surface.bounds.size.height.0),
-                                                },
-                                            },
-                                            content_mask: geometry::Bounds {
-                                                origin: geometry::Point {
-                                                    x: Pixels(
-                                                        surface.content_mask.bounds.origin.x.0,
-                                                    ),
-                                                    y: Pixels(
-                                                        surface.content_mask.bounds.origin.y.0,
-                                                    ),
-                                                },
-                                                size: geometry::Size {
-                                                    width: Pixels(
-                                                        surface.content_mask.bounds.size.width.0,
-                                                    ),
-                                                    height: Pixels(
-                                                        surface.content_mask.bounds.size.height.0,
-                                                    ),
-                                                },
-                                            },
-                                            layout_version: self
-                                                .layout_version
-                                                .load(Ordering::Acquire),
-                                        },
-                                    );
-
-                                    let params_buffer = self.context.device.create_buffer_init(
-                                        &wgpu::util::BufferInitDescriptor {
-                                            label: Some("surface_params_buffer"),
-                                            contents: bytemuck::bytes_of(&params),
-                                            usage: wgpu::BufferUsages::UNIFORM,
-                                        },
-                                    );
-
-                                    let surface_bind_group = self.context.device.create_bind_group(
-                                        &wgpu::BindGroupDescriptor {
-                                            label: Some("surface_bind_group"),
-                                            layout: &self.pipelines.surfaces_bind_group_layout,
-                                            entries: &[
-                                                wgpu::BindGroupEntry {
-                                                    binding: 0,
-                                                    resource: wgpu::BindingResource::Buffer(
-                                                        wgpu::BufferBinding {
-                                                            buffer: &params_buffer,
-                                                            offset: 0,
-                                                            size: None,
-                                                        },
-                                                    ),
-                                                },
-                                                wgpu::BindGroupEntry {
-                                                    binding: 1,
-                                                    resource: wgpu::BindingResource::TextureView(
-                                                        &view,
-                                                    ),
-                                                },
-                                                wgpu::BindGroupEntry {
-                                                    binding: 2,
-                                                    resource: wgpu::BindingResource::Sampler(
-                                                        &self.surface_sampler,
-                                                    ),
-                                                },
-                                            ],
-                                        },
-                                    );
-
-                                    pass.set_pipeline(&self.pipelines.surfaces_pipeline);
-                                    pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
-                                    pass.set_bind_group(1, &surface_bind_group, &[]);
-                                    pass.draw(0..4, 0..1);
-
-                                    // CRITICAL: Keep view alive until after render pass ends
-                                    // The bind_group holds a reference to it
-                                    surface_views.push(view);
-                                    surface_param_buffers.push(params_buffer);
-
-                                    // Clear redraw pending AFTER we're done with the view
-                                    // This prevents the external thread from triggering another compositor
-                                    // pass while we're still using this view
-                                    self.context
-                                        .surface_registry
-                                        .clear_redraw_pending(*surface_id);
-
-                                    seen_surfaces.push(*surface_id);
-                                }
+                                seen_surfaces.push(*surface_id);
                             }
                         }
                     }

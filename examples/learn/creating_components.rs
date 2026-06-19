@@ -11,9 +11,23 @@
 mod example_prelude;
 
 use example_prelude::init_example;
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Colors, Context, Entity, IntoElement, Render, RenderOnce, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App,
+    Application,
+    Bounds,
+    Colors,
+    Context,
+    Entity,
+    IntoElement,
+    Render,
+    RenderOnce,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    px,
+    size,
 };
 
 // ============================================================================

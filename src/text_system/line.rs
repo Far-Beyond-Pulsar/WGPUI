@@ -1,11 +1,32 @@
-use crate::{
-    App, Bounds, Half, Hsla, LineLayout, Pixels, Point, Result, SharedString, StrikethroughStyle,
-    TextAlign, TextColor, UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill,
-    point, px, size, solid_text_color,
-};
+use std::sync::Arc;
+
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
-use std::sync::Arc;
+
+use crate::{
+    App,
+    Bounds,
+    Half,
+    Hsla,
+    LineLayout,
+    Pixels,
+    Point,
+    Result,
+    SharedString,
+    StrikethroughStyle,
+    TextAlign,
+    TextColor,
+    UnderlineStyle,
+    Window,
+    WrapBoundary,
+    WrappedLineLayout,
+    black,
+    fill,
+    point,
+    px,
+    size,
+    solid_text_color,
+};
 
 /// Set the text decoration for a run of text.
 #[derive(Debug, Clone)]
@@ -304,7 +325,9 @@ fn paint_line(
                                     glyph_origin.y + baseline_offset.y + (layout.descent * 0.618),
                                 ),
                                 UnderlineStyle {
-                                    color: Some(run_underline.color.unwrap_or(style_run.color.to_hsla())),
+                                    color: Some(
+                                        run_underline.color.unwrap_or(style_run.color.to_hsla()),
+                                    ),
                                     thickness: run_underline.thickness,
                                     wavy: run_underline.wavy,
                                 },
@@ -323,7 +346,11 @@ fn paint_line(
                                         + (((layout.ascent * 0.5) + baseline_offset.y) * 0.5),
                                 ),
                                 StrikethroughStyle {
-                                    color: Some(run_strikethrough.color.unwrap_or(style_run.color.to_hsla())),
+                                    color: Some(
+                                        run_strikethrough
+                                            .color
+                                            .unwrap_or(style_run.color.to_hsla()),
+                                    ),
                                     thickness: run_strikethrough.thickness,
                                 },
                             ));

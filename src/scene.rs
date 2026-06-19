@@ -1,17 +1,36 @@
+#![expect(
+    dead_code,
+    reason = "scene keeps dormant damage and changed-range APIs for staged rendering performance work"
+)]
+
+use std::fmt::Debug;
+use std::iter::Peekable;
+use std::ops::{Add, Range, Sub};
+use std::slice;
+
 use collections::FxHashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::bounds_tree::BoundsTree;
+use crate::platform::cross::surface_registry::SurfaceId;
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, EntityId, Hsla,
-    Pixels, Point, Radians, ScaledPixels, Size, TextColor, bounds_tree::BoundsTree,
-    platform::cross::surface_registry::SurfaceId, point,
-};
-use std::{
-    fmt::Debug,
-    iter::Peekable,
-    ops::{Add, Range, Sub},
-    slice,
+    AtlasTextureId,
+    AtlasTile,
+    Background,
+    Bounds,
+    ContentMask,
+    Corners,
+    Edges,
+    EntityId,
+    Hsla,
+    Pixels,
+    Point,
+    Radians,
+    ScaledPixels,
+    Size,
+    TextColor,
+    point,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -157,7 +176,6 @@ impl Scene {
         };
 
         self.active_chunk = Some(chunk_index);
-        self.generation += 1;
     }
 
     /// Close the active chunk, recording where each primitive vector ended.
@@ -334,10 +352,14 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
+        let has_dirty_chunks = self.chunks.iter().any(|chunk| chunk.dirty);
         self.finish_incremental();
         self.compute_damage_rects();
         for chunk in &mut self.chunks {
             chunk.dirty = false;
+        }
+        if has_dirty_chunks {
+            self.generation += 1;
         }
         self.batch_count = self.total_batch_count();
     }
@@ -390,8 +412,6 @@ impl Scene {
                 }
             }
         }
-
-        self.generation += 1;
     }
 
     /// Compute merged damage rectangles from the dirty chunks' primitive bounds.
@@ -459,15 +479,17 @@ impl Scene {
                 Self::include_bounds(&mut bounds, underline.bounds);
             }
         }
-        if let Some(monochrome_sprites) =
-            self.monochrome_sprites.get(chunk.monochrome_sprites.clone())
+        if let Some(monochrome_sprites) = self
+            .monochrome_sprites
+            .get(chunk.monochrome_sprites.clone())
         {
             for sprite in monochrome_sprites {
                 Self::include_bounds(&mut bounds, sprite.bounds);
             }
         }
-        if let Some(polychrome_sprites) =
-            self.polychrome_sprites.get(chunk.polychrome_sprites.clone())
+        if let Some(polychrome_sprites) = self
+            .polychrome_sprites
+            .get(chunk.polychrome_sprites.clone())
         {
             for sprite in polychrome_sprites {
                 Self::include_bounds(&mut bounds, sprite.bounds);
@@ -511,7 +533,8 @@ impl Scene {
 
     fn sort_all_primitives(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
-        self.backdrop_blurs.sort_by_key(|backdrop_blur| backdrop_blur.order);
+        self.backdrop_blurs
+            .sort_by_key(|backdrop_blur| backdrop_blur.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
@@ -648,10 +671,7 @@ impl BatchCounter {
                 PrimitiveKind::Path,
             ),
             (
-                scene
-                    .underlines
-                    .get(self.underlines_index)
-                    .map(|u| u.order),
+                scene.underlines.get(self.underlines_index).map(|u| u.order),
                 PrimitiveKind::Underline,
             ),
             (
@@ -1409,5 +1429,29 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_advances_for_dirty_chunks_not_clean_reuse() {
+        let view_id = EntityId::from(1);
+        let mut scene = Scene::default();
+
+        scene.begin_view_chunk(view_id);
+        scene.mark_chunk_clean(view_id);
+        scene.end_view_chunk();
+        scene.finish();
+
+        assert_eq!(scene.scene_generation(), 0);
+
+        scene.begin_view_chunk(view_id);
+        scene.end_view_chunk();
+        scene.finish();
+
+        assert_eq!(scene.scene_generation(), 1);
     }
 }

@@ -13,10 +13,30 @@ mod example_prelude;
 use std::time::Duration;
 
 use anyhow::Result;
+use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt as _, App, Application, AssetSource, Bounds, Colors, Context, Hsla,
-    SharedString, Transformation, Window, WindowBounds, WindowOptions, bounce, div, ease_in_out,
-    linear, percentage, prelude::*, px, size as gpui_size, svg,
+    Animation,
+    AnimationExt as _,
+    App,
+    Application,
+    AssetSource,
+    Bounds,
+    Colors,
+    Context,
+    Hsla,
+    SharedString,
+    Transformation,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    bounce,
+    div,
+    ease_in_out,
+    linear,
+    percentage,
+    px,
+    size as gpui_size,
+    svg,
 };
 
 struct Assets {}

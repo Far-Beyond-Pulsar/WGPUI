@@ -1,12 +1,36 @@
-use std::{fs, path::Path, sync::Arc};
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
 
-use crate::{
-    App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
-    StyleRefinement, Styled, TransformationMatrix, Window, geometry::Negate as _, point, px,
-    radians, size,
-};
 use util::ResultExt;
+
+use crate::geometry::Negate as _;
+use crate::{
+    App,
+    Asset,
+    Bounds,
+    Element,
+    GlobalElementId,
+    Hitbox,
+    InspectorElementId,
+    InteractiveElement,
+    Interactivity,
+    IntoElement,
+    LayoutId,
+    Pixels,
+    Point,
+    Radians,
+    SharedString,
+    Size,
+    StyleRefinement,
+    Styled,
+    TransformationMatrix,
+    Window,
+    point,
+    px,
+    radians,
+    size,
+};
 
 /// An SVG element.
 pub struct Svg {
@@ -127,7 +151,14 @@ impl Element for Svg {
                         .unwrap_or_default();
 
                     window
-                        .paint_svg(bounds, path.clone(), None, transformation, color.to_hsla(), cx)
+                        .paint_svg(
+                            bounds,
+                            path.clone(),
+                            None,
+                            transformation,
+                            color.to_hsla(),
+                            cx,
+                        )
                         .log_err();
                 } else if let Some((path, color)) =
                     self.external_path.as_ref().zip(style.text.color)

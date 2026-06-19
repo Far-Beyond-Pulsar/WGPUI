@@ -8,9 +8,20 @@
 mod example_prelude;
 
 use example_prelude::init_example;
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    App,
+    Application,
+    Bounds,
+    Context,
+    Render,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    px,
+    rgb,
+    size,
 };
 
 struct BlurShowcase;
@@ -152,7 +163,7 @@ fn radial_demo_row(
 }
 
 impl Render for BlurShowcase {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .p_6()

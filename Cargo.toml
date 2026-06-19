@@ -66,7 +66,6 @@ http_client = { package = "gpui_http_client", version = "0.2.2" }
 image = "0.25.1"
 inventory = "0.3.19"
 itertools = "0.14.0"
-libc = "0.2"
 log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
 lyon = "1.0"
 num_cpus = "1.13"
@@ -89,7 +88,6 @@ resvg = { version = "0.47.0", default-features = false, features = [
 rfd = "0.17.2"
 schemars = { version = "1.0", features = ["indexmap2"] }
 seahash = "4.1"
-semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0.221", features = ["derive", "rc"] }
 serde_json = { version = "1.0.144", features = ["preserve_order", "raw_value"] }
 slotmap = "1.0.6"

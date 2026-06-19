@@ -20,5 +20,7 @@ extend-ignore-re = [
     "Big Sur",
     # Stripped version of reserved keyword `type`
     "typ",
+    # Exact font family name.
+    "SVGinOT",
 ]
 check-filename = true

@@ -11,10 +11,29 @@
 mod example_prelude;
 
 use example_prelude::init_example;
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, ClickEvent, Colors, Context, Entity, Half, Hsla, IntoElement,
-    MouseButton, MouseMoveEvent, Pixels, Point, Render, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, size,
+    App,
+    Application,
+    Bounds,
+    ClickEvent,
+    Colors,
+    Context,
+    Entity,
+    Half,
+    Hsla,
+    IntoElement,
+    MouseButton,
+    MouseMoveEvent,
+    Pixels,
+    Point,
+    Render,
+    Window,
+    WindowBounds,
+    WindowOptions,
+    div,
+    px,
+    size,
 };
 
 // ============================================================================

@@ -1,14 +1,48 @@
-use crate::{
-    self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
-    DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, Hsla, JustifyContent, Length, LinearColorStop, SharedString,
-    StrikethroughStyle, StyleRefinement, TextAlign, TextColor, TextOverflow, TextStyleRefinement,
-    UnderlineStyle, WhiteSpace, px, relative, rems,
-};
 pub use gpui_macros::{
-    border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
-    overflow_style_methods, padding_style_methods, position_style_methods,
+    border_style_methods,
+    box_shadow_style_methods,
+    cursor_style_methods,
+    margin_style_methods,
+    overflow_style_methods,
+    padding_style_methods,
+    position_style_methods,
     visibility_style_methods,
+};
+
+use crate::{
+    self as gpui,
+    AbsoluteLength,
+    AlignContent,
+    AlignItems,
+    AlignSelf,
+    BorderStyle,
+    CursorStyle,
+    DefiniteLength,
+    Display,
+    Fill,
+    FlexDirection,
+    FlexWrap,
+    Font,
+    FontFeatures,
+    FontStyle,
+    FontWeight,
+    GridPlacement,
+    Hsla,
+    JustifyContent,
+    Length,
+    LinearColorStop,
+    SharedString,
+    StrikethroughStyle,
+    StyleRefinement,
+    TextAlign,
+    TextColor,
+    TextOverflow,
+    TextStyleRefinement,
+    UnderlineStyle,
+    WhiteSpace,
+    px,
+    relative,
+    rems,
 };
 const ELLIPSIS: SharedString = SharedString::new_static("…");
 
@@ -502,9 +536,11 @@ pub trait Styled: Sized {
     ///
     /// # Example
     /// ```
-    /// div().text_gradient(90.0,
+    /// div().text_gradient(
+    ///     90.0,
     ///     linear_color_stop(red(), 0.0),
-    ///     linear_color_stop(blue(), 1.0))
+    ///     linear_color_stop(blue(), 1.0),
+    /// )
     /// ```
     ///
     /// This value cascades to its child elements.
@@ -514,9 +550,8 @@ pub trait Styled: Sized {
         from: impl Into<LinearColorStop>,
         to: impl Into<LinearColorStop>,
     ) -> Self {
-        self.text_style()
-            .get_or_insert_with(Default::default)
-            .color = Some(crate::text_gradient(angle, from, to));
+        self.text_style().get_or_insert_with(Default::default).color =
+            Some(crate::text_gradient(angle, from, to));
         self
     }
 

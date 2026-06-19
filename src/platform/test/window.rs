@@ -1,15 +1,35 @@
-use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DispatchEventResult, GpuSpecs,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, RequestFrameOptions, Size, TestPlatform, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
-};
+use std::rc::{Rc, Weak};
+use std::sync::{self, Arc};
+
 use collections::HashMap;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::{
-    rc::{Rc, Weak},
-    sync::{self, Arc},
+
+use crate::{
+    AnyWindowHandle,
+    AtlasKey,
+    AtlasTextureId,
+    AtlasTile,
+    Bounds,
+    DispatchEventResult,
+    GpuSpecs,
+    Pixels,
+    PlatformAtlas,
+    PlatformDisplay,
+    PlatformInput,
+    PlatformInputHandler,
+    PlatformWindow,
+    Point,
+    PromptButton,
+    RequestFrameOptions,
+    Size,
+    TestPlatform,
+    TileId,
+    WindowAppearance,
+    WindowBackgroundAppearance,
+    WindowBounds,
+    WindowControlArea,
+    WindowParams,
 };
 
 pub(crate) struct TestWindowState {

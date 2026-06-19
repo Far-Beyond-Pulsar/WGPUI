@@ -297,7 +297,7 @@ impl RenderOnce for LyricLineComponent {
                         linear_color_stop(self.line.color, (state.progress - 0.015).max(0.0)),
                         linear_color_stop(inactive_color, (state.progress + 0.015).min(1.0)),
                     )
-                    .child(self.line.text.clone()),
+                    .child(self.line.text),
             )
     }
 }

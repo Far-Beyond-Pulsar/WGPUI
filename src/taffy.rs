@@ -1,15 +1,27 @@
-use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, Length, Pixels, Point, Size, Style, Window,
-    point, size,
-};
+use std::fmt::Debug;
+use std::ops::Range;
+
 use collections::{FxHashMap, FxHashSet};
 use stacksafe::{StackSafe, stacksafe};
-use std::{fmt::Debug, ops::Range};
-use taffy::{
-    TaffyTree, TraversePartialTree as _,
-    geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
-    style::AvailableSpace as TaffyAvailableSpace,
-    tree::NodeId,
+use taffy::geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize};
+use taffy::style::AvailableSpace as TaffyAvailableSpace;
+use taffy::tree::NodeId;
+use taffy::{TaffyTree, TraversePartialTree as _};
+
+use crate::{
+    AbsoluteLength,
+    App,
+    Bounds,
+    DefiniteLength,
+    Edges,
+    Length,
+    Pixels,
+    Point,
+    Size,
+    Style,
+    Window,
+    point,
+    size,
 };
 
 type NodeMeasureFn = StackSafe<

@@ -1,5 +1,6 @@
-use crate::Pixels;
 use std::time::Instant;
+
+use crate::Pixels;
 
 /// Controls how scroll motion is visually presented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

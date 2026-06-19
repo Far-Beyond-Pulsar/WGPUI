@@ -1,5 +1,6 @@
-use crate::{Bounds, DisplayId, Pixels, PlatformDisplay, Point, px};
 use anyhow::{Ok, Result};
+
+use crate::{Bounds, DisplayId, Pixels, PlatformDisplay, Point, px};
 
 #[derive(Debug)]
 pub(crate) struct TestDisplay {

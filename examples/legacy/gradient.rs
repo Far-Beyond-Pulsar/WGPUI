@@ -1,6 +1,22 @@
+use gpui::prelude::*;
 use gpui::{
-    App, Application, Bounds, ColorSpace, Context, Half, Render, Window, WindowOptions, canvas,
-    div, gradient_color_stop, linear_gradient, point, prelude::*, px, radial_gradient, size,
+    App,
+    Application,
+    Bounds,
+    ColorSpace,
+    Context,
+    Half,
+    Render,
+    Window,
+    WindowOptions,
+    canvas,
+    div,
+    gradient_color_stop,
+    linear_gradient,
+    point,
+    px,
+    radial_gradient,
+    size,
 };
 
 struct GradientViewer {

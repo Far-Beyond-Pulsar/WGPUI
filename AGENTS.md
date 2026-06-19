@@ -1,3 +1,27 @@
+# WGPUI Agent Instructions
+
+This file exists for compatibility with agents that read `AGENTS.md`. Read `CLAUDE.md` first when available; it is the primary project instruction file.
+
+## Project Goal
+
+- Keep WGPUI as a single-crate `gpui-ce` fork with one `wgpu` + `winit` backend.
+- Preserve GPUI public API compatibility while improving rendering correctness and performance.
+- Treat `RENDERING_PERF_PORT_PLAN.md` as the live source of truth for the rendering-perf port.
+- Do not blindly port Phase 5, Phase 3, or Phase 7. Phase 5 needs real display validation because list cache handle propagation can create stale or missing rows; Phase 3 needs generation semantics fixed before diff uploads are meaningful; Phase 7 depends on Phase 3.
+- Use `.claude/rules/` for focused code-style, testing, and security reminders.
+
+## Verification
+
+For Rust code changes, run:
+
+```sh
+cargo fmt --all
+./script/clippy
+cargo test --workspace --all-targets
+```
+
+For rendering or windowing changes, also run the smallest relevant display-backed example and report whether display validation was available.
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.

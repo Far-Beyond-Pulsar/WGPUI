@@ -1,10 +1,18 @@
-use crate::{
-    GLOBAL_THREAD_TIMINGS, PlatformDispatcher, Priority, PriorityQueueSender, RealtimePriority,
-    RunnableVariant, THREAD_TIMINGS, ThreadTaskTimings,
-};
-use priority_threadpool::ThreadPool;
 use std::thread::ThreadId;
+
+use priority_threadpool::ThreadPool;
 use winit::event_loop::EventLoopProxy;
+
+use crate::{
+    GLOBAL_THREAD_TIMINGS,
+    PlatformDispatcher,
+    Priority,
+    PriorityQueueSender,
+    RealtimePriority,
+    RunnableVariant,
+    THREAD_TIMINGS,
+    ThreadTaskTimings,
+};
 
 pub enum CrossEvent {
     WakeUp,

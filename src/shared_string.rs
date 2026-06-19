@@ -1,7 +1,5 @@
-use std::{
-    borrow::{Borrow, Cow},
-    sync::Arc,
-};
+use std::borrow::{Borrow, Cow};
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
