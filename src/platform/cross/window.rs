@@ -13,8 +13,9 @@ use std::{
 };
 use winit::event_loop::EventLoopProxy;
 
-#[cfg(target_os = "linux")]
-use winit::platform::linux::WindowExtLinux;
+// NOTE (axon-mind local patch): `winit::platform::linux::WindowExtLinux` does not
+// exist in winit 0.30 (Linux split into wayland/x11) and the trait was unused
+// here, so the import is dropped to let the crate build on Linux.
 
 #[cfg(target_os = "windows")]
 use winit::platform::windows::{BackdropType, WindowExtWindows};
@@ -280,8 +281,9 @@ impl PlatformWindow for CrossWindow {
 
     fn set_app_id(&mut self, app_id: &str) {
         self.0.state.app_id.borrow_mut().replace(app_id.to_owned());
-        #[cfg(target_os = "linux")]
-        self.window().set_app_id(Some(app_id));
+        // NOTE (axon-mind local patch): winit 0.30 has no runtime `Window::set_app_id`
+        // (the app id is set at window creation via WindowAttributesExtWayland). The
+        // id is still stored above; the no-op runtime call is dropped to compile.
     }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
