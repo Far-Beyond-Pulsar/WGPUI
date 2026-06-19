@@ -1,9 +1,10 @@
+use collections::FxHashMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, TextColor, bounds_tree::BoundsTree,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, EntityId, Hsla,
+    Pixels, Point, Radians, ScaledPixels, Size, TextColor, bounds_tree::BoundsTree,
     platform::cross::surface_registry::SurfaceId, point,
 };
 use std::{
@@ -18,6 +19,55 @@ pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 pub(crate) type DrawOrder = u32;
 
+/// A per-view slice into each of the Scene's primitive vectors, plus a `dirty`
+/// flag — the foundation for incremental sort / damage / GPU diff-uploads. A
+/// view that didn't change keeps `dirty = false` and its primitives are reused.
+#[derive(Debug, Clone)]
+pub(crate) struct SceneChunk {
+    #[allow(dead_code)]
+    pub view_id: EntityId,
+    pub shadows: Range<usize>,
+    pub backdrop_blurs: Range<usize>,
+    pub quads: Range<usize>,
+    pub paths: Range<usize>,
+    pub underlines: Range<usize>,
+    pub monochrome_sprites: Range<usize>,
+    pub polychrome_sprites: Range<usize>,
+    pub surfaces: Range<usize>,
+    pub paint_operations: Range<usize>,
+    pub dirty: bool,
+}
+
+impl SceneChunk {
+    fn new(view_id: EntityId, scene: &Scene) -> Self {
+        Self {
+            view_id,
+            shadows: scene.shadows.len()..scene.shadows.len(),
+            backdrop_blurs: scene.backdrop_blurs.len()..scene.backdrop_blurs.len(),
+            quads: scene.quads.len()..scene.quads.len(),
+            paths: scene.paths.len()..scene.paths.len(),
+            underlines: scene.underlines.len()..scene.underlines.len(),
+            monochrome_sprites: scene.monochrome_sprites.len()..scene.monochrome_sprites.len(),
+            polychrome_sprites: scene.polychrome_sprites.len()..scene.polychrome_sprites.len(),
+            surfaces: scene.surfaces.len()..scene.surfaces.len(),
+            paint_operations: scene.paint_operations.len()..scene.paint_operations.len(),
+            dirty: true,
+        }
+    }
+
+    fn end_at(&mut self, scene: &Scene) {
+        self.shadows.end = scene.shadows.len();
+        self.backdrop_blurs.end = scene.backdrop_blurs.len();
+        self.quads.end = scene.quads.len();
+        self.paths.end = scene.paths.len();
+        self.underlines.end = scene.underlines.len();
+        self.monochrome_sprites.end = scene.monochrome_sprites.len();
+        self.polychrome_sprites.end = scene.polychrome_sprites.len();
+        self.surfaces.end = scene.surfaces.len();
+        self.paint_operations.end = scene.paint_operations.len();
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
@@ -31,6 +81,10 @@ pub(crate) struct Scene {
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
     pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
     pub(crate) surfaces: Vec<PaintSurface>,
+    pub(crate) chunks: Vec<SceneChunk>,
+    pub(crate) active_chunk: Option<usize>,
+    pub(crate) chunk_map: FxHashMap<EntityId, usize>,
+    pub(crate) generation: u64,
 }
 
 impl Scene {
@@ -46,6 +100,70 @@ impl Scene {
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.chunks.clear();
+        self.active_chunk = None;
+        self.chunk_map.clear();
+    }
+
+    /// Begin recording a view's primitives into a (possibly reused) chunk.
+    pub fn begin_view_chunk(&mut self, view_id: EntityId) {
+        let chunk = SceneChunk::new(view_id, self);
+        let chunk_index = if let Some(&chunk_index) = self.chunk_map.get(&view_id) {
+            if let Some(existing_chunk) = self.chunks.get_mut(chunk_index) {
+                *existing_chunk = chunk;
+            }
+            chunk_index
+        } else {
+            let chunk_index = self.chunks.len();
+            self.chunks.push(chunk);
+            self.chunk_map.insert(view_id, chunk_index);
+            chunk_index
+        };
+
+        self.active_chunk = Some(chunk_index);
+        self.generation += 1;
+    }
+
+    /// Close the active chunk, recording where each primitive vector ended.
+    pub fn end_view_chunk(&mut self) {
+        if let Some(chunk_index) = self.active_chunk.take() {
+            let mut chunk = if let Some(chunk) = self.chunks.get(chunk_index) {
+                chunk.clone()
+            } else {
+                return;
+            };
+            chunk.end_at(self);
+            if let Some(existing_chunk) = self.chunks.get_mut(chunk_index) {
+                *existing_chunk = chunk;
+            }
+        }
+    }
+
+    /// Mark a reused (unchanged) view's chunk as clean.
+    pub fn mark_chunk_clean(&mut self, view_id: EntityId) {
+        if let Some(&chunk_index) = self.chunk_map.get(&view_id)
+            && let Some(chunk) = self.chunks.get_mut(chunk_index)
+        {
+            chunk.dirty = false;
+        }
+    }
+
+    /// Whether a view's chunk is dirty (defaults to dirty if unknown).
+    pub fn is_chunk_dirty(&self, view_id: EntityId) -> bool {
+        self.chunk_map
+            .get(&view_id)
+            .and_then(|&chunk_index| self.chunks.get(chunk_index))
+            .is_none_or(|chunk| chunk.dirty)
+    }
+
+    /// A monotonically increasing counter bumped on scene mutations.
+    pub fn scene_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// How many chunks are currently dirty.
+    pub fn dirty_chunk_count(&self) -> usize {
+        self.chunks.iter().filter(|chunk| chunk.dirty).count()
     }
 
     pub fn len(&self) -> usize {
@@ -129,6 +247,67 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
+        self.finish_incremental();
+    }
+
+    /// Sort only the dirty chunks' primitive ranges when <30% of chunks changed,
+    /// falling back to a full sort otherwise (or when there are no chunks).
+    fn finish_incremental(&mut self) {
+        let total_chunk_count = self.chunks.len();
+        let dirty_chunk_count = self.dirty_chunk_count();
+
+        if total_chunk_count == 0 || dirty_chunk_count * 10 >= total_chunk_count * 3 {
+            self.sort_all_primitives();
+            for chunk in &mut self.chunks {
+                chunk.dirty = false;
+            }
+        } else {
+            for chunk in &mut self.chunks {
+                if !chunk.dirty {
+                    continue;
+                }
+
+                if let Some(shadows) = self.shadows.get_mut(chunk.shadows.clone()) {
+                    shadows.sort_by_key(|shadow| shadow.order);
+                }
+                if let Some(backdrop_blurs) =
+                    self.backdrop_blurs.get_mut(chunk.backdrop_blurs.clone())
+                {
+                    backdrop_blurs.sort_by_key(|backdrop_blur| backdrop_blur.order);
+                }
+                if let Some(quads) = self.quads.get_mut(chunk.quads.clone()) {
+                    quads.sort_by_key(|quad| quad.order);
+                }
+                if let Some(paths) = self.paths.get_mut(chunk.paths.clone()) {
+                    paths.sort_by_key(|path| path.order);
+                }
+                if let Some(underlines) = self.underlines.get_mut(chunk.underlines.clone()) {
+                    underlines.sort_by_key(|underline| underline.order);
+                }
+                if let Some(monochrome_sprites) = self
+                    .monochrome_sprites
+                    .get_mut(chunk.monochrome_sprites.clone())
+                {
+                    monochrome_sprites.sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+                }
+                if let Some(polychrome_sprites) = self
+                    .polychrome_sprites
+                    .get_mut(chunk.polychrome_sprites.clone())
+                {
+                    polychrome_sprites.sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+                }
+                if let Some(surfaces) = self.surfaces.get_mut(chunk.surfaces.clone()) {
+                    surfaces.sort_by_key(|surface| surface.order);
+                }
+
+                chunk.dirty = false;
+            }
+        }
+
+        self.generation += 1;
+    }
+
+    fn sort_all_primitives(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.backdrop_blurs.sort_by_key(|backdrop_blur| backdrop_blur.order);
         self.quads.sort_by_key(|quad| quad.order);

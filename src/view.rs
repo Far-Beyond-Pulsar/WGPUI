@@ -269,7 +269,9 @@ impl Element for AnyView {
                     global_id.unwrap(),
                     |element_state, window| {
                         let mut element_state = element_state.unwrap();
+                        let view_id = self.entity_id();
 
+                        window.begin_view_chunk(view_id);
                         let paint_start = window.paint_index();
 
                         if let Some(element) = element {
@@ -277,17 +279,20 @@ impl Element for AnyView {
                             element.paint(window, cx);
                             window.refreshing = refreshing;
                         } else {
-                            window.reuse_paint(element_state.paint_range.clone());
+                            window.reuse_paint(view_id, element_state.paint_range.clone());
                         }
 
                         let paint_end = window.paint_index();
+                        window.end_view_chunk();
                         element_state.paint_range = paint_start..paint_end;
 
                         ((), element_state)
                     },
                 )
             } else {
+                window.begin_view_chunk(self.entity_id());
                 element.as_mut().unwrap().paint(window, cx);
+                window.end_view_chunk();
             }
         });
     }
