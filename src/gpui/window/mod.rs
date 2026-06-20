@@ -1831,6 +1831,16 @@ impl Window {
         self.platform_window.register_render_primitive(primitive);
     }
 
+    /// Read the most recently rendered frame back from the GPU as an RGBA8
+    /// [`PixelBuffer`], for pixel-level rendering audits / golden comparisons.
+    ///
+    /// Returns `None` on platforms without a GPU renderer (e.g. the test
+    /// platform) or before the first frame has been drawn. Call after a draw, on
+    /// the window's own thread.
+    pub fn read_back_pixels(&self) -> Option<crate::PixelBuffer> {
+        self.platform_window.read_back_pixels()
+    }
+
     /// Start a window resize operation (Wayland)
     pub fn start_window_resize(&self, edge: ResizeEdge) {
         self.platform_window.start_window_resize(edge);

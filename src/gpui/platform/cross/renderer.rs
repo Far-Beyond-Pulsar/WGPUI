@@ -1890,6 +1890,14 @@ struct PrimitiveUploadStates {
 pub struct WgpuRenderer {
     context: Arc<WgpuContext>,
     surface: ManuallyDrop<wgpu::Surface<'static>>,
+    // Keeps the winit window alive for at least as long as the surface. The
+    // surface was created from this window's raw handle (`create_surface_unsafe`),
+    // so destroying the window before the surface would leave the surface's
+    // destructor dereferencing a freed window — a segfault deep in the GPU/driver
+    // teardown. `Drop::drop` destroys the surface in its body; struct fields
+    // (including this one) drop only after that body returns, so holding the
+    // window here guarantees surface-before-window ordering. See `Drop`.
+    window: Option<std::sync::Arc<winit::window::Window>>,
     surface_configuration: wgpu::SurfaceConfiguration,
     atlas_sampler: wgpu::Sampler,
     surface_sampler: wgpu::Sampler,
@@ -2074,6 +2082,7 @@ impl WgpuRenderer {
         Ok(Self {
             context: context.clone(),
             surface: ManuallyDrop::new(surface),
+            window: None,
             surface_configuration,
             atlas,
             atlas_sampler,
@@ -2094,10 +2103,37 @@ impl WgpuRenderer {
         })
     }
 
+    /// Keep `window` alive for the lifetime of this renderer so the surface (built
+    /// from the window's raw handle) is always destroyed before the window. Must
+    /// be set right after construction; without it, window teardown can segfault.
+    pub fn keep_window_alive(&mut self, window: std::sync::Arc<winit::window::Window>) {
+        self.window = Some(window);
+    }
+
     /// Register a custom render-primitive plugin so its queued instances are drawn
     /// (batched, one GPU call per type) after the built-in primitives each frame.
     pub fn register_primitive(&mut self, kind: Box<dyn gpui_render_primitive::RenderPrimitive>) {
         self.primitive_registry.register(kind);
+    }
+
+    /// Read the most recently drawn frame back from the persistent framebuffer as
+    /// tightly packed RGBA8, for the rendering audit kit. Returns an error if no
+    /// retained frame exists yet (call after a `draw`) or if no framebuffer is
+    /// available. Must run on the renderer-owning thread.
+    pub(crate) fn read_persistent_framebuffer_rgba8(&self) -> anyhow::Result<crate::PixelBuffer> {
+        let texture = self
+            .persistent_framebuffer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no persistent framebuffer to read back"))?;
+        if !self.persistent_framebuffer_has_frame {
+            anyhow::bail!("no retained frame yet; call draw() before reading back pixels");
+        }
+        crate::platform::cross::audit::read_texture_rgba8(
+            &self.context.device,
+            &self.context.queue,
+            texture,
+            self.surface_configuration.format,
+        )
     }
 
     fn upload_primitive_buffer(

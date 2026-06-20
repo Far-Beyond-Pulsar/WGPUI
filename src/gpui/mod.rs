@@ -34,6 +34,8 @@ mod platform;
 pub mod prelude;
 mod profiler;
 mod queue;
+#[cfg(test)]
+mod render_audit_tests;
 mod retained;
 mod scene;
 mod shared_string;

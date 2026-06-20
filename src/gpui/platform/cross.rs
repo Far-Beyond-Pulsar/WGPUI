@@ -1,4 +1,5 @@
 pub mod atlas;
+pub mod audit;
 pub mod dispatcher;
 pub mod keyboard;
 pub mod platform;

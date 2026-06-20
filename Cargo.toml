@@ -153,6 +153,18 @@ path = "examples/text_gradients.rs"
 name = "refresh_overlay"
 path = "examples/refresh_overlay.rs"
 
+[[example]]
+name = "render_audit"
+path = "examples/render_audit.rs"
+
+[[example]]
+name = "color_probe"
+path = "examples/color_probe.rs"
+
+[[example]]
+name = "teardown_repro"
+path = "examples/teardown_repro.rs"
+
 # ============================================================================
 # Learn Examples - Educational examples for learning GPUI
 # ============================================================================
@@ -323,6 +335,25 @@ syn = { opt-level = 3 }
 proc-macro2 = { opt-level = 3 }
 taffy = { opt-level = 3 }
 resvg = { opt-level = 3 }
+
+# Debugging profile: a single unstripped binary with full DWARF symbols for the
+# crate AND all dependencies (wgpu, etc.), so gdb/lldb can symbolicate teardown
+# crashes that reach into the GPU stack. Build with:
+#     cargo build --profile debug-unstripped --example teardown_repro
+# For unwinding through optimized/driver frames, also pass frame pointers:
+#     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile debug-unstripped ...
+[profile.debug-unstripped]
+inherits = "dev"
+opt-level = 0
+debug = "full"          # complete DWARF (line tables, variables, types)
+strip = false           # never strip symbols
+split-debuginfo = "off" # embed debuginfo in the binary (one unstripped file)
+incremental = false
+
+# Give dependencies full symbols too, not just our crate.
+[profile.debug-unstripped.package."*"]
+debug = "full"
+opt-level = 1
 
 [profile.release]
 debug = "limited"

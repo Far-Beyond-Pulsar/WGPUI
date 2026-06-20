@@ -131,6 +131,14 @@ impl CrossWindow {
             )
             .expect("Failed to create renderer");
 
+            // Keep the winit window alive for at least as long as the renderer's
+            // surface (which was built from this window's raw handle). Without
+            // this, on teardown the window can be freed before the surface, and
+            // the surface's destructor segfaults dereferencing the freed window.
+            if let Some(window) = self.0.winit_window.get() {
+                renderer.keep_window_alive(window.clone());
+            }
+
             // Configure the wgpu surface immediately so that any
             // `get_current_texture()` call that arrives before the first OS
             // `Resized` event (e.g. from a background render thread calling
@@ -444,6 +452,17 @@ impl PlatformWindow for CrossWindow {
             renderer.borrow_mut().register_primitive(primitive);
         } else {
             self.0.pending_primitives.borrow_mut().push(primitive);
+        }
+    }
+
+    fn read_back_pixels(&self) -> Option<crate::PixelBuffer> {
+        let renderer = self.0.renderer.get()?;
+        match renderer.borrow().read_persistent_framebuffer_rgba8() {
+            Ok(pixels) => Some(pixels),
+            Err(error) => {
+                log::warn!("read_back_pixels failed: {error:#}");
+                None
+            }
         }
     }
 

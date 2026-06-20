@@ -927,6 +927,36 @@ impl VisualTestContext {
         self.background_executor.run_until_parked();
     }
 
+    /// Simulates the user activating (focusing) the window. The counterpart to
+    /// [`VisualTestContext::deactivate_window`]; drives `on_active_status_change`.
+    pub fn activate_window(&mut self) {
+        let test_window = self.test_window(self.window);
+        self.test_platform.set_active_window(Some(test_window));
+        self.background_executor.run_until_parked();
+    }
+
+    /// Simulate an IME composition update (marked / preedit text) — e.g. typing
+    /// with a CJK input method before committing. This drives the marked-range
+    /// path (`replace_and_mark_text_in_range`) that ordinary keystroke simulation
+    /// never exercises.
+    ///
+    /// The focused element must have installed an input handler this frame, so
+    /// draw the window (or `run_until_parked` after focusing an input) first.
+    /// Commit the composition with [`VisualTestContext::simulate_input`].
+    pub fn simulate_ime_marked_text(
+        &mut self,
+        replacement_range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<std::ops::Range<usize>>,
+    ) {
+        let mut handler = self
+            .update(|window, _| window.platform_window.take_input_handler())
+            .expect("focused element must install an input handler (draw the window first)");
+        handler.replace_and_mark_text_in_range(replacement_range, new_text, new_selected_range);
+        self.update(|window, _| window.platform_window.set_input_handler(handler));
+        self.background_executor.run_until_parked();
+    }
+
     /// Simulates the user closing the window.
     /// Returns true if the window was closed.
     pub fn simulate_close(&mut self) -> bool {

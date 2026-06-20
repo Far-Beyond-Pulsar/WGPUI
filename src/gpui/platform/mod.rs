@@ -1,6 +1,7 @@
 mod app_menu;
 mod keyboard;
 mod keystroke;
+mod pixel_buffer;
 
 #[cfg(any(test, feature = "test-support"))]
 mod test;
@@ -26,6 +27,7 @@ use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, Frame};
 pub use keyboard::*;
 pub use keystroke::*;
+pub use pixel_buffer::PixelBuffer;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use schemars::JsonSchema;
 use seahash::SeaHasher;
@@ -427,6 +429,13 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// built-in primitives each frame. Default is a no-op — platforms without a
     /// GPU renderer (e.g. the test platform) simply drop the registration.
     fn register_render_primitive(&self, _primitive: Box<dyn crate::RenderPrimitive>) {}
+
+    /// Read the most recently rendered frame back from the GPU as RGBA8 for the
+    /// rendering audit kit. Returns `None` on platforms without a GPU renderer
+    /// (e.g. the test platform) or before the first frame has been drawn.
+    fn read_back_pixels(&self) -> Option<crate::PixelBuffer> {
+        None
+    }
 
     // macOS specific methods
     fn get_title(&self) -> String {
