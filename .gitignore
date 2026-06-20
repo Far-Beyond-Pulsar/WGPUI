@@ -33,3 +33,7 @@ xcuserdata/
 .build
 MEMORY.md
 .claude/settings.local.json
+
+# Local agent/session artifacts (transient; not part of the crate)
+session-ses_*.md
+.opencode/

@@ -1,0 +1,10 @@
+[package]
+name = "gpui-prim-solid"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Example WGPUI render-primitive plugin (solid-color rectangles) living in its own crate, depending only on gpui-render-primitive."
+
+[dependencies]
+gpui-render-primitive = { path = "../gpui-render-primitive" }
+bytemuck = { version = "1.24", features = ["derive"] }

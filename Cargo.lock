@@ -2120,6 +2120,8 @@ dependencies = [
  "futures-concurrency",
  "glam",
  "gpui-macros",
+ "gpui-prim-solid",
+ "gpui-render-primitive",
  "gpui_collections",
  "gpui_http_client",
  "gpui_refineable",
@@ -2175,13 +2177,26 @@ dependencies = [
 [[package]]
 name = "gpui-macros"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcb02dd63a2859714ac7b6b476937617c3c744157af1b49f7c904023a79039be"
 dependencies = [
  "heck",
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "gpui-prim-solid"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "gpui-render-primitive",
+]
+
+[[package]]
+name = "gpui-render-primitive"
+version = "0.1.0"
+dependencies = [
+ "wgpu",
 ]
 
 [[package]]

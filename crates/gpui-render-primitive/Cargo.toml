@@ -1,0 +1,15 @@
+[package]
+name = "gpui-render-primitive"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Zero-overhead, extensible render-primitive plugin API for WGPUI. Primitive types implement RenderPrimitive in their own crates, depending only on this crate."
+
+[dependencies]
+wgpu = { git = "https://github.com/Far-Beyond-Pulsar/wgpu", rev = "fce5b80e8017304449124b12637ec324417e40c8", default-features = false, features = [
+    "web",
+    "webgpu",
+    "dx12",
+    "vulkan",
+    "wgsl",
+] }

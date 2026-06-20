@@ -7,7 +7,7 @@ This file exists for compatibility with agents that read `AGENTS.md`. Read `CLAU
 - Keep WGPUI as a single-crate `gpui-ce` fork with one `wgpu` + `winit` backend.
 - Preserve GPUI public API compatibility while improving rendering correctness and performance.
 - Treat `RENDERING_PERF_PORT_PLAN.md` as the live source of truth for the rendering-perf port.
-- Do not blindly port Phase 5, Phase 3, or Phase 7. Phase 5 needs real display validation because list cache handle propagation can create stale or missing rows; Phase 3 needs generation semantics fixed before diff uploads are meaningful; Phase 7 depends on Phase 3.
+- Build on the existing safe rendering bridge: Phase 3 dirty-range uploads, Phase 5 list/uniform-list identity caching, Phase 7 compaction, persistent-framebuffer copy, and default-on partial redraw policy are in the working tree. The active target is full retained-fiber parity with tests and compatibility shims, not a blind copy of Zed's split platform renderer architecture.
 - Use `.claude/rules/` for focused code-style, testing, and security reminders.
 
 ## Verification
@@ -35,7 +35,7 @@ For rendering or windowing changes, also run the smallest relevant display-backe
   - Use explicit error handling with `match` or `if let Err(...)` when you need custom logic
   - Example: avoid `let _ = client.request(...).await?;` - use `client.request(...).await?;` instead
 * When implementing async operations that may fail, ensure errors propagate to the UI layer so users get meaningful feedback.
-* Never create files with `mod.rs` paths - prefer `src/some_module.rs` instead of `src/some_module/mod.rs`.
+* Prefer domain-shaped module trees over flat file piles. Use `mod.rs` as the hub for large domains and focused child modules for implementation details.
 * When creating new crates, prefer specifying the library root path in `Cargo.toml` using `[lib] path = "...rs"` instead of the default `lib.rs`, to maintain consistent and descriptive naming (e.g., `gpui.rs` or `main.rs`).
 * Avoid creative additions unless explicitly requested
 * Use full words for variable names (no abbreviations like "q" for "queue")
