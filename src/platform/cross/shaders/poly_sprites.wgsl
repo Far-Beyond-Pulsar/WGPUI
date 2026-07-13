@@ -57,6 +57,7 @@ struct PolySpriteVarying {
 @group(1) @binding(0) var t_sprite: texture_2d<f32>;
 @group(1) @binding(1) var s_sprite: sampler;
 @group(2) @binding(0) var<storage, read> b_poly_sprites: array<PolychromeSprite>;
+@group(2) @binding(1) var<storage, read> b_poly_sprite_instances: array<u32>;
 
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
     let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
@@ -130,12 +131,13 @@ fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
 @vertex
 fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> PolySpriteVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let sprite = b_poly_sprites[instance_id];
+    let slot = b_poly_sprite_instances[instance_id];
+    let sprite = b_poly_sprites[slot];
 
     var out = PolySpriteVarying();
     out.position = to_device_position(unit_vertex, sprite.bounds);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
-    out.sprite_id = instance_id;
+    out.sprite_id = slot;
     out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
     return out;
 }

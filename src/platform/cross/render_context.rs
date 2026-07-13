@@ -34,6 +34,14 @@ pub struct WgpuContext {
     pub(super) color_adjustments_buffer: wgpu::Buffer,
     pub(super) paths_vertices_buffer: Mutex<wgpu::Buffer>,
 
+    // Indirection buffers (mapping draw-order position → generational-vec slot)
+    pub(super) quad_indirection_buffer: Mutex<wgpu::Buffer>,
+    pub(super) shadow_indirection_buffer: Mutex<wgpu::Buffer>,
+    pub(super) backdrop_filter_indirection_buffer: Mutex<wgpu::Buffer>,
+    pub(super) underline_indirection_buffer: Mutex<wgpu::Buffer>,
+    pub(super) mono_sprite_indirection_buffer: Mutex<wgpu::Buffer>,
+    pub(super) poly_sprite_indirection_buffer: Mutex<wgpu::Buffer>,
+
     pub(crate) surface_registry: Arc<SurfaceRegistry>,
 }
 
@@ -187,6 +195,47 @@ impl WgpuContext {
             mapped_at_creation: false,
         });
 
+        // Indirection buffers (64 KB = 16384 u32 entries, enough for typical scenes)
+        let indirection_buffer_size = 64 * 1024;
+        let indirection_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+
+        let quad_indirection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Quad Indirection Buffer"),
+            size: indirection_buffer_size,
+            usage: indirection_usage,
+            mapped_at_creation: false,
+        });
+        let shadow_indirection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow Indirection Buffer"),
+            size: indirection_buffer_size,
+            usage: indirection_usage,
+            mapped_at_creation: false,
+        });
+        let backdrop_filter_indirection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Backdrop Filter Indirection Buffer"),
+            size: indirection_buffer_size,
+            usage: indirection_usage,
+            mapped_at_creation: false,
+        });
+        let underline_indirection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Underline Indirection Buffer"),
+            size: indirection_buffer_size,
+            usage: indirection_usage,
+            mapped_at_creation: false,
+        });
+        let mono_sprite_indirection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Mono Sprite Indirection Buffer"),
+            size: indirection_buffer_size,
+            usage: indirection_usage,
+            mapped_at_creation: false,
+        });
+        let poly_sprite_indirection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Poly Sprite Indirection Buffer"),
+            size: indirection_buffer_size,
+            usage: indirection_usage,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             adapter,
             device,
@@ -203,6 +252,14 @@ impl WgpuContext {
             color_adjustments_buffer,
 
             paths_vertices_buffer: Mutex::new(paths_vertices_buffer),
+
+            quad_indirection_buffer: Mutex::new(quad_indirection_buffer),
+            shadow_indirection_buffer: Mutex::new(shadow_indirection_buffer),
+            backdrop_filter_indirection_buffer: Mutex::new(backdrop_filter_indirection_buffer),
+            underline_indirection_buffer: Mutex::new(underline_indirection_buffer),
+            mono_sprite_indirection_buffer: Mutex::new(mono_sprite_indirection_buffer),
+            poly_sprite_indirection_buffer: Mutex::new(poly_sprite_indirection_buffer),
+
             surface_registry: Arc::new(SurfaceRegistry::new()),
         })
     }

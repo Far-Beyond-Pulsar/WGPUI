@@ -926,7 +926,7 @@ impl Frame {
             }
         }
 
-        self.scene.finish();
+        self.scene.sort();
     }
 }
 
@@ -2748,10 +2748,12 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
-        );
+        let prev_scene = &self.rendered_frame.scene;
+        for i in range.start.scene_index..range.end.scene_index {
+            let operation = &prev_scene.paint_operations[i];
+            let slot_info = prev_scene.paint_slots.get(i).and_then(|s| s.clone());
+            self.next_frame.scene.replay(operation, &slot_info);
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.

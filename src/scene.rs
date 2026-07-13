@@ -8,9 +8,7 @@ use crate::{
 };
 use std::{
     fmt::Debug,
-    iter::Peekable,
-    ops::{Add, Range, Sub},
-    slice,
+    ops::{Add, Sub},
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -18,36 +16,230 @@ pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 pub(crate) type DrawOrder = u32;
 
+/// A persistent slot in a generational arena.
+#[derive(Clone)]
+pub(crate) struct GenSlot<T> {
+    pub data: T,
+    pub version: u64,
+}
+
+/// Persistent generational arena for GPU buffer data.
+#[derive(Clone)]
+pub(crate) struct GenerationalVec<T> {
+    pub slots: Vec<Option<GenSlot<T>>>,
+    pub free: Vec<usize>,
+    pub generation: u64,
+}
+
+impl<T: Clone> GenerationalVec<T> {
+    pub fn new() -> Self {
+        Self { slots: Vec::new(), free: Vec::new(), generation: 0 }
+    }
+
+    pub fn allocate(&mut self) -> usize {
+        if let Some(idx) = self.free.pop() {
+            self.slots[idx] = Some(GenSlot {
+                data: unsafe { std::mem::zeroed() },
+                version: 0,
+            });
+            idx
+        } else {
+            let idx = self.slots.len();
+            self.slots.push(Some(GenSlot {
+                data: unsafe { std::mem::zeroed() },
+                version: 0,
+            }));
+            idx
+        }
+    }
+
+    pub fn free(&mut self, idx: usize) {
+        if idx < self.slots.len() {
+            self.slots[idx] = None;
+            self.free.push(idx);
+        }
+    }
+
+    pub fn write(&mut self, idx: usize, data: T) {
+        if let Some(Some(slot)) = self.slots.get_mut(idx) {
+            slot.data = data;
+            self.generation += 1;
+            slot.version = self.generation;
+        }
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&T> {
+        self.slots.get(idx).and_then(|s| s.as_ref().map(|s| &s.data))
+    }
+
+    pub fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
+        self.slots.get_mut(idx).and_then(|s| s.as_mut().map(|s| &mut s.data))
+    }
+
+    pub fn drain_changes_since(&self, since_generation: u64) -> Vec<usize> {
+        self.slots.iter().enumerate()
+            .filter_map(|(idx, slot)| {
+                slot.as_ref()
+                    .filter(|s| s.version > since_generation)
+                    .map(|_| idx)
+            })
+            .collect()
+    }
+
+    pub fn allocated_count(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    pub fn clear(&mut self) {
+        self.slots.clear();
+        self.free.clear();
+    }
+}
+
+impl<T: Clone> Default for GenerationalVec<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Records one changed slot for the GPU upload path
+#[derive(Clone, Debug)]
+pub(crate) struct ChangedSlot {
+    pub slot: usize,
+    pub byte_offset: u64,
+    pub byte_length: u64,
+    pub bounds: Bounds<ScaledPixels>,
+}
+
+/// Accumulated changes during a single frame's paint phase.
+#[derive(Clone, Debug)]
+pub(crate) struct SceneDelta {
+    pub changed_quads: Vec<ChangedSlot>,
+    pub changed_shadows: Vec<ChangedSlot>,
+    pub changed_backdrop_filters: Vec<ChangedSlot>,
+    pub changed_underlines: Vec<ChangedSlot>,
+    pub changed_monochrome_sprites: Vec<ChangedSlot>,
+    pub changed_polychrome_sprites: Vec<ChangedSlot>,
+    pub changed_surfaces: Vec<ChangedSlot>,
+    pub paths_changed: bool,
+    pub damage_rect: Option<Bounds<ScaledPixels>>,
+    pub is_empty: bool,
+}
+
+impl SceneDelta {
+    pub fn new() -> Self {
+        Self {
+            changed_quads: Vec::new(),
+            changed_shadows: Vec::new(),
+            changed_backdrop_filters: Vec::new(),
+            changed_underlines: Vec::new(),
+            changed_monochrome_sprites: Vec::new(),
+            changed_polychrome_sprites: Vec::new(),
+            changed_surfaces: Vec::new(),
+            paths_changed: false,
+            damage_rect: None,
+            is_empty: true,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.changed_quads.clear();
+        self.changed_shadows.clear();
+        self.changed_backdrop_filters.clear();
+        self.changed_underlines.clear();
+        self.changed_monochrome_sprites.clear();
+        self.changed_polychrome_sprites.clear();
+        self.changed_surfaces.clear();
+        self.paths_changed = false;
+        self.damage_rect = None;
+        self.is_empty = true;
+    }
+
+    pub fn add_damage(&mut self, bounds: Bounds<ScaledPixels>) {
+        self.damage_rect = Some(match self.damage_rect {
+            Some(existing) => existing.union(&bounds),
+            None => bounds,
+        });
+    }
+}
+
+impl Default for SceneDelta {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Tracks which generational-vec slots each primitive type occupies for a paint operation.
+#[derive(Clone, Debug)]
+pub(crate) struct PaintOperationSlots {
+    pub quad_slot: Option<usize>,
+    pub shadow_slot: Option<usize>,
+    pub backdrop_filter_slot: Option<usize>,
+    pub underline_slot: Option<usize>,
+    pub mono_sprite_slot: Option<usize>,
+    pub poly_sprite_slot: Option<usize>,
+    pub surface_slot: Option<usize>,
+    pub path_slot: Option<usize>,
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
+    pub(crate) paint_slots: Vec<Option<PaintOperationSlots>>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
-    pub(crate) shadows: Vec<Shadow>,
-    pub(crate) backdrop_filters: Vec<BackdropFilter>,
+
+    // === PERSISTENT GENERATIONAL ARENAS (NOT cleared per frame) ===
+    pub(crate) quads: GenerationalVec<Quad>,
+    pub(crate) shadows: GenerationalVec<Shadow>,
+    pub(crate) backdrop_filters: GenerationalVec<BackdropFilter>,
+    pub(crate) underlines: GenerationalVec<Underline>,
+    pub(crate) monochrome_sprites: GenerationalVec<MonochromeSprite>,
+    pub(crate) polychrome_sprites: GenerationalVec<PolychromeSprite>,
+    pub(crate) surfaces: GenerationalVec<PaintSurface>,
+    pub(crate) paths: GenerationalVec<Path<ScaledPixels>>,
+
+    // Filter boundaries (always rebuilt — NOT in a generational vec)
     pub(crate) filter_boundaries: Vec<FilterBoundary>,
-    pub(crate) quads: Vec<Quad>,
-    pub(crate) paths: Vec<Path<ScaledPixels>>,
-    pub(crate) underlines: Vec<Underline>,
-    pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
-    pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
-    pub(crate) surfaces: Vec<PaintSurface>,
+
+    // === SORTED DRAW-ORDER INDICES (indirection buffers) ===
+    pub(crate) sorted_quad_indices: Vec<u32>,
+    pub(crate) sorted_shadow_indices: Vec<u32>,
+    pub(crate) sorted_backdrop_filter_indices: Vec<u32>,
+    pub(crate) sorted_underline_indices: Vec<u32>,
+    pub(crate) sorted_mono_sprite_indices: Vec<u32>,
+    pub(crate) sorted_poly_sprite_indices: Vec<u32>,
+    pub(crate) sorted_surface_indices: Vec<u32>,
+    pub(crate) sorted_path_indices: Vec<u32>,
+
+    // === DELTA ACCUMULATION ===
+    pub(crate) pending_delta: SceneDelta,
+    pub(crate) last_uploaded_quad_gen: u64,
+    pub(crate) last_uploaded_shadow_gen: u64,
+    pub(crate) last_uploaded_backdrop_filter_gen: u64,
+    pub(crate) last_uploaded_underline_gen: u64,
+    pub(crate) last_uploaded_mono_sprite_gen: u64,
+    pub(crate) last_uploaded_poly_sprite_gen: u64,
+    pub(crate) last_uploaded_surface_gen: u64,
+    pub(crate) last_uploaded_path_gen: u64,
 }
 
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
+        self.paint_slots.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
-        self.paths.clear();
-        self.shadows.clear();
-        self.backdrop_filters.clear();
         self.filter_boundaries.clear();
-        self.quads.clear();
-        self.underlines.clear();
-        self.monochrome_sprites.clear();
-        self.polychrome_sprites.clear();
-        self.surfaces.clear();
+        self.sorted_quad_indices.clear();
+        self.sorted_shadow_indices.clear();
+        self.sorted_backdrop_filter_indices.clear();
+        self.sorted_underline_indices.clear();
+        self.sorted_mono_sprite_indices.clear();
+        self.sorted_poly_sprite_indices.clear();
+        self.sorted_surface_indices.clear();
+        self.sorted_path_indices.clear();
+        self.pending_delta.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -57,12 +249,14 @@ impl Scene {
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
+        self.paint_slots.push(None);
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
 
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
+        self.paint_slots.push(None);
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
@@ -81,18 +275,13 @@ impl Scene {
             .bounds()
             .intersect(&primitive.content_mask().bounds);
 
-        // Content-filter boundaries must always be inserted as matched pairs — dropping one
-        // (e.g. for an empty clipped region) would orphan its partner and corrupt the renderer's
-        // target stack. Each marker takes an order strictly above ALL prior content, so the start
-        // sorts after everything painted before it and the element's own children (which overlap
-        // the marker bounds) sort strictly above the start. This keeps a marker's order range from
-        // colliding with unrelated non-overlapping content that reuses low orderings (e.g. a
-        // background grid), which would otherwise sweep that content into the group.
         let is_filter_boundary = matches!(primitive, Primitive::FilterBoundary(_));
 
         if clipped_bounds.is_empty() && !is_filter_boundary {
             return;
         }
+
+        self.pending_delta.is_empty = false;
 
         let order = if is_filter_boundary {
             let order_bounds = if clipped_bounds.is_empty() {
@@ -107,14 +296,39 @@ impl Scene {
                 .copied()
                 .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
         };
+
+        let mut slots = PaintOperationSlots {
+            quad_slot: None, shadow_slot: None, backdrop_filter_slot: None,
+            underline_slot: None, mono_sprite_slot: None, poly_sprite_slot: None,
+            surface_slot: None, path_slot: None,
+        };
+
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
-                self.shadows.push(shadow.clone());
+                let slot = self.shadows.allocate();
+                self.shadows.write(slot, shadow.clone());
+                slots.shadow_slot = Some(slot);
+                self.pending_delta.changed_shadows.push(ChangedSlot {
+                    slot,
+                    byte_offset: slot as u64 * std::mem::size_of::<Shadow>() as u64,
+                    byte_length: std::mem::size_of::<Shadow>() as u64,
+                    bounds: shadow.bounds,
+                });
+                self.pending_delta.add_damage(shadow.bounds);
             }
             Primitive::BackdropFilter(filter) => {
                 filter.order = order;
-                self.backdrop_filters.push(*filter);
+                let slot = self.backdrop_filters.allocate();
+                self.backdrop_filters.write(slot, *filter);
+                slots.backdrop_filter_slot = Some(slot);
+                self.pending_delta.changed_backdrop_filters.push(ChangedSlot {
+                    slot,
+                    byte_offset: slot as u64 * std::mem::size_of::<BackdropFilter>() as u64,
+                    byte_length: std::mem::size_of::<BackdropFilter>() as u64,
+                    bounds: filter.bounds,
+                });
+                self.pending_delta.add_damage(filter.bounds);
             }
             Primitive::FilterBoundary(boundary) => {
                 boundary.order = order;
@@ -122,92 +336,286 @@ impl Scene {
             }
             Primitive::Quad(quad) => {
                 quad.order = order;
-                self.quads.push(quad.clone());
+                let slot = self.quads.allocate();
+                self.quads.write(slot, quad.clone());
+                slots.quad_slot = Some(slot);
+                self.pending_delta.changed_quads.push(ChangedSlot {
+                    slot,
+                    byte_offset: slot as u64 * std::mem::size_of::<Quad>() as u64,
+                    byte_length: std::mem::size_of::<Quad>() as u64,
+                    bounds: quad.bounds,
+                });
+                self.pending_delta.add_damage(quad.bounds);
             }
             Primitive::Path(path) => {
                 path.order = order;
-                path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
+                let slot = self.paths.allocate();
+                self.paths.write(slot, path.clone());
+                slots.path_slot = Some(slot);
+                self.pending_delta.paths_changed = true;
+                self.pending_delta.add_damage(path.bounds);
             }
             Primitive::Underline(underline) => {
                 underline.order = order;
-                self.underlines.push(underline.clone());
+                let slot = self.underlines.allocate();
+                self.underlines.write(slot, underline.clone());
+                slots.underline_slot = Some(slot);
+                self.pending_delta.changed_underlines.push(ChangedSlot {
+                    slot,
+                    byte_offset: slot as u64 * std::mem::size_of::<Underline>() as u64,
+                    byte_length: std::mem::size_of::<Underline>() as u64,
+                    bounds: underline.bounds,
+                });
+                self.pending_delta.add_damage(underline.bounds);
             }
             Primitive::MonochromeSprite(sprite) => {
                 sprite.order = order;
-                self.monochrome_sprites.push(sprite.clone());
+                let slot = self.monochrome_sprites.allocate();
+                self.monochrome_sprites.write(slot, sprite.clone());
+                slots.mono_sprite_slot = Some(slot);
+                self.pending_delta.changed_monochrome_sprites.push(ChangedSlot {
+                    slot,
+                    byte_offset: slot as u64 * std::mem::size_of::<MonochromeSprite>() as u64,
+                    byte_length: std::mem::size_of::<MonochromeSprite>() as u64,
+                    bounds: sprite.bounds,
+                });
+                self.pending_delta.add_damage(sprite.bounds);
             }
             Primitive::PolychromeSprite(sprite) => {
                 sprite.order = order;
-                self.polychrome_sprites.push(sprite.clone());
+                let slot = self.polychrome_sprites.allocate();
+                self.polychrome_sprites.write(slot, sprite.clone());
+                slots.poly_sprite_slot = Some(slot);
+                self.pending_delta.changed_polychrome_sprites.push(ChangedSlot {
+                    slot,
+                    byte_offset: slot as u64 * std::mem::size_of::<PolychromeSprite>() as u64,
+                    byte_length: std::mem::size_of::<PolychromeSprite>() as u64,
+                    bounds: sprite.bounds,
+                });
+                self.pending_delta.add_damage(sprite.bounds);
             }
             Primitive::Surface(surface) => {
                 surface.order = order;
-                self.surfaces.push(surface.clone());
+                let slot = self.surfaces.allocate();
+                self.surfaces.write(slot, surface.clone());
+                slots.surface_slot = Some(slot);
+                self.pending_delta.changed_surfaces.push(ChangedSlot {
+                    slot,
+                    byte_offset: slot as u64 * std::mem::size_of::<PaintSurface>() as u64,
+                    byte_length: std::mem::size_of::<PaintSurface>() as u64,
+                    bounds: surface.bounds,
+                });
+                self.pending_delta.add_damage(surface.bounds);
             }
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
-    }
 
-    pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
-        for operation in &prev_scene.paint_operations[range] {
-            match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
-                PaintOperation::EndLayer => self.pop_layer(),
-            }
+        if is_filter_boundary {
+            self.paint_slots.push(None);
+        } else {
+            self.paint_slots.push(Some(slots));
         }
+        self.paint_operations.push(PaintOperation::Primitive(primitive));
     }
 
-    pub fn finish(&mut self) {
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.paths.sort_by_key(|path| path.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.surfaces.sort_by_key(|surface| surface.order);
-        self.backdrop_filters.sort_by_key(|filter| filter.order);
-        // Markers normally get distinct, monotonically-increasing orders (children overlap
-        // their group bounds and so sort strictly between the start and end). The `!is_start`
-        // tiebreak only matters for a degenerate empty group whose start and end tie: it keeps
-        // the start (false = 0) ahead of the end (true = 1) so the pair stays well-formed.
+    pub fn replay(&mut self, operation: &PaintOperation, slot_info: &Option<PaintOperationSlots>) {
+        self.paint_operations.push(operation.clone());
+        self.paint_slots.push(slot_info.clone());
+    }
+
+    pub fn sort(&mut self) {
         self.filter_boundaries
             .sort_by_key(|boundary| (boundary.order, !boundary.is_start));
+        self.build_indirection_buffers();
+        self.free_orphaned_slots();
+    }
+
+    pub fn free_orphaned_slots(&mut self) {
+        let used_quads: std::collections::HashSet<usize> = self.paint_slots.iter()
+            .filter_map(|s| s.as_ref()?.quad_slot).collect();
+        let used_shadows: std::collections::HashSet<usize> = self.paint_slots.iter()
+            .filter_map(|s| s.as_ref()?.shadow_slot).collect();
+        let used_backdrop_filters: std::collections::HashSet<usize> = self.paint_slots.iter()
+            .filter_map(|s| s.as_ref()?.backdrop_filter_slot).collect();
+        let used_underlines: std::collections::HashSet<usize> = self.paint_slots.iter()
+            .filter_map(|s| s.as_ref()?.underline_slot).collect();
+        let used_mono_sprites: std::collections::HashSet<usize> = self.paint_slots.iter()
+            .filter_map(|s| s.as_ref()?.mono_sprite_slot).collect();
+        let used_poly_sprites: std::collections::HashSet<usize> = self.paint_slots.iter()
+            .filter_map(|s| s.as_ref()?.poly_sprite_slot).collect();
+        let used_surfaces: std::collections::HashSet<usize> = self.paint_slots.iter()
+            .filter_map(|s| s.as_ref()?.surface_slot).collect();
+
+        for idx in 0..self.quads.slots.len() {
+            if self.quads.slots[idx].is_some() && !used_quads.contains(&idx) {
+                self.quads.free(idx);
+            }
+        }
+        for idx in 0..self.shadows.slots.len() {
+            if self.shadows.slots[idx].is_some() && !used_shadows.contains(&idx) {
+                self.shadows.free(idx);
+            }
+        }
+        for idx in 0..self.backdrop_filters.slots.len() {
+            if self.backdrop_filters.slots[idx].is_some() && !used_backdrop_filters.contains(&idx) {
+                self.backdrop_filters.free(idx);
+            }
+        }
+        for idx in 0..self.underlines.slots.len() {
+            if self.underlines.slots[idx].is_some() && !used_underlines.contains(&idx) {
+                self.underlines.free(idx);
+            }
+        }
+        for idx in 0..self.monochrome_sprites.slots.len() {
+            if self.monochrome_sprites.slots[idx].is_some() && !used_mono_sprites.contains(&idx) {
+                self.monochrome_sprites.free(idx);
+            }
+        }
+        for idx in 0..self.polychrome_sprites.slots.len() {
+            if self.polychrome_sprites.slots[idx].is_some() && !used_poly_sprites.contains(&idx) {
+                self.polychrome_sprites.free(idx);
+            }
+        }
+        for idx in 0..self.surfaces.slots.len() {
+            if self.surfaces.slots[idx].is_some() && !used_surfaces.contains(&idx) {
+                self.surfaces.free(idx);
+            }
+        }
+    }
+
+    fn build_indirection_buffers(&mut self) {
+        let mut quad_pairs: Vec<(u32, u32)> = Vec::new();
+        for (op, slots) in self.paint_operations.iter().zip(self.paint_slots.iter()) {
+            if let PaintOperation::Primitive(Primitive::Quad(quad)) = op {
+                if let Some(slots) = slots {
+                    if let Some(slot) = slots.quad_slot {
+                        quad_pairs.push((quad.order, slot as u32));
+                    }
+                }
+            }
+        }
+        quad_pairs.sort_by_key(|(order, _)| *order);
+        self.sorted_quad_indices = quad_pairs.into_iter().map(|(_, slot)| slot).collect();
+
+        let mut shadow_pairs: Vec<(u32, u32)> = Vec::new();
+        for (op, slots) in self.paint_operations.iter().zip(self.paint_slots.iter()) {
+            if let PaintOperation::Primitive(Primitive::Shadow(shadow)) = op {
+                if let Some(slots) = slots {
+                    if let Some(slot) = slots.shadow_slot {
+                        shadow_pairs.push((shadow.order, slot as u32));
+                    }
+                }
+            }
+        }
+        shadow_pairs.sort_by_key(|(order, _)| *order);
+        self.sorted_shadow_indices = shadow_pairs.into_iter().map(|(_, slot)| slot).collect();
+
+        let mut bf_pairs: Vec<(u32, u32)> = Vec::new();
+        for (op, slots) in self.paint_operations.iter().zip(self.paint_slots.iter()) {
+            if let PaintOperation::Primitive(Primitive::BackdropFilter(bf)) = op {
+                if let Some(slots) = slots {
+                    if let Some(slot) = slots.backdrop_filter_slot {
+                        bf_pairs.push((bf.order, slot as u32));
+                    }
+                }
+            }
+        }
+        bf_pairs.sort_by_key(|(order, _)| *order);
+        self.sorted_backdrop_filter_indices = bf_pairs.into_iter().map(|(_, slot)| slot).collect();
+
+        let mut ul_pairs: Vec<(u32, u32)> = Vec::new();
+        for (op, slots) in self.paint_operations.iter().zip(self.paint_slots.iter()) {
+            if let PaintOperation::Primitive(Primitive::Underline(ul)) = op {
+                if let Some(slots) = slots {
+                    if let Some(slot) = slots.underline_slot {
+                        ul_pairs.push((ul.order, slot as u32));
+                    }
+                }
+            }
+        }
+        ul_pairs.sort_by_key(|(order, _)| *order);
+        self.sorted_underline_indices = ul_pairs.into_iter().map(|(_, slot)| slot).collect();
+
+        let mut mono_pairs: Vec<(u32, u32, u32)> = Vec::new();
+        for (op, slots) in self.paint_operations.iter().zip(self.paint_slots.iter()) {
+            if let PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)) = op {
+                if let Some(slots) = slots {
+                    if let Some(slot) = slots.mono_sprite_slot {
+                        mono_pairs.push((sprite.order, sprite.tile.texture_id.index, slot as u32));
+                    }
+                }
+            }
+        }
+        mono_pairs.sort_by_key(|(order, _, _)| *order);
+        self.sorted_mono_sprite_indices = mono_pairs.into_iter().map(|(_, _, slot)| slot).collect();
+
+        let mut poly_pairs: Vec<(u32, u32, u32)> = Vec::new();
+        for (op, slots) in self.paint_operations.iter().zip(self.paint_slots.iter()) {
+            if let PaintOperation::Primitive(Primitive::PolychromeSprite(sprite)) = op {
+                if let Some(slots) = slots {
+                    if let Some(slot) = slots.poly_sprite_slot {
+                        poly_pairs.push((sprite.order, sprite.tile.texture_id.index, slot as u32));
+                    }
+                }
+            }
+        }
+        poly_pairs.sort_by_key(|(order, _, _)| *order);
+        self.sorted_poly_sprite_indices = poly_pairs.into_iter().map(|(_, _, slot)| slot).collect();
+
+        let mut surface_pairs: Vec<(u32, u32)> = Vec::new();
+        for (op, slots) in self.paint_operations.iter().zip(self.paint_slots.iter()) {
+            if let PaintOperation::Primitive(Primitive::Surface(surface)) = op {
+                if let Some(slots) = slots {
+                    if let Some(slot) = slots.surface_slot {
+                        surface_pairs.push((surface.order, slot as u32));
+                    }
+                }
+            }
+        }
+        surface_pairs.sort_by_key(|(order, _)| *order);
+        self.sorted_surface_indices = surface_pairs.into_iter().map(|(_, slot)| slot).collect();
+
+        let mut path_pairs: Vec<(u32, u32)> = Vec::new();
+        for (op, slots) in self.paint_operations.iter().zip(self.paint_slots.iter()) {
+            if let PaintOperation::Primitive(Primitive::Path(path)) = op {
+                if let Some(slots) = slots {
+                    if let Some(slot) = slots.path_slot {
+                        path_pairs.push((path.order, slot as u32));
+                    }
+                }
+            }
+        }
+        path_pairs.sort_by_key(|(order, _)| *order);
+        self.sorted_path_indices = path_pairs.into_iter().map(|(_, slot)| slot).collect();
     }
 
     pub(crate) fn batches(&self) -> impl Iterator<Item = PrimitiveBatch<'_>> {
         BatchIterator {
-            shadows: &self.shadows,
-            shadows_start: 0,
-            shadows_iter: self.shadows.iter().peekable(),
-            quads: &self.quads,
-            quads_start: 0,
-            quads_iter: self.quads.iter().peekable(),
-            paths: &self.paths,
-            paths_start: 0,
-            paths_iter: self.paths.iter().peekable(),
-            underlines: &self.underlines,
-            underlines_start: 0,
-            underlines_iter: self.underlines.iter().peekable(),
-            monochrome_sprites: &self.monochrome_sprites,
-            monochrome_sprites_start: 0,
-            monochrome_sprites_iter: self.monochrome_sprites.iter().peekable(),
-            polychrome_sprites: &self.polychrome_sprites,
-            polychrome_sprites_start: 0,
-            polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
-            surfaces: &self.surfaces,
-            surfaces_start: 0,
-            surfaces_iter: self.surfaces.iter().peekable(),
-            backdrop_filters: &self.backdrop_filters,
-            backdrop_filters_start: 0,
-            backdrop_filters_iter: self.backdrop_filters.iter().peekable(),
+            quad_indices: &self.sorted_quad_indices,
+            quad_data: &self.quads,
+            quad_cursor: 0,
+            shadow_indices: &self.sorted_shadow_indices,
+            shadow_data: &self.shadows,
+            shadow_cursor: 0,
+            path_indices: &self.sorted_path_indices,
+            path_data: &self.paths,
+            path_cursor: 0,
+            underline_indices: &self.sorted_underline_indices,
+            underline_data: &self.underlines,
+            underline_cursor: 0,
+            mono_sprite_indices: &self.sorted_mono_sprite_indices,
+            mono_sprite_data: &self.monochrome_sprites,
+            mono_sprite_cursor: 0,
+            poly_sprite_indices: &self.sorted_poly_sprite_indices,
+            poly_sprite_data: &self.polychrome_sprites,
+            poly_sprite_cursor: 0,
+            surface_indices: &self.sorted_surface_indices,
+            surface_data: &self.surfaces,
+            surface_cursor: 0,
+            backdrop_filter_indices: &self.sorted_backdrop_filter_indices,
+            backdrop_filter_data: &self.backdrop_filters,
+            backdrop_filter_cursor: 0,
             filter_boundaries: &self.filter_boundaries,
-            filter_boundaries_start: 0,
-            filter_boundaries_iter: self.filter_boundaries.iter().peekable(),
+            filter_boundaries_cursor: 0,
         }
     }
 }
@@ -281,34 +689,97 @@ impl Primitive {
     }
 }
 
+pub(crate) unsafe fn as_bytes<T>(slice: &[T]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            slice.as_ptr() as *const u8,
+            slice.len() * std::mem::size_of::<T>(),
+        )
+    }
+}
+
+/// Flatten a GenerationalVec into a byte buffer with zero-padding for free slots.
+/// Each live slot's data occupies `sizeof<T>()` bytes at `slot_index * sizeof<T>()`.
+pub(crate) fn flatten_generational_vec<T: Clone>(gv: &GenerationalVec<T>) -> Vec<u8> {
+    let elem_size = std::mem::size_of::<T>();
+    let mut bytes = Vec::with_capacity(gv.slots.len() * elem_size);
+    for slot in &gv.slots {
+        match slot {
+            Some(s) => {
+                let ptr = &s.data as *const T as *const u8;
+                let slice = unsafe { std::slice::from_raw_parts(ptr, elem_size) };
+                bytes.extend_from_slice(slice);
+            }
+            None => {
+                bytes.extend(std::iter::repeat(0u8).take(elem_size));
+            }
+        }
+    }
+    bytes
+}
+
 struct BatchIterator<'a> {
-    shadows: &'a [Shadow],
-    shadows_start: usize,
-    shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
-    quads: &'a [Quad],
-    quads_start: usize,
-    quads_iter: Peekable<slice::Iter<'a, Quad>>,
-    paths: &'a [Path<ScaledPixels>],
-    paths_start: usize,
-    paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
-    underlines: &'a [Underline],
-    underlines_start: usize,
-    underlines_iter: Peekable<slice::Iter<'a, Underline>>,
-    monochrome_sprites: &'a [MonochromeSprite],
-    monochrome_sprites_start: usize,
-    monochrome_sprites_iter: Peekable<slice::Iter<'a, MonochromeSprite>>,
-    polychrome_sprites: &'a [PolychromeSprite],
-    polychrome_sprites_start: usize,
-    polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
-    surfaces: &'a [PaintSurface],
-    surfaces_start: usize,
-    surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
-    backdrop_filters: &'a [BackdropFilter],
-    backdrop_filters_start: usize,
-    backdrop_filters_iter: Peekable<slice::Iter<'a, BackdropFilter>>,
+    quad_indices: &'a [u32],
+    quad_data: &'a GenerationalVec<Quad>,
+    quad_cursor: usize,
+    shadow_indices: &'a [u32],
+    shadow_data: &'a GenerationalVec<Shadow>,
+    shadow_cursor: usize,
+    path_indices: &'a [u32],
+    path_data: &'a GenerationalVec<Path<ScaledPixels>>,
+    path_cursor: usize,
+    underline_indices: &'a [u32],
+    underline_data: &'a GenerationalVec<Underline>,
+    underline_cursor: usize,
+    mono_sprite_indices: &'a [u32],
+    mono_sprite_data: &'a GenerationalVec<MonochromeSprite>,
+    mono_sprite_cursor: usize,
+    poly_sprite_indices: &'a [u32],
+    poly_sprite_data: &'a GenerationalVec<PolychromeSprite>,
+    poly_sprite_cursor: usize,
+    surface_indices: &'a [u32],
+    surface_data: &'a GenerationalVec<PaintSurface>,
+    surface_cursor: usize,
+    backdrop_filter_indices: &'a [u32],
+    backdrop_filter_data: &'a GenerationalVec<BackdropFilter>,
+    backdrop_filter_cursor: usize,
     filter_boundaries: &'a [FilterBoundary],
-    filter_boundaries_start: usize,
-    filter_boundaries_iter: Peekable<slice::Iter<'a, FilterBoundary>>,
+    filter_boundaries_cursor: usize,
+}
+
+impl<'a> BatchIterator<'a> {
+    fn peek_shadow_order(&self) -> Option<u32> {
+        let slot = *self.shadow_indices.get(self.shadow_cursor)?;
+        self.shadow_data.get(slot as usize).map(|s| s.order)
+    }
+    fn peek_quad_order(&self) -> Option<u32> {
+        let slot = *self.quad_indices.get(self.quad_cursor)?;
+        self.quad_data.get(slot as usize).map(|q| q.order)
+    }
+    fn peek_path_order(&self) -> Option<u32> {
+        let slot = *self.path_indices.get(self.path_cursor)?;
+        self.path_data.get(slot as usize).map(|p| p.order)
+    }
+    fn peek_underline_order(&self) -> Option<u32> {
+        let slot = *self.underline_indices.get(self.underline_cursor)?;
+        self.underline_data.get(slot as usize).map(|u| u.order)
+    }
+    fn peek_mono_sprite_order(&self) -> Option<u32> {
+        let slot = *self.mono_sprite_indices.get(self.mono_sprite_cursor)?;
+        self.mono_sprite_data.get(slot as usize).map(|s| s.order)
+    }
+    fn peek_poly_sprite_order(&self) -> Option<u32> {
+        let slot = *self.poly_sprite_indices.get(self.poly_sprite_cursor)?;
+        self.poly_sprite_data.get(slot as usize).map(|s| s.order)
+    }
+    fn peek_surface_order(&self) -> Option<u32> {
+        let slot = *self.surface_indices.get(self.surface_cursor)?;
+        self.surface_data.get(slot as usize).map(|s| s.order)
+    }
+    fn peek_backdrop_filter_order(&self) -> Option<u32> {
+        let slot = *self.backdrop_filter_indices.get(self.backdrop_filter_cursor)?;
+        self.backdrop_filter_data.get(slot as usize).map(|f| f.order)
+    }
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -316,38 +787,17 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            (self.peek_shadow_order(), PrimitiveKind::Shadow),
+            (self.peek_quad_order(), PrimitiveKind::Quad),
+            (self.peek_path_order(), PrimitiveKind::Path),
+            (self.peek_underline_order(), PrimitiveKind::Underline),
+            (self.peek_mono_sprite_order(), PrimitiveKind::MonochromeSprite),
+            (self.peek_poly_sprite_order(), PrimitiveKind::PolychromeSprite),
+            (self.peek_surface_order(), PrimitiveKind::Surface),
+            (self.peek_backdrop_filter_order(), PrimitiveKind::BackdropFilter),
             (
-                self.shadows_iter.peek().map(|s| s.order),
-                PrimitiveKind::Shadow,
-            ),
-            (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
-            (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
-            (
-                self.underlines_iter.peek().map(|u| u.order),
-                PrimitiveKind::Underline,
-            ),
-            (
-                self.monochrome_sprites_iter.peek().map(|s| s.order),
-                PrimitiveKind::MonochromeSprite,
-            ),
-            (
-                self.polychrome_sprites_iter.peek().map(|s| s.order),
-                PrimitiveKind::PolychromeSprite,
-            ),
-            (
-                self.surfaces_iter.peek().map(|s| s.order),
-                PrimitiveKind::Surface,
-            ),
-            (
-                self.backdrop_filters_iter.peek().map(|f| f.order),
-                PrimitiveKind::BackdropFilter,
-            ),
-            (
-                self.filter_boundaries_iter.peek().map(|b| b.order),
-                // The same vec yields both start and end markers; the discriminant decides
-                // where the next marker sorts relative to draw batches at an equal order
-                // (start before content, end after).
-                match self.filter_boundaries_iter.peek() {
+                self.filter_boundaries.get(self.filter_boundaries_cursor).map(|b| b.order),
+                match self.filter_boundaries.get(self.filter_boundaries_cursor) {
                     Some(boundary) if boundary.is_start => PrimitiveKind::FilterBoundaryStart,
                     _ => PrimitiveKind::FilterBoundaryEnd,
                 },
@@ -365,145 +815,118 @@ impl<'a> Iterator for BatchIterator<'a> {
 
         match batch_kind {
             PrimitiveKind::Shadow => {
-                let shadows_start = self.shadows_start;
-                let mut shadows_end = shadows_start + 1;
-                self.shadows_iter.next();
-                while self
-                    .shadows_iter
-                    .next_if(|shadow| (shadow.order, batch_kind) < max_order_and_kind)
-                    .is_some()
-                {
-                    shadows_end += 1;
+                let start = self.shadow_cursor;
+                self.shadow_cursor += 1;
+                while let Some(order) = self.peek_shadow_order() {
+                    if (order, batch_kind) < max_order_and_kind {
+                        self.shadow_cursor += 1;
+                    } else {
+                        break;
+                    }
                 }
-                self.shadows_start = shadows_end;
-                Some(PrimitiveBatch::Shadows(
-                    &self.shadows[shadows_start..shadows_end],
-                ))
+                Some(PrimitiveBatch::Shadows(&self.shadow_indices[start..self.shadow_cursor]))
             }
             PrimitiveKind::Quad => {
-                let quads_start = self.quads_start;
-                let mut quads_end = quads_start + 1;
-                self.quads_iter.next();
-                while self
-                    .quads_iter
-                    .next_if(|quad| (quad.order, batch_kind) < max_order_and_kind)
-                    .is_some()
-                {
-                    quads_end += 1;
+                let start = self.quad_cursor;
+                self.quad_cursor += 1;
+                while let Some(order) = self.peek_quad_order() {
+                    if (order, batch_kind) < max_order_and_kind {
+                        self.quad_cursor += 1;
+                    } else {
+                        break;
+                    }
                 }
-                self.quads_start = quads_end;
-                Some(PrimitiveBatch::Quads(&self.quads[quads_start..quads_end]))
+                Some(PrimitiveBatch::Quads(&self.quad_indices[start..self.quad_cursor]))
             }
             PrimitiveKind::Path => {
-                let paths_start = self.paths_start;
-                let mut paths_end = paths_start + 1;
-                self.paths_iter.next();
-                while self
-                    .paths_iter
-                    .next_if(|path| (path.order, batch_kind) < max_order_and_kind)
-                    .is_some()
-                {
-                    paths_end += 1;
+                let start = self.path_cursor;
+                self.path_cursor += 1;
+                while let Some(order) = self.peek_path_order() {
+                    if (order, batch_kind) < max_order_and_kind {
+                        self.path_cursor += 1;
+                    } else {
+                        break;
+                    }
                 }
-                self.paths_start = paths_end;
-                Some(PrimitiveBatch::Paths(&self.paths[paths_start..paths_end]))
+                Some(PrimitiveBatch::Paths(&self.path_indices[start..self.path_cursor]))
             }
             PrimitiveKind::Underline => {
-                let underlines_start = self.underlines_start;
-                let mut underlines_end = underlines_start + 1;
-                self.underlines_iter.next();
-                while self
-                    .underlines_iter
-                    .next_if(|underline| (underline.order, batch_kind) < max_order_and_kind)
-                    .is_some()
-                {
-                    underlines_end += 1;
+                let start = self.underline_cursor;
+                self.underline_cursor += 1;
+                while let Some(order) = self.peek_underline_order() {
+                    if (order, batch_kind) < max_order_and_kind {
+                        self.underline_cursor += 1;
+                    } else {
+                        break;
+                    }
                 }
-                self.underlines_start = underlines_end;
-                Some(PrimitiveBatch::Underlines(
-                    &self.underlines[underlines_start..underlines_end],
-                ))
+                Some(PrimitiveBatch::Underlines(&self.underline_indices[start..self.underline_cursor]))
             }
             PrimitiveKind::MonochromeSprite => {
-                let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
-                let sprites_start = self.monochrome_sprites_start;
-                let mut sprites_end = sprites_start + 1;
-                self.monochrome_sprites_iter.next();
-                while self
-                    .monochrome_sprites_iter
-                    .next_if(|sprite| {
-                        (sprite.order, batch_kind) < max_order_and_kind
-                            && sprite.tile.texture_id == texture_id
-                    })
-                    .is_some()
-                {
-                    sprites_end += 1;
+                let slot = self.mono_sprite_indices[self.mono_sprite_cursor] as usize;
+                let texture_id = self.mono_sprite_data.get(slot).unwrap().tile.texture_id;
+                let start = self.mono_sprite_cursor;
+                self.mono_sprite_cursor += 1;
+                while let Some(order) = self.peek_mono_sprite_order() {
+                    let current_slot = self.mono_sprite_indices[self.mono_sprite_cursor] as usize;
+                    let current_texture_id = self.mono_sprite_data.get(current_slot).unwrap().tile.texture_id;
+                    if (order, batch_kind) < max_order_and_kind && current_texture_id == texture_id {
+                        self.mono_sprite_cursor += 1;
+                    } else {
+                        break;
+                    }
                 }
-                self.monochrome_sprites_start = sprites_end;
                 Some(PrimitiveBatch::MonochromeSprites {
                     texture_id,
-                    sprites: &self.monochrome_sprites[sprites_start..sprites_end],
+                    indices: &self.mono_sprite_indices[start..self.mono_sprite_cursor],
                 })
             }
             PrimitiveKind::PolychromeSprite => {
-                let texture_id = self.polychrome_sprites_iter.peek().unwrap().tile.texture_id;
-                let sprites_start = self.polychrome_sprites_start;
-                let mut sprites_end = self.polychrome_sprites_start + 1;
-                self.polychrome_sprites_iter.next();
-                while self
-                    .polychrome_sprites_iter
-                    .next_if(|sprite| {
-                        (sprite.order, batch_kind) < max_order_and_kind
-                            && sprite.tile.texture_id == texture_id
-                    })
-                    .is_some()
-                {
-                    sprites_end += 1;
+                let slot = self.poly_sprite_indices[self.poly_sprite_cursor] as usize;
+                let texture_id = self.poly_sprite_data.get(slot).unwrap().tile.texture_id;
+                let start = self.poly_sprite_cursor;
+                self.poly_sprite_cursor += 1;
+                while let Some(order) = self.peek_poly_sprite_order() {
+                    let current_slot = self.poly_sprite_indices[self.poly_sprite_cursor] as usize;
+                    let current_texture_id = self.poly_sprite_data.get(current_slot).unwrap().tile.texture_id;
+                    if (order, batch_kind) < max_order_and_kind && current_texture_id == texture_id {
+                        self.poly_sprite_cursor += 1;
+                    } else {
+                        break;
+                    }
                 }
-                self.polychrome_sprites_start = sprites_end;
                 Some(PrimitiveBatch::PolychromeSprites {
                     texture_id,
-                    sprites: &self.polychrome_sprites[sprites_start..sprites_end],
+                    indices: &self.poly_sprite_indices[start..self.poly_sprite_cursor],
                 })
             }
             PrimitiveKind::Surface => {
-                let surfaces_start = self.surfaces_start;
-                let mut surfaces_end = surfaces_start + 1;
-                self.surfaces_iter.next();
-                while self
-                    .surfaces_iter
-                    .next_if(|surface| (surface.order, batch_kind) < max_order_and_kind)
-                    .is_some()
-                {
-                    surfaces_end += 1;
+                let start = self.surface_cursor;
+                self.surface_cursor += 1;
+                while let Some(order) = self.peek_surface_order() {
+                    if (order, batch_kind) < max_order_and_kind {
+                        self.surface_cursor += 1;
+                    } else {
+                        break;
+                    }
                 }
-                self.surfaces_start = surfaces_end;
-                Some(PrimitiveBatch::Surfaces(
-                    &self.surfaces[surfaces_start..surfaces_end],
-                ))
+                Some(PrimitiveBatch::Surfaces(&self.surface_indices[start..self.surface_cursor]))
             }
             PrimitiveKind::BackdropFilter => {
-                let backdrop_filters_start = self.backdrop_filters_start;
-                let mut backdrop_filters_end = backdrop_filters_start + 1;
-                self.backdrop_filters_iter.next();
-                while self
-                    .backdrop_filters_iter
-                    .next_if(|filter| (filter.order, batch_kind) < max_order_and_kind)
-                    .is_some()
-                {
-                    backdrop_filters_end += 1;
+                let start = self.backdrop_filter_cursor;
+                self.backdrop_filter_cursor += 1;
+                while let Some(order) = self.peek_backdrop_filter_order() {
+                    if (order, batch_kind) < max_order_and_kind {
+                        self.backdrop_filter_cursor += 1;
+                    } else {
+                        break;
+                    }
                 }
-                self.backdrop_filters_start = backdrop_filters_end;
-                Some(PrimitiveBatch::BackdropFilters(
-                    &self.backdrop_filters[backdrop_filters_start..backdrop_filters_end],
-                ))
+                Some(PrimitiveBatch::BackdropFilters(&self.backdrop_filter_indices[start..self.backdrop_filter_cursor]))
             }
-            // Boundaries are emitted one at a time (never merged) so the renderer can switch
-            // render targets at exactly the right point in the batch stream.
             PrimitiveKind::FilterBoundaryStart | PrimitiveKind::FilterBoundaryEnd => {
-                let index = self.filter_boundaries_start;
-                self.filter_boundaries_iter.next();
-                self.filter_boundaries_start = index + 1;
+                let index = self.filter_boundaries_cursor;
+                self.filter_boundaries_cursor += 1;
                 Some(PrimitiveBatch::FilterBoundary(index))
             }
         }
@@ -512,23 +935,20 @@ impl<'a> Iterator for BatchIterator<'a> {
 
 #[derive(Debug)]
 pub(crate) enum PrimitiveBatch<'a> {
-    Shadows(&'a [Shadow]),
-    Quads(&'a [Quad]),
-    Paths(&'a [Path<ScaledPixels>]),
-    Underlines(&'a [Underline]),
+    Shadows(&'a [u32]),
+    Quads(&'a [u32]),
+    Paths(&'a [u32]),
+    Underlines(&'a [u32]),
     MonochromeSprites {
         texture_id: AtlasTextureId,
-        sprites: &'a [MonochromeSprite],
+        indices: &'a [u32],
     },
     PolychromeSprites {
         texture_id: AtlasTextureId,
-        sprites: &'a [PolychromeSprite],
+        indices: &'a [u32],
     },
-    Surfaces(&'a [PaintSurface]),
-    BackdropFilters(&'a [BackdropFilter]),
-    /// A single content-filter group boundary; index into [`Scene::filter_boundaries`]. Read
-    /// `is_start` to tell whether this opens the group (switch render target) or closes it
-    /// (filter the offscreen target and composite it back).
+    Surfaces(&'a [u32]),
+    BackdropFilters(&'a [u32]),
     FilterBoundary(usize),
 }
 
@@ -1039,7 +1459,7 @@ mod tests {
     }
 
     fn batch_kinds(scene: &mut Scene) -> Vec<&'static str> {
-        scene.finish();
+        scene.sort();
         scene
             .batches()
             .map(|batch| match batch {

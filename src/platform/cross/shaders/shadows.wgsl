@@ -43,6 +43,7 @@ struct ShadowVarying {
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var<storage, read> b_shadows: array<Shadow>;
+@group(1) @binding(1) var<storage, read> b_shadow_instances: array<u32>;
 
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
     let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
@@ -143,7 +144,8 @@ fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>) -
 @vertex
 fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ShadowVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    var shadow = b_shadows[instance_id];
+    let slot = b_shadow_instances[instance_id];
+    var shadow = b_shadows[slot];
 
     let margin = 3.0 * shadow.blur_radius;
     shadow.bounds.origin -= vec2<f32>(margin);
@@ -152,7 +154,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     var out = ShadowVarying();
     out.position = to_device_position(unit_vertex, shadow.bounds);
     out.color = hsla_to_rgba(shadow.color);
-    out.shadow_id = instance_id;
+    out.shadow_id = slot;
     out.clip_distances = distance_from_clip_rect(unit_vertex, shadow.bounds, shadow.content_mask);
     return out;
 }

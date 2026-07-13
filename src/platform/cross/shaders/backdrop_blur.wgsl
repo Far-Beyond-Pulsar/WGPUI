@@ -39,6 +39,7 @@ struct BackdropFilterVarying {
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var<storage, read> b_backdrop_filters: array<BackdropFilter>;
+@group(1) @binding(1) var<storage, read> b_backdrop_filter_instances: array<u32>;
 @group(2) @binding(0) var backdrop_texture: texture_2d<f32>;
 @group(2) @binding(1) var backdrop_sampler: sampler;
 
@@ -78,7 +79,8 @@ fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
 @vertex
 fn vs_backdrop_filter(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> BackdropFilterVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let backdrop_filter = b_backdrop_filters[instance_id];
+    let slot = b_backdrop_filter_instances[instance_id];
+    let backdrop_filter = b_backdrop_filters[slot];
 
     let position = to_device_position(unit_vertex, backdrop_filter.bounds);
 
@@ -90,7 +92,7 @@ fn vs_backdrop_filter(@builtin(vertex_index) vertex_id: u32, @builtin(instance_i
     clip_distances.z = content_mask.origin.x + content_mask.size.x - pixel_position.x;
     clip_distances.w = content_mask.origin.y + content_mask.size.y - pixel_position.y;
 
-    return BackdropFilterVarying(position, instance_id, clip_distances);
+    return BackdropFilterVarying(position, slot, clip_distances);
 }
 
 @fragment

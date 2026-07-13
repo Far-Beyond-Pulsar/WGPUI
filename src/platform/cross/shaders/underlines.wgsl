@@ -37,6 +37,7 @@ struct UnderlineVarying {
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var<storage, read> b_underlines: array<Underline>;
+@group(1) @binding(1) var<storage, read> b_underline_instances: array<u32>;
 
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
     let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
@@ -102,12 +103,13 @@ fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
 @vertex
 fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> UnderlineVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let underline = b_underlines[instance_id];
+    let slot = b_underline_instances[instance_id];
+    let underline = b_underlines[slot];
 
     var out = UnderlineVarying();
     out.position = to_device_position(unit_vertex, underline.bounds);
     out.color = hsla_to_rgba(underline.color);
-    out.underline_id = instance_id;
+    out.underline_id = slot;
     out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
     return out;
 }

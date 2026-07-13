@@ -79,6 +79,7 @@ struct QuadVarying {
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var<storage, read> b_quads: array<Quad>;
+@group(1) @binding(1) var<storage, read> b_quad_instances: array<u32>;
 
 /// Convert an Oklab color to linear sRGB space.
 fn oklab_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
@@ -457,7 +458,8 @@ fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
 @vertex
 fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> QuadVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let quad = b_quads[instance_id];
+    let slot = b_quad_instances[instance_id];
+    let quad = b_quads[slot];
 
     var out = QuadVarying();
     out.position = to_device_position(unit_vertex, quad.bounds);
@@ -474,7 +476,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_color0 = gradient.color0;
     out.background_color1 = gradient.color1;
     out.border_color = hsla_to_rgba(quad.border_color);
-    out.quad_id = instance_id;
+    out.quad_id = slot;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
     return out;
 }

@@ -232,6 +232,7 @@ fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
 @group(2) @binding(1) var s_sprite: sampler;
 
 @group(3) @binding(0) var<storage, read> b_mono_sprites: array<MonochromeSprite>;
+@group(3) @binding(1) var<storage, read> b_mono_sprite_instances: array<u32>;
 
 struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
@@ -243,7 +244,8 @@ struct MonoSpriteVarying {
 @vertex
 fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> MonoSpriteVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let sprite = b_mono_sprites[instance_id];
+    let slot = b_mono_sprite_instances[instance_id];
+    let sprite = b_mono_sprites[slot];
 
     var out = MonoSpriteVarying();
     out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
