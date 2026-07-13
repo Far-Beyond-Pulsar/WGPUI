@@ -2000,7 +2000,9 @@ impl WgpuRenderer {
         let (group_textures, group_views) =
             create_filter_group_textures(&context.device, width, height, format);
 
-        let mode = if std::env::var("WGPUI_COMPOSITOR").is_ok() {
+        let mode = if std::env::var("WGPUI_SYNCHRONOUS").is_ok() {
+            WgpuRendererMode::Synchronous
+        } else {
             let (handle, _join_handle) = start_compositor(
                 context.clone(),
                 atlas.clone(),
@@ -2011,8 +2013,6 @@ impl WgpuRenderer {
                 path_sample_count,
             );
             WgpuRendererMode::Compositor(handle)
-        } else {
-            WgpuRendererMode::Synchronous
         };
 
         Ok(Self {
