@@ -314,8 +314,11 @@ impl OverscrollState {
                 (buffer_h - viewport_h) / 2.0,
             ),
             rendered_area: crate::geometry::Bounds {
-                origin: crate::geometry::point(0.0, 0.0),
-                size: crate::geometry::size(buffer_w, buffer_h),
+                origin: crate::geometry::point(
+                    (buffer_w - viewport_w) / 2.0,
+                    (buffer_h - viewport_h) / 2.0,
+                ),
+                size: crate::geometry::size(viewport_w, viewport_h),
             },
             overscroll_factor: factor,
             viewport_width: viewport_w,

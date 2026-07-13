@@ -1368,6 +1368,20 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
         }
     }
 
+    // Extend the rendered area to include the viewport we just rendered.
+    {
+        let os = state.overscroll_state.lock().unwrap();
+        let render_origin = os.content_origin;
+        let render_size = crate::geometry::size(os.viewport_width, os.viewport_height);
+        drop(os);
+        state.overscroll_state.lock().unwrap().extend_rendered_area(
+            crate::geometry::Bounds {
+                origin: render_origin,
+                size: render_size,
+            },
+        );
+    }
+
     state.context.queue.submit(Some(command_encoder.finish()));
 
     let _ = state.completion_tx.try_send(CompositorCompletion {
