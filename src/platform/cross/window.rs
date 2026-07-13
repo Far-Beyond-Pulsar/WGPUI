@@ -407,6 +407,12 @@ impl PlatformWindow for CrossWindow {
         }
     }
 
+    fn record_scroll(&self, delta: Point<Pixels>) {
+        if let Some(renderer) = self.0.renderer.get() {
+            renderer.borrow().record_scroll(crate::geometry::point(delta.x.0, delta.y.0));
+        }
+    }
+
     fn try_present(&self) -> bool {
         if let Some(renderer) = self.0.renderer.get() {
             renderer.borrow().try_present()

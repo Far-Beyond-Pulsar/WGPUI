@@ -2367,6 +2367,16 @@ impl Window {
         profiling::finish_frame!();
     }
 
+    /// Record a scroll delta without triggering a full re-render.
+    /// This uses the overscroll buffer fast path: the blit UV offset is adjusted
+    /// to show the scrolled viewport within the larger pipeline texture.
+    /// A full commit cycle is only needed when the viewport scrolls outside
+    /// the rendered area.
+    pub fn record_scroll(&self, delta: Point<Pixels>) {
+        self.platform_window.record_scroll(delta);
+        self.needs_present.set(true);
+    }
+
     /// Present only the cached framebuffer (fast path - no compositor)
     #[profiling::function]
     fn present_framebuffer_only(&self) {

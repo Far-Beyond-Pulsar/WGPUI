@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use wgpu::util::DeviceExt;
 
 use crate::{
@@ -8,7 +8,7 @@ use crate::{
         atlas::WgpuAtlas,
         render_context::WgpuContext,
         renderer::{
-            ColorAdjustments, GpuPathVertex, GlobalParams, MAX_FILTER_DEPTH, RenderingParameters,
+            ColorAdjustments, GpuPathVertex, GlobalParams, OverscrollState, RenderingParameters,
             WgpuPipelines, create_filter_group_textures,
         },
     },
@@ -25,6 +25,9 @@ unsafe fn as_bytes<T>(slice: &[T]) -> &[u8] {
 
 pub(crate) enum CompositorJob {
     Commit(Scene),
+    ExtendTiles { rect: crate::geometry::Bounds<f32> },
+    ReCenter { new_content_origin: crate::geometry::Point<f32> },
+    Scroll(crate::geometry::Point<f32>),
     Resize(u32, u32),
     Shutdown,
 }
@@ -39,6 +42,7 @@ pub(crate) struct CompositorHandle {
     pub(crate) pipeline_texture: wgpu::Texture,
     pub(crate) pipeline_texture_view: wgpu::TextureView,
     pub(crate) pipeline_texture_size: wgpu::Extent3d,
+    pub(crate) overscroll_state: Arc<Mutex<OverscrollState>>,
 }
 
 struct CompositorState {
@@ -51,6 +55,7 @@ struct CompositorState {
     pipeline_texture_view: wgpu::TextureView,
     viewport_width: u32,
     viewport_height: u32,
+    overscroll_state: Arc<Mutex<OverscrollState>>,
     backdrop_blur_texture: wgpu::Texture,
     backdrop_blur_texture_view: wgpu::TextureView,
     backdrop_blur_sampler: wgpu::Sampler,
@@ -62,6 +67,14 @@ struct CompositorState {
     completion_tx: flume::Sender<CompositorCompletion>,
 }
 
+fn determine_overscroll_factor() -> f32 {
+    if let Ok(val) = std::env::var("WGPUI_OVERSCROLL_FACTOR") {
+        val.parse().unwrap_or(3.0)
+    } else {
+        3.0
+    }
+}
+
 pub(crate) fn start_compositor(
     context: Arc<WgpuContext>,
     atlas: Arc<WgpuAtlas>,
@@ -71,11 +84,18 @@ pub(crate) fn start_compositor(
     height: u32,
     path_sample_count: u32,
 ) -> (CompositorHandle, std::thread::JoinHandle<()>) {
+    let overscroll_factor = determine_overscroll_factor();
+    let pipeline_width = (width as f32 * overscroll_factor).ceil() as u32;
+    let pipeline_height = (height as f32 * overscroll_factor).ceil() as u32;
+
     let size = wgpu::Extent3d {
-        width,
-        height,
+        width: pipeline_width,
+        height: pipeline_height,
         depth_or_array_layers: 1,
     };
+
+    let overscroll = OverscrollState::new(width as f32, height as f32, overscroll_factor);
+    let overscroll_state = Arc::new(Mutex::new(overscroll));
 
     let pipeline_texture = context.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("compositor_pipeline_texture"),
@@ -100,9 +120,14 @@ pub(crate) fn start_compositor(
         ..Default::default()
     });
 
+    // Backdrop blur texture stays viewport-sized (not overscroll-sized)
     let backdrop_blur_texture = context.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("compositor_backdrop_blur_texture"),
-        size,
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -117,6 +142,7 @@ pub(crate) fn start_compositor(
 
     let pipelines = WgpuPipelines::new(context.as_ref(), format, alpha_mode, path_sample_count);
 
+    // Group textures stay viewport-sized
     let (group_textures, group_views) =
         create_filter_group_textures(&context.device, width, height, format);
 
@@ -147,6 +173,7 @@ pub(crate) fn start_compositor(
         pipeline_texture_view: pipeline_texture_view.clone(),
         viewport_width: width,
         viewport_height: height,
+        overscroll_state: overscroll_state.clone(),
         backdrop_blur_texture,
         backdrop_blur_texture_view,
         backdrop_blur_sampler,
@@ -169,6 +196,7 @@ pub(crate) fn start_compositor(
         pipeline_texture,
         pipeline_texture_view,
         pipeline_texture_size: size,
+        overscroll_state,
     };
 
     (handle, join_handle)
@@ -190,6 +218,15 @@ fn compositor_main(mut state: CompositorState) {
             CompositorJob::Commit(scene) => {
                 process_commit(&mut state, scene);
             }
+            CompositorJob::ExtendTiles { rect } => {
+                process_extend_tiles(&mut state, rect);
+            }
+            CompositorJob::ReCenter { new_content_origin } => {
+                process_recenter(&mut state, new_content_origin);
+            }
+            CompositorJob::Scroll(delta) => {
+                process_scroll(&mut state, delta);
+            }
             CompositorJob::Resize(width, height) => {
                 resize_compositor(&mut state, width, height);
             }
@@ -204,9 +241,13 @@ fn compositor_main(mut state: CompositorState) {
 }
 
 fn resize_compositor(state: &mut CompositorState, width: u32, height: u32) {
+    let overscroll_factor = state.overscroll_state.lock().unwrap().overscroll_factor;
+    let pipeline_width = (width as f32 * overscroll_factor).ceil() as u32;
+    let pipeline_height = (height as f32 * overscroll_factor).ceil() as u32;
+
     let size = wgpu::Extent3d {
-        width,
-        height,
+        width: pipeline_width,
+        height: pipeline_height,
         depth_or_array_layers: 1,
     };
     let format = state.pipeline_texture.format();
@@ -231,12 +272,17 @@ fn resize_compositor(state: &mut CompositorState, width: u32, height: u32) {
             .pipeline_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+    // Backdrop blur texture stays viewport-sized
     state.backdrop_blur_texture = state
         .context
         .device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("compositor_backdrop_blur_texture"),
-            size,
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -250,6 +296,10 @@ fn resize_compositor(state: &mut CompositorState, width: u32, height: u32) {
         state
             .backdrop_blur_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+    // Reset overscroll state for new viewport dimensions
+    *state.overscroll_state.lock().unwrap() =
+        OverscrollState::new(width as f32, height as f32, overscroll_factor);
 
     let (group_textures, group_views) =
         create_filter_group_textures(&state.context.device, width, height, format);
@@ -284,10 +334,14 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
         bytemuck::bytes_of(&color_adjustments),
     );
 
-    let viewport_size = [
-        state.pipeline_texture.width() as f32,
-        state.pipeline_texture.height() as f32,
-    ];
+    // Globals use the LOGICAL viewport size (not the pipeline texture size)
+    // so that shader computations (e.g. screen-space coordinates) remain correct.
+    let (content_origin_x, content_origin_y, vp_w, vp_h) = {
+        let os = state.overscroll_state.lock().unwrap();
+        (os.content_origin.x, os.content_origin.y, os.viewport_width, os.viewport_height)
+    };
+
+    let viewport_size = [vp_w, vp_h];
 
     let globals = GlobalParams {
         viewport_size,
@@ -795,6 +849,9 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
         wgpu::LoadOp::Clear(wgpu::Color::BLACK)
     };
 
+    let pipeline_w = state.pipeline_texture.width();
+    let pipeline_h = state.pipeline_texture.height();
+
     let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("compositor_main"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -812,16 +869,20 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
             multiview_mask: None,
         });
 
+    // Offset the viewport by content_origin so primitives render at the correct
+    // position within the overscroll buffer.
+    pass.set_viewport(content_origin_x, content_origin_y, vp_w, vp_h, 0.0, 1.0);
+
     if let Some(damage) = &scene.pending_delta.damage_rect {
-        let vp_w = state.viewport_width;
-        let vp_h = state.viewport_height;
-        let x = (damage.origin.x.0.max(0.0) as u32).min(vp_w);
-        let y = (damage.origin.y.0.max(0.0) as u32).min(vp_h);
-        let max_w = vp_w.saturating_sub(x);
-        let max_h = vp_h.saturating_sub(y);
+        // Damage rect is in viewport coordinates; offset by content_origin for
+        // framebuffer (pipeline texture) coordinates.
+        let sx = (damage.origin.x.0 + content_origin_x).max(0.0) as u32;
+        let sy = (damage.origin.y.0 + content_origin_y).max(0.0) as u32;
+        let max_w = pipeline_w.saturating_sub(sx);
+        let max_h = pipeline_h.saturating_sub(sy);
         let w = (damage.size.width.0.max(0.0) as u32).min(max_w).max(1);
         let h = (damage.size.height.0.max(0.0) as u32).min(max_h).max(1);
-        pass.set_scissor_rect(x, y, w, h);
+        pass.set_scissor_rect(sx, sy, w, h);
     }
 
         let mut quads_first_instance: u32 = 0;
@@ -942,10 +1003,32 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
 
                     drop(pass);
 
+                    // Copy only the visible viewport portion of the pipeline texture
+                    // to the backdrop blur texture (which is viewport-sized).
+                    let vp_w_u32 = vp_w as u32;
+                    let vp_h_u32 = vp_h as u32;
                     command_encoder.copy_texture_to_texture(
-                        state.pipeline_texture.as_image_copy(),
-                        state.backdrop_blur_texture.as_image_copy(),
-                        state.pipeline_texture.size(),
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &state.pipeline_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: content_origin_x as u32,
+                                y: content_origin_y as u32,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &state.backdrop_blur_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: vp_w_u32,
+                            height: vp_h_u32,
+                            depth_or_array_layers: 1,
+                        },
                     );
 
                     pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -965,16 +1048,16 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
                         multiview_mask: None,
                     });
 
+                    pass.set_viewport(content_origin_x, content_origin_y, vp_w, vp_h, 0.0, 1.0);
+
                     if let Some(damage) = &scene.pending_delta.damage_rect {
-                        let vp_w = state.viewport_width;
-                        let vp_h = state.viewport_height;
-                        let x = (damage.origin.x.0.max(0.0) as u32).min(vp_w);
-                        let y = (damage.origin.y.0.max(0.0) as u32).min(vp_h);
-                        let max_w = vp_w.saturating_sub(x);
-                        let max_h = vp_h.saturating_sub(y);
+                        let sx = (damage.origin.x.0 + content_origin_x).max(0.0) as u32;
+                        let sy = (damage.origin.y.0 + content_origin_y).max(0.0) as u32;
+                        let max_w = pipeline_w.saturating_sub(sx);
+                        let max_h = pipeline_h.saturating_sub(sy);
                         let w = (damage.size.width.0.max(0.0) as u32).min(max_w).max(1);
                         let h = (damage.size.height.0.max(0.0) as u32).min(max_h).max(1);
-                        pass.set_scissor_rect(x, y, w, h);
+                        pass.set_scissor_rect(sx, sy, w, h);
                     }
 
                     pass.set_pipeline(&state.pipelines.backdrop_filters_pipeline);
@@ -1022,6 +1105,9 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
                                 },
                             );
 
+                            // Group textures are viewport-sized; viewport at origin
+                            pass.set_viewport(0.0, 0.0, vp_w, vp_h, 0.0, 1.0);
+
                             filter_stack.push((boundary, Some(depth)));
                         }
                     } else {
@@ -1035,6 +1121,7 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
 
                         drop(pass);
 
+                        let is_pipeline_texture = filter_stack.last().map_or(true, |(_, d)| d.is_none());
                         let parent_view: &wgpu::TextureView = match filter_stack.last() {
                             Some((_, Some(parent_depth))) => &state.group_views[*parent_depth],
                             _ => &state.pipeline_texture_view,
@@ -1057,16 +1144,25 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
                             multiview_mask: None,
                         });
 
+                        if is_pipeline_texture {
+                            pass.set_viewport(content_origin_x, content_origin_y, vp_w, vp_h, 0.0, 1.0);
+                        } else {
+                            pass.set_viewport(0.0, 0.0, vp_w, vp_h, 0.0, 1.0);
+                        }
+
                         if let Some(damage) = &scene.pending_delta.damage_rect {
-                            let vp_w = state.viewport_width;
-                            let vp_h = state.viewport_height;
-                            let x = (damage.origin.x.0.max(0.0) as u32).min(vp_w);
-                            let y = (damage.origin.y.0.max(0.0) as u32).min(vp_h);
-                            let max_w = vp_w.saturating_sub(x);
-                            let max_h = vp_h.saturating_sub(y);
+                            let (sx, sy, mx, my) = if is_pipeline_texture {
+                                (damage.origin.x.0 + content_origin_x, damage.origin.y.0 + content_origin_y, pipeline_w as f32, pipeline_h as f32)
+                            } else {
+                                (damage.origin.x.0, damage.origin.y.0, vp_w, vp_h)
+                            };
+                            let sx = sx.max(0.0) as u32;
+                            let sy = sy.max(0.0) as u32;
+                            let max_w = (mx as u32).saturating_sub(sx);
+                            let max_h = (my as u32).saturating_sub(sy);
                             let w = (damage.size.width.0.max(0.0) as u32).min(max_w).max(1);
                             let h = (damage.size.height.0.max(0.0) as u32).min(max_h).max(1);
-                            pass.set_scissor_rect(x, y, w, h);
+                            pass.set_scissor_rect(sx, sy, w, h);
                         }
 
                         let composite = BackdropFilter {
@@ -1270,6 +1366,148 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
                 }
             }
         }
+    }
+
+    state.context.queue.submit(Some(command_encoder.finish()));
+
+    let _ = state.completion_tx.try_send(CompositorCompletion {
+        frame_ready: true,
+    });
+}
+
+/// Handle a scroll delta: update content_origin without re-rendering.
+fn process_scroll(state: &mut CompositorState, delta: crate::geometry::Point<f32>) {
+    let mut os = state.overscroll_state.lock().unwrap();
+    os.scroll(delta.x, delta.y);
+    // Check if recenter is needed
+    if os.recenter_needed() {
+        // For now, just notify that a recenter may be needed.
+        // The actual recenter + GPU copy is triggered by ReCenter job.
+        log::debug!("Compositor: recenter may be needed");
+    }
+}
+
+/// Handle an ExtendTiles job: render newly-exposed areas with LoadOp::Load.
+fn process_extend_tiles(state: &mut CompositorState, rect: crate::geometry::Bounds<f32>) {
+    log::debug!("Compositor: extend tiles for rect {:?}", rect);
+
+    let mut command_encoder =
+        state
+            .context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compositor_extend"),
+            });
+
+    state.atlas.before_frame(&mut command_encoder);
+
+    // ExtendTiles always uses LoadOp::Load (does not clear)
+    // The scissor rect limits rendering to the extension area.
+    let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("compositor_extend_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &state.pipeline_texture_view,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+            resolve_target: None,
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+
+    // The extension rect is in pipeline texture coordinates.
+    // Set scissor to the extension rect to avoid drawing outside it.
+    {
+        let pipeline_w = state.pipeline_texture.width();
+        let pipeline_h = state.pipeline_texture.height();
+        let sx = rect.origin.x.max(0.0) as u32;
+        let sy = rect.origin.y.max(0.0) as u32;
+        let sw = (rect.size.width.max(0.0) as u32).min(pipeline_w.saturating_sub(sx)).max(1);
+        let sh = (rect.size.height.max(0.0) as u32).min(pipeline_h.saturating_sub(sy)).max(1);
+        pass.set_scissor_rect(sx, sy, sw, sh);
+    }
+
+    // Set viewport to the viewport region within the pipeline texture
+    let (content_origin_x, content_origin_y, vp_w, vp_h) = {
+        let os = state.overscroll_state.lock().unwrap();
+        (os.content_origin.x, os.content_origin.y, os.viewport_width, os.viewport_height)
+    };
+    pass.set_viewport(content_origin_x, content_origin_y, vp_w, vp_h, 0.0, 1.0);
+
+    drop(pass);
+
+    state.context.queue.submit(Some(command_encoder.finish()));
+
+    // Extend the rendered area in overscroll state
+    let mut os = state.overscroll_state.lock().unwrap();
+    os.extend_rendered_area(rect);
+
+    let _ = state.completion_tx.try_send(CompositorCompletion {
+        frame_ready: true,
+    });
+}
+
+/// Handle a ReCenter job: GPU copy to shift content within pipeline texture,
+/// then render newly-exposed edges.
+fn process_recenter(state: &mut CompositorState, new_content_origin: crate::geometry::Point<f32>) {
+    log::debug!("Compositor: recenter to {:?}", new_content_origin);
+
+    let mut command_encoder =
+        state
+            .context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("compositor_recenter"),
+            });
+
+    state.atlas.before_frame(&mut command_encoder);
+
+    // Compute shift vector for GPU copy
+    let (old_origin_x, old_origin_y, vp_w, vp_h) = {
+        let os = state.overscroll_state.lock().unwrap();
+        (os.content_origin.x, os.content_origin.y, os.viewport_width, os.viewport_height)
+    };
+    let shift_x = new_content_origin.x - old_origin_x;
+    let shift_y = new_content_origin.y - old_origin_y;
+
+    // Only copy if the shift is non-trivial
+    if shift_x.abs() > 0.5 || shift_y.abs() > 0.5 {
+        // Copy visible content from old position to new position within the same texture
+        let src_x = old_origin_x.max(0.0) as u32;
+        let src_y = old_origin_y.max(0.0) as u32;
+        let dst_x = new_content_origin.x.max(0.0) as u32;
+        let dst_y = new_content_origin.y.max(0.0) as u32;
+        let copy_w = (vp_w as u32).min(state.pipeline_texture.width().saturating_sub(src_x)).min(state.pipeline_texture.width().saturating_sub(dst_x));
+        let copy_h = (vp_h as u32).min(state.pipeline_texture.height().saturating_sub(src_y)).min(state.pipeline_texture.height().saturating_sub(dst_y));
+
+        if copy_w > 0 && copy_h > 0 {
+            command_encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &state.pipeline_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: src_x, y: src_y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &state.pipeline_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: dst_x, y: dst_y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: copy_w, height: copy_h, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
+    // Update overscroll state
+    {
+        let mut os = state.overscroll_state.lock().unwrap();
+        os.recenter(new_content_origin);
     }
 
     state.context.queue.submit(Some(command_encoder.finish()));

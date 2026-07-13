@@ -285,6 +285,144 @@ impl geometry::Edges<ScaledPixels> {
     ];
 }
 
+/// Per-frame blit parameters for the overscroll-aware blit shader.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct BlitParamsRaw {
+    uv_origin: [f32; 2],
+    uv_size: [f32; 2],
+}
+
+/// Tracks the content position within an overscroll buffer for efficient
+/// scrolling without re-rendering.
+#[derive(Clone, Debug)]
+pub struct OverscrollState {
+    pub content_origin: crate::geometry::Point<f32>,
+    pub rendered_area: crate::geometry::Bounds<f32>,
+    pub overscroll_factor: f32,
+    pub viewport_width: f32,
+    pub viewport_height: f32,
+}
+
+impl OverscrollState {
+    pub fn new(viewport_w: f32, viewport_h: f32, factor: f32) -> Self {
+        let buffer_w = viewport_w * factor;
+        let buffer_h = viewport_h * factor;
+        Self {
+            content_origin: crate::geometry::point(
+                (buffer_w - viewport_w) / 2.0,
+                (buffer_h - viewport_h) / 2.0,
+            ),
+            rendered_area: crate::geometry::Bounds {
+                origin: crate::geometry::point(0.0, 0.0),
+                size: crate::geometry::size(buffer_w, buffer_h),
+            },
+            overscroll_factor: factor,
+            viewport_width: viewport_w,
+            viewport_height: viewport_h,
+        }
+    }
+
+    /// Compute UV origin/size for the blit, given current content_origin
+    pub fn compute_blit_uvs(&self) -> ([f32; 2], [f32; 2]) {
+        let buffer_w = self.viewport_width * self.overscroll_factor;
+        let buffer_h = self.viewport_height * self.overscroll_factor;
+        let uv_origin = [
+            self.content_origin.x / buffer_w,
+            self.content_origin.y / buffer_h,
+        ];
+        let uv_size = [
+            self.viewport_width / buffer_w,
+            self.viewport_height / buffer_h,
+        ];
+        (uv_origin, uv_size)
+    }
+
+    /// Check if a given viewport rect (in content coords) is within the rendered area
+    pub fn covers(&self, viewport_origin: crate::geometry::Point<f32>) -> bool {
+        let vp_bounds = crate::geometry::Bounds {
+            origin: viewport_origin,
+            size: crate::geometry::size(self.viewport_width, self.viewport_height),
+        };
+        vp_bounds.is_contained_within(&self.rendered_area)
+    }
+
+    /// Check if the content origin is approaching the edge of the buffer
+    pub fn nearly_exceeded(&self, margin: f32) -> Option<crate::geometry::Bounds<f32>> {
+        let margin_px = margin * self.viewport_width.min(self.viewport_height);
+        let vp_right = self.content_origin.x + self.viewport_width;
+        let vp_bottom = self.content_origin.y + self.viewport_height;
+        let ra_right = self.rendered_area.origin.x + self.rendered_area.size.width;
+        let ra_bottom = self.rendered_area.origin.y + self.rendered_area.size.height;
+
+        if vp_right > ra_right - margin_px {
+            return Some(crate::geometry::Bounds {
+                origin: crate::geometry::point(ra_right, self.content_origin.y),
+                size: crate::geometry::size(self.viewport_width * 0.5, self.viewport_height),
+            });
+        }
+        if self.content_origin.x < self.rendered_area.origin.x + margin_px {
+            return Some(crate::geometry::Bounds {
+                origin: crate::geometry::point(
+                    self.content_origin.x - self.viewport_width * 0.5,
+                    self.content_origin.y,
+                ),
+                size: crate::geometry::size(self.viewport_width * 0.5, self.viewport_height),
+            });
+        }
+        if vp_bottom > ra_bottom - margin_px {
+            return Some(crate::geometry::Bounds {
+                origin: crate::geometry::point(self.content_origin.x, ra_bottom),
+                size: crate::geometry::size(self.viewport_width, self.viewport_height * 0.5),
+            });
+        }
+        if self.content_origin.y < self.rendered_area.origin.y + margin_px {
+            return Some(crate::geometry::Bounds {
+                origin: crate::geometry::point(
+                    self.content_origin.x,
+                    self.content_origin.y - self.viewport_height * 0.5,
+                ),
+                size: crate::geometry::size(self.viewport_width, self.viewport_height * 0.5),
+            });
+        }
+        None
+    }
+
+    /// Re-center: shift content_origin to the center of the buffer
+    pub fn recenter_needed(&self) -> bool {
+        let buffer_w = self.viewport_width * self.overscroll_factor;
+        let buffer_h = self.viewport_height * self.overscroll_factor;
+        let center_x = (buffer_w - self.viewport_width) / 2.0;
+        let center_y = (buffer_h - self.viewport_height) / 2.0;
+        let drift = (self.content_origin.x - center_x)
+            .abs()
+            .max((self.content_origin.y - center_y).abs());
+        drift > (buffer_w * 0.25)
+    }
+
+    /// Record a scroll delta (moves content_origin, no rendering needed)
+    pub fn scroll(&mut self, delta_x: f32, delta_y: f32) {
+        self.content_origin.x -= delta_x;
+        self.content_origin.y -= delta_y;
+    }
+
+    /// Extend the rendered area to include new bounds
+    pub fn extend_rendered_area(&mut self, new_bounds: crate::geometry::Bounds<f32>) {
+        self.rendered_area = self.rendered_area.union(&new_bounds);
+    }
+
+    /// Re-center the content within the buffer for GPU copy
+    pub fn recenter(&mut self, new_origin: crate::geometry::Point<f32>) {
+        self.content_origin = new_origin;
+        let buffer_w = self.viewport_width * self.overscroll_factor;
+        let buffer_h = self.viewport_height * self.overscroll_factor;
+        self.rendered_area = crate::geometry::Bounds {
+            origin: crate::geometry::point(0.0, 0.0),
+            size: crate::geometry::size(buffer_w, buffer_h),
+        };
+    }
+}
+
 impl Bounds {
     const VERTEX_ATTRIBUTES: &'static [wgpu::VertexAttribute; 2] = &[
         wgpu::VertexAttribute {
@@ -1562,6 +1700,7 @@ pub struct WgpuRenderer {
     blit_pipeline: wgpu::RenderPipeline,
     blit_bind_group_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
+    blit_params_buffer: wgpu::Buffer,
 
     // Pipeline texture: offscreen render target (both sync and compositor modes)
     pipeline_texture: wgpu::Texture,
@@ -1732,6 +1871,16 @@ impl WgpuRenderer {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
 
@@ -1780,6 +1929,13 @@ impl WgpuRenderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
+        });
+
+        let blit_params_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blit_params_buffer"),
+            size: std::mem::size_of::<BlitParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         // ----- Pipeline texture (offscreen render target) -----------------------
@@ -1872,6 +2028,7 @@ impl WgpuRenderer {
             blit_pipeline,
             blit_bind_group_layout,
             blit_sampler,
+            blit_params_buffer,
             pipeline_texture,
             pipeline_texture_view,
             mode,
@@ -2924,12 +3081,33 @@ impl WgpuRenderer {
         log::debug!("Renderer::draw_sync: complete");
     }
 
-    /// Blit the pipeline_texture to the swapchain and present.
+    /// Blit the pipeline_texture to the swapchain and present (full-texture UVs).
     fn blit_to_swapchain(&self) {
+        self.blit_to_swapchain_inner([0.0, 0.0], [1.0, 1.0]);
+    }
+
+    /// Blit the pipeline_texture to the swapchain with given UV offset/size.
+    fn blit_to_swapchain_with_uvs(&self, uv_origin: [f32; 2], uv_size: [f32; 2]) {
+        self.blit_to_swapchain_inner(uv_origin, uv_size);
+    }
+
+    fn blit_to_swapchain_inner(&self, uv_origin: [f32; 2], uv_size: [f32; 2]) {
         let surface_texture = match self.acquire_swapchain() {
             Some(t) => t,
             None => return,
         };
+
+        // In compositor mode, read from the compositor's pipeline texture.
+        // In synchronous mode, read from the local pipeline texture.
+        let pipeline_view = match &self.mode {
+            WgpuRendererMode::Synchronous => &self.pipeline_texture_view,
+            WgpuRendererMode::Compositor(handle) => &handle.pipeline_texture_view,
+        };
+
+        let params = BlitParamsRaw { uv_origin, uv_size };
+        self.context
+            .queue
+            .write_buffer(&self.blit_params_buffer, 0, bytemuck::bytes_of(&params));
 
         let mut encoder =
             self.context
@@ -2950,11 +3128,19 @@ impl WgpuRenderer {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.pipeline_texture_view),
+                        resource: wgpu::BindingResource::TextureView(pipeline_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.blit_params_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
                     },
                 ],
             });
@@ -3039,13 +3225,72 @@ impl WgpuRenderer {
         match &self.mode {
             WgpuRendererMode::Synchronous => false,
             WgpuRendererMode::Compositor(handle) => {
-                match handle.completion_rx.try_recv() {
-                    Ok(_completion) => {
-                        self.blit_to_swapchain();
-                        true
+                if let Ok(_completion) = handle.completion_rx.try_recv() {
+                    // Three-case overscroll model:
+                    // 1. Viewport within rendered area → blit with UV offset (no re-render)
+                    // 2. Near edge → send ExtendTiles, still blit current
+                    // 3. Otherwise → fall through to full blit
+
+                    let (uv_origin, uv_size, _covers, extend) = {
+                        let os = handle.overscroll_state.lock().unwrap();
+                        let vp_origin = crate::geometry::point(
+                            os.content_origin.x,
+                            os.content_origin.y,
+                        );
+                        let covers = os.covers(vp_origin);
+                        let uvs = if covers {
+                            Some(os.compute_blit_uvs())
+                        } else {
+                            None
+                        };
+                        let extend = if !covers {
+                            os.nearly_exceeded(0.1)
+                        } else {
+                            None
+                        };
+                        (uvs.map(|(u, _)| u), uvs.map(|(_, s)| s), covers, extend)
+                    };
+
+                    if let (Some(uv_origin), Some(uv_size)) = (uv_origin, uv_size) {
+                        // Case 1: viewport within rendered area
+                        self.blit_to_swapchain_with_uvs(uv_origin, uv_size);
+                        return true;
                     }
-                    Err(_) => false,
+
+                    if let Some(extend_rect) = extend {
+                        // Case 2: near edge → request tile extension
+                        let _ = handle
+                            .job_tx
+                            .try_send(CompositorJob::ExtendTiles { rect: extend_rect });
+                        let (uv_origin, uv_size) = {
+                            let os = handle.overscroll_state.lock().unwrap();
+                            os.compute_blit_uvs()
+                        };
+                        self.blit_to_swapchain_with_uvs(uv_origin, uv_size);
+                        return true;
+                    }
+
+                    // Case 3: fall through to full blit (will trigger a commit)
+                    self.blit_to_swapchain();
+                    true
+                } else {
+                    false
                 }
+            }
+        }
+    }
+
+    /// Record a scroll delta without triggering a full re-render.
+    /// In compositor mode this sends a Scroll job to the compositor thread.
+    pub fn record_scroll(&self, delta: crate::geometry::Point<f32>) {
+        match &self.mode {
+            WgpuRendererMode::Synchronous => {
+                // In synchronous mode, no overscroll optimization yet
+            }
+            WgpuRendererMode::Compositor(handle) => {
+                let _ = handle
+                    .job_tx
+                    .try_send(CompositorJob::Scroll(delta));
             }
         }
     }
@@ -3247,7 +3492,18 @@ impl WgpuRenderer {
     /// Used in compositor mode when no new frame is ready but we still
     /// need to refresh the display (e.g. cursor blink).
     pub fn present_framebuffer_only(&self) {
-        self.blit_to_swapchain();
+        match &self.mode {
+            WgpuRendererMode::Synchronous => {
+                self.blit_to_swapchain();
+            }
+            WgpuRendererMode::Compositor(handle) => {
+                let (uv_origin, uv_size) = {
+                    let os = handle.overscroll_state.lock().unwrap();
+                    os.compute_blit_uvs()
+                };
+                self.blit_to_swapchain_with_uvs(uv_origin, uv_size);
+            }
+        }
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
