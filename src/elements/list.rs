@@ -31,6 +31,7 @@ pub fn list(
         render_item: Box::new(render_item),
         style: StyleRefinement::default(),
         sizing_behavior: ListSizingBehavior::default(),
+        use_overscroll_fast_path: true,
     }
 }
 
@@ -40,12 +41,22 @@ pub struct List {
     render_item: Box<RenderItemFn>,
     style: StyleRefinement,
     sizing_behavior: ListSizingBehavior,
+    use_overscroll_fast_path: bool,
 }
 
 impl List {
     /// Set the sizing behavior for the list.
     pub fn with_sizing_behavior(mut self, behavior: ListSizingBehavior) -> Self {
         self.sizing_behavior = behavior;
+        self
+    }
+
+    /// When enabled (default), scroll deltas are recorded via [`Window::record_scroll`],
+    /// bypassing a full re-render by using the overscroll buffer fast path.
+    /// Set to `false` for containers with variable-height content that would
+    /// invalidate the overscroll buffer's cached pixels.
+    pub fn overscroll_fast_path(mut self, enabled: bool) -> Self {
+        self.use_overscroll_fast_path = enabled;
         self
     }
 }
@@ -527,6 +538,7 @@ impl StateInner {
         height: Pixels,
         delta: Point<Pixels>,
         current_view: EntityId,
+        use_overscroll_fast_path: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -572,7 +584,11 @@ impl StateInner {
             );
         }
 
-        cx.notify(current_view);
+        if use_overscroll_fast_path {
+            window.record_scroll(delta);
+        } else {
+            cx.notify(current_view);
+        }
     }
 
     fn logical_scroll_top(&self) -> ListOffset {
@@ -1124,6 +1140,7 @@ impl Element for List {
         let height = bounds.size.height;
         let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
+        let use_overscroll_fast_path = self.use_overscroll_fast_path;
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
@@ -1134,6 +1151,7 @@ impl Element for List {
                     height,
                     pixel_delta,
                     current_view,
+                    use_overscroll_fast_path,
                     window,
                     cx,
                 )
@@ -1144,11 +1162,17 @@ impl Element for List {
         window.on_next_frame(move |window, cx| {
             let mut state_inner = state.0.borrow_mut();
 
+            let previous_visual = state_inner.smooth_scroll.visual_offset;
             let animating = state_inner.smooth_scroll.update();
 
             if animating {
                 window.request_animation_frame();
-                cx.notify(current_view);
+                if use_overscroll_fast_path {
+                    let delta = state_inner.smooth_scroll.visual_offset - previous_visual;
+                    window.record_scroll(point(px(0.), delta));
+                } else {
+                    cx.notify(current_view);
+                }
             }
         });
     }

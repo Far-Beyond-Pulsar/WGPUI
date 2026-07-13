@@ -91,6 +91,7 @@ impl Interactivity {
     #[track_caller]
     pub fn new() -> Interactivity {
         Interactivity {
+            use_overscroll_fast_path: true,
             source_location: Some(core::panic::Location::caller()),
             ..Default::default()
         }
@@ -99,7 +100,10 @@ impl Interactivity {
     /// Create an `Interactivity`, capturing the caller location in debug mode.
     #[cfg(not(any(feature = "inspector", debug_assertions)))]
     pub fn new() -> Interactivity {
-        Interactivity::default()
+        Interactivity {
+            use_overscroll_fast_path: true,
+            ..Default::default()
+        }
     }
 
     /// Gets the source location of construction. Returns `None` when not in debug mode.
@@ -1081,6 +1085,15 @@ pub trait InteractiveElement: Sized {
         self.interactivity().focus_visible_style = Some(Box::new(f(StyleRefinement::default())));
         self
     }
+
+    /// When enabled (default), scroll deltas are recorded via [`Window::record_scroll`],
+    /// bypassing a full re-render by using the overscroll buffer fast path.
+    /// Set to `false` for containers with variable-height content that would
+    /// invalidate the overscroll buffer's cached pixels.
+    fn overscroll_fast_path(mut self, enabled: bool) -> Self {
+        self.interactivity().use_overscroll_fast_path = enabled;
+        self
+    }
 }
 
 /// A trait for elements that want to use the standard GPUI interactivity features
@@ -1574,6 +1587,7 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) use_overscroll_fast_path: bool,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -1624,6 +1638,15 @@ pub struct Interactivity {
 }
 
 impl Interactivity {
+    /// When enabled (default), scroll deltas are recorded via [`Window::record_scroll`],
+    /// bypassing a full re-render by using the overscroll buffer fast path.
+    /// Set to `false` for containers with variable-height content that would
+    /// invalidate the overscroll buffer's cached pixels.
+    pub fn overscroll_fast_path(mut self, enabled: bool) -> Self {
+        self.use_overscroll_fast_path = enabled;
+        self
+    }
+
     /// Layout this element according to this interactivity state's configured styles
     pub fn request_layout(
         &mut self,
@@ -2559,6 +2582,7 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            let use_overscroll_fast_path = self.use_overscroll_fast_path;
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -2591,7 +2615,11 @@ impl Interactivity {
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
                     if *scroll_offset != old_scroll_offset {
-                        cx.notify(current_view);
+                        if use_overscroll_fast_path {
+                            window.record_scroll(point(delta_x, delta_y));
+                        } else {
+                            cx.notify(current_view);
+                        }
                     }
                 }
             });

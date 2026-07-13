@@ -984,6 +984,7 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    pub(crate) pending_scroll_delta: Rc<Cell<Point<Pixels>>>,
     pub(crate) last_input_timestamp: Rc<Cell<Instant>>,
     pub(crate) resizing_window: Rc<Cell<bool>>,
     last_input_modality: InputModality,
@@ -1156,6 +1157,7 @@ impl Window {
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let pending_scroll_delta = Rc::new(Cell::new(Point::default()));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
 
@@ -1418,6 +1420,7 @@ impl Window {
             active,
             hovered,
             needs_present,
+            pending_scroll_delta,
             last_input_timestamp,
             resizing_window: Rc::new(Cell::new(false)),
             last_input_modality: InputModality::Mouse,
@@ -2231,6 +2234,10 @@ impl Window {
             self.needs_present.set(false);
         }
 
+        // Reset pending scroll delta after it has been consumed by the
+        // overscroll buffer fast path during presentation.
+        self.pending_scroll_delta.set(Point::default());
+
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
@@ -2373,6 +2380,9 @@ impl Window {
     /// A full commit cycle is only needed when the viewport scrolls outside
     /// the rendered area.
     pub fn record_scroll(&self, delta: Point<Pixels>) {
+        let mut pending = self.pending_scroll_delta.get();
+        pending += delta;
+        self.pending_scroll_delta.set(pending);
         self.platform_window.record_scroll(delta);
         self.needs_present.set(true);
     }
