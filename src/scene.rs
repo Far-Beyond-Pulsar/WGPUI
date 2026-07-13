@@ -18,7 +18,7 @@ pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 pub(crate) type DrawOrder = u32;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
@@ -231,6 +231,7 @@ pub(crate) enum PrimitiveKind {
     FilterBoundaryEnd,
 }
 
+#[derive(Clone)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),

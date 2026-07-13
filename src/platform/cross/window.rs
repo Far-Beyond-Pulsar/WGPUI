@@ -407,6 +407,14 @@ impl PlatformWindow for CrossWindow {
         }
     }
 
+    fn try_present(&self) -> bool {
+        if let Some(renderer) = self.0.renderer.get() {
+            renderer.borrow().try_present()
+        } else {
+            false
+        }
+    }
+
     fn present_framebuffer_only(&self) {
         if let Some(renderer) = self.0.renderer.get() {
             renderer.borrow().present_framebuffer_only();

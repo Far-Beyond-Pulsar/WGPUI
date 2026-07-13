@@ -10,6 +10,7 @@ use crate::{
     ScaledPixels, Scene, TransformationMatrix, color, geometry,
     platform::cross::{
         atlas::WgpuAtlas,
+        compositor::{CompositorCompletion, CompositorJob, start_compositor, CompositorHandle},
         render_context::{WgpuContext, ensure_buffer_size},
         surface_registry::SurfaceId,
     },
@@ -193,10 +194,10 @@ impl color::TextColor {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GlobalParams {
-    viewport_size: [f32; 2],
-    premultimated_alpha: u32,
-    pad: u32,
+pub(crate) struct GlobalParams {
+    pub(crate) viewport_size: [f32; 2],
+    pub(crate) premultimated_alpha: u32,
+    pub(crate) pad: u32,
 }
 
 impl GlobalParams {
@@ -221,9 +222,9 @@ impl GlobalParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Bounds {
-    origin: [f32; 2],
-    size: [f32; 2],
+pub(crate) struct Bounds {
+    pub(crate) origin: [f32; 2],
+    pub(crate) size: [f32; 2],
 }
 
 impl geometry::Corners<ScaledPixels> {
@@ -300,9 +301,9 @@ impl Bounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct SurfaceParams {
-    bounds: Bounds,
-    content_mask: Bounds,
+pub(crate) struct SurfaceParams {
+    pub(crate) bounds: Bounds,
+    pub(crate) content_mask: Bounds,
 }
 
 impl Quad {
@@ -403,12 +404,12 @@ struct PathsData {
 /// Layout must exactly match the `GpuPathVertex` struct in `paths.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GpuPathVertex {
-    xy_position: [f32; 2],         // offset  0
-    st_position: [f32; 2],         // offset  8
-    hsla: [f32; 4],                // offset 16  (h, s, l, a)
-    content_mask_origin: [f32; 2], // offset 32
-    content_mask_size: [f32; 2],   // offset 40
+pub(crate) struct GpuPathVertex {
+    pub(crate) xy_position: [f32; 2],         // offset  0
+    pub(crate) st_position: [f32; 2],         // offset  8
+    pub(crate) hsla: [f32; 4],                // offset 16  (h, s, l, a)
+    pub(crate) content_mask_origin: [f32; 2], // offset 32
+    pub(crate) content_mask_size: [f32; 2],   // offset 40
 } // stride  48
 
 struct UnderlinesData {
@@ -657,43 +658,44 @@ impl MonochromeSprite {
 
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-struct ColorAdjustments {
-    gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
-    _padding: [f32; 3],
+pub(crate) struct ColorAdjustments {
+    pub(crate) gamma_ratios: [f32; 4],
+    pub(crate) grayscale_enhanced_contrast: f32,
+    pub(crate) _padding: [f32; 3],
 }
 
-struct WgpuPipelines {
-    color_targets: Vec<Option<wgpu::ColorTargetState>>,
+pub(crate) struct WgpuPipelines {
+    pub(crate) color_targets: Vec<Option<wgpu::ColorTargetState>>,
 
-    quads_bind_group_layout: wgpu::BindGroupLayout,
-    shadows_bind_group_layout: wgpu::BindGroupLayout,
-    backdrop_filters_bind_group_layout: wgpu::BindGroupLayout,
-    backdrop_texture_bind_group_layout: wgpu::BindGroupLayout,
-    underlines_bind_group_layout: wgpu::BindGroupLayout,
-    sprites_bind_group_layout: wgpu::BindGroupLayout,
-    mono_sprites_bind_group_layout: wgpu::BindGroupLayout,
-    poly_sprites_bind_group_layout: wgpu::BindGroupLayout,
-    surfaces_bind_group_layout: wgpu::BindGroupLayout,
-    paths_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) quads_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) shadows_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) backdrop_filters_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) backdrop_texture_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) underlines_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) sprites_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) mono_sprites_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) poly_sprites_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) surfaces_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) paths_bind_group_layout: wgpu::BindGroupLayout,
 
-    globals_bind_group: wgpu::BindGroup,
-    color_adjustments_bind_group: wgpu::BindGroup,
+    pub(crate) globals_bind_group: wgpu::BindGroup,
+    pub(crate) color_adjustments_bind_group: wgpu::BindGroup,
 
-    quads_pipeline: wgpu::RenderPipeline,
-    shadows_pipeline: wgpu::RenderPipeline,
-    backdrop_filters_pipeline: wgpu::RenderPipeline,
-    underlines_pipeline: wgpu::RenderPipeline,
-    mono_sprites_pipeline: wgpu::RenderPipeline,
-    poly_sprites_pipeline: wgpu::RenderPipeline,
-    surfaces_pipeline: wgpu::RenderPipeline,
-    paths_pipeline: wgpu::RenderPipeline,
+    pub(crate) quads_pipeline: wgpu::RenderPipeline,
+    pub(crate) shadows_pipeline: wgpu::RenderPipeline,
+    pub(crate) backdrop_filters_pipeline: wgpu::RenderPipeline,
+    pub(crate) underlines_pipeline: wgpu::RenderPipeline,
+    pub(crate) mono_sprites_pipeline: wgpu::RenderPipeline,
+    pub(crate) poly_sprites_pipeline: wgpu::RenderPipeline,
+    pub(crate) surfaces_pipeline: wgpu::RenderPipeline,
+    pub(crate) paths_pipeline: wgpu::RenderPipeline,
 }
 
 impl WgpuPipelines {
-    pub fn new(
+    pub(crate) fn new(
         context: &WgpuContext,
-        surface_configuration: &wgpu::SurfaceConfiguration,
+        format: wgpu::TextureFormat,
+        alpha_mode: wgpu::CompositeAlphaMode,
         _path_sample_count: u32,
     ) -> Self {
         let quads_shader = context
@@ -747,7 +749,7 @@ impl WgpuPipelines {
                     ),
                 });
 
-        let blend_mode = match surface_configuration.alpha_mode {
+        let blend_mode = match alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied => {
                 wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
             }
@@ -755,7 +757,7 @@ impl WgpuPipelines {
         };
 
         let color_targets = &[Some(wgpu::ColorTargetState {
-            format: surface_configuration.format,
+            format,
             blend: Some(blend_mode),
             write_mask: wgpu::ColorWrites::ALL,
         })];
@@ -1382,14 +1384,14 @@ impl WgpuPipelines {
     }
 }
 
-struct RenderingParameters {
-    path_sample_count: u32,
-    gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
+pub(crate) struct RenderingParameters {
+    pub(crate) path_sample_count: u32,
+    pub(crate) gamma_ratios: [f32; 4],
+    pub(crate) grayscale_enhanced_contrast: f32,
 }
 
 impl RenderingParameters {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         use std::env;
 
         let path_sample_count = env::var("ZED_PATH_SAMPLE_COUNT")
@@ -1418,7 +1420,7 @@ impl RenderingParameters {
 
 /// Cached bounds information for fast surface blitting
 #[derive(Clone, Debug)]
-struct SurfaceBoundsEntry {
+pub(crate) struct SurfaceBoundsEntry {
     /// Screen-space bounds where the surface should be rendered
     screen_bounds: geometry::Bounds<Pixels>,
     /// Content mask for clipping
@@ -1430,11 +1432,11 @@ struct SurfaceBoundsEntry {
 /// Maximum nesting depth supported for CSS-style content `filter` groups
 /// (`with_filter_layer`). Groups nested deeper than this are painted inline,
 /// unisolated and unblurred, rather than allocating unbounded offscreen textures.
-const MAX_FILTER_DEPTH: usize = 4;
+pub(crate) const MAX_FILTER_DEPTH: usize = 4;
 
 /// Allocates the pool of full-surface-sized offscreen textures that
 /// content-filter groups render into, one per supported nesting depth.
-fn create_filter_group_textures(
+pub(crate) fn create_filter_group_textures(
     device: &wgpu::Device,
     width: u32,
     height: u32,
@@ -1463,6 +1465,16 @@ fn create_filter_group_textures(
         .unzip()
 }
 
+/// Operating mode for the renderer — synchronous (immediate) vs. compositor (off-thread).
+pub(crate) enum WgpuRendererMode {
+    /// Render directly to pipeline_texture, then blit to swapchain synchronously
+    /// (the current behaviour). Always available; the fallback path.
+    Synchronous,
+    /// Delegate scene rendering to a dedicated compositor thread.
+    /// The main thread only blits the compositor's output to the swapchain.
+    Compositor(CompositorHandle),
+}
+
 pub struct WgpuRenderer {
     context: Arc<WgpuContext>,
     surface: ManuallyDrop<wgpu::Surface<'static>>,
@@ -1472,6 +1484,18 @@ pub struct WgpuRenderer {
     atlas: Arc<WgpuAtlas>,
     pipelines: WgpuPipelines,
     rendering_parameters: RenderingParameters,
+
+    // Blit pipeline: copies pipeline_texture → swapchain
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bind_group_layout: wgpu::BindGroupLayout,
+    blit_sampler: wgpu::Sampler,
+
+    // Pipeline texture: offscreen render target (both sync and compositor modes)
+    pipeline_texture: wgpu::Texture,
+    pipeline_texture_view: wgpu::TextureView,
+
+    // Current renderer mode
+    mode: WgpuRendererMode,
 
     // cache bind groups for each double-buffered surface (index 0/1)
     surface_bind_groups:
@@ -1599,7 +1623,106 @@ impl WgpuRenderer {
         });
 
         let pipelines =
-            WgpuPipelines::new(context.as_ref(), &surface_configuration, path_sample_count);
+            WgpuPipelines::new(context.as_ref(), format, alpha_mode, path_sample_count);
+
+        // ----- Blit pipeline (pipeline_texture → swapchain) --------------------
+        let blit_shader = context
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("blit_shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blit.wgsl").into()),
+            });
+
+        let blit_bind_group_layout =
+            context
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("blit_bind_group_layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let blit_pipeline_layout =
+            context
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("blit_pipeline_layout"),
+                    bind_group_layouts: &[Some(&blit_bind_group_layout)],
+                    immediate_size: 0,
+                });
+
+        let blit_pipeline = context.device.create_render_pipeline(
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("blit"),
+                layout: Some(&blit_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &blit_shader,
+                    entry_point: Some("vs_blit"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &blit_shader,
+                    entry_point: Some("fs_blit"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            },
+        );
+
+        let blit_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // ----- Pipeline texture (offscreen render target) -----------------------
+        let pipeline_texture = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pipeline_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let pipeline_texture_view = pipeline_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create persistent framebuffer for browser-canvas-style blitting
         let persistent_framebuffer = context.device.create_texture(&wgpu::TextureDescriptor {
@@ -1644,6 +1767,21 @@ impl WgpuRenderer {
         let (group_textures, group_views) =
             create_filter_group_textures(&context.device, width, height, format);
 
+        let mode = if std::env::var("WGPUI_COMPOSITOR").is_ok() {
+            let (handle, _join_handle) = start_compositor(
+                context.clone(),
+                atlas.clone(),
+                format,
+                alpha_mode,
+                width,
+                height,
+                path_sample_count,
+            );
+            WgpuRendererMode::Compositor(handle)
+        } else {
+            WgpuRendererMode::Synchronous
+        };
+
         Ok(Self {
             context: context.clone(),
             surface: ManuallyDrop::new(surface),
@@ -1654,6 +1792,12 @@ impl WgpuRenderer {
             backdrop_blur_sampler,
             pipelines,
             rendering_parameters: RenderingParameters::from_env(),
+            blit_pipeline,
+            blit_bind_group_layout,
+            blit_sampler,
+            pipeline_texture,
+            pipeline_texture_view,
+            mode,
             surface_bind_groups: Mutex::new(HashMap::new()),
             persistent_framebuffer: Some(persistent_framebuffer),
             persistent_framebuffer_view: Some(persistent_framebuffer_view),
@@ -1667,26 +1811,32 @@ impl WgpuRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
-        log::debug!("Renderer::draw: starting frame");
+        match &self.mode {
+            WgpuRendererMode::Synchronous => {
+                self.draw_sync(scene);
+            }
+            WgpuRendererMode::Compositor(handle) => {
+                self.draw_compositor(scene, handle);
+            }
+        }
+    }
+
+    /// Synchronous rendering path: render to pipeline_texture, then blit to swapchain.
+    fn draw_sync(&mut self, scene: &Scene) {
+        log::debug!("Renderer::draw_sync: starting");
 
         let mut command_encoder =
             self.context
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("main"),
+                    label: Some("sync"),
                 });
 
         self.atlas.before_frame(&mut command_encoder);
-        log::trace!("Renderer::draw: atlas.before_frame complete");
 
-        // keep track of which surface ids we rendered this frame
         let mut seen_surfaces: Vec<crate::platform::cross::surface_registry::SurfaceId> =
             Vec::new();
-
-        // CRITICAL: Keep surface views alive until after the render pass ends
-        // The bind groups reference these views, so they must not be dropped early
         let mut surface_views: Vec<wgpu::TextureView> = Vec::new();
-        // Surface bind groups also reference per-surface params buffers.
         let mut surface_param_buffers: Vec<wgpu::Buffer> = Vec::new();
 
         let color_adjustments = ColorAdjustments {
@@ -1824,7 +1974,6 @@ impl WgpuRenderer {
             );
         }
 
-        // Build flat vertex array for all paths (color + content mask baked per-vertex)
         let mut flat_path_vertices: Vec<GpuPathVertex> = Vec::new();
         for path in &scene.paths {
             let color = path.color.solid;
@@ -1857,49 +2006,6 @@ impl WgpuRenderer {
             );
         }
 
-        // Acquire the next swapchain image.  On the first frame after window
-        // creation (or after a resize races with the GPU) the surface can be
-        // reported as `Outdated` or `Other`.  Rather than panicking we
-        // reconfigure and retry once; if the second attempt also fails we
-        // simply drop this frame.
-        let surface_texture = {
-            let first = self.surface.get_current_texture();
-            match first {
-                Ok(t) => t,
-                Err(wgpu::SurfaceError::Outdated)
-                | Err(wgpu::SurfaceError::Lost)
-                | Err(wgpu::SurfaceError::Other) => {
-                    // Reconfigure with the current known size and retry.
-                    self.surface
-                        .configure(&self.context.device, &self.surface_configuration);
-                    match self.surface.get_current_texture() {
-                        Ok(t) => t,
-                        Err(e) => {
-                            log::warn!(
-                                "Skipping frame: failed to acquire swap chain texture after reconfigure: {:?}",
-                                e
-                            );
-                            return;
-                        }
-                    }
-                }
-                Err(wgpu::SurfaceError::Timeout) => {
-                    log::warn!("Skipping frame: swap chain acquire timed out");
-                    return;
-                }
-                Err(wgpu::SurfaceError::OutOfMemory) => {
-                    log::warn!("Skipping frame: out of memory");
-                    return;
-                }
-            }
-        };
-
-        // Increment layout version - all bounds caches are now fresh
-        // IMPORTANT: Only increment after successful swapchain acquisition
-        // If we skip the frame, bounds remain valid
-        self.layout_version.fetch_add(1, Ordering::Release);
-
-        // Borrow buffers for bind group creation - these borrows must live until bind groups are done
         let quads_buffer_ref = self.context.quads_buffer.lock().unwrap();
         let shadows_buffer_ref = self.context.shadows_buffer.lock().unwrap();
         let backdrop_filters_buffer_ref = self.context.backdrop_filters_buffer.lock().unwrap();
@@ -2041,13 +2147,10 @@ impl WgpuRenderer {
             });
 
         {
-            // Render to swapchain directly for now (TODO: render to framebuffer, then blit)
             let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main"),
+                label: Some("sync_pipeline"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_texture
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default()),
+                    view: &self.pipeline_texture_view,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -2069,10 +2172,6 @@ impl WgpuRenderer {
             let mut poly_sprites_first_instance: u32 = 0;
             let mut paths_vertex_offset: u32 = 0;
 
-            // Stack of active content-filter groups. Each entry pairs the group's
-            // `FilterBoundary` start marker with the `group_textures`/`group_views`
-            // slot its content is being rendered into (`None` if the group exceeded
-            // `MAX_FILTER_DEPTH` and is being painted inline, unisolated).
             let mut filter_stack: Vec<(FilterBoundary, Option<usize>)> = Vec::new();
 
             for batch in scene.batches() {
@@ -2176,33 +2275,25 @@ impl WgpuRenderer {
                     PrimitiveBatch::BackdropFilters(backdrop_filters) => {
                         let count = backdrop_filters.len() as u32;
 
-                        // End the current render pass to copy texture
                         drop(pass);
 
-                        // Copy surface texture to backdrop_blur_texture for sampling
                         if let Some(ref blur_texture) = self.backdrop_blur_texture {
-                            // Use actual surface texture size (may differ from configured size)
-                            let surface_size = surface_texture.texture.size();
-
-                            // Only copy if sizes match (otherwise skip to avoid validation error)
-                            if surface_size.width == blur_texture.width()
-                                && surface_size.height == blur_texture.height()
+                            let pipeline_size = self.pipeline_texture.size();
+                            if pipeline_size.width == blur_texture.width()
+                                && pipeline_size.height == blur_texture.height()
                             {
                                 command_encoder.copy_texture_to_texture(
-                                    surface_texture.texture.as_image_copy(),
+                                    self.pipeline_texture.as_image_copy(),
                                     blur_texture.as_image_copy(),
-                                    surface_size,
+                                    pipeline_size,
                                 );
                             }
                         }
 
-                        // Begin new render pass with Load to preserve existing content
                         pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("main_resumed"),
+                            label: Some("sync_backdrop_resumed"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &surface_texture
-                                    .texture
-                                    .create_view(&wgpu::TextureViewDescriptor::default()),
+                                view: &self.pipeline_texture_view,
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Load,
                                     store: wgpu::StoreOp::Store,
@@ -2216,7 +2307,6 @@ impl WgpuRenderer {
                             multiview_mask: None,
                         });
 
-                        // Now render the backdrop blur quads
                         pass.set_pipeline(&self.pipelines.backdrop_filters_pipeline);
                         pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
                         pass.set_bind_group(1, &backdrop_filters_bind_group, &[]);
@@ -2233,14 +2323,12 @@ impl WgpuRenderer {
                         if boundary.is_start {
                             let depth = filter_stack.len();
                             if depth >= self.group_textures.len() {
-                                // Exceeded the supported nesting depth: paint the group's
-                                // content inline (unisolated/unblurred) rather than dropping it.
                                 filter_stack.push((boundary, None));
                             } else {
                                 drop(pass);
 
                                 pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("filter_group"),
+                                    label: Some("sync_filter_group"),
                                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                         view: &self.group_views[depth],
                                         ops: wgpu::Operations {
@@ -2264,24 +2352,18 @@ impl WgpuRenderer {
                             };
 
                             let Some(depth) = depth else {
-                                // The group was painted inline; nothing to composite.
                                 continue;
                             };
 
-                            // End the group's pass: its content is now baked into
-                            // `group_textures[depth]`.
                             drop(pass);
 
-                            let surface_view = surface_texture
-                                .texture
-                                .create_view(&wgpu::TextureViewDescriptor::default());
                             let parent_view: &wgpu::TextureView = match filter_stack.last() {
                                 Some((_, Some(parent_depth))) => &self.group_views[*parent_depth],
-                                _ => &surface_view,
+                                _ => &self.pipeline_texture_view,
                             };
 
                             pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("filter_group_resumed"),
+                                label: Some("sync_filter_group_resumed"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                     view: parent_view,
                                     ops: wgpu::Operations {
@@ -2297,9 +2379,6 @@ impl WgpuRenderer {
                                 multiview_mask: None,
                             });
 
-                            // Composite the blurred group content back over the parent using
-                            // the same backdrop-filter pipeline, sampling from the group's
-                            // offscreen texture instead of a surface snapshot.
                             let composite = BackdropFilter {
                                 order: 0,
                                 bounds: start_boundary.bounds,
@@ -2372,10 +2451,8 @@ impl WgpuRenderer {
                         underlines_first_instance += count;
                     }
                     PrimitiveBatch::Surfaces(surfaces) => {
-                        log::debug!("Renderer: processing {} surface(s)", surfaces.len());
                         for surface in surfaces {
                             if let crate::SurfaceContent::Wgpu(surface_id) = &surface.content {
-                                // Atomically swap ready ↔ display buffers with GPU sync
                                 let _swapped = self
                                     .context
                                     .surface_registry
@@ -2407,8 +2484,6 @@ impl WgpuRenderer {
                                         },
                                     };
 
-                                    // Cache bounds for fast surface blitting
-                                    // Surface bounds are in ScaledPixels (f32), store as Pixels for caching
                                     self.surface_bounds_cache.lock().unwrap().insert(
                                         *surface_id,
                                         SurfaceBoundsEntry {
@@ -2490,14 +2565,9 @@ impl WgpuRenderer {
                                     pass.set_bind_group(1, &surface_bind_group, &[]);
                                     pass.draw(0..4, 0..1);
 
-                                    // CRITICAL: Keep view alive until after render pass ends
-                                    // The bind_group holds a reference to it
                                     surface_views.push(view);
                                     surface_param_buffers.push(params_buffer);
 
-                                    // Clear redraw pending AFTER we're done with the view
-                                    // This prevents the external thread from triggering another compositor
-                                    // pass while we're still using this view
                                     self.context
                                         .surface_registry
                                         .clear_redraw_pending(*surface_id);
@@ -2507,7 +2577,6 @@ impl WgpuRenderer {
                             }
                         }
                     }
-                    // TODO(mdeand): Implement paths rendering.
                     PrimitiveBatch::Paths(paths) => {
                         let vertex_count: u32 = paths.iter().map(|p| p.vertices.len() as u32).sum();
                         if vertex_count > 0 {
@@ -2525,13 +2594,137 @@ impl WgpuRenderer {
             }
         }
 
-        // TODO: Blit persistent framebuffer to swapchain (needs proper pipeline)
-
-        log::debug!("Renderer::draw: submitting command buffer");
+        // Submit the render commands, then blit to swapchain and present
         self.context.queue.submit(Some(command_encoder.finish()));
-        log::debug!("Renderer::draw: presenting surface");
+
+        self.blit_to_swapchain();
+        log::debug!("Renderer::draw_sync: complete");
+    }
+
+    /// Blit the pipeline_texture to the swapchain and present.
+    fn blit_to_swapchain(&self) {
+        let surface_texture = match self.acquire_swapchain() {
+            Some(t) => t,
+            None => return,
+        };
+
+        let mut encoder =
+            self.context
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("blit_to_swapchain"),
+                });
+
+        let swapchain_view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let blit_bind_group = self
+            .context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blit_bind_group"),
+                layout: &self.blit_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.pipeline_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                    },
+                ],
+            });
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blit_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &swapchain_view,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                resolve_target: None,
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        pass.set_pipeline(&self.blit_pipeline);
+        pass.set_bind_group(0, &blit_bind_group, &[]);
+        pass.draw(0..4, 0..1);
+        drop(pass);
+
+        self.context.queue.submit(Some(encoder.finish()));
         surface_texture.present();
-        log::debug!("Renderer::draw: frame complete");
+    }
+
+    /// Acquire the swapchain texture with error handling.
+    fn acquire_swapchain(&self) -> Option<wgpu::SurfaceTexture> {
+        let first = self.surface.get_current_texture();
+        match first {
+            Ok(t) => Some(t),
+            Err(wgpu::SurfaceError::Outdated)
+            | Err(wgpu::SurfaceError::Lost)
+            | Err(wgpu::SurfaceError::Other) => {
+                self.surface
+                    .configure(&self.context.device, &self.surface_configuration);
+                match self.surface.get_current_texture() {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to acquire swapchain after reconfigure: {:?}",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            Err(wgpu::SurfaceError::Timeout) => {
+                log::warn!("Swapchain acquire timed out");
+                None
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                log::warn!("Swapchain acquire: out of memory");
+                None
+            }
+        }
+    }
+
+    /// Compositor path: send the scene to the compositor thread.
+    /// Returns immediately. The main thread polls `try_present()` to blit the
+    /// completed frame to the swapchain on a subsequent `RedrawRequested`.
+    fn draw_compositor(&self, scene: &Scene, handle: &CompositorHandle) {
+        // Clone the scene to send across threads.
+        // The compositor thread takes ownership.
+        let scene = scene.clone();
+
+        if let Err(e) = handle.job_tx.try_send(CompositorJob::Commit(scene)) {
+            log::warn!(
+                "Compositor: channel full, dropping frame: {:?}",
+                e
+            );
+        }
+    }
+
+    /// Try to present a completed compositor frame.
+    /// Returns `true` if a frame was blitted to the swapchain.
+    pub fn try_present(&self) -> bool {
+        match &self.mode {
+            WgpuRendererMode::Synchronous => false,
+            WgpuRendererMode::Compositor(handle) => {
+                match handle.completion_rx.try_recv() {
+                    Ok(_completion) => {
+                        self.blit_to_swapchain();
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+        }
     }
 
     /// Fast path: blit all visible surfaces in a single swapchain pass.
@@ -2727,11 +2920,11 @@ impl WgpuRenderer {
         }
     }
 
-    /// Present without running compositor (fast blit already updated swapchain)
+    /// Present the last good frame from pipeline_texture to swapchain.
+    /// Used in compositor mode when no new frame is ready but we still
+    /// need to refresh the display (e.g. cursor blink).
     pub fn present_framebuffer_only(&self) {
-        // NOTE: Fast blit already presented to swapchain, so this is a no-op
-        // When we implement persistent framebuffer properly, this will blit framebuffer → swapchain
-        log::debug!("Present framebuffer only (no compositor) - fast blit already presented");
+        self.blit_to_swapchain();
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
@@ -2739,6 +2932,33 @@ impl WgpuRenderer {
         self.surface_configuration.height = size.height.0 as u32;
         self.surface
             .configure(&self.context.device, &self.surface_configuration);
+
+        // Recreate pipeline texture at new size
+        let format = self.surface_configuration.format;
+        let new_size = wgpu::Extent3d {
+            width: self.surface_configuration.width,
+            height: self.surface_configuration.height,
+            depth_or_array_layers: 1,
+        };
+        let pipeline_texture = self
+            .context
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("pipeline_texture"),
+                size: new_size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+        let pipeline_texture_view =
+            pipeline_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.pipeline_texture = pipeline_texture;
+        self.pipeline_texture_view = pipeline_texture_view;
 
         // Recreate persistent framebuffer at new size
         let persistent_framebuffer = self
@@ -2754,7 +2974,7 @@ impl WgpuRenderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: self.surface_configuration.format,
+                format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
@@ -2781,7 +3001,7 @@ impl WgpuRenderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: self.surface_configuration.format,
+                format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_DST,
@@ -2799,7 +3019,7 @@ impl WgpuRenderer {
             &self.context.device,
             self.surface_configuration.width,
             self.surface_configuration.height,
-            self.surface_configuration.format,
+            format,
         );
         self.group_textures = group_textures;
         self.group_views = group_views;

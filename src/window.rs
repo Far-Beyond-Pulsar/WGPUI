@@ -2226,6 +2226,11 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw<'app>(&mut self, cx: &'app mut App) -> ArenaClearNeeded<'app> {
+        // Try to present any completed compositor frame before starting a new one.
+        if self.platform_window.try_present() {
+            self.needs_present.set(false);
+        }
+
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
