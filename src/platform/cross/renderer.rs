@@ -314,11 +314,8 @@ impl OverscrollState {
                 (buffer_h - viewport_h) / 2.0,
             ),
             rendered_area: crate::geometry::Bounds {
-                origin: crate::geometry::point(
-                    (buffer_w - viewport_w) / 2.0,
-                    (buffer_h - viewport_h) / 2.0,
-                ),
-                size: crate::geometry::size(viewport_w, viewport_h),
+                origin: crate::geometry::point(0.0, 0.0),
+                size: crate::geometry::size(buffer_w, buffer_h),
             },
             overscroll_factor: factor,
             viewport_width: viewport_w,
@@ -3228,72 +3225,90 @@ impl WgpuRenderer {
         match &self.mode {
             WgpuRendererMode::Synchronous => false,
             WgpuRendererMode::Compositor(handle) => {
-                if let Ok(_completion) = handle.completion_rx.try_recv() {
-                    // Three-case overscroll model:
-                    // 1. Viewport within rendered area → blit with UV offset (no re-render)
-                    // 2. Near edge → send ExtendTiles, still blit current
-                    // 3. Otherwise → fall through to full blit
-
-                    let (uv_origin, uv_size, _covers, extend) = {
-                        let os = handle.overscroll_state.lock().unwrap();
-                        let vp_origin = crate::geometry::point(
-                            os.content_origin.x,
-                            os.content_origin.y,
-                        );
-                        let covers = os.covers(vp_origin);
-                        let uvs = if covers {
-                            Some(os.compute_blit_uvs())
-                        } else {
-                            None
-                        };
-                        let extend = if !covers {
-                            os.nearly_exceeded(0.1)
-                        } else {
-                            None
-                        };
-                        (uvs.map(|(u, _)| u), uvs.map(|(_, s)| s), covers, extend)
-                    };
-
-                    if let (Some(uv_origin), Some(uv_size)) = (uv_origin, uv_size) {
-                        // Case 1: viewport within rendered area
+                // Always try overscroll blit first — this handles pure scroll
+                // events where no Commit was sent to the compositor.
+                {
+                    let os = handle.overscroll_state.lock().unwrap();
+                    let vp_origin = crate::geometry::point(
+                        os.content_origin.x,
+                        os.content_origin.y,
+                    );
+                    if os.covers(vp_origin) {
+                        let (uv_origin, uv_size) = os.compute_blit_uvs();
+                        drop(os);
                         self.blit_to_swapchain_with_uvs(uv_origin, uv_size);
                         return true;
                     }
-
-                    if let Some(extend_rect) = extend {
-                        // Case 2: near edge → request tile extension
-                        let _ = handle
-                            .job_tx
-                            .try_send(CompositorJob::ExtendTiles { rect: extend_rect });
-                        let (uv_origin, uv_size) = {
-                            let os = handle.overscroll_state.lock().unwrap();
-                            os.compute_blit_uvs()
-                        };
-                        self.blit_to_swapchain_with_uvs(uv_origin, uv_size);
-                        return true;
-                    }
-
-                    // Case 3: fall through to full blit (will trigger a commit)
-                    self.blit_to_swapchain();
-                    true
-                } else {
-                    false
                 }
+
+                // Viewport not covered by cached content — need a commit.
+                // Poll for a completed one and try to blit it.
+                let _completion = match handle.completion_rx.try_recv() {
+                    Ok(c) => c,
+                    Err(_) => return false,
+                };
+
+                // Three-case overscroll model for newly committed frames:
+                // 1. Viewport within rendered area → blit with UV offset
+                // 2. Near edge → send ExtendTiles, still blit current
+                // 3. Otherwise → full blit
+                let (uv_origin, uv_size, _covers, extend) = {
+                    let os = handle.overscroll_state.lock().unwrap();
+                    let vp_origin = crate::geometry::point(
+                        os.content_origin.x,
+                        os.content_origin.y,
+                    );
+                    let covers = os.covers(vp_origin);
+                    let uvs = if covers {
+                        Some(os.compute_blit_uvs())
+                    } else {
+                        None
+                    };
+                    let extend = if !covers {
+                        os.nearly_exceeded(0.1)
+                    } else {
+                        None
+                    };
+                    (uvs.map(|(u, _)| u), uvs.map(|(_, s)| s), covers, extend)
+                };
+
+                if let (Some(uv_origin), Some(uv_size)) = (uv_origin, uv_size) {
+                    self.blit_to_swapchain_with_uvs(uv_origin, uv_size);
+                    return true;
+                }
+
+                if let Some(extend_rect) = extend {
+                    let _ = handle
+                        .job_tx
+                        .try_send(CompositorJob::ExtendTiles { rect: extend_rect });
+                    let (uv_origin, uv_size) = {
+                        let os = handle.overscroll_state.lock().unwrap();
+                        os.compute_blit_uvs()
+                    };
+                    self.blit_to_swapchain_with_uvs(uv_origin, uv_size);
+                    return true;
+                }
+
+                self.blit_to_swapchain();
+                true
             }
         }
     }
 
     /// Record a scroll delta without triggering a full re-render.
-    /// In compositor mode this sends a Scroll job to the compositor thread.
+    /// Updates overscroll state synchronously and notifies the compositor.
     pub fn record_scroll(&self, delta: crate::geometry::Point<f32>) {
         match &self.mode {
-            WgpuRendererMode::Synchronous => {
-                // In synchronous mode, no overscroll optimization yet
-            }
+            WgpuRendererMode::Synchronous => {}
             WgpuRendererMode::Compositor(handle) => {
-                let _ = handle
-                    .job_tx
-                    .try_send(CompositorJob::Scroll(delta));
+                // Update overscroll state synchronously so try_present
+                // immediately sees the new content_origin.
+                {
+                    let mut os = handle.overscroll_state.lock().unwrap();
+                    os.scroll(delta.x, delta.y);
+                }
+                // Notify compositor thread so future commits use the right origin.
+                let _ = handle.job_tx.try_send(CompositorJob::Scroll(delta));
             }
         }
     }

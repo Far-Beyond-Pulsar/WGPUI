@@ -63,6 +63,7 @@ struct CompositorState {
     group_views: Vec<wgpu::TextureView>,
     rendering_parameters: RenderingParameters,
     first_frame: bool,
+    last_commit_content_origin: crate::geometry::Point<f32>,
     job_rx: flume::Receiver<CompositorJob>,
     completion_tx: flume::Sender<CompositorCompletion>,
 }
@@ -181,6 +182,7 @@ pub(crate) fn start_compositor(
         group_views,
         rendering_parameters: RenderingParameters::from_env(),
         first_frame: true,
+        last_commit_content_origin: overscroll_state.lock().unwrap().content_origin,
         job_rx,
         completion_tx,
     };
@@ -336,9 +338,10 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
 
     // Globals use the LOGICAL viewport size (not the pipeline texture size)
     // so that shader computations (e.g. screen-space coordinates) remain correct.
-    let (content_origin_x, content_origin_y, vp_w, vp_h) = {
+    let (content_origin_x, content_origin_y, vp_w, vp_h, viewport_moved) = {
         let os = state.overscroll_state.lock().unwrap();
-        (os.content_origin.x, os.content_origin.y, os.viewport_width, os.viewport_height)
+        let moved = os.content_origin != state.last_commit_content_origin;
+        (os.content_origin.x, os.content_origin.y, os.viewport_width, os.viewport_height, moved)
     };
 
     let viewport_size = [vp_w, vp_h];
@@ -840,8 +843,12 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
             }],
         });
 
+    // When the viewport moved, we must Clear to prevent stale pixels from the
+    // previous viewport position showing through where no new primitive covers.
     let load_op = if state.first_frame {
         state.first_frame = false;
+        wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+    } else if viewport_moved {
         wgpu::LoadOp::Clear(wgpu::Color::BLACK)
     } else if has_damage_rect {
         wgpu::LoadOp::Load
@@ -1381,6 +1388,9 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
             },
         );
     }
+
+    // Remember the content origin for viewport-moved detection on next commit.
+    state.last_commit_content_origin = state.overscroll_state.lock().unwrap().content_origin;
 
     state.context.queue.submit(Some(command_encoder.finish()));
 
