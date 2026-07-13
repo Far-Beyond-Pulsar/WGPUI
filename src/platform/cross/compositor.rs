@@ -1399,10 +1399,15 @@ fn process_commit(state: &mut CompositorState, mut scene: Scene) {
     });
 }
 
-/// Handle a scroll delta: update content_origin without re-rendering.
-fn process_scroll(state: &mut CompositorState, delta: crate::geometry::Point<f32>) {
-    let mut os = state.overscroll_state.lock().unwrap();
-    os.scroll(delta.x, delta.y);
+/// Handle a scroll delta notification from the renderer thread.
+/// `content_origin` was already updated synchronously by `record_scroll()`
+/// on the shared `OverscrollState` — applying the delta again here would
+/// double-count every scroll event and make content_origin drift at 2x the
+/// real scroll speed, causing newly painted content to land away from
+/// previously painted content in the pipeline texture (visible as a
+/// growing overlay/ghosting effect while scrolling).
+fn process_scroll(state: &mut CompositorState, _delta: crate::geometry::Point<f32>) {
+    let os = state.overscroll_state.lock().unwrap();
     // Check if recenter is needed
     if os.recenter_needed() {
         // For now, just notify that a recenter may be needed.
