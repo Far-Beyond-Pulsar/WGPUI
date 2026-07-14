@@ -4,12 +4,14 @@ use gpui::{
     App, Application, Context, Render, WgpuSurfaceHandle, Window, WindowOptions, div, prelude::*,
     rgb, wgpu_surface,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use helio::{
-    Camera, GpuLight, GpuMaterial, LightId, LightType, MaterialId, MeshId, MeshUpload,
-    ObjectDescriptor, ObjectId, PackedVertex, Renderer, RendererConfig, SceneActor,
+    Camera, DebugCameraUniform, DebugDrawState, GpuLight, GpuMaterial, LightId, LightType,
+    MaterialId, MeshId, MeshUpload, ObjectDescriptor, ObjectId, PackedVertex, Renderer,
+    RendererConfig, Scene, SceneActor,
 };
+use helio_default_graphs::build_default_graph_external;
 
 // ── Mesh helpers ────────────────────────────────────────────────────────────
 
@@ -124,6 +126,7 @@ fn insert_object(
             flags: 0,
             groups: helio::GroupMask::NONE,
             movability: Some(helio::Movability::Movable),
+            user_tag: 0,
         }))
         .as_object()
         .ok_or(helio::SceneError::InvalidHandle { resource: "object" })
@@ -313,10 +316,46 @@ fn build_helio_state(
     height: u32,
     format: wgpu::TextureFormat,
 ) -> HelioRenderState {
+    let config = RendererConfig::new(width, height, format);
+    let scene = Scene::new(Arc::clone(&device), Arc::clone(&queue));
+    let debug_state = Arc::new(Mutex::new(DebugDrawState::default()));
+    let debug_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("WGPUI Helio Debug Camera"),
+        size: std::mem::size_of::<DebugCameraUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let cull_stats_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("WGPUI Helio Cull Stats"),
+        size: 32,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let graph = build_default_graph_external(
+        &device,
+        &queue,
+        &scene,
+        config,
+        Arc::clone(&debug_state),
+        &debug_camera_buffer,
+        &cull_stats_buffer,
+        None,
+    );
     let mut renderer = Renderer::new_with_external_device(
         device,
         queue,
-        RendererConfig::new(width, height, format),
+        format,
+        width,
+        height,
+        config.render_scale,
+        config,
+        scene,
+        graph,
+        debug_state,
+        debug_camera_buffer,
+        cull_stats_buffer,
     );
 
     let mat = renderer.scene_mut().insert_material(make_material(
