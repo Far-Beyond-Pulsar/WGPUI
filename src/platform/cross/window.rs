@@ -442,6 +442,7 @@ impl PlatformWindow for CrossWindow {
             registry,
             present_trigger,
             winit_arc,
+            ctx.gpu_submit_lock.clone(),
             width,
             height,
             format,

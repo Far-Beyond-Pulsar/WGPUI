@@ -35,6 +35,23 @@ pub struct WgpuContext {
     pub(super) paths_vertices_buffer: Mutex<wgpu::Buffer>,
 
     pub(crate) surface_registry: Arc<SurfaceRegistry>,
+
+    /// Guards swapchain reconfiguration against concurrent queue submission.
+    ///
+    /// `Surface::configure` waits for the device to go idle and fails with
+    /// `GpuWaitTimeout` if anything submits while it waits — wgpu-core treats a
+    /// non-empty queue after the wait as proof that "another thread is submitting
+    /// at the same time". Because `WgpuSurfaceHandle` hands out clones of this
+    /// device and queue, every external render thread is such a submitter.
+    ///
+    /// External render threads hold a **read** guard across render + submit;
+    /// `Surface::configure` call sites hold the **write** guard. Read guards do
+    /// not block each other, so any number of surfaces keep rendering at
+    /// independent rates; only reconfiguration (resize) serializes against them.
+    ///
+    /// The renderer's own submits deliberately do NOT take a read guard: they run
+    /// on the same thread as `configure`, so guarding them would self-deadlock.
+    pub(crate) gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
 }
 
 impl WgpuContext {
@@ -225,6 +242,7 @@ impl WgpuContext {
 
             paths_vertices_buffer: Mutex::new(paths_vertices_buffer),
             surface_registry: Arc::new(SurfaceRegistry::new()),
+            gpu_submit_lock: Arc::new(parking_lot::RwLock::new(())),
         })
     }
 }

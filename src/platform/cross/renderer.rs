@@ -1678,6 +1678,16 @@ impl WgpuRenderer {
         })
     }
 
+    /// Reconfigure the swapchain while excluding external render-thread
+    /// submissions that share this device and queue.
+    ///
+    /// All `Surface::configure` calls must go through here.
+    fn reconfigure_surface(&self) {
+        let _exclusive = self.context.gpu_submit_lock.write();
+        self.surface
+            .configure(&self.context.device, &self.surface_configuration);
+    }
+
     /// Reserve a timestamp-write pair against the current flamegraph GPU
     /// capture generation, if one is active and actively recording a frame.
     /// Returns `None` (cheaply, no wgpu resource allocation) otherwise, e.g.
@@ -1929,8 +1939,7 @@ impl WgpuRenderer {
                 | CurrentSurfaceTexture::Lost
                 | CurrentSurfaceTexture::Validation => {
                     // Reconfigure with the current known size and retry.
-                    self.surface
-                        .configure(&self.context.device, &self.surface_configuration);
+                    self.reconfigure_surface();
                     match self.surface.get_current_texture() {
                         CurrentSurfaceTexture::Success(t)
                         | CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -2707,8 +2716,7 @@ impl WgpuRenderer {
             CurrentSurfaceTexture::Outdated
             | CurrentSurfaceTexture::Lost
             | CurrentSurfaceTexture::Validation => {
-                self.surface
-                    .configure(&self.context.device, &self.surface_configuration);
+                self.reconfigure_surface();
                 match self.surface.get_current_texture() {
                     CurrentSurfaceTexture::Success(t)
                     | CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -2873,8 +2881,7 @@ impl WgpuRenderer {
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
         self.surface_configuration.width = size.width.0 as u32;
         self.surface_configuration.height = size.height.0 as u32;
-        self.surface
-            .configure(&self.context.device, &self.surface_configuration);
+        self.reconfigure_surface();
 
         // Recreate persistent framebuffer at new size
         let persistent_framebuffer = self
@@ -2967,8 +2974,7 @@ impl WgpuRenderer {
             // wgpu::CompositeAlphaMode::Opaque
             wgpu::CompositeAlphaMode::Inherit
         };
-        self.surface
-            .configure(&self.context.device, &self.surface_configuration);
+        self.reconfigure_surface();
     }
 
     pub fn viewport_size(&self) -> geometry::Size<DevicePixels> {
