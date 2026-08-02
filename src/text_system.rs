@@ -459,6 +459,10 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        // Sibling probe point to the one in `layout_line`, not a nested one:
+        // `shape_text` goes straight to the wrapped-line cache and never routes
+        // through `layout_line`, so the two never overlap.
+        let _t = crate::render_stats::scope("frame: text shaping");
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -597,6 +601,7 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
+        let _t = crate::render_stats::scope("frame: text shaping");
         let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         font_runs.clear();

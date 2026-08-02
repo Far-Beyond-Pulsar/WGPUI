@@ -62,6 +62,7 @@ impl TaffyLayoutEngine {
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
 
+        crate::render_stats::count("frame: taffy nodes created");
         if children.is_empty() {
             self.taffy
                 .new_leaf(taffy_style)
@@ -91,6 +92,7 @@ impl TaffyLayoutEngine {
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
 
+        crate::render_stats::count("frame: taffy nodes created");
         self.taffy
             .new_leaf_with_context(
                 taffy_style,

@@ -10,6 +10,31 @@
 //! Timers report count, mean and max in milliseconds; the max column is the one
 //! that matters for stalls, since a single multi-second frame vanishes into a
 //! mean over 120 samples.
+//!
+//! # Reading the `frame:` timers
+//!
+//! Timers accumulate wall time, so a timer entered inside another one is counted
+//! by both. The `frame:` family is deliberately not flat, because the frame path
+//! itself is not flat — `render()` runs inside `request_layout`, text is shaped
+//! from both layout measure callbacks and prepaint, and primitives are emitted
+//! during paint. The containment is:
+//!
+//! - `frame: layout`, `frame: prepaint` and `frame: paint` are disjoint. They
+//!   are taken at the window root, so summing them gives the frame's element
+//!   cost once.
+//! - `frame: render` is a subset of `frame: layout`, since a view's `render()`
+//!   is invoked from its `request_layout`. The exception is a `.cached()` view
+//!   rebuilding, which renders from prepaint — so for those it falls under
+//!   `frame: prepaint` instead.
+//! - `frame: text shaping` is a subset of `frame: layout` (text measure
+//!   callbacks) plus `frame: prepaint` (line shaping for paint).
+//! - `frame: bounds tree` is a subset of `frame: paint`.
+//! - `frame: scene finish` and `frame: gpu upload` are outside all of the above.
+//!
+//! So the Phase 0 question — is building the element description cheap relative
+//! to the work reconciliation would skip? — is `frame: render` over
+//! `frame: layout + frame: prepaint + frame: paint`, with no double counting to
+//! correct for, because `frame: render` is wholly contained in that sum.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -2731,7 +2731,15 @@ impl Window {
 
         // Layout all root elements.
         let mut root_element = self.root.as_ref().unwrap().clone().into_any();
-        root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+        // `prepaint_as_root` split into its two halves so layout and prepaint can
+        // be timed apart; the pair is exactly what that method does.
+        {
+            let _t = crate::render_stats::scope("frame: layout");
+            root_element.layout_as_root(root_size.into(), self, cx);
+        }
+
+        let prepaint_timer = crate::render_stats::scope("frame: prepaint");
+        root_element.prepaint_at(Point::default(), self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(inspector_width, cx);
@@ -2760,8 +2768,10 @@ impl Window {
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        drop(prepaint_timer);
 
         // Now actually paint the elements.
+        let paint_timer = crate::render_stats::scope("frame: paint");
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -2780,6 +2790,8 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        drop(paint_timer);
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {

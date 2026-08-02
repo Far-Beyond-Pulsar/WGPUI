@@ -239,7 +239,10 @@ impl Element for AnyView {
                     (layout_id, None)
                 }
                 _ => {
-                    let mut element = (self.render)(self, window, cx);
+                    let mut element = {
+                        let _t = crate::render_stats::scope("frame: render");
+                        (self.render)(self, window, cx)
+                    };
                     let layout_id = element.request_layout(window, cx);
                     (layout_id, Some(element))
                 }
@@ -354,6 +357,11 @@ impl Element for AnyView {
                         // conflating them hides which one to go after.
                         let mut element = {
                             let _t = crate::render_stats::scope("  rebuild: render");
+                            // Also counted into the whole-frame bucket. A cached
+                            // view renders from prepaint rather than from
+                            // request_layout, so this is the one place where
+                            // `frame: render` nests under `frame: prepaint`.
+                            let _frame_render = crate::render_stats::scope("frame: render");
                             (self.render)(self, window, cx)
                         };
                         {
