@@ -1,8 +1,8 @@
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element,
     ElementGeometry, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle,
-    WeakEntity,
+    LayerPolicy, LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, Style, StyleRefinement,
+    TextStyle, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -320,20 +320,19 @@ impl Element for AnyView {
                         window.reuse_prepaint(element_state.prepaint_range.clone());
                         cx.entities
                             .extend_accessed(&element_state.accessed_entities);
+
+                        // `on_frame` effects still run on a cache hit — that is
+                        // the whole point of the channel: side effects that must
+                        // fire every frame regardless of caching. They are
+                        // replayed from what the subtree recorded when it last
+                        // rendered, *not* by rebuilding the subtree to find
+                        // them again. Rebuilding would run `render` and a full
+                        // `layout_as_root` on every reuse, which is most of
+                        // what the cache is here to skip.
+                        window.replay_frame_effects(&element_state.prepaint_range, cx);
+
                         let prepaint_end = window.prepaint_index();
                         element_state.prepaint_range = prepaint_start..prepaint_end;
-
-                        // on_frame still runs on cache hits — it is the
-                        // whole point of the seam: side effects that must
-                        // fire every frame regardless of caching.
-                        let mut element = (self.render)(self, window, cx);
-                        element.layout_as_root(bounds.size.into(), window, cx);
-                        let geom = ElementGeometry {
-                            bounds,
-                            content_mask,
-                            scale_factor: window.scale_factor(),
-                        };
-                        element.on_frame(geom, window, cx);
 
                         return (None, element_state);
                     }
@@ -413,7 +412,7 @@ impl Element for AnyView {
         &mut self,
         global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         element: &mut Self::PrepaintState,
         window: &mut Window,
@@ -422,31 +421,57 @@ impl Element for AnyView {
         window.with_rendered_view(self.entity_id(), |window| {
             let caching_disabled = window.is_inspector_picking(cx);
             if self.cached_style.is_some() && !caching_disabled {
-                window.with_element_state::<AnyViewState, _>(
-                    global_id.unwrap(),
-                    |element_state, window| {
-                        let mut element_state = element_state.unwrap();
+                let global_id = global_id.unwrap();
+                // `cached` is a layer with a compat policy: every axis
+                // invalidated together, primitive-retained. The decision about
+                // *whether* to reuse was made in prepaint by `AnyViewState`,
+                // which predates layers and reaches things layers cannot see
+                // yet (recorded bounds, text style, the dispatch subtree). The
+                // layer supplies only the retention — which is where the win
+                // is, because it replaces re-inserting every primitive into a
+                // `BoundsTree` with re-emitting orders that are already right.
+                let (layer_key, layer_cache_key) = window.layer_identity(global_id, bounds);
+                let layers_enabled = crate::layer::layers_enabled();
 
-                        let paint_start = window.paint_index();
+                window.with_element_state::<AnyViewState, _>(global_id, |element_state, window| {
+                    let mut element_state = element_state.unwrap();
 
-                        if let Some(element) = element {
-                            // Paired with the prepaint path above.
-                            let nested_cache_suppressed = window.nested_view_cache_suppressed;
-                            if !nested_view_cache_enabled() {
-                                window.nested_view_cache_suppressed = true;
-                            }
-                            element.paint(window, cx);
-                            window.nested_view_cache_suppressed = nested_cache_suppressed;
-                        } else {
-                            window.reuse_paint(element_state.paint_range.clone());
+                    let paint_start = window.paint_index();
+
+                    if let Some(element) = element {
+                        // Paired with the prepaint path above.
+                        let nested_cache_suppressed = window.nested_view_cache_suppressed;
+                        if !nested_view_cache_enabled() {
+                            window.nested_view_cache_suppressed = true;
                         }
+                        if layers_enabled {
+                            window.record_layer(
+                                layer_key,
+                                layer_cache_key,
+                                LayerPolicy::compat(),
+                                |window| element.paint(window, cx),
+                            );
+                        } else {
+                            element.paint(window, cx);
+                        }
+                        window.nested_view_cache_suppressed = nested_cache_suppressed;
+                    } else {
+                        window.reuse_paint_except_scene(&element_state.paint_range);
+                        // The layer can be gone even though prepaint committed
+                        // to reusing — eviction is driven by draw age, and this
+                        // view's element state outlives it. Falling back to the
+                        // recorded scene range keeps that a slower frame rather
+                        // than a missing panel.
+                        if !window.try_composite_layer(layer_key) {
+                            window.replay_scene_range(&element_state.paint_range);
+                        }
+                    }
 
-                        let paint_end = window.paint_index();
-                        element_state.paint_range = paint_start..paint_end;
+                    let paint_end = window.paint_index();
+                    element_state.paint_range = paint_start..paint_end;
 
-                        ((), element_state)
-                    },
-                )
+                    ((), element_state)
+                })
             } else {
                 element.as_mut().unwrap().paint(window, cx);
             }

@@ -4,10 +4,12 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
-    DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
+    DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, ElementGeometry, Entity, EntityId,
+    EventEmitter,
     FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId,
     GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext,     KeyDownEvent, KeyEvent, KeyUpEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    KeystrokeEvent, LayerId, LayerKey, LayerPolicy, LayerTransform, LayoutId, LineLayoutIndex,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseDownEvent, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, ScrollWheelEvent,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
@@ -48,6 +50,7 @@ use std::{
     },
     time::Duration,
 };
+use crate::layer::{Layer, LayerCacheKey, LayerItem};
 use crate::time_ext::Instant;
 use crate::util::post_inc;
 use crate::util::{ResultExt, measure};
@@ -111,14 +114,9 @@ const DEFERRED_NOTIFY_LOOP_WARN_DRAWS: u32 = 120;
 /// will produce it, so that the scope enum is complete from the start and later
 /// phases add behaviour to a variant instead of reshaping the type and every
 /// match on it. Nothing constructs one yet; the representation is provisional.
+/// [`LayerKey`], defined the same way, is now real — see [`crate::layer`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InstanceId(pub u64);
-
-/// Identifies one retained layer for as long as the window keeps it.
-///
-/// Provisional, and unconstructed, for the same reason as [`InstanceId`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LayerKey(pub u64);
 
 /// In what respect something stopped being valid.
 ///
@@ -199,8 +197,7 @@ pub enum InvalidationScope {
     /// One retained element instance, and nothing above or below it. Nothing
     /// produces this yet.
     Instance(InstanceId),
-    /// One retained layer, and nothing above or below it. Nothing produces this
-    /// yet.
+    /// One retained layer, and nothing above or below it.
     Layer(LayerKey),
     /// Every consumer whose recorded dependency set contains this entity.
     Entity(EntityId),
@@ -259,6 +256,15 @@ struct WindowInvalidatorInner {
     /// A set, so a view notifying the same entity repeatedly inside one draw
     /// costs one entry.
     deferred_notifies: FxHashSet<EntityId>,
+    /// Layers named by an [`InvalidationScope::Layer`] request, and the axes
+    /// each was named with, accumulated since a draw last took them.
+    ///
+    /// Held here rather than written straight into `Window::layers` because
+    /// [`WindowInvalidator::invalidate`] takes `&self` and may be called
+    /// mid-draw, when the window's retained state is being read. The draw that
+    /// answers the request folds these into the layers at
+    /// `Window::apply_invalidations`.
+    dirty_layers: FxHashMap<LayerKey, Invalidation>,
     /// Window-scope axes accumulated since a draw last took them.
     window_axes: Invalidation,
     /// Window-scope axes requested while a draw was in progress.
@@ -289,6 +295,7 @@ impl WindowInvalidator {
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
                 deferred_notifies: FxHashSet::default(),
+                dirty_layers: FxHashMap::default(),
                 window_axes: Invalidation::empty(),
                 deferred_window_axes: Invalidation::empty(),
                 consecutive_deferred_draws: 0,
@@ -314,19 +321,38 @@ impl WindowInvalidator {
             // one respect and left alone in the others.
             InvalidationScope::Entity(entity_id) => self.invalidate_entity(entity_id, cx),
             InvalidationScope::Window => self.invalidate_window(request.axes),
-            // Unreachable today: nothing constructs these scopes, because
-            // nothing retains the instances or layers they name. Counted rather
-            // than asserted so that the first phase to produce one can see it
-            // arriving before it has anywhere to apply it.
+            InvalidationScope::Layer(key) => self.invalidate_layer(key, request.axes),
+            // Unreachable today: nothing constructs this scope, because nothing
+            // retains the instances it names. Counted rather than asserted so
+            // that the phase which produces the first one can see it arriving
+            // before it has anywhere to apply it.
             InvalidationScope::Instance(_) => {
                 crate::render_stats::count("invalidate: instance");
                 true
             }
-            InvalidationScope::Layer(_) => {
-                crate::render_stats::count("invalidate: layer");
-                true
-            }
         }
+    }
+
+    /// Record that one retained layer stopped being valid in `axes`, and
+    /// nothing above or below it.
+    ///
+    /// Unlike [`Self::invalidate_entity`] this never defers: a layer's axes are
+    /// read at the start of the next draw, so recording them mid-draw is
+    /// harmless and the request is answered by the frame after the one in
+    /// progress — which is the same frame a deferred notify would reach.
+    pub fn invalidate_layer(&self, key: LayerKey, axes: Invalidation) -> bool {
+        crate::render_stats::count("invalidate: layer");
+        let mut inner = self.inner.borrow_mut();
+        inner.update_count += 1;
+        *inner.dirty_layers.entry(key).or_insert(Invalidation::empty()) |= axes;
+        inner.dirty = true;
+        true
+    }
+
+    /// Take the per-layer axes accumulated since the last call, for the draw
+    /// that is about to answer them.
+    pub fn take_layer_axes(&self) -> FxHashMap<LayerKey, Invalidation> {
+        mem::take(&mut self.inner.borrow_mut().dirty_layers)
     }
 
     /// Record a window-scope invalidation.
@@ -450,6 +476,10 @@ impl WindowInvalidator {
         self.inner.borrow_mut().draw_phase = phase
     }
 
+    pub fn draw_phase(&self) -> DrawPhase {
+        self.inner.borrow().draw_phase
+    }
+
     pub fn update_count(&self) -> usize {
         self.inner.borrow().update_count
     }
@@ -496,14 +526,23 @@ impl WindowInvalidator {
         );
     }
 
+    /// [`DrawPhase::Effects`] is deliberately **not** accepted here.
+    ///
+    /// `on_frame` is meant to be cheap by construction: it receives resolved
+    /// geometry and returns nothing, so it cannot build an element tree — and
+    /// the assertion is what keeps that true rather than merely intended. The
+    /// methods gated on this include `with_element_state`, which an effect must
+    /// not touch: element state is migrated forward by whichever frame accessed
+    /// it, and an effect replayed on behalf of a view that never ran would
+    /// register accesses for a subtree that does not exist this frame.
     #[track_caller]
     pub fn debug_assert_paint_or_prepaint(&self) {
         debug_assert!(
             matches!(
                 self.inner.borrow().draw_phase,
-                DrawPhase::Paint | DrawPhase::Prepaint | DrawPhase::Effects
+                DrawPhase::Paint | DrawPhase::Prepaint
             ),
-            "this method can only be called during request_layout, prepaint, on_frame, or paint"
+            "this method can only be called during request_layout, prepaint, or paint"
         );
     }
 }
@@ -1072,6 +1111,29 @@ pub(crate) struct DeferredDraw {
     paint_range: Range<PaintIndex>,
 }
 
+/// A callback registered by [`Element::on_frame`](crate::Element::on_frame).
+///
+/// `Fn` and `Rc` rather than owned `FnMut` because the callback has to outlive
+/// the element that registered it: an element inside a cached view is never
+/// built on a frame the view replays, and the whole point of the channel is
+/// that its effect still happens.
+pub(crate) type FrameEffectCallback = Rc<dyn Fn(ElementGeometry, &mut Window, &mut App)>;
+
+/// One recorded `on_frame` effect: what to run, and the geometry it resolved
+/// against.
+///
+/// Recorded like a hitbox, and replayed by the same kind of index range. The
+/// geometry is the one from the frame the element last actually ran on, which
+/// is exactly right on a cache hit — a cached view only replays when its bounds
+/// and content mask are unchanged, so re-deriving the geometry could not
+/// produce a different answer, and deriving it would mean re-rendering the view
+/// to get an element tree to derive it from.
+#[derive(Clone)]
+pub(crate) struct FrameEffect {
+    pub(crate) callback: FrameEffectCallback,
+    pub(crate) geometry: ElementGeometry,
+}
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -1081,6 +1143,8 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    /// `on_frame` effects registered this frame, in the order they ran.
+    pub(crate) effects: Vec<FrameEffect>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1109,6 +1173,7 @@ pub(crate) struct Frame {
 #[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
+    effects_index: usize,
     tooltips_index: usize,
     deferred_draws_index: usize,
     dispatch_tree_index: usize,
@@ -1138,6 +1203,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            effects: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1176,6 +1242,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.effects.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -1283,6 +1350,18 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    /// Retained layers, addressed by a stable key rather than by an offset into
+    /// a frame array.
+    ///
+    /// Deliberately not part of [`Frame`]: a layer's whole purpose is to
+    /// outlive the frame that built it, and the frames are swapped and cleared
+    /// every draw.
+    pub(crate) layers: FxHashMap<LayerKey, Layer>,
+    /// Monotonic draw counter, for layer eviction. Not a frame *index* — it
+    /// counts draws this window performed, so a window that stops drawing stops
+    /// ageing its layers.
+    pub(crate) layer_frame: u64,
+    next_layer_id: u32,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -1767,6 +1846,9 @@ impl Window {
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            layers: FxHashMap::default(),
+            layer_frame: 0,
+            next_layer_id: 0,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -2796,7 +2878,12 @@ impl Window {
                 ui_tree_capture_guard = crate::maybe_begin_capture(self.handle.id.as_u64());
             }
 
+            // Layers age by *draws that could have visited them*. Bumping this
+            // for a skipped draw would evict a window's layers for not being
+            // visited by a frame that never looked at anything.
+            self.layer_frame = self.layer_frame.wrapping_add(1);
             self.draw_roots(cx);
+            self.evict_stale_layers();
 
             #[cfg(any(feature = "inspector", debug_assertions))]
             {
@@ -2919,6 +3006,25 @@ impl Window {
     /// element walk reads: window-scope axes, and the entity-scope dirty sets.
     fn apply_invalidations(&mut self) {
         self.window_invalidation = self.invalidator.take_window_axes();
+
+        // Layer-scope requests mark exactly the layer they name — no ancestor
+        // walk, which is the property that kills the chatty-leaf problem.
+        for (key, axes) in self.invalidator.take_layer_axes() {
+            if let Some(layer) = self.layers.get_mut(&key) {
+                layer.needs |= axes;
+            }
+        }
+
+        // A window-scope request claims every layer's recorded output is stale.
+        // `refresh_buffers` — window scope, `DISPLAY` only — deliberately does
+        // not: there the pixels behind a surface quad advanced while the quad
+        // referring to them did not, so compositing is exactly right.
+        const LAYER_INVALIDATING: Invalidation = Invalidation::LAYOUT.union(Invalidation::HIT);
+        if self.window_invalidation.intersects(LAYER_INVALIDATING) {
+            for layer in self.layers.values_mut() {
+                layer.needs |= self.window_invalidation;
+            }
+        }
 
         let mut views = self.invalidator.take_views();
         for entity in views.drain() {
@@ -3256,6 +3362,7 @@ impl Window {
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
+            effects_index: self.next_frame.effects.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
@@ -3292,9 +3399,6 @@ impl Window {
         let frame = &self.rendered_frame;
         let layouts = self.text_system.previous_frame_layout_extent();
 
-        let frame = &self.rendered_frame;
-        let layouts = self.text_system.previous_frame_layout_extent();
-
         // Every offset in both index types, paired with the array it slices.
         //
         // Listed exhaustively and checked uniformly on purpose: an earlier
@@ -3303,13 +3407,19 @@ impl Window {
         // side), which left `reuse_paint` free to slice out of bounds on
         // exactly the fields nobody had thought about. If a field is added to
         // `PrepaintStateIndex` or `PaintIndex`, add it here.
-        let checks: [(&'static str, usize, usize, usize); 15] = [
+        let checks: [(&'static str, usize, usize, usize); 16] = [
             // (name, start, end, length of the array it indexes)
             (
                 "prepaint hitboxes",
                 prepaint.start.hitboxes_index,
                 prepaint.end.hitboxes_index,
                 frame.hitboxes.len(),
+            ),
+            (
+                "prepaint effects",
+                prepaint.start.effects_index,
+                prepaint.end.effects_index,
+                frame.effects.len(),
             ),
             (
                 "prepaint tooltip_requests",
@@ -3411,6 +3521,57 @@ impl Window {
         None
     }
 
+    /// Record an [`Element::on_frame`](crate::Element::on_frame) effect on this
+    /// frame, so a cached ancestor replaying next frame can re-run it.
+    ///
+    /// Called by the element as it runs its own effect; the recording is what
+    /// makes the effect survive the element not being built at all.
+    pub(crate) fn record_frame_effect(
+        &mut self,
+        callback: FrameEffectCallback,
+        geometry: ElementGeometry,
+    ) {
+        // Registering from anywhere else would put an entry in the frame's
+        // effect list that no `on_frame` walk produced, and the ranges a cached
+        // view records around its subtree would no longer describe that
+        // subtree's effects.
+        self.invalidator.debug_assert_effects();
+        self.next_frame.effects.push(FrameEffect {
+            callback,
+            geometry,
+        });
+    }
+
+    /// Re-run the effects a cached subtree registered when it last rendered,
+    /// and re-record them so the range stays valid for the frame after this
+    /// one.
+    ///
+    /// This is what makes caching safe: an element inside a replayed view never
+    /// runs, so any side effect living in its closures would silently stop. It
+    /// used to be handled by re-rendering the view and calling `on_frame` on
+    /// the fresh tree, which ran `render` and a full `layout_as_root` on every
+    /// cache hit — the two things the cache exists to skip. Replaying the
+    /// recorded effects costs one `Rc` clone and one call each.
+    pub(crate) fn replay_frame_effects(
+        &mut self,
+        range: &Range<PrepaintStateIndex>,
+        cx: &mut App,
+    ) {
+        let range = range.start.effects_index..range.end.effects_index;
+        if range.is_empty() {
+            return;
+        }
+        let effects = self.rendered_frame.effects[range].to_vec();
+        self.next_frame.effects.extend(effects.iter().cloned());
+
+        let phase = self.invalidator.draw_phase();
+        self.invalidator.set_phase(DrawPhase::Effects);
+        for effect in effects {
+            (effect.callback)(effect.geometry, self, cx);
+        }
+        self.invalidator.set_phase(phase);
+    }
+
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
@@ -3473,6 +3634,33 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.reuse_paint_except_scene(&range);
+        self.next_frame.scene.replay(
+            range.start.scene_index..range.end.scene_index,
+            &self.rendered_frame.scene,
+        );
+    }
+
+    /// Replay just the scene half of a recorded paint range.
+    ///
+    /// The fallback for a reuse that expected a retained layer and did not find
+    /// one.
+    pub(crate) fn replay_scene_range(&mut self, range: &Range<PaintIndex>) {
+        self.next_frame.scene.replay(
+            range.start.scene_index..range.end.scene_index,
+            &self.rendered_frame.scene,
+        );
+    }
+
+    /// Everything [`Self::reuse_paint`] replays except the scene.
+    ///
+    /// Split out because a retained layer is a better source for the scene half
+    /// than a recorded index range: it re-emits primitives with the draw orders
+    /// they already have, where `Scene::replay` pushes each one back through
+    /// `insert_primitive` and re-derives its order from a `BoundsTree` — the
+    /// per-primitive cost the whole retained model exists to remove. The other
+    /// arrays still travel by range until #97.
+    pub(crate) fn reuse_paint_except_scene(&mut self, range: &Range<PaintIndex>) {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -3503,11 +3691,7 @@ impl Window {
         );
 
         self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
-        );
+            .reuse_layouts(range.start.line_layout_index.clone()..range.end.line_layout_index.clone());
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -3955,9 +4139,333 @@ impl Window {
         });
     }
 
+    /// Paint into the retained layer named by `global_id`, or composite last
+    /// frame's primitives for it and skip painting entirely.
+    ///
+    /// Returns `Some(_)` when `f` ran, `None` when the layer composited. A
+    /// caller that needs to know which happened — because it also holds
+    /// index-range state for the old replay path — should branch on that.
+    ///
+    /// # When a layer composites
+    ///
+    /// Never on the first sight of a key, and afterwards only when *every* one
+    /// of these holds:
+    ///
+    /// - no [`InvalidationScope::Layer`] request has named it since it rendered;
+    /// - no entity it read while rendering has been invalidated — the same
+    ///   dependency test cached views use, which is what makes notifying a model
+    ///   reach the layers that display it;
+    /// - its bounds, content mask, opacity and scale factor are unchanged;
+    /// - its transform is the identity. Compositing at a *new* offset without
+    ///   re-prepainting would leave every hitbox inside the layer at last
+    ///   frame's position, desyncing hover and click from the pixels. #90 makes
+    ///   hitboxes layer-relative and lifts this;
+    /// - the pointer is outside it, and was outside it last frame. Hover state
+    ///   is read during paint and is not an entity, so nothing invalidates a
+    ///   layer when the pointer crosses it. Re-rendering under the pointer is
+    ///   cheaper than auditing every style for hover-sensitivity, and wrong
+    ///   hover is a defect users notice immediately;
+    /// - no window-scope invalidation claims the recorded geometry is stale.
+    ///
+    /// The list is deliberately conservative: every entry is a way a layer
+    /// could otherwise show last frame's pixels for this frame's state.
+    pub(crate) fn with_retained_layer<R>(
+        &mut self,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        policy: LayerPolicy,
+        cx: &mut App,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        if !crate::layer::layers_enabled() {
+            return Some(f(self, cx));
+        }
+
+        let key = LayerKey::from_global_element_id(global_id);
+        let cache_key = LayerCacheKey {
+            bounds,
+            content_mask: self.content_mask(),
+            opacity: self.element_opacity,
+            scale_factor: self.scale_factor(),
+        };
+        let mouse_inside = bounds.contains(&self.mouse_position);
+
+        let composite = self.layers.get(&key).is_some_and(|layer| {
+            layer.has_content()
+                && layer.needs.is_empty()
+                && layer.transform.is_identity()
+                && layer.cache_key == cache_key
+                && !layer.had_mouse
+                && !mouse_inside
+                && !self.accessed_entity_invalidated(&layer.accessed_entities)
+                // The paint range is an absolute offset into last frame's
+                // arrays. It is validated for the same reason
+                // `AnyView::cached` validates its own: nothing in the type
+                // system ties a stored range to the array it came from, and a
+                // range that has aged slices out of bounds and takes the
+                // process down. A stale range is a re-render, not a crash.
+                && self
+                    .invalid_reuse_range(
+                        &(PrepaintStateIndex::default()..PrepaintStateIndex::default()),
+                        &layer.paint_range,
+                    )
+                    .is_none()
+        }) && self.view_cache_available();
+
+        if composite {
+            // Primitives come from the layer; everything else the skipped paint
+            // would have registered — mouse listeners, cursor styles, input
+            // handlers, tab stops, shaped text, accessed element state — comes
+            // from the recorded range. Without this a composited panel renders
+            // correctly and stops responding to the mouse.
+            let range = self.layers[&key].paint_range.clone();
+            self.reuse_paint_except_scene(&range);
+            self.composite_layer(key);
+            return None;
+        }
+
+        let (result, accessed_entities) =
+            cx.detect_accessed_entities(|cx| self.record_layer(key, cache_key, policy, |window| f(window, cx)));
+
+        if let Some(layer) = self.layers.get_mut(&key) {
+            layer.accessed_entities = accessed_entities;
+            layer.had_mouse = mouse_inside;
+        }
+
+        Some(result)
+    }
+
+    /// Run `f`, keeping every primitive it paints in the retained layer `key`.
+    ///
+    /// The lower half of [`Self::with_retained_layer`], split out because
+    /// [`AnyView::cached`](crate::AnyView::cached) makes its own decision about
+    /// whether to reuse — it has an invalidation record of its own that
+    /// predates layers — and needs only the retention.
+    pub(crate) fn record_layer<R>(
+        &mut self,
+        key: LayerKey,
+        cache_key: LayerCacheKey,
+        policy: LayerPolicy,
+        f: impl FnOnce(&mut Window) -> R,
+    ) -> R {
+        crate::render_stats::count("layer: re-rendered");
+        let scaled_bounds = cache_key.bounds.scale(cache_key.scale_factor);
+        let paint_start = self.paint_index();
+
+        self.next_frame.scene.begin_layer(key, scaled_bounds, true);
+        let result = f(self);
+        let items = self
+            .next_frame
+            .scene
+            .end_layer()
+            .expect("a recording layer must return its captured items");
+
+        let paint_range = paint_start..self.paint_index();
+        let frame = self.layer_frame;
+        let id = self.next_layer_id;
+        let layer = self.layers.entry(key).or_insert_with(|| {
+            crate::render_stats::count("layer: created");
+            Layer::new(LayerId(id), policy, frame)
+        });
+        if layer.id.0 == id {
+            self.next_layer_id = self.next_layer_id.wrapping_add(1);
+        }
+        layer.policy = policy;
+        layer.items = items;
+        layer.paint_range = paint_range;
+        let bounds = cache_key.bounds;
+        layer.cache_key = cache_key;
+        layer.transform = LayerTransform::default();
+        layer.needs = Invalidation::empty();
+        layer.last_visited = frame;
+        // Rewritten by `with_retained_layer` when it owns the decision. A
+        // caller that keeps its own invalidation record leaves these alone.
+        layer.had_mouse = false;
+
+        if crate::layer::layer_debug_enabled() {
+            self.paint_layer_debug_tint(key, bounds, true);
+        }
+
+        result
+    }
+
+    /// The [`LayerKey`] and cache key a layer rooted at `global_id` would have
+    /// right now.
+    pub(crate) fn layer_identity(
+        &self,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+    ) -> (LayerKey, LayerCacheKey) {
+        (
+            LayerKey::from_global_element_id(global_id),
+            LayerCacheKey {
+                bounds,
+                content_mask: self.content_mask(),
+                opacity: self.element_opacity,
+                scale_factor: self.scale_factor(),
+            },
+        )
+    }
+
+    /// Composite `key` if it holds retained content, reporting whether it did.
+    ///
+    /// A caller that decided to reuse before reaching paint has to handle
+    /// `false`: the layer may have been evicted, in which case the only
+    /// remaining source for its primitives is the old index-range replay.
+    pub(crate) fn try_composite_layer(&mut self, key: LayerKey) -> bool {
+        if !crate::layer::layers_enabled() {
+            return false;
+        }
+        if !self
+            .layers
+            .get(&key)
+            .is_some_and(|layer| layer.has_content())
+        {
+            crate::render_stats::count("layer: composite missed (no retained content)");
+            return false;
+        }
+        self.composite_layer(key);
+        true
+    }
+
+    /// Re-emit `key`'s retained primitives, and those of every layer nested
+    /// inside it, without re-running any element code.
+    fn composite_layer(&mut self, key: LayerKey) {
+        fn composite(
+            scene: &mut Scene,
+            layers: &mut FxHashMap<LayerKey, Layer>,
+            key: LayerKey,
+            frame: u64,
+            scale_factor: f32,
+        ) {
+            let Some(layer) = layers.get_mut(&key) else {
+                // A nested layer evicted out from under its parent. The parent
+                // was judged clean, so this cannot produce wrong pixels on its
+                // own — but it does mean content silently vanished, so make it
+                // visible rather than merely absent.
+                crate::render_stats::count("layer: nested reference missing");
+                return;
+            };
+            layer.last_visited = frame;
+            let bounds = layer.cache_key.bounds.scale(scale_factor);
+            // Taken out so the recursive call can borrow the map; put back
+            // below. A layer never appears twice in one composite tree, so
+            // nothing can observe the gap.
+            let items = mem::take(&mut layer.items);
+
+            scene.begin_layer(key, bounds, false);
+            for item in &items {
+                match item {
+                    LayerItem::Primitive(primitive) => scene.push_retained(primitive),
+                    LayerItem::Nested(nested) => {
+                        composite(scene, layers, *nested, frame, scale_factor)
+                    }
+                }
+            }
+            scene.end_layer();
+
+            if let Some(layer) = layers.get_mut(&key) {
+                layer.items = items;
+            }
+        }
+
+        crate::render_stats::count("layer: composited");
+        let _t = crate::render_stats::scope("layer: composite");
+        let frame = self.layer_frame;
+        let scale_factor = self.scale_factor();
+        let bounds = self
+            .layers
+            .get(&key)
+            .map(|layer| layer.cache_key.bounds)
+            .unwrap_or_default();
+        composite(
+            &mut self.next_frame.scene,
+            &mut self.layers,
+            key,
+            frame,
+            scale_factor,
+        );
+
+        if crate::layer::layer_debug_enabled() {
+            self.paint_layer_debug_tint(key, bounds, false);
+        }
+    }
+
+    /// Tint `bounds` by the layer's id, at full strength on a frame it
+    /// re-rendered.
+    ///
+    /// The failure this makes visible is a layer that re-renders every frame
+    /// while looking correct. Without it that layer is only *slow*, which is
+    /// indistinguishable from the layer simply being large — and the sizing
+    /// rule layers introduce (separate content by update frequency, not just by
+    /// visual grouping) is otherwise impossible to check.
+    fn paint_layer_debug_tint(&mut self, key: LayerKey, bounds: Bounds<Pixels>, re_rendered: bool) {
+        let Some(layer) = self.layers.get(&key) else {
+            return;
+        };
+        let color = crate::layer::debug_tint(layer.id, re_rendered);
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        self.next_frame.scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: bounds.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            background: color.into(),
+            border_color: Hsla {
+                a: 1.0,
+                ..color
+            }
+            .into(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::all(ScaledPixels(1.)),
+        });
+    }
+
+    /// Drop retained content for layers no draw has visited recently.
+    ///
+    /// Mark-and-sweep: every layer that composited or re-rendered this draw
+    /// stamped `last_visited`. A layer past its `evict_after_frames` gives up
+    /// its primitives but keeps its record — its key, its id, and the fact that
+    /// it exists — so a scrolled-away-and-back panel re-materialises into the
+    /// same identity instead of being seen as new. The record itself is dropped
+    /// after a further interval.
+    ///
+    /// This is what will bound retained *instance* memory in #92: instances are
+    /// owned by layers and die with them.
+    fn evict_stale_layers(&mut self) {
+        let frame = self.layer_frame;
+        let mut dropped_content = 0usize;
+        let mut dropped_records = 0usize;
+        self.layers.retain(|key, layer| {
+            let age = frame.saturating_sub(layer.last_visited);
+            let evict_after = layer.policy.evict_after_frames as u64;
+            if age > evict_after.saturating_mul(2) {
+                dropped_records += 1;
+                log::trace!("layer {key:?} ({:?}) forgotten after {age} frames", layer.id);
+                return false;
+            }
+            if age > evict_after && layer.has_content() {
+                dropped_content += 1;
+                log::trace!(
+                    "layer {key:?} ({:?}) dropped its content after {age} frames",
+                    layer.id
+                );
+                layer.drop_content();
+            }
+            true
+        });
+        for _ in 0..dropped_content + dropped_records {
+            crate::render_stats::count("layer: evicted");
+        }
+    }
+
     /// Creates a new painting layer for the specified bounds. A "layer" is a batch
     /// of geometry that are non-overlapping and have the same draw order. This is typically used
     /// for performance reasons.
+    ///
+    /// Unrelated to [`Self::with_retained_layer`]: this is a clip-and-collapse
+    /// group within one frame, not a retained one across frames.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -6634,7 +7142,7 @@ pub fn outline(
 
 #[cfg(test)]
 mod test {
-    use crate::{prelude::*, px, size, TestAppContext, Window};
+    use crate::{prelude::*, px, size, Invalidation, TestAppContext, Window};
 
     struct EmptyView;
     impl crate::Render for EmptyView {
@@ -7876,5 +8384,437 @@ mod test {
 
         cx.open_window(size(px(800.), px(600.)), |_, _| PaintFromOnFrame);
         cx.run_until_parked();
+    }
+
+    /// `on_frame` receives resolved geometry precisely so that it never needs
+    /// to build anything. Requesting layout from it would put element-tree
+    /// construction back on a path that also runs for cached subtrees, which is
+    /// the whole thing the channel is designed to avoid.
+    #[gpui::test]
+    #[should_panic(expected = "this method can only be called during request_layout, or prepaint")]
+    fn on_frame_cannot_request_layout(cx: &mut TestAppContext) {
+        use crate::{Style, div};
+
+        struct LayoutFromOnFrame;
+
+        impl Render for LayoutFromOnFrame {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                div().on_frame(|_geom, window, cx| {
+                    window.request_layout(Style::default(), None, cx);
+                })
+            }
+        }
+
+        cx.open_window(size(px(800.), px(600.)), |_, _| LayoutFromOnFrame);
+        cx.run_until_parked();
+    }
+
+    /// Element state is keyed by `GlobalElementId` and migrated forward by
+    /// whichever frame accessed it. An effect replayed on behalf of a view that
+    /// never ran this frame would register accesses for a subtree that does not
+    /// exist, so `with_element_state` is out of bounds from `on_frame` too.
+    #[gpui::test]
+    #[should_panic(expected = "this method can only be called during request_layout, prepaint, or paint")]
+    fn on_frame_cannot_touch_element_state(cx: &mut TestAppContext) {
+        use crate::div;
+
+        struct ElementStateFromOnFrame;
+
+        impl Render for ElementStateFromOnFrame {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .on_frame(|_geom, window: &mut Window, _cx| {
+                        let id = crate::GlobalElementId(std::sync::Arc::from(
+                            [crate::ElementId::Name("root".into())].as_slice(),
+                        ));
+                        window.with_element_state::<usize, _>(&id, |state, _| {
+                            ((), state.unwrap_or(0))
+                        });
+                    })
+                    .id("root")
+            }
+        }
+
+        cx.open_window(size(px(800.), px(600.)), |_, _| ElementStateFromOnFrame);
+        cx.run_until_parked();
+    }
+
+    /// A view whose `on_frame` records its own bounds, nested under two plain
+    /// divs with different bounds.
+    struct GeometryStasher {
+        seen: std::rc::Rc<std::cell::RefCell<Vec<crate::Bounds<crate::Pixels>>>>,
+    }
+
+    impl crate::Render for GeometryStasher {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let seen = self.seen.clone();
+            crate::div().size_full().child(
+                crate::div().w(px(400.)).h(px(300.)).child(
+                    crate::div()
+                        .w(px(100.))
+                        .h(px(50.))
+                        .on_frame(move |geom, _, _| seen.borrow_mut().push(geom.bounds))
+                        .id("stasher"),
+                ),
+            )
+        }
+    }
+
+    /// The effect must fire once per frame, with *this* element's geometry.
+    ///
+    /// It used to fire once per ancestor as well, because `Div::on_frame`
+    /// recursed into its children while `Drawable::prepaint` was already
+    /// calling `on_frame` on every element it walked. The ancestor's call ran
+    /// last and passed the *ancestor's* bounds, so an element stashing
+    /// `geom.bounds` ended up holding the size of whatever div was furthest up
+    /// the tree — which is exactly the stale-geometry defect this channel was
+    /// added to close, reintroduced by the channel itself.
+    #[gpui::test]
+    fn on_frame_runs_once_per_element_with_its_own_geometry(cx: &mut TestAppContext) {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen_for_view = seen.clone();
+        let _window = cx.open_window(size(px(800.), px(600.)), move |_, _| GeometryStasher {
+            seen: seen_for_view,
+        });
+        cx.run_until_parked();
+
+        let recorded = seen.borrow().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "on_frame fired {} times for one element in one frame: {recorded:?}",
+            recorded.len()
+        );
+        assert_eq!(recorded[0].size, size(px(100.), px(50.)));
+    }
+
+    /// The acceptance condition for the effects channel: a cached view replays
+    /// without rendering, *and* the effects inside it still fire, with the
+    /// geometry they resolved against.
+    struct CachedStasherRoot {
+        stasher: crate::Entity<GeometryStasher>,
+    }
+
+    impl crate::Render for CachedStasherRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div().size_full().child(
+                crate::AnyView::from(self.stasher.clone())
+                    .cached(crate::StyleRefinement::default().w(px(400.)).h(px(300.))),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn on_frame_effects_survive_a_cached_view_reusing(cx: &mut TestAppContext) {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen_for_view = seen.clone();
+        let stasher = cx.update(|cx| {
+            cx.new(move |_| GeometryStasher {
+                seen: seen_for_view,
+            })
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let stasher = stasher.clone();
+            move |_, _| CachedStasherRoot { stasher }
+        });
+        cx.run_until_parked();
+
+        let after_first = seen.borrow().len();
+        assert_eq!(after_first, 1, "the first frame renders and stashes once");
+
+        for round in 0..3 {
+            clean_frame(cx, window.into());
+            assert_eq!(
+                seen.borrow().len(),
+                after_first + round + 1,
+                "round {round}: the cached view replayed but its on_frame effect did not run"
+            );
+            assert_eq!(
+                seen.borrow().last().copied().unwrap().size,
+                size(px(100.), px(50.)),
+                "round {round}: the replayed effect got the wrong geometry"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Retained layers
+    // -------------------------------------------------------------------
+
+    /// A view with a `.layer()` div wrapping a canvas that counts its own
+    /// paints.
+    ///
+    /// The canvas is the observable: `paint` runs only when the layer actually
+    /// re-emits its content, so the counter distinguishes "composited" from
+    /// "re-rendered" — which nothing else about a correct layer does, because a
+    /// composite is meant to be indistinguishable in its output.
+    struct LayerView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for LayerView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    // Positioned away from the origin so the test platform's
+                    // mouse position (0,0) is outside it: a layer under the
+                    // pointer always re-renders.
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(100.))
+                    .h(px(100.))
+                    .bg(crate::red())
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                paints.set(paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .w(px(10.))
+                        .h(px(10.)),
+                    )
+                    // Interactivity registered during the subtree's paint —
+                    // the part a composite skips and has to replay.
+                    .child(
+                        crate::div()
+                            .w(px(10.))
+                            .h(px(10.))
+                            .cursor_pointer()
+                            .on_mouse_down(crate::MouseButton::Left, |_, _, _| {}),
+                    ),
+            )
+        }
+    }
+
+    /// The layer tests assert on retained state that `WGPUI_LAYERS=0` is
+    /// defined to remove. Skipping under the kill switch is what makes "the
+    /// switch reverts to the old path" a claim the suite actually checks: with
+    /// it set, every remaining test must still pass.
+    fn layers_off() -> bool {
+        !crate::layer::layers_enabled()
+    }
+
+    fn layer_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        crate::WindowHandle<LayerView>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| LayerView {
+            paints: paints_for_view,
+        });
+        cx.run_until_parked();
+        (window, paints)
+    }
+
+    /// The phase's headline acceptance: a layer with unchanged content
+    /// composites across frames instead of re-emitting its primitives.
+    #[gpui::test]
+    fn an_unchanged_layer_composites_instead_of_re_rendering(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let (window, paints) = layer_window(cx);
+        let painted_once = paints.get();
+        assert_eq!(painted_once, 1, "the first frame renders the layer");
+
+        let key = window
+            .update(cx, |_, this, _| {
+                assert_eq!(this.layers.len(), 1, "the `.layer()` div created a layer");
+                *this.layers.keys().next().unwrap()
+            })
+            .unwrap();
+
+        for round in 0..4 {
+            clean_frame(cx, window.into());
+            window
+                .update(cx, |_, this, _| {
+                    let layer = this.layers.get(&key).expect("layer survived the frame");
+                    assert!(
+                        layer.has_content(),
+                        "round {round}: the layer lost its retained primitives"
+                    );
+                    assert_eq!(
+                        layer.last_visited, this.layer_frame,
+                        "round {round}: the layer was not visited this frame, so it \
+                         neither composited nor re-rendered"
+                    );
+                    assert!(
+                        layer.needs.is_empty(),
+                        "round {round}: a clean frame left the layer invalidated"
+                    );
+                })
+                .unwrap();
+            assert_eq!(
+                paints.get(),
+                painted_once,
+                "round {round}: the layer re-emitted its content instead of compositing"
+            );
+        }
+    }
+
+    /// A layer-scope invalidation marks exactly the layer it names, and that
+    /// layer re-renders on the next frame.
+    #[gpui::test]
+    fn invalidating_a_layer_marks_only_that_layer(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let (window, _paints) = layer_window(cx);
+
+        window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().unwrap();
+                this.invalidator
+                    .invalidate_layer(key, Invalidation::DISPLAY);
+                this.invalidator.invalidate_layer(
+                    crate::LayerKey(0xdead_beef),
+                    Invalidation::DISPLAY,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, this, _| {
+                assert_eq!(
+                    this.layers.len(),
+                    1,
+                    "naming a key no layer holds must not create one"
+                );
+                let layer = this.layers.values().next().unwrap();
+                assert!(
+                    layer.needs.is_empty(),
+                    "the layer was invalidated but did not re-render in answer"
+                );
+                assert!(layer.has_content());
+            })
+            .unwrap();
+    }
+
+    /// Eviction is mark-and-sweep on draw age. A layer that stops being visited
+    /// gives up its primitives first and its record later, so a panel that
+    /// scrolls away and back re-materialises into the same identity.
+    #[gpui::test]
+    fn stale_layers_lose_content_before_they_lose_identity(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let (window, _paints) = layer_window(cx);
+
+        let (key, id) = window
+            .update(cx, |_, this, _| {
+                let (key, layer) = this.layers.iter().next().unwrap();
+                (*key, layer.id)
+            })
+            .unwrap();
+
+        // Age the layer past `evict_after_frames` without visiting it.
+        window
+            .update(cx, |_, this, _| {
+                let evict_after = this.layers[&key].policy.evict_after_frames as u64;
+                this.layer_frame += evict_after + 1;
+                this.evict_stale_layers();
+            })
+            .unwrap();
+
+        window
+            .update(cx, |_, this, _| {
+                let layer = this
+                    .layers
+                    .get(&key)
+                    .expect("the record must outlive its content");
+                assert!(!layer.has_content(), "content should have been dropped");
+                assert_eq!(layer.id, id, "identity must survive content eviction");
+                assert_eq!(
+                    layer.needs,
+                    Invalidation::all(),
+                    "an emptied layer must not be judged clean when next visited"
+                );
+
+                // Age it past the second interval: now the record goes too.
+                this.layer_frame += layer.policy.evict_after_frames as u64 * 2;
+                this.evict_stale_layers();
+                assert!(this.layers.is_empty(), "the record should be gone");
+            })
+            .unwrap();
+    }
+
+    /// Compositing skips the layer's subtree paint, and everything except
+    /// primitives is registered *during* paint. A layer that composites while
+    /// losing its mouse listeners looks perfectly correct and stops responding
+    /// to clicks, which is the failure mode this whole epic is trying to stop
+    /// reintroducing.
+    #[gpui::test]
+    fn a_composited_layer_keeps_its_subtrees_interactivity(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let (window, _paints) = layer_window(cx);
+
+        let baseline = window
+            .update(cx, |_, this, _| {
+                (
+                    this.rendered_frame.mouse_listeners.len(),
+                    this.rendered_frame.cursor_styles.len(),
+                )
+            })
+            .unwrap();
+
+        for round in 0..3 {
+            clean_frame(cx, window.into());
+            let after = window
+                .update(cx, |_, this, _| {
+                    (
+                        this.rendered_frame.mouse_listeners.len(),
+                        this.rendered_frame.cursor_styles.len(),
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                after, baseline,
+                "round {round}: compositing dropped what the skipped paint had registered"
+            );
+        }
+    }
+
+    /// A cached view's primitives come from its layer, and a frame that reuses
+    /// must produce the same scene as the frame that rendered it.
+    #[gpui::test]
+    fn a_reused_cached_view_composites_the_same_scene(cx: &mut TestAppContext) {
+        // The debug overlay adds primitives on purpose, so scene equality is
+        // not a meaningful assertion with it on.
+        if layers_off() || crate::layer::layer_debug_enabled() {
+            return;
+        }
+        let (window, _leaf, _leaf_renders, _root_renders) = cached_leaf_window(cx, false);
+
+        let rendered: Vec<u32> = window
+            .update(cx, |_, this, _| {
+                this.rendered_frame.scene.quads.iter().map(|q| q.order).collect()
+            })
+            .unwrap();
+
+        clean_frame(cx, window.into());
+
+        let composited: Vec<u32> = window
+            .update(cx, |_, this, _| {
+                this.rendered_frame.scene.quads.iter().map(|q| q.order).collect()
+            })
+            .unwrap();
+
+        assert_eq!(
+            rendered, composited,
+            "compositing the cached view's layer produced a different scene than \
+             painting it did"
+        );
     }
 }

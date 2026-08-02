@@ -2,13 +2,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, TextColor, bounds_tree::BoundsTree,
-    platform::cross::surface_registry::SurfaceId, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, LayerKey,
+    Pixels, Point, Radians, ScaledPixels, Size, TextColor, bounds_tree::BoundsTree,
+    layer::LayerItem, platform::cross::surface_registry::SurfaceId, point,
 };
 use std::{
     fmt::Debug,
     iter::Peekable,
+    mem,
     ops::{Add, Range, Sub},
     slice,
 };
@@ -18,11 +19,106 @@ pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 pub(crate) type DrawOrder = u32;
 
-#[derive(Default)]
+/// One ordering scope: a `BoundsTree` starting at zero, plus where the scope
+/// sits in its parent.
+///
+/// The root scope is the window. Every retained layer paints into a scope of
+/// its own, which is what makes a layer's draw orders independent of everything
+/// painted outside it. Before this existed, `insert_primitive` assigned `order`
+/// from a single global tree, so a primitive's z — and therefore, downstream,
+/// its byte offset in the GPU buffer — was a function of every other primitive
+/// in the window.
+struct OrderScope {
+    tree: BoundsTree<ScaledPixels>,
+    /// The scope this one was entered from, and the local order it was entered
+    /// at. `None` for the root.
+    parent: Option<(usize, DrawOrder)>,
+    /// Scopes entered from this one, in entry order.
+    children: Vec<usize>,
+    /// The highest local order handed out in this scope.
+    max_local: DrawOrder,
+    /// Whether entering this scope pushed a synthetic clip entry that leaving
+    /// it has to pop. See [`Scene::begin_scope`].
+    synthetic_clip: bool,
+    /// The union of everything actually painted in this scope, including nested
+    /// scopes. A layer's content is not confined to its bounds — shadows,
+    /// overflowing children and outlines all paint outside — so this, not the
+    /// declared bounds, is what the parent has to record.
+    painted: Option<Bounds<ScaledPixels>>,
+    /// Local order -> global order. Built by [`Scene::resolve_orders`].
+    global: Vec<DrawOrder>,
+}
+
+impl OrderScope {
+    fn new(parent: Option<(usize, DrawOrder)>) -> Self {
+        OrderScope {
+            tree: BoundsTree::default(),
+            parent,
+            children: Vec::new(),
+            max_local: 0,
+            synthetic_clip: false,
+            painted: None,
+            global: Vec::new(),
+        }
+    }
+}
+
+/// A clip group opened by [`Scene::push_layer`], tagged with the ordering scope
+/// it belongs to.
+///
+/// The scope matters because a retained layer may be painted inside a clip
+/// group: the clip's order is a *local* order in the outer scope and means
+/// nothing in the inner one.
+#[derive(Copy, Clone)]
+struct ClipEntry {
+    scope: usize,
+    order: DrawOrder,
+}
+
+/// The length of every primitive array, captured at a scope boundary.
+///
+/// Primitives are appended in paint order, so the stretch of each array a scope
+/// contributed is exactly the span between two of these. Recording nine lengths
+/// twice per layer is what lets `finish` rewrite orders per scope without
+/// tagging every individual primitive with the scope it came from.
+#[derive(Clone, Copy, Default)]
+struct ArrayLens {
+    shadows: usize,
+    backdrop_filters: usize,
+    filter_boundaries: usize,
+    quads: usize,
+    paths: usize,
+    underlines: usize,
+    monochrome_sprites: usize,
+    polychrome_sprites: usize,
+    surfaces: usize,
+}
+
+/// One uninterrupted stretch of one scope's primitives.
+struct ScopeRun {
+    scope: usize,
+    start: ArrayLens,
+    end: ArrayLens,
+}
+
 pub(crate) struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
-    primitive_bounds: BoundsTree<ScaledPixels>,
-    layer_stack: Vec<DrawOrder>,
+    /// Every ordering scope this frame. `scopes[0]` is the root and always
+    /// exists.
+    scopes: Vec<OrderScope>,
+    /// The chain of open scopes; the last is where primitives land.
+    scope_stack: Vec<usize>,
+    /// Contiguous stretches of primitives, one per uninterrupted period a scope
+    /// was active. Closed and reopened at every scope boundary.
+    runs: Vec<ScopeRun>,
+    clip_stack: Vec<ClipEntry>,
+    /// Layers currently being painted, innermost last.
+    ///
+    /// The `Vec` is present when the layer is *recording* — re-rendering, and
+    /// keeping what it emits. A compositing layer is on the stack with no
+    /// recording buffer, so that an enclosing recorder still learns it was
+    /// nested here and can replay it by reference next time.
+    capture_stack: Vec<(LayerKey, Option<Vec<LayerItem>>)>,
     pub(crate) shadows: Vec<Shadow>,
     pub(crate) backdrop_filters: Vec<BackdropFilter>,
     pub(crate) filter_boundaries: Vec<FilterBoundary>,
@@ -34,11 +130,47 @@ pub(crate) struct Scene {
     pub(crate) surfaces: Vec<PaintSurface>,
 }
 
+impl Default for Scene {
+    fn default() -> Self {
+        Scene {
+            paint_operations: Vec::new(),
+            scopes: vec![OrderScope::new(None)],
+            scope_stack: vec![0],
+            runs: vec![ScopeRun {
+                scope: 0,
+                start: ArrayLens::default(),
+                end: ArrayLens::default(),
+            }],
+            clip_stack: Vec::new(),
+            capture_stack: Vec::new(),
+            shadows: Vec::new(),
+            backdrop_filters: Vec::new(),
+            filter_boundaries: Vec::new(),
+            quads: Vec::new(),
+            paths: Vec::new(),
+            underlines: Vec::new(),
+            monochrome_sprites: Vec::new(),
+            polychrome_sprites: Vec::new(),
+            surfaces: Vec::new(),
+        }
+    }
+}
+
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
-        self.primitive_bounds.clear();
-        self.layer_stack.clear();
+        self.scopes.clear();
+        self.scopes.push(OrderScope::new(None));
+        self.scope_stack.clear();
+        self.scope_stack.push(0);
+        self.runs.clear();
+        self.runs.push(ScopeRun {
+            scope: 0,
+            start: ArrayLens::default(),
+            end: ArrayLens::default(),
+        });
+        self.clip_stack.clear();
+        self.capture_stack.clear();
         self.paths.clear();
         self.shadows.clear();
         self.backdrop_filters.clear();
@@ -54,15 +186,186 @@ impl Scene {
         self.paint_operations.len()
     }
 
+    fn array_lens(&self) -> ArrayLens {
+        ArrayLens {
+            shadows: self.shadows.len(),
+            backdrop_filters: self.backdrop_filters.len(),
+            filter_boundaries: self.filter_boundaries.len(),
+            quads: self.quads.len(),
+            paths: self.paths.len(),
+            underlines: self.underlines.len(),
+            monochrome_sprites: self.monochrome_sprites.len(),
+            polychrome_sprites: self.polychrome_sprites.len(),
+            surfaces: self.surfaces.len(),
+        }
+    }
+
+    /// Close the open run and start one for `scope`.
+    fn switch_run(&mut self, scope: usize) {
+        let at = self.array_lens();
+        if let Some(run) = self.runs.last_mut() {
+            run.end = at;
+        }
+        self.runs.push(ScopeRun {
+            scope,
+            start: at,
+            end: at,
+        });
+    }
+
+    fn active_scope(&self) -> usize {
+        self.scope_stack.last().copied().unwrap_or(0)
+    }
+
+    /// Hand out the next local order in the active scope, recording it as the
+    /// scope's high-water mark and widening the scope's painted extent.
+    fn note_order(&mut self, order: DrawOrder, bounds: Bounds<ScaledPixels>) -> DrawOrder {
+        let scope = &mut self.scopes[self.scope_stack.last().copied().unwrap_or(0)];
+        scope.max_local = scope.max_local.max(order);
+        scope.painted = Some(match scope.painted {
+            Some(painted) => painted.union(&bounds),
+            None => bounds,
+        });
+        order
+    }
+
+    /// Open an ordering scope for a layer occupying `bounds`.
+    ///
+    /// The layer takes an order strictly above everything already painted in
+    /// the parent scope, and its whole contents are numbered into the gap
+    /// between that order and the next. Above-all rather than overlap-based
+    /// because a layer's content is not confined to its bounds — shadows,
+    /// overflowing children and outlines all paint outside — so an
+    /// overlap-derived order could place content beneath something it was
+    /// painted after. This mirrors how content-filter boundaries have always
+    /// been ordered.
+    fn begin_scope(&mut self, bounds: Bounds<ScaledPixels>) -> usize {
+        let parent = self.active_scope();
+        let entry_order = self.scopes[parent].tree.insert_above_all(bounds);
+        self.scopes[parent].max_local = self.scopes[parent].max_local.max(entry_order);
+
+        let index = self.scopes.len();
+        self.scopes.push(OrderScope::new(Some((parent, entry_order))));
+        self.scopes[parent].children.push(index);
+        self.scope_stack.push(index);
+
+        // A clip group open in an enclosing scope collapses everything inside
+        // it to one order. That order belongs to the outer scope, so re-express
+        // it here: open a clip in the new scope too, and the collapse carries
+        // across the boundary instead of being silently dropped.
+        if self
+            .clip_stack
+            .last()
+            .is_some_and(|clip| clip.scope != index)
+        {
+            let order = self.scopes[index].tree.insert(bounds);
+            self.scopes[index].max_local = self.scopes[index].max_local.max(order);
+            self.clip_stack.push(ClipEntry {
+                scope: index,
+                order,
+            });
+            self.scopes[index].synthetic_clip = true;
+        }
+
+        self.switch_run(index);
+        index
+    }
+
+    /// Close the scope opened by [`Self::begin_scope`], widening the parent's
+    /// record of the layer to whatever it actually painted.
+    ///
+    /// The parent recorded the layer's *bounds* on entry, but content escapes
+    /// those bounds routinely. Re-inserting the union at the same order means
+    /// content painted afterwards that overlaps the overflow still sorts above
+    /// the layer, which an entry-time insert alone would not guarantee.
+    fn end_scope(&mut self) {
+        let index = self.active_scope();
+        if self.scopes[index].synthetic_clip {
+            self.clip_stack.pop();
+        }
+        self.scope_stack.pop();
+
+        let painted = self.scopes[index].painted;
+        if let (Some((parent, entry_order)), Some(painted)) = (self.scopes[index].parent, painted) {
+            crate::render_stats::count("layer: order tree reinsert");
+            self.scopes[parent].tree.insert_at_order(painted, entry_order);
+            let parent_painted = &mut self.scopes[parent].painted;
+            *parent_painted = Some(match *parent_painted {
+                Some(existing) => existing.union(&painted),
+                None => painted,
+            });
+        }
+
+        let parent = self.active_scope();
+        self.switch_run(parent);
+    }
+
+    /// Open an ordering scope for the layer `key`.
+    ///
+    /// `record` asks for everything painted inside to be kept, which is what a
+    /// re-rendering layer wants. A compositing layer passes `false`: it is
+    /// replaying content it already holds, and re-recording it would only
+    /// duplicate it.
+    pub fn begin_layer(&mut self, key: LayerKey, bounds: Bounds<ScaledPixels>, record: bool) {
+        self.begin_scope(bounds);
+        self.capture_stack
+            .push((key, record.then(Vec::new)));
+    }
+
+    /// Close the scope opened by [`Self::begin_layer`], returning what it
+    /// captured — in paint order, carrying layer-local draw orders — if it was
+    /// recording.
+    pub fn end_layer(&mut self) -> Option<Vec<LayerItem>> {
+        let (key, items) = self
+            .capture_stack
+            .pop()
+            .expect("end_layer without a matching begin_layer");
+        self.end_scope();
+        // An enclosing recorder stores the nested layer by reference. Inlining
+        // its primitives would merge two local order spaces into one and
+        // silently reorder them, and it would also defeat the nested layer's
+        // own independent invalidation.
+        if let Some((_, Some(parent_items))) = self.capture_stack.last_mut() {
+            parent_items.push(LayerItem::Nested(key));
+        }
+        items
+    }
+
+    /// Re-emit a retained primitive, keeping the layer-local order it was
+    /// recorded with.
+    ///
+    /// This is the saving the whole phase is for: no `BoundsTree` insert, and
+    /// no re-derivation of z from whatever else happens to be painted this
+    /// frame.
+    pub fn push_retained(&mut self, primitive: &Primitive) {
+        let mut primitive = primitive.clone();
+        let bounds = primitive
+            .bounds()
+            .intersect(&primitive.content_mask().bounds);
+        let order = self.note_order(primitive_order(&primitive), bounds);
+        set_primitive_order(&mut primitive, order);
+        // Path ids are indices into `self.paths`, so they mean nothing outside
+        // the scene being built and have to be reassigned on every replay.
+        if let Primitive::Path(path) = &mut primitive {
+            path.id = PathId(self.paths.len());
+        }
+        count_primitive(&primitive);
+        self.push_to_array(&primitive);
+        self.paint_operations
+            .push(PaintOperation::Primitive(primitive));
+    }
+
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        let scope = self.active_scope();
+        let order = self.scopes[scope].tree.insert(bounds);
+        self.note_order(order, bounds);
+        self.clip_stack.push(ClipEntry { scope, order });
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
 
     pub fn pop_layer(&mut self) {
-        self.layer_stack.pop();
+        self.clip_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
@@ -70,9 +373,15 @@ impl Scene {
     /// inserted before. Called before painting deferred draws so overlays (tooltips, popovers,
     /// drag images) sort above the main scene — and a deferred backdrop's order can't fall inside
     /// a content-filter (`filter`) order range left behind by the main scene.
+    ///
+    /// Scoped to the active ordering scope. Deferred draws are painted at the
+    /// top level, so in practice that is the root — but a layer that hoists its
+    /// own deferred content hoists it within itself, which is the layer-granular
+    /// behaviour this phase is for.
     pub fn raise_order_floor(&mut self) {
-        let floor = self.primitive_bounds.max_order() + 1;
-        self.primitive_bounds.set_order_floor(floor);
+        let scope = self.active_scope();
+        let floor = self.scopes[scope].tree.max_order() + 1;
+        self.scopes[scope].tree.set_order_floor(floor);
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
@@ -94,70 +403,56 @@ impl Scene {
             return;
         }
 
+        // A degenerate filter boundary has no clipped extent, but it still has
+        // to widen the scope's painted region — an enclosing layer's recorded
+        // extent must cover the marker pair or a later sibling could sort
+        // between them.
+        let extent = if clipped_bounds.is_empty() {
+            *primitive.bounds()
+        } else {
+            clipped_bounds
+        };
+
+        let scope = self.active_scope();
         let order = {
             let _t = crate::render_stats::scope("frame: bounds tree");
             if is_filter_boundary {
-                let order_bounds = if clipped_bounds.is_empty() {
-                    *primitive.bounds()
-                } else {
-                    clipped_bounds
-                };
-                self.primitive_bounds.insert_above_all(order_bounds)
+                self.scopes[scope].tree.insert_above_all(extent)
             } else {
-                self.layer_stack
+                self.clip_stack
                     .last()
-                    .copied()
-                    .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
+                    .filter(|clip| clip.scope == scope)
+                    .map(|clip| clip.order)
+                    .unwrap_or_else(|| self.scopes[scope].tree.insert(clipped_bounds))
             }
         };
-        match &mut primitive {
-            Primitive::Shadow(shadow) => {
-                crate::render_stats::count("frame: primitives emitted (shadow)");
-                shadow.order = order;
-                self.shadows.push(shadow.clone());
-            }
-            Primitive::BackdropFilter(filter) => {
-                filter.order = order;
-                self.backdrop_filters.push(*filter);
-            }
-            Primitive::FilterBoundary(boundary) => {
-                boundary.order = order;
-                self.filter_boundaries.push(*boundary);
-            }
-            Primitive::Quad(quad) => {
-                crate::render_stats::count("frame: primitives emitted (quad)");
-                quad.order = order;
-                self.quads.push(quad.clone());
-            }
-            Primitive::Path(path) => {
-                crate::render_stats::count("frame: primitives emitted (path)");
-                path.order = order;
-                path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
-            }
-            Primitive::Underline(underline) => {
-                crate::render_stats::count("frame: primitives emitted (underline)");
-                underline.order = order;
-                self.underlines.push(underline.clone());
-            }
-            Primitive::MonochromeSprite(sprite) => {
-                crate::render_stats::count("frame: primitives emitted (sprite)");
-                sprite.order = order;
-                self.monochrome_sprites.push(sprite.clone());
-            }
-            Primitive::PolychromeSprite(sprite) => {
-                crate::render_stats::count("frame: primitives emitted (sprite)");
-                sprite.order = order;
-                self.polychrome_sprites.push(sprite.clone());
-            }
-            Primitive::Surface(surface) => {
-                crate::render_stats::count("frame: primitives emitted (surface)");
-                surface.order = order;
-                self.surfaces.push(surface.clone());
-            }
+        let order = self.note_order(order, extent);
+        set_primitive_order(&mut primitive, order);
+        if let Primitive::Path(path) = &mut primitive {
+            path.id = PathId(self.paths.len());
+        }
+        count_primitive(&primitive);
+        self.push_to_array(&primitive);
+        if let Some((_, Some(items))) = self.capture_stack.last_mut() {
+            items.push(LayerItem::Primitive(primitive.clone()));
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
+    }
+
+    /// Append `primitive` to the array for its kind, without touching its order.
+    fn push_to_array(&mut self, primitive: &Primitive) {
+        match primitive {
+            Primitive::Shadow(shadow) => self.shadows.push(shadow.clone()),
+            Primitive::BackdropFilter(filter) => self.backdrop_filters.push(*filter),
+            Primitive::FilterBoundary(boundary) => self.filter_boundaries.push(*boundary),
+            Primitive::Quad(quad) => self.quads.push(quad.clone()),
+            Primitive::Path(path) => self.paths.push(path.clone()),
+            Primitive::Underline(underline) => self.underlines.push(underline.clone()),
+            Primitive::MonochromeSprite(sprite) => self.monochrome_sprites.push(sprite.clone()),
+            Primitive::PolychromeSprite(sprite) => self.polychrome_sprites.push(sprite.clone()),
+            Primitive::Surface(surface) => self.surfaces.push(surface.clone()),
+        }
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -170,8 +465,122 @@ impl Scene {
         }
     }
 
+    /// Map every scope's local orders into a global range reserved for it, and
+    /// rewrite the orders recorded on primitives to match.
+    ///
+    /// Depth-first, in entry order: a scope entered at parent-local order `o`
+    /// consumes a contiguous run of global orders sitting strictly between the
+    /// global orders of `o` and `o + 1`. That is exactly the nesting property
+    /// the local trees were built on — content inside a layer sorts above
+    /// everything painted before the layer in its parent, and below everything
+    /// the parent painted afterwards that overlaps it.
+    fn resolve_orders(&mut self) {
+        fn assign(scopes: &mut Vec<OrderScope>, index: usize, counter: &mut DrawOrder) {
+            let max_local = scopes[index].max_local;
+            // Taken out so the recursive call can borrow `scopes` mutably;
+            // restored before returning.
+            let children = mem::take(&mut scopes[index].children);
+
+            let mut global = vec![0; max_local as usize + 1];
+            let mut next_child = 0;
+            for local in 1..=max_local {
+                *counter += 1;
+                global[local as usize] = *counter;
+                while next_child < children.len() {
+                    let child = children[next_child];
+                    // Entry orders are handed out by `insert_above_all`, so
+                    // they only ever increase and this scan is linear.
+                    match scopes[child].parent {
+                        Some((_, entry)) if entry == local => {
+                            assign(scopes, child, counter);
+                            next_child += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            // Defensive: a child whose entry order somehow exceeded the
+            // parent's high-water mark still has to be numbered, or its
+            // primitives would keep unmapped local orders.
+            while next_child < children.len() {
+                assign(scopes, children[next_child], counter);
+                next_child += 1;
+            }
+
+            scopes[index].global = global;
+            scopes[index].children = children;
+        }
+
+        let mut counter = 0;
+        assign(&mut self.scopes, 0, &mut counter);
+
+        for run in &self.runs {
+            let global = &self.scopes[run.scope].global;
+            let map = |order: &mut DrawOrder| {
+                *order = global
+                    .get(*order as usize)
+                    .copied()
+                    .unwrap_or(DrawOrder::MAX);
+            };
+            for shadow in &mut self.shadows[run.start.shadows..run.end.shadows] {
+                map(&mut shadow.order);
+            }
+            for filter in
+                &mut self.backdrop_filters[run.start.backdrop_filters..run.end.backdrop_filters]
+            {
+                map(&mut filter.order);
+            }
+            for boundary in
+                &mut self.filter_boundaries[run.start.filter_boundaries..run.end.filter_boundaries]
+            {
+                map(&mut boundary.order);
+            }
+            for quad in &mut self.quads[run.start.quads..run.end.quads] {
+                map(&mut quad.order);
+            }
+            for path in &mut self.paths[run.start.paths..run.end.paths] {
+                map(&mut path.order);
+            }
+            for underline in &mut self.underlines[run.start.underlines..run.end.underlines] {
+                map(&mut underline.order);
+            }
+            for sprite in &mut self.monochrome_sprites
+                [run.start.monochrome_sprites..run.end.monochrome_sprites]
+            {
+                map(&mut sprite.order);
+            }
+            for sprite in &mut self.polychrome_sprites
+                [run.start.polychrome_sprites..run.end.polychrome_sprites]
+            {
+                map(&mut sprite.order);
+            }
+            for surface in &mut self.surfaces[run.start.surfaces..run.end.surfaces] {
+                map(&mut surface.order);
+            }
+        }
+    }
+
     pub fn finish(&mut self) {
         let _t = crate::render_stats::scope("frame: scene finish");
+        debug_assert_eq!(
+            self.scope_stack.len(),
+            1,
+            "a layer was left open when the frame finished"
+        );
+        if let Some(run) = self.runs.last_mut() {
+            run.end = ArrayLens {
+                shadows: self.shadows.len(),
+                backdrop_filters: self.backdrop_filters.len(),
+                filter_boundaries: self.filter_boundaries.len(),
+                quads: self.quads.len(),
+                paths: self.paths.len(),
+                underlines: self.underlines.len(),
+                monochrome_sprites: self.monochrome_sprites.len(),
+                polychrome_sprites: self.polychrome_sprites.len(),
+                surfaces: self.surfaces.len(),
+            };
+        }
+        self.resolve_orders();
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
@@ -288,6 +697,50 @@ impl Primitive {
             Primitive::BackdropFilter(filter) => &filter.content_mask,
             Primitive::FilterBoundary(boundary) => &boundary.content_mask,
         }
+    }
+}
+
+fn primitive_order(primitive: &Primitive) -> DrawOrder {
+    match primitive {
+        Primitive::Shadow(shadow) => shadow.order,
+        Primitive::Quad(quad) => quad.order,
+        Primitive::Path(path) => path.order,
+        Primitive::Underline(underline) => underline.order,
+        Primitive::MonochromeSprite(sprite) => sprite.order,
+        Primitive::PolychromeSprite(sprite) => sprite.order,
+        Primitive::Surface(surface) => surface.order,
+        Primitive::BackdropFilter(filter) => filter.order,
+        Primitive::FilterBoundary(boundary) => boundary.order,
+    }
+}
+
+fn set_primitive_order(primitive: &mut Primitive, order: DrawOrder) {
+    match primitive {
+        Primitive::Shadow(shadow) => shadow.order = order,
+        Primitive::Quad(quad) => quad.order = order,
+        Primitive::Path(path) => path.order = order,
+        Primitive::Underline(underline) => underline.order = order,
+        Primitive::MonochromeSprite(sprite) => sprite.order = order,
+        Primitive::PolychromeSprite(sprite) => sprite.order = order,
+        Primitive::Surface(surface) => surface.order = order,
+        Primitive::BackdropFilter(filter) => filter.order = order,
+        Primitive::FilterBoundary(boundary) => boundary.order = order,
+    }
+}
+
+fn count_primitive(primitive: &Primitive) {
+    match primitive {
+        Primitive::Shadow(_) => crate::render_stats::count("frame: primitives emitted (shadow)"),
+        Primitive::Quad(_) => crate::render_stats::count("frame: primitives emitted (quad)"),
+        Primitive::Path(_) => crate::render_stats::count("frame: primitives emitted (path)"),
+        Primitive::Underline(_) => {
+            crate::render_stats::count("frame: primitives emitted (underline)")
+        }
+        Primitive::MonochromeSprite(_) | Primitive::PolychromeSprite(_) => {
+            crate::render_stats::count("frame: primitives emitted (sprite)")
+        }
+        Primitive::Surface(_) => crate::render_stats::count("frame: primitives emitted (surface)"),
+        Primitive::BackdropFilter(_) | Primitive::FilterBoundary(_) => {}
     }
 }
 
@@ -1114,5 +1567,344 @@ mod tests {
         scene.insert_primitive(quad());
 
         assert_eq!(batch_kinds(&mut scene), vec!["quad", "backdrop", "quad"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Ordering equivalence: layer-local ordering against the global tree.
+    //
+    // This is the correctness gate for the retained-layer phase. Layer-local
+    // ordering is the thing everything downstream — per-layer slabs, occlusion,
+    // transform-only scrolling — is built on; get it wrong here and every later
+    // phase inherits it, invisibly.
+    //
+    // What is asserted is *relative* order between overlapping primitives, not
+    // equality of the order integers. Those cannot match and should not: the
+    // global tree reuses low orders for non-overlapping content, and a layer
+    // deliberately takes an order above everything painted before it so that
+    // content escaping its bounds still sorts correctly. Two primitives that do
+    // not overlap have no visual relationship, so any relative order is
+    // equally correct for them. Two that *do* overlap have exactly one correct
+    // answer, and it must be the same answer the global tree gives.
+    // ---------------------------------------------------------------------
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point { x: sp(x), y: sp(y) },
+            size: Size {
+                width: sp(w),
+                height: sp(h),
+            },
+        }
+    }
+
+    fn quad_at(bounds: Bounds<ScaledPixels>) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask {
+                bounds: rect(-1000., -1000., 10_000., 10_000.),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// One step of a reference scene, replayed through both ordering schemes.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Quad(Bounds<ScaledPixels>),
+        /// Content-filter group markers, which take an order above all prior
+        /// content and must keep their contents strictly between them.
+        FilterStart(Bounds<ScaledPixels>),
+        FilterEnd(Bounds<ScaledPixels>),
+        /// A retained layer boundary. Ignored by the reference, which has only
+        /// the one global tree — which is exactly the equivalence being tested.
+        BeginLayer(LayerKey, Bounds<ScaledPixels>),
+        EndLayer,
+        /// A clip group: everything inside collapses to one order.
+        PushClip(Bounds<ScaledPixels>),
+        PopClip,
+        /// What `paint_deferred_draws` does before painting overlays.
+        RaiseFloor,
+    }
+
+    /// The reference scene, exercising every ordering mechanism at once:
+    /// overlapping and non-overlapping content, layers nested two deep, a layer
+    /// whose content escapes its declared bounds, a filter group containing a
+    /// layer, a clip group, and deferred draws hoisted above everything.
+    fn reference_scene() -> Vec<Step> {
+        let panel = rect(0., 0., 200., 400.);
+        let inner = rect(10., 10., 180., 100.);
+        vec![
+            // Background grid: non-overlapping, so the global tree reuses low
+            // orders for it. This is the content a badly-chosen layer order
+            // range would sweep into a filter group.
+            Step::Quad(rect(0., 500., 50., 50.)),
+            Step::Quad(rect(100., 500., 50., 50.)),
+            Step::Quad(rect(200., 500., 50., 50.)),
+            // Main content behind the panel.
+            Step::Quad(rect(0., 0., 800., 600.)),
+            // A retained layer, with a layer nested inside it.
+            Step::BeginLayer(LayerKey(1), panel),
+            Step::Quad(panel),
+            Step::BeginLayer(LayerKey(2), inner),
+            Step::Quad(inner),
+            Step::Quad(rect(20., 20., 60., 60.)),
+            Step::EndLayer,
+            // Overlaps the nested layer, painted after it.
+            Step::Quad(rect(10., 60., 180., 60.)),
+            // Escapes the layer's declared bounds — the case `end_scope`'s
+            // re-insert exists for.
+            Step::Quad(rect(150., 380., 300., 60.)),
+            Step::EndLayer,
+            // Painted after the layer and overlapping only its overflow.
+            Step::Quad(rect(300., 390., 100., 40.)),
+            // A filter group containing a layer.
+            Step::FilterStart(rect(400., 0., 200., 200.)),
+            Step::Quad(rect(400., 0., 200., 200.)),
+            Step::BeginLayer(LayerKey(3), rect(420., 20., 160., 160.)),
+            Step::Quad(rect(420., 20., 160., 160.)),
+            Step::EndLayer,
+            Step::FilterEnd(rect(400., 0., 200., 200.)),
+            // A clip group, collapsing its contents to one order.
+            Step::PushClip(rect(0., 200., 300., 100.)),
+            Step::Quad(rect(0., 200., 150., 100.)),
+            Step::Quad(rect(100., 200., 150., 100.)),
+            Step::PopClip,
+            // Deferred draws: overlays hoisted above the whole main scene.
+            Step::RaiseFloor,
+            Step::Quad(rect(50., 50., 100., 100.)),
+            Step::BeginLayer(LayerKey(4), rect(60., 60., 80., 80.)),
+            Step::Quad(rect(60., 60., 80., 80.)),
+            Step::EndLayer,
+        ]
+    }
+
+    /// Replay `steps` through `Scene`, returning each quad's final z-position,
+    /// indexed by the order the quads were painted in.
+    fn layered_ranks(steps: &[Step]) -> Vec<usize> {
+        let mut scene = Scene::default();
+        for step in steps {
+            match *step {
+                Step::Quad(bounds) => scene.insert_primitive(quad_at(bounds)),
+                Step::FilterStart(bounds) => scene.insert_primitive(FilterBoundary {
+                    bounds,
+                    is_start: true,
+                    ..boundary(true)
+                }),
+                Step::FilterEnd(bounds) => scene.insert_primitive(FilterBoundary {
+                    bounds,
+                    is_start: false,
+                    ..boundary(false)
+                }),
+                Step::BeginLayer(key, bounds) => scene.begin_layer(key, bounds, true),
+                Step::EndLayer => {
+                    scene.end_layer();
+                }
+                Step::PushClip(bounds) => scene.push_layer(bounds),
+                Step::PopClip => scene.pop_layer(),
+                Step::RaiseFloor => scene.raise_order_floor(),
+            }
+        }
+        // Tag each quad with its paint index before sorting, so the sorted
+        // position can be mapped back. `corner_radii.top_left` is unused by
+        // ordering and survives the sort untouched.
+        for (index, quad) in scene.quads.iter_mut().enumerate() {
+            quad.corner_radii.top_left = sp(index as f32);
+        }
+        scene.finish();
+
+        let mut ranks = vec![0; scene.quads.len()];
+        for (rank, quad) in scene.quads.iter().enumerate() {
+            ranks[quad.corner_radii.top_left.0 as usize] = rank;
+        }
+        ranks
+    }
+
+    /// Replay `steps` through a single global `BoundsTree`, reproducing exactly
+    /// what `insert_primitive` did before layers existed.
+    fn global_ranks(steps: &[Step]) -> Vec<usize> {
+        let mut tree = BoundsTree::<ScaledPixels>::default();
+        let mut clip: Vec<DrawOrder> = Vec::new();
+        // (paint index, order), for quads only.
+        let mut quads: Vec<(usize, DrawOrder)> = Vec::new();
+        let mut painted = 0;
+
+        for step in steps {
+            match *step {
+                Step::Quad(bounds) => {
+                    let order = clip
+                        .last()
+                        .copied()
+                        .unwrap_or_else(|| tree.insert(bounds));
+                    quads.push((painted, order));
+                    painted += 1;
+                }
+                Step::FilterStart(bounds) | Step::FilterEnd(bounds) => {
+                    tree.insert_above_all(bounds);
+                }
+                // Layers do not exist in the reference. That is the point: the
+                // same paint sequence, ordered by one global tree.
+                Step::BeginLayer(..) | Step::EndLayer => {}
+                Step::PushClip(bounds) => clip.push(tree.insert(bounds)),
+                Step::PopClip => {
+                    clip.pop();
+                }
+                Step::RaiseFloor => tree.set_order_floor(tree.max_order() + 1),
+            }
+        }
+
+        // Stable sort by order, matching `Scene::finish`.
+        let mut sorted = quads.clone();
+        sorted.sort_by_key(|(_, order)| *order);
+        let mut ranks = vec![0; quads.len()];
+        for (rank, (index, _)) in sorted.iter().enumerate() {
+            ranks[*index] = rank;
+        }
+        ranks
+    }
+
+    #[test]
+    fn layer_local_ordering_matches_the_global_tree_on_the_reference_scene() {
+        let steps = reference_scene();
+        let layered = layered_ranks(&steps);
+        let global = global_ranks(&steps);
+        assert_eq!(layered.len(), global.len());
+
+        let bounds: Vec<Bounds<ScaledPixels>> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Quad(bounds) => Some(*bounds),
+                _ => None,
+            })
+            .collect();
+
+        let mut compared = 0;
+        for a in 0..bounds.len() {
+            for b in (a + 1)..bounds.len() {
+                if !bounds[a].intersects(&bounds[b]) {
+                    continue;
+                }
+                compared += 1;
+                assert_eq!(
+                    layered[a] < layered[b],
+                    global[a] < global[b],
+                    "quads {a} and {b} overlap, and layer-local ordering put them in the \
+                     opposite z-order to the global tree. layered={:?} global={:?}",
+                    (layered[a], layered[b]),
+                    (global[a], global[b]),
+                );
+            }
+        }
+        assert!(
+            compared > 10,
+            "the reference scene must actually exercise overlap; only {compared} \
+             overlapping pairs were compared"
+        );
+    }
+
+    #[test]
+    fn a_layers_orders_do_not_depend_on_what_is_painted_outside_it() {
+        // The property that makes retained primitives reusable at all: a
+        // layer's local orders are a function of its own content and nothing
+        // else. Under the old global tree they were a function of every
+        // primitive painted before it in the window.
+        let panel = rect(0., 0., 200., 200.);
+        let capture = |before: &[Bounds<ScaledPixels>]| -> Vec<DrawOrder> {
+            let mut scene = Scene::default();
+            for bounds in before {
+                scene.insert_primitive(quad_at(*bounds));
+            }
+            scene.begin_layer(LayerKey(1), panel, true);
+            scene.insert_primitive(quad_at(panel));
+            scene.insert_primitive(quad_at(rect(10., 10., 100., 100.)));
+            scene.insert_primitive(quad_at(rect(50., 50., 100., 100.)));
+            let items = scene.end_layer().unwrap();
+            items
+                .iter()
+                .map(|item| match item {
+                    LayerItem::Primitive(primitive) => primitive_order(primitive),
+                    LayerItem::Nested(_) => unreachable!("no nested layers here"),
+                })
+                .collect()
+        };
+
+        let alone = capture(&[]);
+        let crowded = capture(&[
+            rect(0., 0., 800., 600.),
+            rect(0., 0., 400., 300.),
+            rect(0., 0., 200., 200.),
+            rect(0., 0., 100., 100.),
+        ]);
+        assert_eq!(
+            alone, crowded,
+            "the same layer content produced different local orders depending on what \
+             was painted before it"
+        );
+        assert_eq!(alone, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn compositing_a_layer_reproduces_the_order_it_recorded() {
+        let panel = rect(0., 0., 200., 200.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad_at(rect(0., 0., 800., 600.)));
+        scene.begin_layer(LayerKey(1), panel, true);
+        scene.insert_primitive(quad_at(panel));
+        scene.insert_primitive(quad_at(rect(10., 10., 100., 100.)));
+        let items = scene.end_layer().unwrap();
+        scene.finish();
+        let recorded: Vec<DrawOrder> = scene.quads.iter().map(|quad| quad.order).collect();
+
+        // Replay the same frame, compositing the layer instead of painting it.
+        let mut replayed = Scene::default();
+        replayed.insert_primitive(quad_at(rect(0., 0., 800., 600.)));
+        replayed.begin_layer(LayerKey(1), panel, false);
+        for item in &items {
+            match item {
+                LayerItem::Primitive(primitive) => replayed.push_retained(primitive),
+                LayerItem::Nested(_) => unreachable!(),
+            }
+        }
+        replayed.end_layer();
+        replayed.finish();
+
+        assert_eq!(
+            recorded,
+            replayed
+                .quads
+                .iter()
+                .map(|quad| quad.order)
+                .collect::<Vec<_>>(),
+            "a composited layer produced different global orders than the paint it replaced"
+        );
+    }
+
+    #[test]
+    fn a_nested_layer_keeps_its_own_order_space() {
+        let outer = rect(0., 0., 400., 400.);
+        let inner = rect(0., 0., 200., 200.);
+        let mut scene = Scene::default();
+        scene.begin_layer(LayerKey(1), outer, true);
+        scene.insert_primitive(quad_at(outer));
+        scene.begin_layer(LayerKey(2), inner, true);
+        scene.insert_primitive(quad_at(inner));
+        scene.insert_primitive(quad_at(inner));
+        let inner_items = scene.end_layer().unwrap();
+        let outer_items = scene.end_layer().unwrap();
+
+        // The outer layer holds one primitive and a reference, not three
+        // primitives: inlining would merge the two local order spaces.
+        assert_eq!(outer_items.len(), 2);
+        assert!(matches!(outer_items[0], LayerItem::Primitive(_)));
+        assert!(matches!(outer_items[1], LayerItem::Nested(LayerKey(2))));
+
+        // The inner layer's own orders start from 1 regardless of the outer's.
+        let inner_orders: Vec<DrawOrder> = inner_items
+            .iter()
+            .map(|item| match item {
+                LayerItem::Primitive(primitive) => primitive_order(primitive),
+                LayerItem::Nested(_) => unreachable!(),
+            })
+            .collect();
+        assert_eq!(inner_orders, vec![1, 2]);
     }
 }

@@ -17,9 +17,9 @@
 
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
-    DispatchPhase, Display, Element, ElementGeometry, ElementId, Entity, FocusHandle, Global,
+    DispatchPhase, Display, Element, ElementGeometry, ElementId, Entity, FocusHandle, FrameEffectCallback, Global,
     GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero,
-    KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId,
+    KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayerPolicy, LayoutId,
     ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Overflow, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
     Size, Style, StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea,
@@ -1092,6 +1092,48 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Make this element a retained layer: an explicit, independently
+    /// invalidated unit of caching.
+    ///
+    /// ```ignore
+    /// div().id("properties-panel").layer().child(expensive_content)
+    /// ```
+    ///
+    /// A layer keeps the primitives it emitted and re-emits them on frames
+    /// where nothing it depends on changed, skipping both its subtree's paint
+    /// and the per-primitive `BoundsTree` insert that would re-derive z-order
+    /// from scratch. It is on [`StatefulInteractiveElement`] rather than
+    /// [`InteractiveElement`] on purpose: a layer's entire value is surviving
+    /// across frames, so it must have a stable name, and `.id(..)` is what
+    /// gives it one. Anonymous caching is what made the mechanism this replaces
+    /// fragile.
+    ///
+    /// # Where to put the boundary
+    ///
+    /// **Separate content by update frequency, not only by visual grouping.**
+    /// Ordering is invalidated per *layer*: if anything inside changes bounds,
+    /// the whole layer's tree re-inserts and all of its primitives re-sort. A
+    /// layer holding one 120Hz-animating element and a thousand static ones
+    /// re-sorts all thousand every frame, and will look perfectly correct while
+    /// being slower than no layer at all. Run with `WGPUI_LAYER_DEBUG=1` to see
+    /// which layers are actually re-rendering.
+    ///
+    /// A layer under the pointer always re-renders, because hover styles are
+    /// resolved during paint and no invalidation names them. Layers wrapping
+    /// content the pointer sits over constantly buy nothing.
+    ///
+    /// Set `WGPUI_LAYERS=0` to make this a no-op passthrough.
+    fn layer(mut self) -> Self {
+        self.interactivity().layer = Some(LayerPolicy::default());
+        self
+    }
+
+    /// [`Self::layer`], with a non-default policy.
+    fn layer_with_policy(mut self, policy: LayerPolicy) -> Self {
+        self.interactivity().layer = Some(policy);
+        self
+    }
+
     /// Set the overflow x and y to scroll.
     fn overflow_scroll(mut self) -> Self {
         self.interactivity().base_style.overflow.x = Some(Overflow::Scroll);
@@ -1316,7 +1358,7 @@ pub struct Div {
     interactivity: Interactivity,
     children: SmallVec<[StackSafe<AnyElement>; 2]>,
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
-    on_frame: Option<Box<dyn FnMut(ElementGeometry, &mut Window, &mut App) + 'static>>,
+    on_frame: Option<FrameEffectCallback>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
 }
 
@@ -1331,14 +1373,30 @@ impl Div {
         self
     }
 
-    /// Register a callback that runs on every frame, cached or not, with
-    /// resolved geometry. Geometry stashing and external-state publication
-    /// belong here, not in on_children_prepainted.
+    /// Register a callback that runs on every frame this element participates
+    /// in, cached or not, with resolved geometry.
+    ///
+    /// Geometry stashing and external-state publication belong here, not in
+    /// [`Self::on_children_prepainted`] or a prepaint closure. Those run only
+    /// when the element is actually walked, so a cached ancestor silently stops
+    /// them — which is how a viewport that recorded its bounds in prepaint and
+    /// read them back in a click handler ended up normalising the cursor
+    /// against last-seen geometry.
+    ///
+    /// The callback is `Fn`, not `FnMut`, because it outlives the element: it
+    /// is recorded on the frame and re-invoked when a cached ancestor replays
+    /// instead of re-rendering. Mutate through a `RefCell`/`Cell`, which is
+    /// what geometry stashing does anyway.
+    ///
+    /// It runs during [`DrawPhase::Effects`](crate::DrawPhase), where building
+    /// elements is illegal by construction: it receives resolved geometry and
+    /// returns nothing, and calling `request_layout`, any `paint_*`, or
+    /// `with_element_state` from it trips a debug assertion.
     pub fn on_frame(
         mut self,
-        callback: impl FnMut(ElementGeometry, &mut Window, &mut App) + 'static,
+        callback: impl Fn(ElementGeometry, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.on_frame = Some(Box::new(callback));
+        self.on_frame = Some(Rc::new(callback));
         self
     }
 
@@ -1537,25 +1595,46 @@ impl Element for Div {
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
-        window.with_image_cache(image_cache, |window| {
-            self.interactivity.paint(
-                global_id,
-                inspector_id,
-                bounds,
-                hitbox.as_ref(),
-                window,
-                cx,
-                |style, window, cx| {
-                    // skip children
-                    if style.display == Display::None {
-                        return;
-                    }
+        // A `.layer()` div paints inside its own retained layer, which may
+        // decline to run this closure at all and composite last frame's
+        // primitives instead. Everything below — including the interactivity
+        // state and the children's paint — is then skipped, which is the point.
+        let layer = self
+            .interactivity
+            .layer
+            .filter(|_| global_id.is_some())
+            .map(|policy| (policy, global_id.unwrap().clone()));
 
-                    for child in &mut self.children {
-                        child.paint(window, cx);
-                    }
-                },
-            )
+        window.with_image_cache(image_cache, |window| {
+            let paint = |this: &mut Self, window: &mut Window, cx: &mut App| {
+                this.interactivity.paint(
+                    global_id,
+                    inspector_id,
+                    bounds,
+                    hitbox.as_ref(),
+                    window,
+                    cx,
+                    |style, window, cx| {
+                        // skip children
+                        if style.display == Display::None {
+                            return;
+                        }
+
+                        for child in &mut this.children {
+                            child.paint(window, cx);
+                        }
+                    },
+                )
+            };
+
+            match layer {
+                Some((policy, layer_id)) => {
+                    window.with_retained_layer(&layer_id, bounds, policy, cx, |window, cx| {
+                        paint(self, window, cx)
+                    });
+                }
+                None => paint(self, window, cx),
+            }
         });
     }
 
@@ -1565,12 +1644,24 @@ impl Element for Div {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(callback) = self.on_frame.as_mut() {
-            callback(geom, window, cx);
-        }
-        for child in &mut self.children {
-            child.on_frame(geom, window, cx);
-        }
+        let Some(callback) = self.on_frame.clone() else {
+            return;
+        };
+        // Recorded before it is called, so the frame's effect list is in the
+        // same order the effects ran in. A cached ancestor replaying next frame
+        // re-invokes this recording, which is the only reason the callback is
+        // `Rc` rather than owned.
+        window.record_frame_effect(callback.clone(), geom);
+        callback(geom, window, cx);
+
+        // Deliberately no recursion into `children`. `Drawable::prepaint`
+        // already calls `on_frame` on every element it walks, each with *its
+        // own* resolved geometry. Recursing here called every descendant a
+        // second time with this div's geometry, and — because the parent's
+        // recursion runs after the child's own call — the wrong geometry landed
+        // last. A viewport stashing `geom.bounds` ended up holding an
+        // ancestor's bounds, which is the exact defect this channel exists to
+        // close.
     }
 }
 
@@ -1639,6 +1730,9 @@ pub struct Interactivity {
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) window_control: Option<WindowControlArea>,
     pub(crate) hitbox_behavior: HitboxBehavior,
+    /// Set by [`StatefulInteractiveElement::layer`]. `Some` makes this element
+    /// a retained layer rooted at its [`GlobalElementId`].
+    pub(crate) layer: Option<LayerPolicy>,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) tab_stop: bool,
@@ -3175,6 +3269,17 @@ where
             window,
             cx,
         );
+    }
+
+    /// Forwarded like every other phase.
+    ///
+    /// `Stateful` calls the inner element's trait methods directly rather than
+    /// going through a `Drawable`, so the inner element is never handed to the
+    /// walk that calls `on_frame`. Without this, `.id(..)` — which is on
+    /// essentially every element worth naming, including every one that could
+    /// hold a layer — silently discarded the element's effect.
+    fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App) {
+        self.element.on_frame(geom, window, cx);
     }
 }
 
