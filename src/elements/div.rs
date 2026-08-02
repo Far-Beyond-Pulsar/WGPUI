@@ -17,13 +17,13 @@
 
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
-    DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
-    Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
-    KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
-    MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    DispatchPhase, Display, Element, ElementGeometry, ElementId, Entity, FocusHandle, Global,
+    GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero,
+    KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId,
+    ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Overflow, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    Size, Style, StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea,
+    point, px, size,
 };
 use collections::HashMap;
 use refineable::Refineable;
@@ -1306,6 +1306,7 @@ pub fn div() -> Div {
         interactivity: Interactivity::new(),
         children: SmallVec::default(),
         prepaint_listener: None,
+        on_frame: None,
         image_cache: None,
     }
 }
@@ -1315,6 +1316,7 @@ pub struct Div {
     interactivity: Interactivity,
     children: SmallVec<[StackSafe<AnyElement>; 2]>,
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
+    on_frame: Option<Box<dyn FnMut(ElementGeometry, &mut Window, &mut App) + 'static>>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
 }
 
@@ -1326,6 +1328,17 @@ impl Div {
         listener: impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.prepaint_listener = Some(Box::new(listener));
+        self
+    }
+
+    /// Register a callback that runs on every frame, cached or not, with
+    /// resolved geometry. Geometry stashing and external-state publication
+    /// belong here, not in on_children_prepainted.
+    pub fn on_frame(
+        mut self,
+        callback: impl FnMut(ElementGeometry, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_frame = Some(Box::new(callback));
         self
     }
 
@@ -1544,6 +1557,20 @@ impl Element for Div {
                 },
             )
         });
+    }
+
+    fn on_frame(
+        &mut self,
+        geom: ElementGeometry,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(callback) = self.on_frame.as_mut() {
+            callback(geom, window, cx);
+        }
+        for child in &mut self.children {
+            child.on_frame(geom, window, cx);
+        }
     }
 }
 

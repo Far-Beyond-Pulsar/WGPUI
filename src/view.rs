@@ -1,7 +1,8 @@
 use crate::{
-    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
-    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle, WeakEntity,
+    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element,
+    ElementGeometry, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle,
+    WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -321,6 +322,18 @@ impl Element for AnyView {
                             .extend_accessed(&element_state.accessed_entities);
                         let prepaint_end = window.prepaint_index();
                         element_state.prepaint_range = prepaint_start..prepaint_end;
+
+                        // on_frame still runs on cache hits — it is the
+                        // whole point of the seam: side effects that must
+                        // fire every frame regardless of caching.
+                        let mut element = (self.render)(self, window, cx);
+                        element.layout_as_root(bounds.size.into(), window, cx);
+                        let geom = ElementGeometry {
+                            bounds,
+                            content_mask,
+                            scale_factor: window.scale_factor(),
+                        };
+                        element.on_frame(geom, window, cx);
 
                         return (None, element_state);
                     }

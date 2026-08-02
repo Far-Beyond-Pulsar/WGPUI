@@ -489,13 +489,21 @@ impl WindowInvalidator {
     }
 
     #[track_caller]
+    pub fn debug_assert_effects(&self) {
+        debug_assert!(
+            matches!(self.inner.borrow().draw_phase, DrawPhase::Effects),
+            "this method can only be called during on_frame"
+        );
+    }
+
+    #[track_caller]
     pub fn debug_assert_paint_or_prepaint(&self) {
         debug_assert!(
             matches!(
                 self.inner.borrow().draw_phase,
-                DrawPhase::Paint | DrawPhase::Prepaint
+                DrawPhase::Paint | DrawPhase::Prepaint | DrawPhase::Effects
             ),
-            "this method can only be called during request_layout, prepaint, or paint"
+            "this method can only be called during request_layout, prepaint, on_frame, or paint"
         );
     }
 }
@@ -1353,6 +1361,7 @@ struct ModifierState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DrawPhase {
     None,
+    Effects,
     Prepaint,
     Paint,
     Focus,
@@ -7848,5 +7857,24 @@ mod test {
         window.update(cx, |_, this, _| {
             this.set_app_id("com.example.updated");
         }).ok();
+    }
+
+    #[gpui::test]
+    #[should_panic(expected = "this method can only be called during paint")]
+    fn on_frame_cannot_call_paint_methods(cx: &mut TestAppContext) {
+        use crate::{div, fill};
+
+        struct PaintFromOnFrame;
+
+        impl Render for PaintFromOnFrame {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                div().on_frame(|geom, window, _cx| {
+                    window.paint_quad(fill(geom.bounds, crate::red()));
+                })
+            }
+        }
+
+        cx.open_window(size(px(800.), px(600.)), |_, _| PaintFromOnFrame);
+        cx.run_until_parked();
     }
 }

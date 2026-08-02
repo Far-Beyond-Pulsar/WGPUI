@@ -32,7 +32,7 @@
 //! your own custom layout algorithm or rendering a code editor.
 
 use crate::{
-    App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId,
+    App, ArenaBox, AvailableSpace, Bounds, ContentMask, Context, DispatchNodeId, DrawPhase, ElementId,
     FocusHandle, InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
     util::FluentBuilder, with_element_arena,
 };
@@ -103,10 +103,35 @@ pub trait Element: 'static + IntoElement {
         cx: &mut App,
     );
 
+    /// Runs on every frame this element participates in, cached or not, with
+    /// resolved geometry. Geometry stashing and external-state publication
+    /// belong here, not in [`prepaint`](Self::prepaint) or [`paint`](Self::paint).
+    ///
+    /// The default implementation is empty, so every existing element compiles
+    /// untouched.
+    fn on_frame(
+        &mut self,
+        _geom: ElementGeometry,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
     /// Convert this element into a dynamically-typed [`AnyElement`].
     fn into_any(self) -> AnyElement {
         AnyElement::new(self)
     }
+}
+
+/// Resolved geometry passed to [`Element::on_frame`] every frame.
+#[derive(Clone, Copy, Debug)]
+pub struct ElementGeometry {
+    /// The resolved bounds of this element in pixels.
+    pub bounds: Bounds<Pixels>,
+    /// The content mask active for this element.
+    pub content_mask: ContentMask<Pixels>,
+    /// The window's scale factor.
+    pub scale_factor: f32,
 }
 
 /// Implemented by any type that can be converted into an element.
@@ -296,6 +321,8 @@ trait ElementObject {
 
     fn paint(&mut self, window: &mut Window, cx: &mut App);
 
+    fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App);
+
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -477,6 +504,16 @@ impl<E: Element> Drawable<E> {
                     window,
                     cx,
                 );
+
+                let geom = ElementGeometry {
+                    bounds,
+                    content_mask: window.content_mask(),
+                    scale_factor: window.scale_factor(),
+                };
+                window.invalidator.set_phase(DrawPhase::Effects);
+                self.element.on_frame(geom, window, cx);
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+
                 window.next_frame.dispatch_tree.pop_node();
 
                 if global_id.is_some() {
@@ -602,6 +639,15 @@ impl<E: Element> Drawable<E> {
         }
     }
 
+    pub(crate) fn on_frame(
+        &mut self,
+        geom: ElementGeometry,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.element.on_frame(geom, window, cx);
+    }
+
     pub(crate) fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -680,6 +726,11 @@ where
     }
 
     #[inline]
+    fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App) {
+        Drawable::on_frame(self, geom, window, cx);
+    }
+
+    #[inline]
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -742,6 +793,12 @@ impl AnyElement {
         cx: &mut App,
     ) -> Size<Pixels> {
         self.0.layout_as_root(available_space, window, cx)
+    }
+
+    /// Call [`Element::on_frame`] on this element with resolved geometry.
+    /// Runs on every frame, cached or not.
+    pub fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App) {
+        self.0.on_frame(geom, window, cx);
     }
 
     /// Prepaints this element at the given absolute origin.
