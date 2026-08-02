@@ -373,7 +373,9 @@ impl Element for HList {
                             scroll_state.smooth_scroll.target_offset = logical_scroll_offset.x;
                             scroll_state.smooth_scroll.animating = false;
                         } else if scroll_state.smooth_scroll.update() {
-                            window.refresh();
+                            // `refresh` would be a no-op here: it is guarded on
+                            // not being mid-draw, and this runs during prepaint.
+                            window.request_animation_frame();
                         }
                         visual_scroll_offset.x = scroll_state.smooth_scroll.current();
                     }
