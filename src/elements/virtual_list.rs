@@ -222,8 +222,11 @@ impl Element for VirtualList {
 
             state.smooth_scroll.set_target(logical_scroll);
 
+            // `refresh` would be a no-op here: it is guarded on not being
+            // mid-draw, and this runs during prepaint. The animation frame is
+            // deferred past the current draw and targets only this view.
             if state.smooth_scroll.update() {
-                window.refresh();
+                window.request_animation_frame();
             }
 
             state.smooth_scroll.current()

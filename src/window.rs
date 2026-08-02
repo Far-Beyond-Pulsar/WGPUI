@@ -1140,6 +1140,32 @@ pub(crate) enum DrawPhase {
     Focus,
 }
 
+/// Report the first `Window::refresh` that was swallowed because a draw was in
+/// progress, then stay quiet.
+///
+/// The guard in `refresh` makes a mid-draw call do nothing at all, with no
+/// diagnostic — the bug it produces is a frame that never arrives, which is
+/// hard to trace back to the call that should have scheduled it. One line
+/// naming the caller is enough to find it; a per-frame flood is not.
+#[track_caller]
+fn log_refresh_during_draw() {
+    // Counted on every occurrence, logged only on the first: the count is what
+    // distinguishes a one-off from something happening every frame, so it must
+    // not sit behind the log-once guard.
+    crate::render_stats::count("window: refresh during draw (ignored)");
+
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    log::warn!(
+        "[WINDOW] `refresh` called at {} while a draw was in progress; ignored. \
+         Use `Window::request_animation_frame` from prepaint or paint. \
+         Further occurrences are ignored silently.",
+        std::panic::Location::caller(),
+    );
+}
+
 #[derive(Default, Debug)]
 struct PendingInput {
     keystrokes: SmallVec<[Keystroke; 1]>,
@@ -1764,10 +1790,18 @@ impl Window {
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
+    ///
+    /// Has no effect while a draw is in progress. Callers that run during
+    /// prepaint or paint — element animation drivers, most commonly — want
+    /// [`Window::request_animation_frame`] instead, which defers past the
+    /// current draw and notifies only the enclosing view.
+    #[track_caller]
     pub fn refresh(&mut self) {
         if self.invalidator.not_drawing() {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
+        } else {
+            log_refresh_during_draw();
         }
     }
 
@@ -6630,6 +6664,28 @@ mod test {
         cx.run_until_parked();
     }
 
+    /// Run whatever `Window::on_next_frame` queued, the way the platform's
+    /// `on_request_frame` hook does, and let any resulting invalidation settle.
+    /// Returns whether there was anything to run.
+    ///
+    /// The test platform's `on_request_frame` discards its callback, so nothing
+    /// in the harness ever drains this queue on its own — without this,
+    /// `request_animation_frame` is invisible to tests.
+    fn pump_next_frame_callbacks(cx: &mut TestAppContext, window: crate::AnyWindowHandle) -> bool {
+        let ran = window
+            .update(cx, |_, window, cx| {
+                let callbacks = window.next_frame_callbacks.take();
+                let ran = !callbacks.is_empty();
+                for callback in callbacks {
+                    callback(window, cx);
+                }
+                ran
+            })
+            .unwrap();
+        cx.run_until_parked();
+        ran
+    }
+
     /// `cx.notify()` on a cached leaf must rebuild that leaf on the next
     /// frame, whether or not an ancestor happened to touch it through
     /// `EntityMap` first.
@@ -7338,6 +7394,118 @@ mod test {
             1,
             "an entity notified during paint never reached its observers"
         );
+    }
+
+    /// The animation drivers in `virtual_list`, `uniform_list` and `h_list` run
+    /// inside `prepaint` and used to call `Window::refresh`, which the
+    /// `not_drawing` guard swallows — smooth scroll only advanced when
+    /// something unrelated kept the window dirty. This pins both halves of
+    /// that: `refresh` from prepaint schedules nothing, and
+    /// `request_animation_frame` schedules exactly the frames asked for and
+    /// then stops.
+    #[gpui::test]
+    fn request_animation_frame_from_prepaint_drives_frames(cx: &mut TestAppContext) {
+        /// Which scheduling call the canvas under test makes from prepaint.
+        #[derive(Clone, Copy)]
+        enum Driver {
+            Refresh,
+            AnimationFrame,
+        }
+
+        struct PrepaintDriver {
+            driver: Driver,
+            /// Remaining prepaints that should ask for another frame. Bounded so
+            /// a runaway shows up as a failed assertion rather than a hang.
+            pending: std::rc::Rc<std::cell::Cell<usize>>,
+            prepaints: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl crate::Render for PrepaintDriver {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl crate::IntoElement {
+                let driver = self.driver;
+                let pending = self.pending.clone();
+                let prepaints = self.prepaints.clone();
+                crate::div().size_full().child(crate::canvas(
+                    move |_, window, _| {
+                        prepaints.set(prepaints.get() + 1);
+                        if pending.get() > 0 {
+                            pending.set(pending.get() - 1);
+                            match driver {
+                                Driver::Refresh => window.refresh(),
+                                Driver::AnimationFrame => window.request_animation_frame(),
+                            }
+                        }
+                    },
+                    |_, _, _, _| (),
+                ))
+            }
+        }
+
+        let requested_frames = 3;
+        for (driver, expected_extra_frames) in [
+            (Driver::Refresh, 0),
+            (Driver::AnimationFrame, requested_frames),
+        ] {
+            let pending = std::rc::Rc::new(std::cell::Cell::new(0));
+            let prepaints = std::rc::Rc::new(std::cell::Cell::new(0));
+            let window = cx.open_window(size(px(800.), px(600.)), {
+                let (pending, prepaints) = (pending.clone(), prepaints.clone());
+                move |_, _| PrepaintDriver {
+                    driver,
+                    pending,
+                    prepaints,
+                }
+            });
+            cx.run_until_parked();
+
+            let before = prepaints.get();
+            pending.set(requested_frames);
+            // One externally-pumped frame, then nothing else touches the
+            // window except the frame callbacks the draw queued for itself —
+            // which is exactly the situation an animation has to survive.
+            clean_frame(cx, window.into());
+
+            let mut pumps = 0;
+            while pump_next_frame_callbacks(cx, window.into()) {
+                pumps += 1;
+                assert!(
+                    pumps <= requested_frames + 1,
+                    "the driver never stopped asking for frames"
+                );
+            }
+
+            let label = match driver {
+                Driver::Refresh => "refresh",
+                Driver::AnimationFrame => "request_animation_frame",
+            };
+            assert_eq!(
+                prepaints.get(),
+                before + 1 + expected_extra_frames,
+                "{label} from prepaint: expected the pumped frame plus \
+                 {expected_extra_frames} self-scheduled frames"
+            );
+            let dirty = window
+                .update(cx, |_, window, _| window.invalidator.is_dirty())
+                .unwrap();
+            assert!(
+                !dirty,
+                "{label}: the window never settled after the driver stopped asking"
+            );
+            assert_eq!(
+                pending.get(),
+                match driver {
+                    // The swallowed `refresh` consumes one request and then
+                    // stalls, which is the bug.
+                    Driver::Refresh => requested_frames - 1,
+                    Driver::AnimationFrame => 0,
+                },
+                "{label}: unexpected number of unconsumed frame requests"
+            );
+        }
     }
 
     #[gpui::test]
