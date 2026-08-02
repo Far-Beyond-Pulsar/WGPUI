@@ -311,7 +311,7 @@ impl Element for AnyView {
                         && element_state.cache_key.text_style == text_style
                         && !window.dirty_views.contains(&self.entity_id())
                         && !dependency_invalidated
-                        && !window.refreshing
+                        && window.view_cache_available()
                     {
                         crate::render_stats::count("view cache: reused");
                         let _t = crate::render_stats::scope("view cache: reuse_prepaint");
@@ -342,12 +342,12 @@ impl Element for AnyView {
                     let _t = crate::render_stats::scope("view cache: rebuild");
 
                     // Rebuilding this view normally forces every cached view
-                    // nested inside it to rebuild too, via `refreshing`. See
+                    // nested inside it to rebuild too. See
                     // `nested_view_cache_enabled` for why, and for the opt-in
                     // that lifts it.
-                    let refreshing = window.refreshing;
+                    let nested_cache_suppressed = window.nested_view_cache_suppressed;
                     if !nested_view_cache_enabled() {
-                        window.refreshing = true;
+                        window.nested_view_cache_suppressed = true;
                     }
 
                     let prepaint_start = window.prepaint_index();
@@ -376,7 +376,7 @@ impl Element for AnyView {
                     });
 
                     let prepaint_end = window.prepaint_index();
-                    window.refreshing = refreshing;
+                    window.nested_view_cache_suppressed = nested_cache_suppressed;
 
                     (
                         Some(element),
@@ -418,12 +418,12 @@ impl Element for AnyView {
 
                         if let Some(element) = element {
                             // Paired with the prepaint path above.
-                            let refreshing = window.refreshing;
+                            let nested_cache_suppressed = window.nested_view_cache_suppressed;
                             if !nested_view_cache_enabled() {
-                                window.refreshing = true;
+                                window.nested_view_cache_suppressed = true;
                             }
                             element.paint(window, cx);
-                            window.refreshing = refreshing;
+                            window.nested_view_cache_suppressed = nested_cache_suppressed;
                         } else {
                             window.reuse_paint(element_state.paint_range.clone());
                         }

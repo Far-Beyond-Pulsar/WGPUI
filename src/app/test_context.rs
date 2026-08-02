@@ -856,7 +856,7 @@ impl VisualTestContext {
             window.invalidator.set_phase(DrawPhase::None);
             // Same contract as the end of `Window::draw`: anything that
             // notified during the phases above is applied here, not dropped.
-            window.invalidator.flush_deferred_notifications(cx);
+            window.invalidator.flush_deferred_invalidations(cx);
             window.refresh();
 
             drop(element);

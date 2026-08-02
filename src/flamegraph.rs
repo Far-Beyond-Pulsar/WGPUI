@@ -343,14 +343,14 @@ pub struct AtlasCounters {
 }
 
 /// Per-frame input/notification activity, tallied in `Window::dispatch_event`
-/// and `App::notify`/`WindowInvalidator::invalidate_view`.
+/// and `App::notify`/`WindowInvalidator::invalidate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EventCounters {
     /// `Window::dispatch_event` calls (mouse/keyboard/etc. input).
     pub input_events_dispatched: u32,
     /// `AppContext::notify`/`Context::notify` calls.
     pub notify_calls: u32,
-    /// Entities marked dirty via `WindowInvalidator::invalidate_view`.
+    /// Entities marked dirty via `WindowInvalidator::invalidate`.
     pub entities_invalidated: u32,
 }
 
@@ -1159,7 +1159,7 @@ pub(crate) fn record_notify_call() {
     FRAME_COUNTERS.with(|counters| counters.borrow_mut().events.notify_calls += 1);
 }
 
-/// Tally an entity marked dirty via `WindowInvalidator::invalidate_view`.
+/// Tally an entity marked dirty via `WindowInvalidator::invalidate`.
 pub(crate) fn record_entity_invalidated() {
     if !capture_enabled() {
         return;

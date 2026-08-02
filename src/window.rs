@@ -100,10 +100,144 @@ impl DispatchPhase {
 }
 
 /// After this many consecutive draws that each ended with deferred
-/// notifications, warn once. A view that notifies from inside its own render
+/// invalidations, warn once. A view that invalidates from inside its own render
 /// now genuinely re-renders forever; that is arguably correct, but it is also
 /// a self-perpetuating frame cost and should be visible rather than silent.
 const DEFERRED_NOTIFY_LOOP_WARN_DRAWS: u32 = 120;
+
+/// Identifies one retained element instance.
+///
+/// Defined alongside [`InvalidationScope`] rather than with the machinery that
+/// will produce it, so that the scope enum is complete from the start and later
+/// phases add behaviour to a variant instead of reshaping the type and every
+/// match on it. Nothing constructs one yet; the representation is provisional.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InstanceId(pub u64);
+
+/// Identifies one retained layer for as long as the window keeps it.
+///
+/// Provisional, and unconstructed, for the same reason as [`InstanceId`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LayerKey(pub u64);
+
+/// In what respect something stopped being valid.
+///
+/// The axes are independent, and that is the whole point of naming them: a
+/// layer that only moved needs a new composite matrix and no CPU work at all,
+/// while a label that changed its text needs repainting without re-laying-out
+/// anything around it.
+///
+/// Axes are *derived by the framework* from what actually changed. They are
+/// deliberately not declared at `cx.notify()` sites: correctness would then
+/// depend on every call site classifying its own change correctly, and the
+/// failure mode of getting it wrong is silently stale UI.
+///
+/// Hand-rolled rather than a `bitflags!` macro because the crate does not
+/// depend on `bitflags`, and one `u8` newtype is not worth a dependency.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Invalidation(u8);
+
+impl Invalidation {
+    /// Sizes and positions must be recomputed.
+    pub const LAYOUT: Self = Self(1 << 0);
+    /// Painted output must be re-emitted.
+    pub const DISPLAY: Self = Self(1 << 1);
+    /// Hitboxes and dispatch nodes must be re-registered.
+    pub const HIT: Self = Self(1 << 2);
+    /// Only the composite transform changed, so nothing needs re-rendering.
+    /// Nothing sets this until layers can be composited independently.
+    pub const TRANSFORM: Self = Self(1 << 3);
+
+    /// No axis at all.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Every axis.
+    pub const fn all() -> Self {
+        Self(Self::LAYOUT.0 | Self::DISPLAY.0 | Self::HIT.0 | Self::TRANSFORM.0)
+    }
+
+    /// Whether no axis is set.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether every axis in `other` is set.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Whether any axis in `other` is set.
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// The axes set in either operand. `BitOr` in a `const` context.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOr for Invalidation {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        self.union(other)
+    }
+}
+
+impl std::ops::BitOrAssign for Invalidation {
+    fn bitor_assign(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+/// What an [`InvalidationRequest`] applies to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum InvalidationScope {
+    /// One retained element instance, and nothing above or below it. Nothing
+    /// produces this yet.
+    Instance(InstanceId),
+    /// One retained layer, and nothing above or below it. Nothing produces this
+    /// yet.
+    Layer(LayerKey),
+    /// Every consumer whose recorded dependency set contains this entity.
+    Entity(EntityId),
+    /// The window as a whole: device loss, scale factor change, focus moving.
+    Window,
+}
+
+/// One typed invalidation: what stopped being valid, and in what respect.
+///
+/// This is the single operation every part of the framework invalidates
+/// through. It replaces three mechanisms with incompatible reach — a
+/// window-wide `refreshing` boolean, an upward dispatch-tree walk, and a
+/// forward dependency-set check — none of which could express the others.
+///
+/// The fields are framework-internal. The public surface is the deliberately
+/// coarse shims [`Window::refresh`] and [`Window::refresh_buffers`], plus
+/// `cx.notify()`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InvalidationRequest {
+    scope: InvalidationScope,
+    axes: Invalidation,
+}
+
+impl InvalidationRequest {
+    pub(crate) fn new(scope: InvalidationScope, axes: Invalidation) -> Self {
+        Self { scope, axes }
+    }
+
+    /// What `cx.notify()` means: this entity's data changed, so anything
+    /// rendering it has stale painted output and stale hit geometry.
+    pub(crate) fn entity(entity_id: EntityId) -> Self {
+        Self::new(
+            InvalidationScope::Entity(entity_id),
+            Invalidation::DISPLAY.union(Invalidation::HIT),
+        )
+    }
+}
 
 struct WindowInvalidatorInner {
     pub dirty: bool,
@@ -119,12 +253,22 @@ struct WindowInvalidatorInner {
     /// dropped instead, which lost two separate things — the dirty flag that
     /// schedules the frame able to answer it, and the effect that runs
     /// `cx.observe` callbacks. Recorded here and applied by
-    /// [`WindowInvalidator::flush_deferred_notifications`] once the draw is
+    /// [`WindowInvalidator::flush_deferred_invalidations`] once the draw is
     /// over and `&mut App` is available again.
     ///
     /// A set, so a view notifying the same entity repeatedly inside one draw
     /// costs one entry.
     deferred_notifies: FxHashSet<EntityId>,
+    /// Window-scope axes accumulated since a draw last took them.
+    window_axes: Invalidation,
+    /// Window-scope axes requested while a draw was in progress.
+    ///
+    /// Same reasoning as `deferred_notifies`: the frame being built has already
+    /// decided which views to rebuild, so a request arriving mid-draw belongs
+    /// to the next one. It used to be dropped outright, which is why a
+    /// smooth-scroll animation driven from prepaint never scheduled its own
+    /// following frame.
+    deferred_window_axes: Invalidation,
     /// Consecutive flushes that had something to apply. Only used to decide
     /// whether to emit the loop warning.
     consecutive_deferred_draws: u32,
@@ -145,18 +289,78 @@ impl WindowInvalidator {
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
                 deferred_notifies: FxHashSet::default(),
+                window_axes: Invalidation::empty(),
+                deferred_window_axes: Invalidation::empty(),
                 consecutive_deferred_draws: 0,
                 warned_about_deferred_loop: false,
             })),
         }
     }
 
-    /// Record that `entity` changed.
+    /// Record `request`, applying it now or deferring it to the end of the
+    /// current draw.
     ///
-    /// Returns whether the notification was applied immediately. `false` means
-    /// it was deferred to the end of the current draw, not that it was
-    /// dropped — see [`WindowInvalidatorInner::deferred_notifies`].
-    pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
+    /// Returns whether it was applied immediately. `false` means it was
+    /// deferred, never that it was dropped: an invalidation is legal in every
+    /// draw phase.
+    pub fn invalidate(&self, request: InvalidationRequest, cx: &mut App) -> bool {
+        match request.scope {
+            // `request.axes` is not consulted. This phase implements `Entity`
+            // scope with the forward dependency check in
+            // `Window::accessed_entity_invalidated`, whose answer is a single
+            // bool — a cached view either replays all of its recorded output or
+            // rebuilds all of it, so there is no subset for an axis to select.
+            // Axes start selecting something once a layer can be invalidated in
+            // one respect and left alone in the others.
+            InvalidationScope::Entity(entity_id) => self.invalidate_entity(entity_id, cx),
+            InvalidationScope::Window => self.invalidate_window(request.axes),
+            // Unreachable today: nothing constructs these scopes, because
+            // nothing retains the instances or layers they name. Counted rather
+            // than asserted so that the first phase to produce one can see it
+            // arriving before it has anywhere to apply it.
+            InvalidationScope::Instance(_) => {
+                crate::render_stats::count("invalidate: instance");
+                true
+            }
+            InvalidationScope::Layer(_) => {
+                crate::render_stats::count("invalidate: layer");
+                true
+            }
+        }
+    }
+
+    /// Record a window-scope invalidation.
+    ///
+    /// Split out of [`Self::invalidate`] because it is the one scope that needs
+    /// no `&mut App`: nothing observes the window itself, so there is no
+    /// `Effect::Notify` to push. [`Window::refresh`] and
+    /// [`Window::refresh_buffers`] are `&mut Window` methods whose public
+    /// signatures carry no context, and they may be called mid-draw, when `App`
+    /// is leased out.
+    pub fn invalidate_window(&self, axes: Invalidation) -> bool {
+        crate::render_stats::count("invalidate: window");
+        let mut inner = self.inner.borrow_mut();
+        inner.update_count += 1;
+        if inner.draw_phase == DrawPhase::None {
+            inner.window_axes |= axes;
+            inner.dirty = true;
+            true
+        } else {
+            inner.deferred_window_axes |= axes;
+            drop(inner);
+            crate::render_stats::count("invalidate: deferred to end of draw");
+            false
+        }
+    }
+
+    /// Take the window-scope axes accumulated since the last call, for the draw
+    /// that is about to answer them.
+    pub fn take_window_axes(&self) -> Invalidation {
+        mem::take(&mut self.inner.borrow_mut().window_axes)
+    }
+
+    fn invalidate_entity(&self, entity: EntityId, cx: &mut App) -> bool {
+        crate::render_stats::count("invalidate: entity");
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
@@ -174,7 +378,7 @@ impl WindowInvalidator {
             let first = inner.deferred_notifies.insert(entity);
             drop(inner);
             if first {
-                crate::render_stats::count("notify: deferred to end of draw");
+                crate::render_stats::count("invalidate: deferred to end of draw");
             } else {
                 crate::render_stats::count("notify: deferred (duplicate, collapsed)");
             }
@@ -182,26 +386,29 @@ impl WindowInvalidator {
         }
     }
 
-    /// Apply everything [`Self::invalidate_view`] deferred while a draw was in
-    /// progress: mark the window dirty so a frame is scheduled to answer the
-    /// invalidations already sitting in `dirty_views`, and push the
+    /// Apply everything [`Self::invalidate`] deferred while a draw was in
+    /// progress: fold the deferred window-scope axes into the ones the next
+    /// draw will take, mark the window dirty so a frame is scheduled to answer
+    /// the invalidations already sitting in `dirty_views`, and push the
     /// `Effect::Notify`s so `cx.observe` callbacks finally run.
     ///
     /// Must be called after the draw phase has returned to
     /// [`DrawPhase::None`], with `&mut App` available. `Window::draw` is the
     /// only production caller.
-    pub fn flush_deferred_notifications(&self, cx: &mut App) {
+    pub fn flush_deferred_invalidations(&self, cx: &mut App) {
         let (deferred, warn) = {
             let mut inner = self.inner.borrow_mut();
             debug_assert_eq!(
                 inner.draw_phase,
                 DrawPhase::None,
-                "deferred notifications must not be flushed while still drawing"
+                "deferred invalidations must not be flushed while still drawing"
             );
-            if inner.deferred_notifies.is_empty() {
+            let window_axes = mem::take(&mut inner.deferred_window_axes);
+            if inner.deferred_notifies.is_empty() && window_axes.is_empty() {
                 inner.consecutive_deferred_draws = 0;
                 return;
             }
+            inner.window_axes |= window_axes;
             inner.dirty = true;
             inner.update_count += 1;
             inner.consecutive_deferred_draws = inner.consecutive_deferred_draws.saturating_add(1);
@@ -213,8 +420,8 @@ impl WindowInvalidator {
         crate::render_stats::count("notify: deferred flush scheduled a redraw");
         if warn {
             log::warn!(
-                "window has deferred notifications on {} consecutive draws \
-                 (entities: {:?}); something is notifying from inside its own \
+                "window has deferred invalidations on {} consecutive draws \
+                 (entities: {:?}); something is invalidating from inside its own \
                  render, which now redraws every frame",
                 DEFERRED_NOTIFY_LOOP_WARN_DRAWS,
                 deferred.iter().take(8).collect::<Vec<_>>(),
@@ -256,17 +463,13 @@ impl WindowInvalidator {
     /// Merges rather than assigns. The caller drains what it consumed and hands
     /// the (empty) set back, so in practice this adds nothing — but assigning
     /// would silently discard anything inserted by
-    /// [`Self::invalidate_view`] in between, and "in between" is a window that
+    /// [`Self::invalidate`] in between, and "in between" is a window that
     /// only ever gets wider.
     pub fn replace_views(&self, views: FxHashSet<EntityId>) {
         if views.is_empty() {
             return;
         }
         self.inner.borrow_mut().dirty_views.extend(views);
-    }
-
-    pub fn not_drawing(&self) -> bool {
-        self.inner.borrow().draw_phase == DrawPhase::None
     }
 
     #[track_caller]
@@ -1107,7 +1310,22 @@ pub struct Window {
     pub(crate) last_input_timestamp: Rc<Cell<Instant>>,
     pub(crate) resizing_window: Rc<Cell<bool>>,
     last_input_modality: InputModality,
-    pub(crate) refreshing: bool,
+    /// The window-scope axes this draw is answering, taken from the invalidator
+    /// at the top of [`Self::draw`] and cleared at the bottom.
+    ///
+    /// This replaces the `refreshing` boolean, which conflated "a redraw was
+    /// requested" with "no view may reuse its cached output". Those are
+    /// different requests, and `refresh_buffers` needs exactly the first
+    /// without the second.
+    pub(crate) window_invalidation: Invalidation,
+    /// Set while a cached view rebuilds, forcing cached views nested inside it
+    /// to rebuild too.
+    ///
+    /// Not invalidation: it says where the element walk currently is, not what
+    /// changed. It shared the `refreshing` field with window-scope invalidation
+    /// only because both happened to mean "no cache reuse right now". See
+    /// `nested_view_cache_enabled` for the opt-in that lifts it.
+    pub(crate) nested_view_cache_suppressed: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -1138,32 +1356,6 @@ pub(crate) enum DrawPhase {
     Prepaint,
     Paint,
     Focus,
-}
-
-/// Report the first `Window::refresh` that was swallowed because a draw was in
-/// progress, then stay quiet.
-///
-/// The guard in `refresh` makes a mid-draw call do nothing at all, with no
-/// diagnostic — the bug it produces is a frame that never arrives, which is
-/// hard to trace back to the call that should have scheduled it. One line
-/// naming the caller is enough to find it; a per-frame flood is not.
-#[track_caller]
-fn log_refresh_during_draw() {
-    // Counted on every occurrence, logged only on the first: the count is what
-    // distinguishes a one-off from something happening every frame, so it must
-    // not sit behind the log-once guard.
-    crate::render_stats::count("window: refresh during draw (ignored)");
-
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    log::warn!(
-        "[WINDOW] `refresh` called at {} while a draw was in progress; ignored. \
-         Use `Window::request_animation_frame` from prepaint or paint. \
-         Further occurrences are ignored silently.",
-        std::panic::Location::caller(),
-    );
 }
 
 #[derive(Default, Debug)]
@@ -1590,7 +1782,8 @@ impl Window {
             last_input_timestamp,
             resizing_window: Rc::new(Cell::new(false)),
             last_input_modality: InputModality::Mouse,
-            refreshing: false,
+            window_invalidation: Invalidation::empty(),
+            nested_view_cache_suppressed: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -1658,6 +1851,12 @@ impl Window {
         // reads) produce an empty path and mark nothing. The *dependency* half
         // lives in [`Self::accessed_entity_invalidated`], which `AnyView`
         // consults with each cached view's own recorded dependency set.
+        //
+        // The upward walk survives only because it is how
+        // [`InvalidationScope::Entity`] is implemented until a reverse index is
+        // possible. `Instance` and `Layer` scope name exactly what they
+        // invalidate and must never reach here — that is what stops one chatty
+        // leaf from defeating every cache above it.
         for view_id in self
             .rendered_frame
             .dispatch_tree
@@ -1789,20 +1988,23 @@ impl Window {
         self.handle
     }
 
-    /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
+    /// Mark the window as dirty, scheduling it to be redrawn on the next frame
+    /// with no view reusing its cached output.
     ///
-    /// Has no effect while a draw is in progress. Callers that run during
-    /// prepaint or paint — element animation drivers, most commonly — want
-    /// [`Window::request_animation_frame`] instead, which defers past the
-    /// current draw and notifies only the enclosing view.
-    #[track_caller]
+    /// Deprecated in favour of invalidating what actually changed: `cx.notify()`
+    /// on the entity, or [`Self::request_animation_frame`] for an animation
+    /// driver, which notifies only the enclosing view. This is
+    /// [`InvalidationScope::Window`] with every axis set, which is the bluntest
+    /// request the framework can express — it is correct for device loss or a
+    /// scale factor change, and wasteful for everything else. It is not marked
+    /// `#[deprecated]` only because it still has dozens of in-crate callers with
+    /// nowhere better to go yet.
+    ///
+    /// Unlike the pre-#87 version, this is legal during a draw: a request made
+    /// from prepaint or paint is deferred to the end of the frame rather than
+    /// silently dropped.
     pub fn refresh(&mut self) {
-        if self.invalidator.not_drawing() {
-            self.refreshing = true;
-            self.invalidator.set_dirty(true);
-        } else {
-            log_refresh_during_draw();
-        }
+        self.invalidator.invalidate_window(Invalidation::all());
     }
 
     /// Request a frame because externally-rendered buffer contents changed,
@@ -1816,9 +2018,14 @@ impl Window {
     /// their primitives — including the surface quad — so the compositor
     /// promotes the new texture with nothing re-rendered.
     ///
+    /// This is [`InvalidationScope::Window`] with [`Invalidation::DISPLAY`] and
+    /// nothing else, and that is the whole difference from [`Self::refresh`]:
+    /// no view's layout or hit geometry is claimed to be stale, so cached views
+    /// keep replaying.
+    ///
     /// The alternatives both over-trigger:
-    /// * [`refresh`](Self::refresh) sets `refreshing`, disabling view caching
-    ///   for the whole window.
+    /// * [`refresh`](Self::refresh) sets every axis, disabling view caching for
+    ///   the whole window.
     /// * `cx.notify()` marks the view *and every ancestor* dirty
     ///   ([`mark_view_dirty`](Self::mark_view_dirty) walks the ancestor path),
     ///   so a leaf publishing frames re-renders everything above it.
@@ -1830,9 +2037,25 @@ impl Window {
     /// Callers must still ensure the producing view renders when its *layout*
     /// changes — a view that never prepaints never observes new bounds.
     pub fn refresh_buffers(&mut self) {
-        if self.invalidator.not_drawing() {
-            self.invalidator.set_dirty(true);
-        }
+        self.invalidator.invalidate_window(Invalidation::DISPLAY);
+    }
+
+    /// Whether a cached view may replay its recorded output this frame.
+    ///
+    /// Two independent things forbid it. A window-scope invalidation touching
+    /// [`LAYOUT`](Invalidation::LAYOUT) or [`HIT`](Invalidation::HIT) says the
+    /// recorded prepaint — layouts, hitboxes, dispatch nodes — describes a
+    /// world that no longer exists, and nothing short of re-running the view
+    /// produces a new one. Window-scope `DISPLAY` alone deliberately does not:
+    /// that is `refresh_buffers`, where the pixels behind a surface quad
+    /// advanced but the quad referring to them did not.
+    ///
+    /// The other is `nested_view_cache_suppressed`, which is about where the
+    /// element walk is rather than about what changed.
+    pub(crate) fn view_cache_available(&self) -> bool {
+        const REPLAY_INVALIDATING: Invalidation = Invalidation::LAYOUT.union(Invalidation::HIT);
+        !self.nested_view_cache_suppressed
+            && !self.window_invalidation.intersects(REPLAY_INVALIDATING)
     }
 
     /// Close this window.
@@ -2528,7 +2751,7 @@ impl Window {
         #[cfg(feature = "flamegraph")]
         let _draw_span = crate::enter_span(crate::SpanName::Static("Window::draw"), crate::SpanCategory::WindowFrame, None);
 
-        self.invalidate_entities();
+        self.apply_invalidations();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
@@ -2647,20 +2870,22 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
-        self.refreshing = false;
+        self.window_invalidation = Invalidation::empty();
         self.invalidator.set_phase(DrawPhase::None);
 
-        // Anything that notified while this draw was running — scrollbar thumb
-        // state computed during prepaint, a view notifying a sibling model, an
-        // observer chain kicked off from paint — was recorded rather than
-        // applied. Now that the phase is `None` again and `cx` is in hand, mark
-        // the window dirty so a frame arrives to consume the entries already in
-        // `dirty_views`, and push the notifications so observers run.
+        // Anything that invalidated while this draw was running — scrollbar
+        // thumb state computed during prepaint, a view notifying a sibling
+        // model, a smooth-scroll animation asking for its next frame from
+        // prepaint, an observer chain kicked off from paint — was recorded
+        // rather than applied. Now that the phase is `None` again and `cx` is
+        // in hand, mark the window dirty so a frame arrives to consume the
+        // entries already in `dirty_views`, hand the deferred window-scope axes
+        // to that frame, and push the notifications so observers run.
         //
         // This must come after `set_phase(DrawPhase::None)`: the focus
         // listeners above run under `DrawPhase::Focus` and can themselves
-        // notify, and those notifies belong in this same flush.
-        self.invalidator.flush_deferred_notifications(cx);
+        // invalidate, and that belongs in this same flush.
+        self.invalidator.flush_deferred_invalidations(cx);
 
         self.needs_present.set(true);
 
@@ -2681,7 +2906,11 @@ impl Window {
         mem::swap(&mut entities, entities_ref.deref_mut());
     }
 
-    fn invalidate_entities(&mut self) {
+    /// Turn everything recorded since the last draw into the per-draw state the
+    /// element walk reads: window-scope axes, and the entity-scope dirty sets.
+    fn apply_invalidations(&mut self) {
+        self.window_invalidation = self.invalidator.take_window_axes();
+
         let mut views = self.invalidator.take_views();
         for entity in views.drain() {
             self.mark_view_dirty(entity);
@@ -6667,8 +6896,8 @@ mod test {
     /// Drive one frame the way an external frame pump does: the window needs
     /// to draw, but nothing is invalidated, so every cached view takes the
     /// reuse path. `refresh_windows`/`Window::refresh` is *not* equivalent —
-    /// it sets `refreshing`, which bypasses the cache entirely and would hide
-    /// exactly the bug these tests are looking for.
+    /// it sets every invalidation axis, which bypasses the cache entirely and
+    /// would hide exactly the bug these tests are looking for.
     fn clean_frame(cx: &mut TestAppContext, window: crate::AnyWindowHandle) {
         window
             .update(cx, |_, window, _| window.refresh_buffers())
@@ -7134,8 +7363,7 @@ mod test {
 
     /// The dependency index must not make everything rebuild: a model nobody
     /// on screen reads still has to leave cached views alone. Without this the
-    /// fix for #83 would just be the `refreshing` sledgehammer under another
-    /// name.
+    /// fix for #83 would just be window-scope invalidation under another name.
     #[gpui::test]
     fn unrelated_notify_leaves_cached_views_alone(cx: &mut TestAppContext) {
         let (window, _leaf, leaf_renders, _root_renders) = cached_leaf_window(cx, false);
@@ -7166,7 +7394,7 @@ mod test {
     // runs during `DrawPhase::Prepaint`. Real code does this constantly:
     // scrollbar thumb geometry is computed during prepaint/paint, and
     // `CodeEditor::set_language` notifies the `InputState` it owns rather than
-    // itself. `WindowInvalidator::invalidate_view` used to answer such a
+    // itself. `WindowInvalidator::invalidate` used to answer such a
     // notify by inserting into `dirty_views` and then doing nothing else — no
     // dirty flag, so no frame was ever scheduled to consume the insertion, and
     // no `Effect::Notify`, so `cx.observe` callbacks never ran at all.
@@ -7377,7 +7605,7 @@ mod test {
                 crate::div()
                     .size_full()
                     .child(crate::canvas(|_, _, _| (), move |_, _, window, cx| {
-                        debug_assert!(!window.invalidator.not_drawing());
+                        window.invalidator.debug_assert_paint();
                         if pending.get() > 0 {
                             pending.set(pending.get() - 1);
                             signal.update(cx, |model, cx| {
@@ -7409,23 +7637,20 @@ mod test {
     }
 
     /// The animation drivers in `virtual_list`, `uniform_list` and `h_list` run
-    /// inside `prepaint` and used to call `Window::refresh`, which the
-    /// `not_drawing` guard swallows — smooth scroll only advanced when
-    /// something unrelated kept the window dirty. This pins both halves of
-    /// that: `refresh` from prepaint schedules nothing, and
-    /// `request_animation_frame` schedules exactly the frames asked for and
-    /// then stops.
+    /// inside `prepaint`. They used to call `Window::refresh`, which the
+    /// `not_drawing` guard swallowed outright, so smooth scroll only advanced
+    /// when something unrelated kept the window dirty.
+    ///
+    /// This pins the replacement: `request_animation_frame` from prepaint
+    /// queues a frame callback, schedules exactly the frames asked for, and
+    /// then settles. That it *queues a callback* is the part that matters —
+    /// #87 later made a mid-draw `refresh` defer rather than drop, but a
+    /// deferred refresh only raises the dirty flag, so it still cannot carry an
+    /// animation on its own. The deferral half is covered by
+    /// [`refresh_during_draw_is_deferred_not_dropped`].
     #[gpui::test]
     fn request_animation_frame_from_prepaint_drives_frames(cx: &mut TestAppContext) {
-        /// Which scheduling call the canvas under test makes from prepaint.
-        #[derive(Clone, Copy)]
-        enum Driver {
-            Refresh,
-            AnimationFrame,
-        }
-
         struct PrepaintDriver {
-            driver: Driver,
             /// Remaining prepaints that should ask for another frame. Bounded so
             /// a runaway shows up as a failed assertion rather than a hang.
             pending: std::rc::Rc<std::cell::Cell<usize>>,
@@ -7438,7 +7663,6 @@ mod test {
                 _window: &mut Window,
                 _cx: &mut Context<Self>,
             ) -> impl crate::IntoElement {
-                let driver = self.driver;
                 let pending = self.pending.clone();
                 let prepaints = self.prepaints.clone();
                 crate::div().size_full().child(crate::canvas(
@@ -7446,10 +7670,7 @@ mod test {
                         prepaints.set(prepaints.get() + 1);
                         if pending.get() > 0 {
                             pending.set(pending.get() - 1);
-                            match driver {
-                                Driver::Refresh => window.refresh(),
-                                Driver::AnimationFrame => window.request_animation_frame(),
-                            }
+                            window.request_animation_frame();
                         }
                     },
                     |_, _, _, _| (),
@@ -7458,19 +7679,12 @@ mod test {
         }
 
         let requested_frames = 3;
-        for (driver, expected_extra_frames) in [
-            (Driver::Refresh, 0),
-            (Driver::AnimationFrame, requested_frames),
-        ] {
+        {
             let pending = std::rc::Rc::new(std::cell::Cell::new(0));
             let prepaints = std::rc::Rc::new(std::cell::Cell::new(0));
             let window = cx.open_window(size(px(800.), px(600.)), {
                 let (pending, prepaints) = (pending.clone(), prepaints.clone());
-                move |_, _| PrepaintDriver {
-                    driver,
-                    pending,
-                    prepaints,
-                }
+                move |_, _| PrepaintDriver { pending, prepaints }
             });
             cx.run_until_parked();
 
@@ -7490,34 +7704,110 @@ mod test {
                 );
             }
 
-            let label = match driver {
-                Driver::Refresh => "refresh",
-                Driver::AnimationFrame => "request_animation_frame",
-            };
             assert_eq!(
                 prepaints.get(),
-                before + 1 + expected_extra_frames,
-                "{label} from prepaint: expected the pumped frame plus \
-                 {expected_extra_frames} self-scheduled frames"
+                before + 1 + requested_frames,
+                "request_animation_frame from prepaint: expected the pumped \
+                 frame plus {requested_frames} self-scheduled frames"
             );
             let dirty = window
                 .update(cx, |_, window, _| window.invalidator.is_dirty())
                 .unwrap();
             assert!(
                 !dirty,
-                "{label}: the window never settled after the driver stopped asking"
+                "the window never settled after the driver stopped asking"
             );
             assert_eq!(
                 pending.get(),
-                match driver {
-                    // The swallowed `refresh` consumes one request and then
-                    // stalls, which is the bug.
-                    Driver::Refresh => requested_frames - 1,
-                    Driver::AnimationFrame => 0,
-                },
-                "{label}: unexpected number of unconsumed frame requests"
+                0,
+                "every frame request should have been consumed by a prepaint"
             );
         }
+    }
+
+    /// A window-scope invalidation issued mid-draw used to be dropped by a
+    /// `not_drawing()` guard. That is why the smooth-scroll drivers in
+    /// `virtual_list`, `uniform_list` and `h_list` — all of which call
+    /// `refresh()` from prepaint while an animation is in flight — never
+    /// scheduled their own next frame, and animated only when some unrelated
+    /// invalidation happened to keep the window dirty.
+    ///
+    /// The request must be recorded and carried to the next draw with its axes
+    /// intact, and the chain must terminate once the requests stop.
+    #[gpui::test]
+    fn refresh_during_draw_is_deferred_not_dropped(cx: &mut TestAppContext) {
+        struct RefreshDuringDraw {
+            leaf: crate::Entity<CacheLeaf>,
+            /// Remaining renders that should refresh. Bounded so a lost
+            /// deferral shows up as a failing assertion rather than a hang.
+            pending: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl crate::Render for RefreshDuringDraw {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl crate::IntoElement {
+                if self.pending.get() > 0 {
+                    self.pending.set(self.pending.get() - 1);
+                    window.refresh();
+                }
+                crate::div().size_full().child(
+                    crate::AnyView::from(self.leaf.clone())
+                        .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+                )
+            }
+        }
+
+        let leaf_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let pending = std::rc::Rc::new(std::cell::Cell::new(0));
+        let leaf = cx.update({
+            let leaf_renders = leaf_renders.clone();
+            move |cx| {
+                cx.new(|_| CacheLeaf {
+                    renders: leaf_renders,
+                })
+            }
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let pending = pending.clone();
+            move |_, _| RefreshDuringDraw { leaf, pending }
+        });
+        cx.run_until_parked();
+
+        clean_frame(cx, window.into());
+        let leaf_before = leaf_renders.get();
+
+        pending.set(1);
+        clean_frame(cx, window.into());
+        assert_eq!(
+            leaf_renders.get(),
+            leaf_before,
+            "the refresh arrived mid-draw, too late for the frame already \
+             being built"
+        );
+
+        // Reading the flag is also what drives the frame that answers it:
+        // leaving `update` flushes effects, and that draws every dirty window.
+        let dirty = window
+            .update(cx, |_, window, _| window.invalidator.is_dirty())
+            .unwrap();
+        assert!(dirty, "a refresh() issued mid-draw was dropped");
+        cx.run_until_parked();
+
+        assert!(
+            leaf_renders.get() > leaf_before,
+            "the follow-up frame replayed the cached leaf, so the deferred \
+             window-scope axes were lost on the way to it"
+        );
+        let still_dirty = window
+            .update(cx, |_, window, _| window.invalidator.is_dirty())
+            .unwrap();
+        assert!(
+            !still_dirty,
+            "the window never settled after the refreshes stopped"
+        );
     }
 
     #[gpui::test]
