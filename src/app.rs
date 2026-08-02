@@ -45,8 +45,8 @@ use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
     ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, Colors, CursorStyle,
     DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global,
-    GlobalColors, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
-    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
+    GlobalColors, InvalidationRequest, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu,
+    MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
     PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
     PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, SharedString,
     SubscriberSet, Subscription, SvgRenderer, Task, TextSystem, Window, WindowAppearance,
@@ -1503,8 +1503,7 @@ impl App {
     fn apply_refresh_effect(&mut self) {
         for window in self.windows.values_mut() {
             if let Some(window) = window.as_deref_mut() {
-                window.refreshing = true;
-                window.invalidator.set_dirty(true);
+                window.refresh();
             }
         }
     }
@@ -2359,7 +2358,7 @@ impl App {
             }
         } else {
             for invalidator in &live_invalidators {
-                invalidator.invalidate_view(entity_id, self);
+                invalidator.invalidate(InvalidationRequest::entity(entity_id), self);
             }
         }
 
