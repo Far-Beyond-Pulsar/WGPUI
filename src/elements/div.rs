@@ -1134,6 +1134,49 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// [`Self::layer`], plus a declaration of what the content is a function
+    /// of.
+    ///
+    /// A plain `.layer()` re-renders whenever its view is notified, because a
+    /// notified view re-runs `render` and produces a fresh description that
+    /// nothing in this phase can compare against the old one. That is the safe
+    /// default, and it is also useless for the case worth caching most: a view
+    /// notified every frame for a reason that has nothing to do with this
+    /// subtree. The level editor's viewport is notified on every engine frame
+    /// because its *texture* advanced, while the chrome drawn over it —
+    /// toolbars, gizmo buttons, graph overlays — is unchanged.
+    ///
+    /// `key` is that subtree's actual inputs. While it hashes equal, the layer
+    /// composites even across a notify:
+    ///
+    /// ```ignore
+    /// div()
+    ///     .id("viewport-overlays")
+    ///     .layer_keyed((selected_tool, show_grid, overlay_flags))
+    ///     .child(expensive_chrome)
+    /// ```
+    ///
+    /// **This is a claim you are making, and a wrong one shows as stale UI.**
+    /// It is the same claim `.cached()` makes about a view, made about a
+    /// subtree instead — narrower than hand-classifying invalidation axes at
+    /// every `cx.notify()` site, because it is local, visible at the call site,
+    /// and describes data rather than framework internals. Everything else
+    /// still applies unchanged: geometry, entity dependencies, transform and
+    /// the pointer all continue to force a re-render, so the key only has to
+    /// cover what `render` reads.
+    ///
+    /// Run with `WGPUI_LAYER_DEBUG=1` and change something the key omits — the
+    /// layer will fail to flash, which is what a missing dependency looks like.
+    fn layer_keyed(mut self, key: impl std::hash::Hash) -> Self {
+        use std::hash::Hasher as _;
+        let mut hasher = collections::FxHasher::default();
+        key.hash(&mut hasher);
+        let interactivity = self.interactivity();
+        interactivity.layer = Some(LayerPolicy::default());
+        interactivity.layer_content_key = Some(hasher.finish());
+        self
+    }
+
     /// Set the overflow x and y to scroll.
     fn overflow_scroll(mut self) -> Self {
         self.interactivity().base_style.overflow.x = Some(Overflow::Scroll);
@@ -1603,7 +1646,13 @@ impl Element for Div {
             .interactivity
             .layer
             .filter(|_| global_id.is_some())
-            .map(|policy| (policy, global_id.unwrap().clone()));
+            .map(|policy| {
+                (
+                    policy,
+                    self.interactivity.layer_content_key,
+                    global_id.unwrap().clone(),
+                )
+            });
 
         window.with_image_cache(image_cache, |window| {
             let paint = |this: &mut Self, window: &mut Window, cx: &mut App| {
@@ -1628,10 +1677,15 @@ impl Element for Div {
             };
 
             match layer {
-                Some((policy, layer_id)) => {
-                    window.with_retained_layer(&layer_id, bounds, policy, cx, |window, cx| {
-                        paint(self, window, cx)
-                    });
+                Some((policy, content_key, layer_id)) => {
+                    window.with_retained_layer(
+                        &layer_id,
+                        bounds,
+                        policy,
+                        content_key,
+                        cx,
+                        |window, cx| paint(self, window, cx),
+                    );
                 }
                 None => paint(self, window, cx),
             }
@@ -1733,6 +1787,10 @@ pub struct Interactivity {
     /// Set by [`StatefulInteractiveElement::layer`]. `Some` makes this element
     /// a retained layer rooted at its [`GlobalElementId`].
     pub(crate) layer: Option<LayerPolicy>,
+    /// Set by [`StatefulInteractiveElement::layer_keyed`]. A hash of what the
+    /// layer's content is a function of, which lets it composite across a
+    /// notify to its view.
+    pub(crate) layer_content_key: Option<u64>,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) tab_stop: bool,

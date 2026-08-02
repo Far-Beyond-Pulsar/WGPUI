@@ -4179,6 +4179,7 @@ impl Window {
         global_id: &GlobalElementId,
         bounds: Bounds<Pixels>,
         policy: LayerPolicy,
+        content_key: Option<u64>,
         cx: &mut App,
         f: impl FnOnce(&mut Window, &mut App) -> R,
     ) -> Option<R> {
@@ -4200,11 +4201,18 @@ impl Window {
         // set to ask rather than the raw notified set, because it has already
         // been walked up the dispatch tree: a notified descendant marks this
         // view too, so a layer cannot composite over a child that changed.
-        let view_rebuilt = self.dirty_views.contains(&self.current_view());
+        //
+        // A `layer_keyed` caller has declared what the content is a function
+        // of, so a notify that leaves the key alone is a notify this subtree
+        // does not care about. That is the whole reason the key exists: the
+        // view most worth caching under is the one notified every frame for a
+        // reason unrelated to the subtree.
+        let view_rebuilt = content_key.is_none() && self.dirty_views.contains(&self.current_view());
 
         let composite = !view_rebuilt
             && self.layers.get(&key).is_some_and(|layer| {
-            layer.has_content()
+            layer.content_key == content_key
+                && layer.has_content()
                 && layer.needs.is_empty()
                 && layer.transform.is_identity()
                 && layer.cache_key == cache_key
@@ -4242,6 +4250,7 @@ impl Window {
 
         if let Some(layer) = self.layers.get_mut(&key) {
             layer.accessed_entities = accessed_entities;
+            layer.content_key = content_key;
             layer.had_mouse = mouse_inside;
         }
 
@@ -8797,6 +8806,91 @@ mod test {
                  composited the description from before the change"
             );
         }
+    }
+
+    /// A view with a `layer_keyed` panel whose key is driven by `version`,
+    /// separate from the notifies the view receives.
+    struct KeyedLayerView {
+        version: u64,
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for KeyedLayerView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer_keyed(self.version)
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(100.))
+                    .h(px(100.))
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                paints.set(paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .w(px(10.))
+                        .h(px(10.)),
+                    ),
+            )
+        }
+    }
+
+    /// `layer_keyed` exists for the case a plain `.layer()` cannot serve: a view
+    /// notified every frame for a reason that has nothing to do with the
+    /// subtree. The level editor's viewport is notified on every engine frame
+    /// because its texture advanced, while the chrome over it is unchanged.
+    ///
+    /// So the key must hold across notifies — and must stop holding the moment
+    /// it changes, or the declaration would be unenforceable.
+    #[gpui::test]
+    fn a_keyed_layer_composites_across_notifies_until_its_key_changes(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| KeyedLayerView {
+            version: 0,
+            paints: paints_for_view,
+        });
+        cx.run_until_parked();
+        let painted_once = paints.get();
+        assert_eq!(painted_once, 1);
+
+        // Notifying without touching the key must not re-render: this is
+        // exactly what a plain `.layer()` would (correctly) refuse to do.
+        for round in 0..3 {
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                paints.get(),
+                painted_once,
+                "round {round}: the key was unchanged, so the layer should have composited"
+            );
+        }
+
+        // Changing the key must re-render, or the declaration means nothing.
+        window
+            .update(cx, |view, _, cx| {
+                view.version += 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            paints.get(),
+            painted_once + 1,
+            "the content key changed and the layer composited stale content anyway"
+        );
     }
 
     /// Compositing skips the layer's subtree paint, and everything except

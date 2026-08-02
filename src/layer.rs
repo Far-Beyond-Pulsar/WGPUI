@@ -26,11 +26,8 @@
 //! (#92) both live inside a layer later; neither exists yet.
 //!
 //! Hitboxes, dispatch nodes, tooltips and shaped text still travel through the
-//! old index-range replay path, which stays until #97. [`Layer::hitboxes`]
-//! records what a layer registered so that #90 — which makes hitboxes
-//! layer-relative — has the data it needs, and so `WGPUI_LAYER_DEBUG=1` can
-//! report a layer whose hit geometry drifts while its pixels are being
-//! composited unchanged.
+//! old index-range replay path, which stays until #97 — see
+//! [`Layer::paint_range`].
 //!
 //! # Ordering
 //!
@@ -226,6 +223,15 @@ pub(crate) struct Layer {
     /// Entities read while the layer last rendered. An invalidation naming any
     /// of these re-renders it.
     pub accessed_entities: FxHashSet<EntityId>,
+    /// What the caller declared the content to be a function of, if anything.
+    ///
+    /// `None` is a plain `.layer()`, which re-renders whenever its view is
+    /// notified. `Some` is `.layer_keyed(..)`, which composites across a notify
+    /// while the key holds — the caller's claim, not the framework's inference.
+    /// Compared as part of the composite decision, so switching a layer from
+    /// keyed to unkeyed (or changing what is hashed) re-renders rather than
+    /// reusing content recorded under different rules.
+    pub content_key: Option<u64>,
     /// The non-entity paint inputs, compared as a whole.
     pub cache_key: LayerCacheKey,
     /// Where the layer sits. Must be the identity to composite; see
@@ -252,6 +258,7 @@ impl Layer {
             items: Vec::new(),
             paint_range: crate::PaintIndex::default()..crate::PaintIndex::default(),
             accessed_entities: FxHashSet::default(),
+            content_key: None,
             cache_key: LayerCacheKey::default(),
             transform: LayerTransform::default(),
             // A layer that has never rendered needs everything.
