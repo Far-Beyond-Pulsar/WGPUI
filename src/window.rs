@@ -4151,7 +4151,12 @@ impl Window {
     /// Never on the first sight of a key, and afterwards only when *every* one
     /// of these holds:
     ///
-    /// - no [`InvalidationScope::Layer`] request has named it since it rendered;
+    /// - the view the layer belongs to was not itself invalidated this frame.
+    ///   A notified view re-runs `render` and produces a *fresh description*,
+    ///   which this phase has no way to compare against the one the layer was
+    ///   built from — reconciliation is #92. Until then, a rebuilt description
+    ///   has to be assumed different, or a panel whose data changed would
+    ///   composite last frame's pixels;
     /// - no entity it read while rendering has been invalidated — the same
     ///   dependency test cached views use, which is what makes notifying a model
     ///   reach the layers that display it;
@@ -4189,8 +4194,16 @@ impl Window {
             scale_factor: self.scale_factor(),
         };
         let mouse_inside = bounds.contains(&self.mouse_position);
+        // A rebuilt view means a rebuilt description, and nothing here can tell
+        // a rebuilt-but-identical description from a rebuilt-and-different one
+        // — that is reconciliation, and it is #92. `dirty_views` is the right
+        // set to ask rather than the raw notified set, because it has already
+        // been walked up the dispatch tree: a notified descendant marks this
+        // view too, so a layer cannot composite over a child that changed.
+        let view_rebuilt = self.dirty_views.contains(&self.current_view());
 
-        let composite = self.layers.get(&key).is_some_and(|layer| {
+        let composite = !view_rebuilt
+            && self.layers.get(&key).is_some_and(|layer| {
             layer.has_content()
                 && layer.needs.is_empty()
                 && layer.transform.is_identity()
@@ -8746,6 +8759,44 @@ mod test {
                 assert!(this.layers.is_empty(), "the record should be gone");
             })
             .unwrap();
+    }
+
+    /// A notified view re-runs `render`, so the description behind its layers
+    /// is new and may say something different. Nothing in this phase can
+    /// compare descriptions — that is #92 — so a rebuilt view must re-render
+    /// its layers.
+    ///
+    /// Without this the failure is silent and severe: a panel whose data
+    /// changed keeps compositing last frame's pixels for as long as its bounds
+    /// hold still, which for a docked panel is forever. It cannot be caught by
+    /// the entity-dependency test either, because a view driven by state
+    /// outside the entity graph — an `Arc<RwLock<_>>` polled by a frame pump,
+    /// which is how the level editor works — reads no entity during paint at
+    /// all.
+    #[gpui::test]
+    fn a_layer_in_a_notified_view_re_renders(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let (window, paints) = layer_window(cx);
+        let painted_once = paints.get();
+
+        // Baseline: without a notify, it composites.
+        clean_frame(cx, window.into());
+        assert_eq!(paints.get(), painted_once, "precondition: it composites");
+
+        for round in 0..3 {
+            window
+                .update(cx, |_, _, cx| cx.notify())
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                paints.get(),
+                painted_once + round + 1,
+                "round {round}: the view was notified and re-rendered, but its layer \
+                 composited the description from before the change"
+            );
+        }
     }
 
     /// Compositing skips the layer's subtree paint, and everything except
