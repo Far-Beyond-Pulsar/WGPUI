@@ -94,21 +94,25 @@ impl Scene {
             return;
         }
 
-        let order = if is_filter_boundary {
-            let order_bounds = if clipped_bounds.is_empty() {
-                *primitive.bounds()
+        let order = {
+            let _t = crate::render_stats::scope("frame: bounds tree");
+            if is_filter_boundary {
+                let order_bounds = if clipped_bounds.is_empty() {
+                    *primitive.bounds()
+                } else {
+                    clipped_bounds
+                };
+                self.primitive_bounds.insert_above_all(order_bounds)
             } else {
-                clipped_bounds
-            };
-            self.primitive_bounds.insert_above_all(order_bounds)
-        } else {
-            self.layer_stack
-                .last()
-                .copied()
-                .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
+                self.layer_stack
+                    .last()
+                    .copied()
+                    .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
+            }
         };
         match &mut primitive {
             Primitive::Shadow(shadow) => {
+                crate::render_stats::count("frame: primitives emitted (shadow)");
                 shadow.order = order;
                 self.shadows.push(shadow.clone());
             }
@@ -121,27 +125,33 @@ impl Scene {
                 self.filter_boundaries.push(*boundary);
             }
             Primitive::Quad(quad) => {
+                crate::render_stats::count("frame: primitives emitted (quad)");
                 quad.order = order;
                 self.quads.push(quad.clone());
             }
             Primitive::Path(path) => {
+                crate::render_stats::count("frame: primitives emitted (path)");
                 path.order = order;
                 path.id = PathId(self.paths.len());
                 self.paths.push(path.clone());
             }
             Primitive::Underline(underline) => {
+                crate::render_stats::count("frame: primitives emitted (underline)");
                 underline.order = order;
                 self.underlines.push(underline.clone());
             }
             Primitive::MonochromeSprite(sprite) => {
+                crate::render_stats::count("frame: primitives emitted (sprite)");
                 sprite.order = order;
                 self.monochrome_sprites.push(sprite.clone());
             }
             Primitive::PolychromeSprite(sprite) => {
+                crate::render_stats::count("frame: primitives emitted (sprite)");
                 sprite.order = order;
                 self.polychrome_sprites.push(sprite.clone());
             }
             Primitive::Surface(surface) => {
+                crate::render_stats::count("frame: primitives emitted (surface)");
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
@@ -161,6 +171,7 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
+        let _t = crate::render_stats::scope("frame: scene finish");
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);

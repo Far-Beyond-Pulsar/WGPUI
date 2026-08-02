@@ -1806,6 +1806,11 @@ impl WgpuRenderer {
         // Surface bind groups also reference per-surface params buffers.
         let mut surface_param_buffers: Vec<wgpu::Buffer> = Vec::new();
 
+        // Covers every per-frame `write_buffer` below, up to the point the
+        // swapchain image is acquired — the whole scene is re-uploaded in full
+        // each frame, so this is the cost persistent GPU slabs would displace.
+        let gpu_upload_timer = crate::render_stats::scope("frame: gpu upload");
+
         let color_adjustments = ColorAdjustments {
             gamma_ratios: self.rendering_parameters.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_parameters.grayscale_enhanced_contrast,
@@ -1973,6 +1978,8 @@ impl WgpuRenderer {
                 data,
             );
         }
+
+        drop(gpu_upload_timer);
 
         // Acquire the next swapchain image.  On the first frame after window
         // creation (or after a resize races with the GPU) the surface can be

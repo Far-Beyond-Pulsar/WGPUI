@@ -379,6 +379,7 @@ impl<E: Element> Drawable<E> {
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
+                crate::render_stats::count("frame: element tree nodes");
                 let global_id = self.element.id().map(|element_id| {
                     window.element_id_stack.push(element_id);
                     GlobalElementId(Arc::from(&*window.element_id_stack))
