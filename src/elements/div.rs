@@ -2633,6 +2633,7 @@ impl Interactivity {
                     move |window: &Window| {
                         pending_mouse_down.borrow().is_none()
                             && source_bounds.contains(&window.mouse_position())
+                            && !window.is_bounds_occluded(source_bounds)
                     }
                 });
                 let check_is_hovered = Rc::new({
@@ -3044,9 +3045,6 @@ pub(crate) fn register_tooltip_mouse_handlers(
 /// `check_is_hovered_during_prepaint` is used which bases the check off of the absolute bounds of
 /// the element.
 ///
-/// TODO: There's a minor bug due to the use of absolute bounds while checking during prepaint - it
-/// does not know if the hitbox is occluded. In the case where a tooltip gets displayed and then
-/// gets occluded after display, it will stick around until the mouse exits the hover bounds.
 fn handle_tooltip_mouse_move(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
     build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,

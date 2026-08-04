@@ -4388,6 +4388,18 @@ impl Window {
         }
     }
 
+    pub(crate) fn is_bounds_occluded(&self, bounds: Bounds<Pixels>) -> bool {
+        if !crate::occlusion::enabled() {
+            return false;
+        }
+        let occluders = self
+            .layers
+            .values()
+            .filter_map(|layer| layer.opaque_bounds)
+            .collect::<Vec<_>>();
+        crate::occlusion::fully_covered(bounds, &occluders)
+    }
+
     fn is_layer_occluded(&self, key: LayerKey) -> bool {
         if !crate::occlusion::enabled() {
             return false;
