@@ -596,20 +596,14 @@ impl Style {
         }
 
         let rem_size = Pixels(16.0);
-        let max_corner_radius = self
-            .corner_radii
-            .to_pixels(rem_size)
-            .map(|v| v.0.max(0.0))
-            .max();
+        let corner_radii_px = self.corner_radii.to_pixels(rem_size);
+        let max_corner_radius = Pixels(corner_radii_px.max().0.max(0.0));
 
         let has_opaque_border = self.border_color.is_some_and(|c| c.a >= 1.0);
         let border_inset = if has_opaque_border {
             Pixels::ZERO
         } else {
-            self.border_widths
-                .to_pixels(rem_size)
-                .map(|v| v.0.max(0.0))
-                .max()
+            self.border_widths.to_pixels(rem_size).max().0.max(0.0).into()
         };
 
         let has_backdrop_filter = !self.backdrop_filter.is_empty();
@@ -618,7 +612,7 @@ impl Style {
             bounds,
             element_opacity,
             true,
-            Pixels(max_corner_radius),
+            max_corner_radius,
             has_opaque_border,
             border_inset,
             has_backdrop_filter,
