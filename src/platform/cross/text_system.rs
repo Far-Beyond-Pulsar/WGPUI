@@ -529,8 +529,7 @@ impl CosmicTextSystemState {
             }
             let is_emoji = loaded_font.is_known_emoji_font;
 
-            // HACK: Prevent crash caused by variation selectors.
-            if glyph.glyph_id == 3 && is_emoji {
+            if glyph.cluster == 0xFE0F && is_emoji {
                 continue;
             }
 
