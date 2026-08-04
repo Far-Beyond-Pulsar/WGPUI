@@ -32,7 +32,6 @@ use anyhow::Result;
 #[cfg(not(target_family = "wasm"))]
 use arboard::Clipboard;
 use collections::FxHashMap;
-use std::collections::HashSet;
 use std::{
     cell::{Cell, RefCell},
     collections::HashSet,
@@ -1054,17 +1053,20 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     winit::event::ElementState::Pressed => {
                         // Synthesize release if a prior press is still pending
                         // (WindowEvent::MouseInput release was not delivered).
-                        if let Some(window_id) = self.hovered_window_id.get() {
-                            if let Some(pending) = self.pending_releases.get_mut(&window_id) {
-                                if pending.remove(&mouse_button) {
-                                    self.synthesize_device_mouse_up(
-                                        event_loop, window_id, mouse_button,
-                                    );
-                                }
+                        let mouse_up_to_synthesize = self
+                            .hovered_window_id
+                            .get()
+                            .and_then(|window_id| {
+                                let pending = self.pending_releases.get_mut(&window_id)?;
+                                let removed = pending.remove(&mouse_button);
                                 if pending.is_empty() {
                                     self.pending_releases.remove(&window_id);
                                 }
-                            }
+                                removed.then_some(window_id)
+                            });
+
+                        if let Some(window_id) = mouse_up_to_synthesize {
+                            self.synthesize_device_mouse_up(event_loop, window_id, mouse_button);
                         }
 
                         self.pressed_button = Some(mouse_button);

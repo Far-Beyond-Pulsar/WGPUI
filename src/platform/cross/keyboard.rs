@@ -6,7 +6,11 @@ fn detect_keyboard_layout() -> &'static str {
     LAYOUT.get_or_init(|| {
         std::env::var("LANG")
             .ok()
-            .and_then(|lang| lang.rsplit_once('.').map(|(tag, _)| tag).or(Some(&lang)))
+            .and_then(|lang| {
+                lang.rsplit_once('.')
+                    .map(|(tag, _)| tag.to_string())
+                    .or(Some(lang))
+            })
             .and_then(|tag| tag.rsplit_once('_').map(|(_, code)| code.to_ascii_lowercase()))
             .unwrap_or_else(|| "us".to_string())
     })

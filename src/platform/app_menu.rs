@@ -234,11 +234,17 @@ use crate as gpui;
 crate::actions!(
     gpui,
     [
+        /// The cut action (mapped to Cmd/Ctrl+X)
         Cut,
+        /// The copy action (mapped to Cmd/Ctrl+C)
         Copy,
+        /// The paste action (mapped to Cmd/Ctrl+V)
         Paste,
+        /// The select all action (mapped to Cmd/Ctrl+A)
         SelectAll,
+        /// The undo action (mapped to Cmd/Ctrl+Z)
         Undo,
+        /// The redo action (mapped to Cmd/Ctrl+Shift+Z)
         Redo,
     ]
 );

@@ -2847,13 +2847,13 @@ impl WgpuRenderer {
                 depth_or_array_layers: 1,
             };
             command_encoder.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: persistent_framebuffer,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &surface_texture.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
