@@ -168,8 +168,7 @@ impl WgpuContext {
 
             let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Globals Buffer"),
-                // FIXME(mdeand): Hack
-                size: 16 as u64,
+                size: std::mem::size_of::<[f32; 4]>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -343,7 +342,7 @@ impl WgpuContext {
     ) -> anyhow::Result<Self> {
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Globals Buffer"),
-            size: 16 as u64,
+            size: std::mem::size_of::<[f32; 4]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
