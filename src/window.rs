@@ -9360,7 +9360,7 @@ mod test {
 
         // The background is dirty but occluded, so it goes deferred dirty.
         // The foreground is dirty and visible, so it re-renders.
-        let bg_key = window
+        window
             .update(cx, |_, this, _| {
                 let mut keys: Vec<_> = this.layers.keys().copied().collect();
                 keys.sort();
@@ -9368,9 +9368,10 @@ mod test {
                 let bg = this.layers.get(&bg_key).unwrap();
                 assert!(
                     bg.deferred_dirty,
-                    "the occluded layer must be marked deferred_dirty"
+                    "the occluded layer must be marked deferred_dirty; has_content={}, opaque_bounds={:?}",
+                    bg.has_content(),
+                    this.layers.iter().map(|(k, l)| (k.0, l.opaque_bounds)).collect::<Vec<_>>(),
                 );
-                bg_key
             })
             .unwrap();
 
