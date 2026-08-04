@@ -844,7 +844,11 @@ impl Platform for CrossPlatform {
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
-        // TODO(mdeand): How do we want to implement this? For now, just return false.
+        #[cfg(target_os = "macos")]
+        {
+            return true;
+        }
+        #[cfg(not(target_os = "macos"))]
         false
     }
 
