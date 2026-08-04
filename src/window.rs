@@ -4325,6 +4325,15 @@ impl Window {
         let scaled_bounds = cache_key.bounds.scale(cache_key.scale_factor);
         let paint_start = self.paint_index();
 
+        // Clear occlusion state before paint runs. The paint may re-set
+        // `opaque_bounds` via `mark_current_layer_opaque` during `f(self)`.
+        let layer = self.layers.entry(key).or_insert_with(|| {
+            crate::render_stats::count("layer: created");
+            Layer::new(LayerId(id), policy, frame)
+        });
+        layer.opaque_bounds = None;
+        layer.poisoned_bounds.clear();
+
         self.next_frame.scene.begin_layer(key, scaled_bounds, true);
         let result = f(self);
         let items = self
@@ -4335,11 +4344,6 @@ impl Window {
 
         let paint_range = paint_start..self.paint_index();
         let frame = self.layer_frame;
-        let id = self.next_layer_id;
-        let layer = self.layers.entry(key).or_insert_with(|| {
-            crate::render_stats::count("layer: created");
-            Layer::new(LayerId(id), policy, frame)
-        });
         if layer.id.0 == id {
             self.next_layer_id = self.next_layer_id.wrapping_add(1);
         }
@@ -4353,10 +4357,7 @@ impl Window {
         };
         layer.needs = Invalidation::empty();
         layer.last_visited = frame;
-        // Rewritten by `with_retained_layer` when it owns the decision. A
-        // caller that keeps its own invalidation record leaves these alone.
         layer.had_mouse = false;
-        layer.opaque_bounds = None;
         layer.deferred_dirty = false;
         layer.poisoned_bounds.clear();
 
