@@ -32,6 +32,7 @@ use anyhow::Result;
 #[cfg(not(target_family = "wasm"))]
 use arboard::Clipboard;
 use collections::FxHashMap;
+use std::collections::HashSet;
 use std::{
     cell::{Cell, RefCell},
     collections::HashSet,
@@ -101,6 +102,8 @@ struct AppState {
     active_window_id: Cell<Option<winit::window::WindowId>>,
     hovered_window_id: Cell<Option<winit::window::WindowId>>,
     hovered_external_paths: Vec<PathBuf>,
+    pending_releases:
+        FxHashMap<winit::window::WindowId, HashSet<MouseButton>>,
     #[cfg(target_family = "wasm")]
     wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>>,
     #[cfg(target_family = "wasm")]
@@ -340,6 +343,7 @@ impl Platform for CrossPlatform {
             active_window_id: Cell::new(None),
             hovered_window_id: Cell::new(None),
             hovered_external_paths: Vec::new(),
+            pending_releases: FxHashMap::default(),
             wgpu_context: self.wgpu_context.clone(),
             wgpu_options: WgpuOptions {
                 additional_features: self.wgpu_options.additional_features,
@@ -365,6 +369,7 @@ impl Platform for CrossPlatform {
             active_window_id: Cell::new(None),
             hovered_window_id: Cell::new(None),
             hovered_external_paths: Vec::new(),
+            pending_releases: FxHashMap::default(),
         };
 
         #[cfg(target_family = "wasm")]
@@ -930,6 +935,33 @@ impl AppState {
         ACTIVE_CONTEXT.with(|s| s.set(None));
     }
 
+    fn synthesize_device_mouse_up(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        mouse_button: MouseButton,
+    ) {
+        self.pressed_button = None;
+        self.set_active_context(event_loop);
+        if let Some(window) = self.windows.get(&window_id) {
+            let position = window.0.state.mouse_position.get();
+            let modifiers = self.current_modifiers;
+            let platform_event = PlatformInput::MouseUp(MouseUpEvent {
+                button: mouse_button,
+                position,
+                modifiers,
+                click_count: self.click_state.current_count,
+            });
+            window.0.state.callbacks.invoke_mut(
+                &window.0.state.callbacks.on_input,
+                |cb| {
+                    cb(platform_event.clone());
+                },
+            );
+        }
+        self.clear_active_context();
+    }
+
     fn drain_main_queue(&mut self) {
         while let Ok(Some(runnable)) = self.main_rx.try_pop() {
             match runnable {
@@ -1012,7 +1044,28 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
                 match state {
                     winit::event::ElementState::Pressed => {
+                        // Synthesize release if a prior press is still pending
+                        // (WindowEvent::MouseInput release was not delivered).
+                        if let Some(window_id) = self.hovered_window_id.get() {
+                            if let Some(pending) = self.pending_releases.get_mut(&window_id) {
+                                if pending.remove(&mouse_button) {
+                                    self.synthesize_device_mouse_up(
+                                        event_loop, window_id, mouse_button,
+                                    );
+                                }
+                                if pending.is_empty() {
+                                    self.pending_releases.remove(&window_id);
+                                }
+                            }
+                        }
+
                         self.pressed_button = Some(mouse_button);
+                        if let Some(window_id) = self.hovered_window_id.get() {
+                            self.pending_releases
+                                .entry(window_id)
+                                .or_default()
+                                .insert(mouse_button);
+                        }
                         if matches!(mouse_button, MouseButton::Navigate(_)) {
                             self.set_active_context(event_loop);
                             if let Some(window_id) = self.hovered_window_id.get() {
@@ -1039,14 +1092,17 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                         }
                     }
                     winit::event::ElementState::Released => {
+                        if let Some(window_id) = self.hovered_window_id.get() {
+                            if let Some(pending) = self.pending_releases.get_mut(&window_id) {
+                                pending.remove(&mouse_button);
+                                if pending.is_empty() {
+                                    self.pending_releases.remove(&window_id);
+                                }
+                            }
+                        }
                         if self.pressed_button == Some(mouse_button) {
                             self.pressed_button = None;
 
-                            // TODO: This is a fallback for macOS when WindowEvent::MouseInput
-                            // release notifications are not delivered reliably. In an ideal fix,
-                            // we would avoid synthesizing MouseUp from raw device events and instead
-                            // make the normal winit event path complete correctly.
-                            //
                             // IMPORTANT: set_active_context must be called here so that any
                             // cx.open_window() calls triggered by the click handler have a valid
                             // event loop reference (without it they silently fail).
@@ -1575,6 +1631,12 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     }
                     winit::event::ElementState::Released => {
                         self.pressed_button = None;
+                        if let Some(pending) = self.pending_releases.get_mut(&window_id) {
+                            pending.remove(&mouse_button);
+                            if pending.is_empty() {
+                                self.pending_releases.remove(&window_id);
+                            }
+                        }
                         if mouse_button == MouseButton::Left {
                             window.window().request_redraw();
                         }
