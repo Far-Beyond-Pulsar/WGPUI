@@ -12,6 +12,7 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// The current occlusion mode.
+#[derive(PartialEq)]
 pub(crate) enum Mode {
     /// Fully disabled (`WGPUI_OCCLUSION=0`).
     Off,
