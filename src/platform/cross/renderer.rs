@@ -2806,7 +2806,6 @@ impl WgpuRenderer {
                             }
                         }
                     }
-                    // TODO(mdeand): Implement paths rendering.
                     PrimitiveBatch::Paths(paths) => {
                         let vertex_count: u32 = paths.iter().map(|p| p.vertices.len() as u32).sum();
                         if vertex_count > 0 {
