@@ -128,11 +128,18 @@ struct ClickState {
 
 impl CrossPlatform {
     pub fn new(wgpu_options: WgpuOptions) -> Result<Self> {
-        Self::new_impl(wgpu_options)
+        Self::new_impl(false, wgpu_options)
     }
 
-    fn new_impl(wgpu_options: WgpuOptions) -> Result<Self> {
-        let wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>> = match WgpuContext::new(&wgpu_options) {
+    pub fn new_headless(wgpu_options: WgpuOptions) -> Result<Self> {
+        Self::new_impl(true, wgpu_options)
+    }
+
+    fn new_impl(headless: bool, wgpu_options: WgpuOptions) -> Result<Self> {
+        let wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>> = if headless {
+            Arc::new(std::sync::OnceLock::new())
+        } else {
+            match WgpuContext::new(&wgpu_options) {
             Ok(ctx) => {
                 let lock = Arc::new(std::sync::OnceLock::new());
                 lock.set(Arc::new(ctx)).ok();
@@ -141,6 +148,7 @@ impl CrossPlatform {
             // On WASM, WgpuContext::new returns an error (needs async init).
             // The OnceLock stays empty; run() will fill it via spawn_local.
             Err(_) => Arc::new(std::sync::OnceLock::new()),
+        }
         };
 
         let (main_tx, main_rx) = PriorityQueueReceiver::new();
