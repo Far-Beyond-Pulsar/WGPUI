@@ -8,12 +8,17 @@ pub struct WgpuOptions {
     /// Additional WGPU features to request when creating the device.
     /// These are OR'd with the features WGPUI itself requires.
     pub additional_features: wgpu::Features,
+
+    /// Maximum number of frames the GPU can queue ahead before blocking.
+    /// Higher values improve throughput at the cost of input latency.
+    pub desired_maximum_frame_latency: u32,
 }
 
 impl Default for WgpuOptions {
     fn default() -> Self {
         Self {
             additional_features: wgpu::Features::empty(),
+            desired_maximum_frame_latency: 2,
         }
     }
 }
@@ -42,6 +47,9 @@ pub struct WgpuContext {
     pub(super) paths_vertices_buffer: Mutex<wgpu::Buffer>,
 
     pub(crate) surface_registry: Arc<SurfaceRegistry>,
+
+    /// Maximum number of frames the GPU can queue ahead before blocking.
+    pub(crate) desired_maximum_frame_latency: u32,
 
     /// Guards swapchain reconfiguration against concurrent queue submission.
     ///
@@ -188,8 +196,8 @@ impl WgpuContext {
 
             let quads_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Quads Buffer"),
-                // TODO(mdeand): Determine appropriate size
-                size: 8 * 1024 * 1024, // 1 MB buffer for quads, for now. (:
+                // Resized dynamically by ensure_buffer_size() when the initial allocation is exceeded.
+                size: 8 * 1024 * 1024,
                 usage: wgpu::BufferUsages::VERTEX
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::STORAGE
@@ -199,7 +207,7 @@ impl WgpuContext {
 
             let mono_sprites_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Monosprites Buffer"),
-                // TODO(mdeand): Determine appropriate size, or make resizable.
+                // Resized dynamically by ensure_buffer_size() when the initial allocation is exceeded.
                 size: 8 * 1024 * 1024,
                 usage: wgpu::BufferUsages::VERTEX
                     | wgpu::BufferUsages::COPY_DST
@@ -259,7 +267,8 @@ impl WgpuContext {
 
             let color_adjustments_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Color Adjustments Buffer"),
-                size: 1024 * 16, // TODO(mdeand): 16 KB buffer for color adjustments, for now. (:
+                // Resized dynamically by ensure_buffer_size() when the initial allocation is exceeded.
+                size: 1024 * 16,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::UNIFORM,
@@ -283,6 +292,7 @@ impl WgpuContext {
 
                 paths_vertices_buffer: Mutex::new(paths_vertices_buffer),
                 surface_registry: Arc::new(SurfaceRegistry::new()),
+                desired_maximum_frame_latency: options.desired_maximum_frame_latency,
                 gpu_submit_lock: Arc::new(parking_lot::RwLock::new(())),
             })
         } // end #[cfg(not(target_family = "wasm"))]
@@ -330,7 +340,13 @@ impl WgpuContext {
             })
             .await?;
 
-        Self::create_buffers(instance, adapter, device, queue)
+        Self::create_buffers(
+            instance,
+            adapter,
+            device,
+            queue,
+            options.desired_maximum_frame_latency,
+        )
     }
 
     /// Shared buffer-creation helper, used by both sync (native) and async (WASM) paths.
@@ -339,6 +355,7 @@ impl WgpuContext {
         adapter: wgpu::Adapter,
         device: wgpu::Device,
         queue: wgpu::Queue,
+        desired_maximum_frame_latency: u32,
     ) -> anyhow::Result<Self> {
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Globals Buffer"),
@@ -445,6 +462,7 @@ impl WgpuContext {
             color_adjustments_buffer,
             paths_vertices_buffer: Mutex::new(paths_vertices_buffer),
             surface_registry: Arc::new(SurfaceRegistry::new()),
+            desired_maximum_frame_latency,
             gpu_submit_lock: Arc::new(parking_lot::RwLock::new(())),
         })
     }

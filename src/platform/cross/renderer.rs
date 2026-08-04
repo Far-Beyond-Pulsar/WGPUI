@@ -1598,8 +1598,7 @@ impl WgpuRenderer {
             alpha_mode,
             color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
-            // TODO(mdeand): Make this configurable?
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: context.desired_maximum_frame_latency,
         };
 
         let atlas_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1640,7 +1639,9 @@ impl WgpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
@@ -2169,13 +2170,13 @@ impl WgpuRenderer {
             let flamegraph_main_pass =
                 self.reserve_gpu_timestamps(crate::SpanName::Static("main"), crate::GpuPassKind::Main);
 
-            // Render to swapchain directly for now (TODO: render to framebuffer, then blit)
             let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_texture
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default()),
+                    view: self
+                        .persistent_framebuffer_view
+                        .as_ref()
+                        .expect("persistent framebuffer view must exist"),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -2839,7 +2840,29 @@ impl WgpuRenderer {
             }
         }
 
-        // TODO: Blit persistent framebuffer to swapchain (needs proper pipeline)
+        // Blit persistent framebuffer to swapchain
+        if let Some(ref persistent_framebuffer) = self.persistent_framebuffer {
+            let extent = wgpu::Extent3d {
+                width: self.surface_configuration.width,
+                height: self.surface_configuration.height,
+                depth_or_array_layers: 1,
+            };
+            command_encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: persistent_framebuffer,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &surface_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                extent,
+            );
+        }
 
         // Close out the GpuSubmitPresent bracket and record the resolve +
         // resolve-to-staging copy for this frame's generation, before the
@@ -3157,7 +3180,8 @@ impl WgpuRenderer {
                 dimension: wgpu::TextureDimension::D2,
                 format: self.surface_configuration.format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
 
