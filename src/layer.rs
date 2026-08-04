@@ -299,6 +299,7 @@ impl Layer {
         self.items.shrink_to_fit();
         self.paint_range = crate::PaintIndex::default()..crate::PaintIndex::default();
         self.needs = Invalidation::all();
+        self.deferred_dirty = false;
     }
 }
 
