@@ -83,12 +83,7 @@ pub struct LayerId(pub u32);
 
 /// How a layer sits relative to its parent.
 ///
-/// Translation only, and required to be the identity for a layer to composite
-/// at all in this phase. Compositing a layer at a *new* offset without
-/// re-prepainting it would leave every hitbox inside it at last frame's
-/// position, so hover, click and cursor would desync from the pixels. Hitboxes
-/// become layer-relative in #90; until then a moved layer re-renders, which is
-/// correct and no slower than today.
+/// Translation from a layer's local coordinate space into window coordinates.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct LayerTransform {
     /// Offset from the parent's coordinate space.
@@ -107,6 +102,18 @@ impl LayerTransform {
     /// Whether this transform moves nothing.
     pub fn is_identity(&self) -> bool {
         self.offset.x == px(0.) && self.offset.y == px(0.)
+    }
+
+    /// Transform a point from the layer's local coordinate space into window
+    /// coordinates.
+    pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
+        point + self.offset
+    }
+
+    /// Transform a point from window coordinates into the layer's local
+    /// coordinate space.
+    pub fn invert(&self, point: Point<Pixels>) -> Point<Pixels> {
+        point - self.offset
     }
 }
 
@@ -388,5 +395,15 @@ mod tests {
             Invalidation::all(),
             "an evicted layer must not be judged clean when it is next visited"
         );
+    }
+
+    #[test]
+    fn layer_transform_round_trips_points() {
+        let transform = LayerTransform {
+            offset: Point::new(px(17.), px(-23.)),
+        };
+        let local = Point::new(px(4.), px(9.));
+
+        assert_eq!(transform.invert(transform.apply(local)), local);
     }
 }

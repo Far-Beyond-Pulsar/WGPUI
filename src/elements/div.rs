@@ -15,15 +15,16 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
+use crate::util::ResultExt;
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
-    DispatchPhase, Display, Element, ElementGeometry, ElementId, Entity, FocusHandle, FrameEffectCallback, Global,
-    GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero,
-    KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayerPolicy, LayoutId,
-    ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Overflow, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    Size, Style, StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea,
-    point, px, size,
+    DispatchPhase, Display, Element, ElementGeometry, ElementId, Entity, FocusHandle,
+    FrameEffectCallback, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
+    InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
+    KeyboardClickEvent, LayerKey, LayerPolicy, LayoutId, ModifiersChangedEvent, MouseButton,
+    MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, Pixels,
+    Point, Render, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
+    TooltipId, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use refineable::Refineable;
@@ -32,16 +33,15 @@ use stacksafe::{StackSafe, stacksafe};
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
-    hash::{Hash, Hasher},
     cmp::Ordering,
     fmt::Debug,
+    hash::{Hash, Hasher},
     marker::PhantomData,
     mem,
     rc::Rc,
     sync::Arc,
     time::Duration,
 };
-use crate::util::ResultExt;
 
 use super::ImageCacheProvider;
 
@@ -535,10 +535,8 @@ impl Interactivity {
         &mut self,
         listener: impl Fn(&bool, &mut Window, &mut App) + 'static,
     ) {
-        self.drag_hover_listeners.push((
-            TypeId::of::<D>(),
-            Box::new(listener),
-        ));
+        self.drag_hover_listeners
+            .push((TypeId::of::<D>(), Box::new(listener)));
     }
 
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
@@ -1594,32 +1592,44 @@ impl Element for Div {
             scroll_handle.scroll_to_active_item();
         }
 
-        self.interactivity.prepaint(
-            global_id,
-            inspector_id,
-            bounds,
-            content_size,
-            window,
-            cx,
-            |style, scroll_offset, hitbox, window, cx| {
-                // skip children
-                if style.display == Display::None {
-                    return hitbox;
-                }
-
-                window.with_element_offset(scroll_offset, |window| {
-                    for child in &mut self.children {
-                        child.prepaint(window, cx);
+        let layer_key = self
+            .interactivity
+            .layer
+            .as_ref()
+            .zip(global_id)
+            .map(|(_, global_id)| LayerKey::from_global_element_id(global_id));
+        let prepaint = |window: &mut Window| {
+            self.interactivity.prepaint(
+                global_id,
+                inspector_id,
+                bounds,
+                content_size,
+                window,
+                cx,
+                |style, scroll_offset, hitbox, window, cx| {
+                    if style.display == Display::None {
+                        return hitbox;
                     }
-                });
 
-                if let Some(listener) = self.prepaint_listener.as_ref() {
-                    listener(children_bounds, window, cx);
-                }
+                    window.with_element_offset(scroll_offset, |window| {
+                        for child in &mut self.children {
+                            child.prepaint(window, cx);
+                        }
+                    });
 
-                hitbox
-            },
-        )
+                    if let Some(listener) = self.prepaint_listener.as_ref() {
+                        listener(children_bounds, window, cx);
+                    }
+
+                    hitbox
+                },
+            )
+        };
+
+        match layer_key {
+            Some(key) => window.with_layer_hitbox_scope(key, bounds.origin, prepaint),
+            None => prepaint(window),
+        }
     }
 
     #[stacksafe]
@@ -1692,12 +1702,7 @@ impl Element for Div {
         });
     }
 
-    fn on_frame(
-        &mut self,
-        geom: ElementGeometry,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+    fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App) {
         let Some(callback) = self.on_frame.clone() else {
             return;
         };
@@ -1762,10 +1767,7 @@ pub struct Interactivity {
         TypeId,
         Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement>,
     )>,
-    pub(crate) drag_hover_listeners: Vec<(
-        TypeId,
-        Box<dyn Fn(&bool, &mut Window, &mut App)>,
-    )>,
+    pub(crate) drag_hover_listeners: Vec<(TypeId, Box<dyn Fn(&bool, &mut Window, &mut App)>)>,
     pub(crate) mouse_enter_listeners: Vec<Box<dyn Fn(&mut Window, &mut App)>>,
     pub(crate) mouse_leave_listeners: Vec<Box<dyn Fn(&mut Window, &mut App)>>,
     pub(crate) mouse_down_listeners: Vec<MouseDownListener>,
@@ -1942,11 +1944,11 @@ impl Interactivity {
                     window.with_content_mask(
                         style.overflow_mask(bounds, window.rem_size()),
                         |window| {
-        let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-            Some(window.insert_hitbox(bounds, self.hitbox_behavior))
-        } else {
-            None
-        };
+                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                            } else {
+                                None
+                            };
 
                             let scroll_offset =
                                 self.clamp_scroll_position(bounds, &style, window, cx);
@@ -2409,7 +2411,9 @@ impl Interactivity {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
-                let Some(active_drag) = &cx.active_drag else { return; };
+                let Some(active_drag) = &cx.active_drag else {
+                    return;
+                };
                 if active_drag.value.as_ref().type_id() != drag_type_id {
                     return;
                 }

@@ -1,21 +1,24 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::layer::{Layer, LayerCacheKey, LayerItem};
+use crate::time_ext::Instant;
+use crate::util::post_inc;
+use crate::util::{ResultExt, measure};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, ElementGeometry, Entity, EntityId,
-    EventEmitter,
-    FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId,
-    GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext,     KeyDownEvent, KeyEvent, KeyUpEvent, Keystroke,
-    KeystrokeEvent, LayerId, LayerKey, LayerPolicy, LayerTransform, LayoutId, LineLayoutIndex,
-    Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseDownEvent, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, ScrollWheelEvent,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId, GlyphId,
+    GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    KeyUpEvent, Keystroke, KeystrokeEvent, LayerId, LayerKey, LayerPolicy, LayerTransform,
+    LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton,
+    MouseDownEvent, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScrollWheelEvent, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextColor, TextStyle,
     TextStyleRefinement, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
@@ -50,10 +53,6 @@ use std::{
     },
     time::Duration,
 };
-use crate::layer::{Layer, LayerCacheKey, LayerItem};
-use crate::time_ext::Instant;
-use crate::util::post_inc;
-use crate::util::{ResultExt, measure};
 use uuid::Uuid;
 
 mod prompts;
@@ -344,7 +343,10 @@ impl WindowInvalidator {
         crate::render_stats::count("invalidate: layer");
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
-        *inner.dirty_layers.entry(key).or_insert(Invalidation::empty()) |= axes;
+        *inner
+            .dirty_layers
+            .entry(key)
+            .or_insert(Invalidation::empty()) |= axes;
         inner.dirty = true;
         true
     }
@@ -980,6 +982,9 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// The retained layer whose local coordinate space contains these bounds.
+    /// `None` identifies legacy window-relative hitboxes.
+    pub(crate) layer: Option<LayerKey>,
 }
 
 impl Hitbox {
@@ -1273,10 +1278,18 @@ impl Frame {
             .into_inner()
     }
 
-    pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
+    pub(crate) fn hit_test(
+        &self,
+        position: Point<Pixels>,
+        layers: &FxHashMap<LayerKey, Layer>,
+    ) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
+            let position = hitbox
+                .layer
+                .and_then(|key| layers.get(&key))
+                .map_or(position, |layer| layer.transform.invert(position));
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
@@ -1344,6 +1357,7 @@ pub struct Window {
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+    pub(crate) hitbox_layer_stack: Vec<(LayerKey, Point<Pixels>)>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
@@ -1841,6 +1855,7 @@ impl Window {
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
+            hitbox_layer_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
@@ -2065,11 +2080,7 @@ impl Window {
         let entity_id = view.entity_id();
         let weak = view.downgrade_unchecked::<T>();
         let mut entity = cx.entities.lease_unchecked::<T>(entity_id);
-        let result = f(
-            &mut entity,
-            self,
-            &mut Context::new_context(cx, weak),
-        );
+        let result = f(&mut entity, self, &mut Context::new_context(cx, weak));
         cx.entities.end_lease_unchecked(entity);
         result
     }
@@ -2840,7 +2851,11 @@ impl Window {
         #[cfg(feature = "flamegraph")]
         self.flamegraph_open_frame.set(frame_index);
         #[cfg(feature = "flamegraph")]
-        let _draw_span = crate::enter_span(crate::SpanName::Static("Window::draw"), crate::SpanCategory::WindowFrame, None);
+        let _draw_span = crate::enter_span(
+            crate::SpanName::Static("Window::draw"),
+            crate::SpanCategory::WindowFrame,
+            None,
+        );
 
         self.apply_invalidations();
         cx.entities.clear_accessed();
@@ -2887,8 +2902,7 @@ impl Window {
 
             #[cfg(any(feature = "inspector", debug_assertions))]
             {
-                let element_infos =
-                    std::mem::take(&mut self.next_frame.inspector_element_infos);
+                let element_infos = std::mem::take(&mut self.next_frame.inspector_element_infos);
                 if let Some(inspector) = &self.inspector {
                     inspector.update(cx, |inspector, _cx| {
                         inspector.set_element_infos(element_infos);
@@ -3042,8 +3056,11 @@ impl Window {
     #[profiling::function]
     fn present(&self) {
         #[cfg(feature = "flamegraph")]
-        let _present_span =
-            crate::enter_span(crate::SpanName::Static("Window::present"), crate::SpanCategory::WindowFrame, None);
+        let _present_span = crate::enter_span(
+            crate::SpanName::Static("Window::present"),
+            crate::SpanCategory::WindowFrame,
+            None,
+        );
 
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
@@ -3145,7 +3162,7 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position, &self.layers);
         drop(prepaint_timer);
 
         // Now actually paint the elements.
@@ -3287,10 +3304,10 @@ impl Window {
                 let prepaint_start = self.prepaint_index();
                 if let Some(element) = deferred_draw.element.as_mut() {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
-                        window.with_absolute_element_offset(
-                            deferred_draw.absolute_offset,
-                            |window| element.prepaint(window, cx),
-                        )
+                        window
+                            .with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
+                                element.prepaint(window, cx)
+                            })
                     });
                 }
                 let prepaint_end = self.prepaint_index();
@@ -3536,10 +3553,9 @@ impl Window {
         // view records around its subtree would no longer describe that
         // subtree's effects.
         self.invalidator.debug_assert_effects();
-        self.next_frame.effects.push(FrameEffect {
-            callback,
-            geometry,
-        });
+        self.next_frame
+            .effects
+            .push(FrameEffect { callback, geometry });
     }
 
     /// Re-run the effects a cached subtree registered when it last rendered,
@@ -3552,11 +3568,7 @@ impl Window {
     /// the fresh tree, which ran `render` and a full `layout_as_root` on every
     /// cache hit — the two things the cache exists to skip. Replaying the
     /// recorded effects costs one `Rc` clone and one call each.
-    pub(crate) fn replay_frame_effects(
-        &mut self,
-        range: &Range<PrepaintStateIndex>,
-        cx: &mut App,
-    ) {
+    pub(crate) fn replay_frame_effects(&mut self, range: &Range<PrepaintStateIndex>, cx: &mut App) {
         let range = range.start.effects_index..range.end.effects_index;
         if range.is_empty() {
             return;
@@ -3690,8 +3702,9 @@ impl Window {
                 [range.start.tab_handle_index..range.end.tab_handle_index],
         );
 
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index.clone()..range.end.line_layout_index.clone());
+        self.text_system.reuse_layouts(
+            range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
+        );
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -4161,10 +4174,9 @@ impl Window {
     ///   dependency test cached views use, which is what makes notifying a model
     ///   reach the layers that display it;
     /// - its bounds, content mask, opacity and scale factor are unchanged;
-    /// - its transform is the identity. Compositing at a *new* offset without
-    ///   re-prepainting would leave every hitbox inside the layer at last
-    ///   frame's position, desyncing hover and click from the pixels. #90 makes
-    ///   hitboxes layer-relative and lifts this;
+    /// - its transform continues to describe the layer's local coordinate
+    ///   space. Hitboxes are recorded in that space and hit testing inverts the
+    ///   transform before applying the usual blocking rules;
     /// - the pointer is outside it, and was outside it last frame. Hover state
     ///   is read during paint and is not an entity, so nothing invalidates a
     ///   layer when the pointer crosses it. Re-rendering under the pointer is
@@ -4211,10 +4223,9 @@ impl Window {
 
         let composite = !view_rebuilt
             && self.layers.get(&key).is_some_and(|layer| {
-            layer.content_key == content_key
+                layer.content_key == content_key
                 && layer.has_content()
                 && layer.needs.is_empty()
-                && layer.transform.is_identity()
                 && layer.cache_key == cache_key
                 && !layer.had_mouse
                 && !mouse_inside
@@ -4231,7 +4242,8 @@ impl Window {
                         &layer.paint_range,
                     )
                     .is_none()
-        }) && self.view_cache_available();
+            })
+            && self.view_cache_available();
 
         if composite {
             // Primitives come from the layer; everything else the skipped paint
@@ -4245,8 +4257,9 @@ impl Window {
             return None;
         }
 
-        let (result, accessed_entities) =
-            cx.detect_accessed_entities(|cx| self.record_layer(key, cache_key, policy, |window| f(window, cx)));
+        let (result, accessed_entities) = cx.detect_accessed_entities(|cx| {
+            self.record_layer(key, cache_key, policy, |window| f(window, cx))
+        });
 
         if let Some(layer) = self.layers.get_mut(&key) {
             layer.accessed_entities = accessed_entities;
@@ -4297,7 +4310,9 @@ impl Window {
         layer.paint_range = paint_range;
         let bounds = cache_key.bounds;
         layer.cache_key = cache_key;
-        layer.transform = LayerTransform::default();
+        layer.transform = LayerTransform {
+            offset: bounds.origin,
+        };
         layer.needs = Invalidation::empty();
         layer.last_visited = frame;
         // Rewritten by `with_retained_layer` when it owns the decision. A
@@ -4434,11 +4449,7 @@ impl Window {
             bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             background: color.into(),
-            border_color: Hsla {
-                a: 1.0,
-                ..color
-            }
-            .into(),
+            border_color: Hsla { a: 1.0, ..color }.into(),
             corner_radii: Corners::default(),
             border_widths: Edges::all(ScaledPixels(1.)),
         });
@@ -4464,7 +4475,10 @@ impl Window {
             let evict_after = layer.policy.evict_after_frames as u64;
             if age > evict_after.saturating_mul(2) {
                 dropped_records += 1;
-                log::trace!("layer {key:?} ({:?}) forgotten after {age} frames", layer.id);
+                log::trace!(
+                    "layer {key:?} ({:?}) forgotten after {age} frames",
+                    layer.id
+                );
                 return false;
             }
             if age > evict_after && layer.has_content() {
@@ -5129,7 +5143,13 @@ impl Window {
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
-        let content_mask = self.content_mask();
+        let mut bounds = bounds;
+        let mut content_mask = self.content_mask();
+        let layer = self.hitbox_layer_stack.last().copied();
+        if let Some((_, origin)) = layer {
+            bounds.origin -= origin;
+            content_mask.bounds.origin -= origin;
+        }
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
@@ -5137,9 +5157,29 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            layer: layer.map(|(key, _)| key),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
+    }
+
+    /// Record hitboxes inserted by `f` in `key`'s local coordinate space.
+    ///
+    /// The layer still paints in window coordinates today, but its input
+    /// geometry must not: a later transform-only composite moves the pixels
+    /// without re-running prepaint. Hit testing therefore maps the query point
+    /// back into this coordinate space once per layer.
+    pub(crate) fn with_layer_hitbox_scope<R>(
+        &mut self,
+        key: LayerKey,
+        origin: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+        self.hitbox_layer_stack.push((key, origin));
+        let result = f(self);
+        self.hitbox_layer_stack.pop();
+        result
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
@@ -5249,17 +5289,22 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let discriminator = type_name_hash::<Event>();
-        self.next_frame.mouse_listeners.push(Some(MouseListenerEntry {
-            discriminator,
-            listener: Box::new(
-                move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                    // SAFETY: dispatch_mouse_event only calls this listener when the
-                    // discriminator matches the dispatched event's type_name_hash.
-                    let event = unsafe { &*(event as *const dyn Any as *const Event) };
-                    listener(event, phase, window, cx)
-                },
-            ),
-        }));
+        self.next_frame
+            .mouse_listeners
+            .push(Some(MouseListenerEntry {
+                discriminator,
+                listener: Box::new(
+                    move |event: &dyn Any,
+                          phase: DispatchPhase,
+                          window: &mut Window,
+                          cx: &mut App| {
+                        // SAFETY: dispatch_mouse_event only calls this listener when the
+                        // discriminator matches the dispatched event's type_name_hash.
+                        let event = unsafe { &*(event as *const dyn Any as *const Event) };
+                        listener(event, phase, window, cx)
+                    },
+                ),
+            }));
     }
 
     /// Register a key event listener on this node for the next frame. The type of event
@@ -5560,7 +5605,9 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, discriminator: u64, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self
+            .rendered_frame
+            .hit_test(self.mouse_position(), &self.layers);
         if std::env::var_os("GPUI_DEBUG_MOUSE").is_some() {
             eprintln!(
                 "[WGPUI] dispatch_mouse_event pos={:?} hit_ids={:?} listeners={} active={} hover={}",
@@ -5584,11 +5631,7 @@ impl Window {
                 if is_resizing {
                     let viewport_width = self.viewport_size.width;
                     let handled = inspector.update(cx, |inspector, _cx| {
-                        crate::handle_inspector_resize(
-                            inspector,
-                            event,
-                            viewport_width,
-                        )
+                        crate::handle_inspector_resize(inspector, event, viewport_width)
                     });
                     if handled {
                         self.refresh();
@@ -5857,8 +5900,12 @@ impl Window {
 
         // Capture phase
         for node_id in dispatch_path {
-            let listeners = self.rendered_frame.dispatch_tree.node(*node_id)
-                .key_listeners.clone();
+            let listeners = self
+                .rendered_frame
+                .dispatch_tree
+                .node(*node_id)
+                .key_listeners
+                .clone();
 
             for (listener_disc, key_listener) in &listeners {
                 if *listener_disc == discriminator {
@@ -5872,8 +5919,12 @@ impl Window {
 
         // Bubble phase
         for node_id in dispatch_path.iter().rev() {
-            let listeners = self.rendered_frame.dispatch_tree.node(*node_id)
-                .key_listeners.clone();
+            let listeners = self
+                .rendered_frame
+                .dispatch_tree
+                .node(*node_id)
+                .key_listeners
+                .clone();
 
             for (listener_disc, key_listener) in &listeners {
                 if *listener_disc == discriminator {
@@ -6341,9 +6392,11 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        self.next_frame
-            .dispatch_tree
-            .on_action(action_type, action_discriminator, Rc::new(listener));
+        self.next_frame.dispatch_tree.on_action(
+            action_type,
+            action_discriminator,
+            Rc::new(listener),
+        );
     }
 
     /// Register a capturing action listener on this node for the next frame if the condition is true.
@@ -6364,9 +6417,11 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         if condition {
-            self.next_frame
-                .dispatch_tree
-                .on_action(action_type, action_discriminator, Rc::new(listener));
+            self.next_frame.dispatch_tree.on_action(
+                action_type,
+                action_discriminator,
+                Rc::new(listener),
+            );
         }
     }
 
@@ -7164,11 +7219,15 @@ pub fn outline(
 
 #[cfg(test)]
 mod test {
-    use crate::{prelude::*, px, size, Invalidation, TestAppContext, Window};
+    use crate::{Invalidation, TestAppContext, Window, prelude::*, px, size};
 
     struct EmptyView;
     impl crate::Render for EmptyView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl crate::IntoElement {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
             crate::Empty
         }
     }
@@ -7187,8 +7246,7 @@ mod test {
             .update(cx, |_, this, _| {
                 // A freshly-drawn window's arrays are empty, so all-zero ranges
                 // are the only ones that fit. They must be accepted.
-                let empty_prepaint =
-                    PrepaintStateIndex::default()..PrepaintStateIndex::default();
+                let empty_prepaint = PrepaintStateIndex::default()..PrepaintStateIndex::default();
                 let empty_paint = PaintIndex::default()..PaintIndex::default();
                 assert!(
                     this.invalid_reuse_range(&empty_prepaint, &empty_paint)
@@ -8005,9 +8063,7 @@ mod test {
         let observed = std::rc::Rc::new(std::cell::Cell::new(0usize));
         let subscription = cx.update({
             let (observed, signal) = (observed.clone(), signal.clone());
-            move |cx| {
-                cx.observe(&signal, move |_, _| observed.set(observed.get() + 1))
-            }
+            move |cx| cx.observe(&signal, move |_, _| observed.set(observed.get() + 1))
         });
         (observed, subscription)
     }
@@ -8141,9 +8197,9 @@ mod test {
                 let _ = self.signal.read(cx).value;
                 let signal = self.signal.clone();
                 let pending = self.pending.clone();
-                crate::div()
-                    .size_full()
-                    .child(crate::canvas(|_, _, _| (), move |_, _, window, cx| {
+                crate::div().size_full().child(crate::canvas(
+                    |_, _, _| (),
+                    move |_, _, window, cx| {
                         window.invalidator.debug_assert_paint();
                         if pending.get() > 0 {
                             pending.set(pending.get() - 1);
@@ -8152,7 +8208,8 @@ mod test {
                                 cx.notify();
                             });
                         }
-                    }))
+                    },
+                ))
             }
         }
 
@@ -8351,42 +8408,41 @@ mod test {
 
     #[gpui::test]
     fn test_set_app_id_via_options(cx: &mut TestAppContext) {
-        let window = cx.open_window(
-            size(px(800.), px(600.)),
-            |_, _| EmptyView,
-        );
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.test-app");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.test-app");
+            })
+            .ok();
     }
 
     #[gpui::test]
     fn test_set_app_id_via_method(cx: &mut TestAppContext) {
-        let window = cx.open_window(
-            size(px(800.), px(600.)),
-            |_, _| EmptyView,
-        );
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.another-app");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.another-app");
+            })
+            .ok();
     }
 
     #[gpui::test]
     fn test_set_app_id_update(cx: &mut TestAppContext) {
-        let window = cx.open_window(
-            size(px(800.), px(600.)),
-            |_, _| EmptyView,
-        );
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.initial");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.initial");
+            })
+            .ok();
 
-        window.update(cx, |_, this, _| {
-            this.set_app_id("com.example.updated");
-        }).ok();
+        window
+            .update(cx, |_, this, _| {
+                this.set_app_id("com.example.updated");
+            })
+            .ok();
     }
 
     #[gpui::test]
@@ -8397,7 +8453,11 @@ mod test {
         struct PaintFromOnFrame;
 
         impl Render for PaintFromOnFrame {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
                 div().on_frame(|geom, window, _cx| {
                     window.paint_quad(fill(geom.bounds, crate::red()));
                 })
@@ -8420,7 +8480,11 @@ mod test {
         struct LayoutFromOnFrame;
 
         impl Render for LayoutFromOnFrame {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
                 div().on_frame(|_geom, window, cx| {
                     window.request_layout(Style::default(), None, cx);
                 })
@@ -8436,14 +8500,20 @@ mod test {
     /// never ran this frame would register accesses for a subtree that does not
     /// exist, so `with_element_state` is out of bounds from `on_frame` too.
     #[gpui::test]
-    #[should_panic(expected = "this method can only be called during request_layout, prepaint, or paint")]
+    #[should_panic(
+        expected = "this method can only be called during request_layout, prepaint, or paint"
+    )]
     fn on_frame_cannot_touch_element_state(cx: &mut TestAppContext) {
         use crate::div;
 
         struct ElementStateFromOnFrame;
 
         impl Render for ElementStateFromOnFrame {
-            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
                 div()
                     .on_frame(|_geom, window: &mut Window, _cx| {
                         let id = crate::GlobalElementId(std::sync::Arc::from(
@@ -8589,6 +8659,7 @@ mod test {
                     .top(px(200.))
                     .w(px(100.))
                     .h(px(100.))
+                    .cursor_pointer()
                     .bg(crate::red())
                     .child(
                         crate::canvas(
@@ -8683,6 +8754,38 @@ mod test {
         }
     }
 
+    #[gpui::test]
+    fn a_layer_hitbox_moves_with_its_transform(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let (window, _) = layer_window(cx);
+
+        window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().expect("the layer was recorded");
+                let layer = this.layers.get_mut(&key).expect("the layer still exists");
+                layer.transform.offset = crate::Point::new(px(220.), px(210.));
+
+                let hit_test = this
+                    .rendered_frame
+                    .hit_test(crate::Point::new(px(225.), px(215.)), &this.layers);
+                assert!(
+                    !hit_test.ids.is_empty(),
+                    "the child hitbox should move with its layer transform"
+                );
+
+                let previous_position = this
+                    .rendered_frame
+                    .hit_test(crate::Point::new(px(205.), px(205.)), &this.layers);
+                assert!(
+                    previous_position.ids.is_empty(),
+                    "the hitbox must not remain at the layer's previous position"
+                );
+            })
+            .unwrap();
+    }
+
     /// A layer-scope invalidation marks exactly the layer it names, and that
     /// layer re-renders on the next frame.
     #[gpui::test]
@@ -8697,10 +8800,8 @@ mod test {
                 let key = *this.layers.keys().next().unwrap();
                 this.invalidator
                     .invalidate_layer(key, Invalidation::DISPLAY);
-                this.invalidator.invalidate_layer(
-                    crate::LayerKey(0xdead_beef),
-                    Invalidation::DISPLAY,
-                );
+                this.invalidator
+                    .invalidate_layer(crate::LayerKey(0xdead_beef), Invalidation::DISPLAY);
             })
             .unwrap();
         cx.run_until_parked();
@@ -8795,9 +8896,7 @@ mod test {
         assert_eq!(paints.get(), painted_once, "precondition: it composites");
 
         for round in 0..3 {
-            window
-                .update(cx, |_, _, cx| cx.notify())
-                .unwrap();
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
             cx.run_until_parked();
             assert_eq!(
                 paints.get(),
@@ -8850,9 +8949,7 @@ mod test {
     /// So the key must hold across notifies — and must stop holding the moment
     /// it changes, or the declaration would be unenforceable.
     #[gpui::test]
-    fn a_keyed_layer_composites_across_notifies_until_its_key_changes(
-        cx: &mut TestAppContext,
-    ) {
+    fn a_keyed_layer_composites_across_notifies_until_its_key_changes(cx: &mut TestAppContext) {
         if layers_off() {
             return;
         }
@@ -8944,7 +9041,12 @@ mod test {
 
         let rendered: Vec<u32> = window
             .update(cx, |_, this, _| {
-                this.rendered_frame.scene.quads.iter().map(|q| q.order).collect()
+                this.rendered_frame
+                    .scene
+                    .quads
+                    .iter()
+                    .map(|q| q.order)
+                    .collect()
             })
             .unwrap();
 
@@ -8952,7 +9054,12 @@ mod test {
 
         let composited: Vec<u32> = window
             .update(cx, |_, this, _| {
-                this.rendered_frame.scene.quads.iter().map(|q| q.order).collect()
+                this.rendered_frame
+                    .scene
+                    .quads
+                    .iter()
+                    .map(|q| q.order)
+                    .collect()
             })
             .unwrap();
 
