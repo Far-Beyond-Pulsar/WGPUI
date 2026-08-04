@@ -168,9 +168,22 @@ mod tests {
     }
 
     #[test]
-    fn coverage_with_multiple_x_slices() {
+    fn coverage_with_two_occluders_side_by_side() {
         let target = make_bounds(0., 0., 200., 100.);
         assert!(fully_covered(
+            target,
+            &[
+                make_bounds(0., 0., 100., 100.),
+                make_bounds(100., 0., 100., 100.),
+            ],
+        ));
+    }
+
+    #[test]
+    fn coverage_with_multi_x_slices_not_all_covered() {
+        let target = make_bounds(0., 0., 200., 100.);
+        // x-slice [150, 200] lacks an occluder for y 0-50.
+        assert!(!fully_covered(
             target,
             &[
                 make_bounds(0., 0., 50., 100.),
@@ -229,5 +242,232 @@ mod tests {
             compute_opaque_region(b, 1.0, true, px(5.), true, px(0.), false),
             None,
         );
+    }
+
+    // --- Adversarial / edge-case coverage tests ---
+
+    #[test]
+    fn coverage_empty_occluders_never_cover() {
+        let target = make_bounds(10., 10., 50., 50.);
+        assert!(!fully_covered(target, &[]));
+    }
+
+    #[test]
+    fn coverage_single_pixel_target() {
+        let target = make_bounds(100., 100., 1., 1.);
+        assert!(fully_covered(target, &[make_bounds(100., 100., 1., 1.)]));
+        assert!(!fully_covered(target, &[make_bounds(100., 100., 1., 0.)]));
+    }
+
+    #[test]
+    fn coverage_occluder_smaller_than_target_everywhere() {
+        // Occluder covers the center but leaves a margin on all four sides.
+        let target = make_bounds(0., 0., 100., 100.);
+        assert!(!fully_covered(target, &[make_bounds(10., 10., 80., 80.)]));
+    }
+
+    #[test]
+    fn coverage_vertical_stack_of_horizontal_strips() {
+        // Three occluders stacked vertically, each full-width.
+        let target = make_bounds(0., 0., 100., 90.);
+        assert!(fully_covered(
+            target,
+            &[
+                make_bounds(0., 0., 100., 30.),
+                make_bounds(0., 30., 100., 30.),
+                make_bounds(0., 60., 100., 30.),
+            ],
+        ));
+    }
+
+    #[test]
+    fn coverage_jagged_occluders_no_overlap() {
+        // Occluders form an L shape — they cover different X-slices at different
+        // Y-ranges but together cover every point.
+        let target = make_bounds(0., 0., 60., 60.);
+        assert!(fully_covered(
+            target,
+            &[
+                make_bounds(0., 0., 60., 30.),  // full-width top half
+                make_bounds(0., 30., 30., 30.), // left half of bottom
+                make_bounds(30., 30., 30., 30.), // right half of bottom
+            ],
+        ));
+    }
+
+    #[test]
+    fn coverage_two_occluders_missing_middle_x_slice() {
+        // Gap in the middle X-slice — each occluder covers a different
+        // X-region but neither covers x=40..60.
+        let target = make_bounds(0., 0., 100., 50.);
+        assert!(!fully_covered(
+            target,
+            &[
+                make_bounds(0., 0., 40., 50.),
+                make_bounds(60., 0., 40., 50.),
+            ],
+        ));
+    }
+
+    #[test]
+    fn coverage_occluder_partially_outside_target() {
+        // Occluder extends beyond the target — only the overlap matters.
+        let target = make_bounds(20., 20., 60., 60.);
+        assert!(fully_covered(
+            target,
+            &[make_bounds(0., 0., 100., 100.)],
+        ));
+    }
+
+    #[test]
+    fn coverage_occluder_entirely_outside_target() {
+        let target = make_bounds(0., 0., 50., 50.);
+        assert!(!fully_covered(target, &[make_bounds(100., 100., 50., 50.)]));
+    }
+
+    #[test]
+    fn coverage_negative_coordinates() {
+        let target = make_bounds(-50., -50., 100., 100.);
+        assert!(fully_covered(target, &[make_bounds(-50., -50., 100., 100.)]));
+        assert!(!fully_covered(target, &[make_bounds(-50., -50., 50., 100.)]));
+    }
+
+    #[test]
+    fn coverage_two_occluders_same_region() {
+        // Duplicate occluders should not break the algorithm.
+        let target = make_bounds(0., 0., 100., 100.);
+        assert!(fully_covered(
+            target,
+            &[
+                make_bounds(0., 0., 100., 100.),
+                make_bounds(0., 0., 100., 100.),
+            ],
+        ));
+    }
+
+    #[test]
+    fn coverage_three_occluders_one_per_x_slice() {
+        // Three occluders tile the target in the X direction.
+        let target = make_bounds(0., 0., 150., 40.);
+        assert!(fully_covered(
+            target,
+            &[
+                make_bounds(0., 0., 50., 40.),
+                make_bounds(50., 0., 50., 40.),
+                make_bounds(100., 0., 50., 40.),
+            ],
+        ));
+    }
+
+    #[test]
+    fn coverage_missing_horizontal_band() {
+        // Two occluders stacked on top and bottom with a gap in the middle.
+        let target = make_bounds(0., 0., 100., 100.);
+        assert!(!fully_covered(
+            target,
+            &[
+                make_bounds(0., 0., 100., 40.),
+                make_bounds(0., 60., 100., 40.),
+            ],
+        ));
+    }
+
+    #[test]
+    fn opaque_region_large_corner_radius_inset_to_zero() {
+        // Corner radius large enough that the inset produces a degenerate
+        // region.
+        let b = make_bounds(0., 0., 20., 20.);
+        assert_eq!(
+            compute_opaque_region(b, 1.0, true, px(10.), true, px(0.), false),
+            None,
+        );
+    }
+
+    #[test]
+    fn opaque_region_uneven_corner_radii_takes_max() {
+        // Only the largest corner radius matters for the conservative inset.
+        let b = make_bounds(0., 0., 100., 100.);
+        let region = compute_opaque_region(b, 1.0, true, px(25.), true, px(0.), false);
+        assert_eq!(region, Some(make_bounds(25., 25., 50., 50.)));
+    }
+
+    #[test]
+    fn opaque_region_backdrop_filter_even_with_solid_bg() {
+        // Backdrop filter takes precedence over solid background.
+        let b = make_bounds(0., 0., 100., 100.);
+        assert_eq!(
+            compute_opaque_region(b, 1.0, true, px(0.), true, px(0.), true),
+            None,
+        );
+    }
+
+    #[test]
+    fn opaque_region_border_inset_larger_than_corner() {
+        // Non-opaque border causes a larger inset than corner radii.
+        let b = make_bounds(0., 0., 100., 100.);
+        let region = compute_opaque_region(b, 1.0, true, px(2.), false, px(20.), false);
+        assert_eq!(region, Some(make_bounds(20., 20., 60., 60.)));
+    }
+
+    #[test]
+    fn opaque_region_corner_larger_than_border_inset() {
+        // Corner radius is the dominant inset.
+        let b = make_bounds(0., 0., 100., 100.);
+        let region = compute_opaque_region(b, 1.0, true, px(15.), false, px(3.), false);
+        assert_eq!(region, Some(make_bounds(15., 15., 70., 70.)));
+    }
+
+    #[test]
+    fn opaque_region_opaque_border_skips_border_inset() {
+        // Opaque border means no border inset — only corner radii matter.
+        let b = make_bounds(0., 0., 100., 100.);
+        let region = compute_opaque_region(b, 1.0, true, px(10.), true, px(30.), false);
+        assert_eq!(region, Some(make_bounds(10., 10., 80., 80.)));
+    }
+
+    #[test]
+    fn coverage_sub_pixel_boundaries() {
+        let target = make_bounds(0.5, 0.5, 99.5, 99.5);
+        assert!(fully_covered(target, &[make_bounds(0., 0., 100., 100.)]));
+        assert!(!fully_covered(
+            target,
+            &[make_bounds(0.5, 0.5, 49.5, 99.5)],
+        ));
+    }
+
+    #[test]
+    fn coverage_many_occluders() {
+        // 100 occluders — each covers a 1px-wide vertical strip. Together
+        // they cover the full target.
+        let target = make_bounds(0., 0., 100., 50.);
+        let occluders: Vec<_> = (0..100)
+            .map(|i| make_bounds(i as f32, 0., 1., 50.))
+            .collect();
+        assert!(fully_covered(target, &occluders));
+    }
+
+    #[test]
+    fn coverage_all_occluders_outside_target_bounds() {
+        // No occluder touches the target.
+        let target = make_bounds(50., 50., 10., 10.);
+        assert!(!fully_covered(
+            target,
+            &[
+                make_bounds(0., 0., 10., 10.),
+                make_bounds(100., 100., 10., 10.),
+            ],
+        ));
+    }
+
+    #[test]
+    fn coverage_target_has_zero_height() {
+        let target = make_bounds(0., 0., 100., 0.);
+        assert!(fully_covered(target, &[]));
+    }
+
+    #[test]
+    fn coverage_target_has_zero_width() {
+        let target = make_bounds(0., 0., 0., 100.);
+        assert!(fully_covered(target, &[make_bounds(0., 0., 0., 50.)]));
     }
 }

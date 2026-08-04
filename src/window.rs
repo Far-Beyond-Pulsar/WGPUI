@@ -9176,4 +9176,785 @@ mod test {
              painting it did"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Occlusion culling
+    // -------------------------------------------------------------------
+
+    /// A two-layer view: a background layer behind a foreground layer of the
+    /// same size. The foreground has a solid opaque background, so it ought to
+    /// occlude the background.
+    struct TwoLayerOcclusionView {
+        bg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        fg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        /// If true, the foreground has `border_radius` which prevents full occlusion.
+        fg_rounded: bool,
+        /// If true, the foreground has non-opaque `.opacity(0.5)`.
+        fg_translucent: bool,
+        /// If true, the foreground has a backdrop filter that poisons the bg.
+        fg_backdrop_filter: bool,
+    }
+
+    impl crate::Render for TwoLayerOcclusionView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let bg_paints = self.bg_paints.clone();
+            let fg_paints = self.fg_paints.clone();
+
+            let mut fg_div = crate::div()
+                .id("fg")
+                .layer()
+                .absolute()
+                .left(px(0.))
+                .top(px(0.))
+                .w(px(200.))
+                .h(px(200.))
+                .bg(crate::red());
+
+            if self.fg_rounded {
+                fg_div = fg_div.rounded(px(20.));
+            }
+            if self.fg_translucent {
+                fg_div = fg_div.opacity(0.5);
+            }
+
+            let mut fg = fg_div.child(crate::canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    fg_paints.set(fg_paints.get() + 1);
+                    window.paint_quad(crate::fill(bounds, crate::blue()));
+                },
+            ));
+
+            if self.fg_backdrop_filter {
+                fg = fg.child(
+                    crate::div()
+                        .w(px(200.))
+                        .h(px(200.))
+                        .backdrop_blur(px(10.)),
+                );
+            }
+
+            crate::div().size_full().child(
+                crate::div()
+                    .id("bg")
+                    .layer()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(200.))
+                    .h(px(200.))
+                    .bg(crate::green())
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                bg_paints.set(bg_paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .w(px(10.))
+                        .h(px(10.)),
+                    ),
+            )
+            .child(fg)
+        }
+    }
+
+    fn occlusion_off() -> bool {
+        !crate::occlusion::enabled()
+    }
+
+    fn two_layer_occlusion_window(
+        cx: &mut TestAppContext,
+        fg_rounded: bool,
+        fg_translucent: bool,
+        fg_backdrop_filter: bool,
+    ) -> (
+        crate::WindowHandle<TwoLayerOcclusionView>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let bg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let bg_paints_for_view = bg_paints.clone();
+        let fg_paints_for_view = fg_paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| TwoLayerOcclusionView {
+                bg_paints: bg_paints_for_view,
+                fg_paints: fg_paints_for_view,
+                fg_rounded,
+                fg_translucent,
+                fg_backdrop_filter,
+            },
+        );
+        cx.run_until_parked();
+        (window, bg_paints, fg_paints)
+    }
+
+    /// The foreground occludes the background: on a clean frame the background
+    /// layer is culled (not composited).
+    #[gpui::test]
+    fn occlusion_culls_covered_layer_on_clean_frame(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let (window, bg_paints, fg_paints) =
+            two_layer_occlusion_window(cx, false, false, false);
+        let bg_painted_once = bg_paints.get();
+        let fg_painted_once = fg_paints.get();
+        assert_eq!(bg_painted_once, 1, "first frame renders both layers");
+        assert_eq!(fg_painted_once, 1, "first frame renders both layers");
+
+        // Find the two layer keys and verify the foreground occludes the background.
+        let (bg_key, fg_key) = window
+            .update(cx, |_, this, _| {
+                let mut keys: Vec<_> = this.layers.keys().copied().collect();
+                keys.sort(); // bg has lower id
+                (keys[0], keys[1])
+            })
+            .unwrap();
+
+        // On a clean frame, the foreground composites normally, the background
+        // is culled.
+        clean_frame(cx, window.into());
+        window
+            .update(cx, |_, this, _| {
+                let bg = this.layers.get(&bg_key).unwrap();
+                let fg = this.layers.get(&fg_key).unwrap();
+                assert!(bg.has_content(), "bg retains its content");
+                assert!(fg.has_content(), "fg retains its content");
+                assert!(
+                    bg.opaque_bounds.is_none() || fg.opaque_bounds.is_some(),
+                    "the foreground should have opaque_bounds set from the solid bg"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            bg_paints.get(),
+            bg_painted_once,
+            "the occluded bg must not re-render"
+        );
+        assert_eq!(
+            fg_paints.get(),
+            fg_painted_once,
+            "the foreground must composite without re-rendering"
+        );
+    }
+
+    /// A layer notified while occluded enters deferred_dirty and does not
+    /// re-render until it becomes visible again.
+    #[gpui::test]
+    fn occlusion_deferred_dirty_when_notified_while_occluded(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let (window, bg_paints, fg_paints) =
+            two_layer_occlusion_window(cx, false, false, false);
+        let bg_painted_once = bg_paints.get();
+        let fg_painted_once = fg_paints.get();
+
+        // Notify the view — this marks the layers dirty.
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        // The background is dirty but occluded, so it goes deferred dirty.
+        // The foreground is dirty and visible, so it re-renders.
+        let bg_key = window
+            .update(cx, |_, this, _| {
+                let mut keys: Vec<_> = this.layers.keys().copied().collect();
+                keys.sort();
+                let bg_key = keys[0];
+                let bg = this.layers.get(&bg_key).unwrap();
+                assert!(
+                    bg.deferred_dirty,
+                    "the occluded layer must be marked deferred_dirty"
+                );
+                bg_key
+            })
+            .unwrap();
+
+        assert_eq!(
+            bg_paints.get(),
+            bg_painted_once,
+            "the occluded bg must not re-render despite being notified"
+        );
+        assert_eq!(
+            fg_paints.get(),
+            fg_painted_once + 1,
+            "the visible fg must re-render when notified"
+        );
+
+        // Now resize the foreground layer so it no longer covers the background
+        // — the background should become visible and re-render.
+        let new_bg_paints = bg_paints.get();
+        window
+            .update(cx, |_, this, _| {
+                let fg = this.layers.get_mut(&bg_key).unwrap();
+                fg.deferred_dirty = false;
+                let fg = this.layers.get_mut(&bg_key).unwrap();
+                fg.cache_key.bounds = crate::Bounds {
+                    origin: crate::point(px(200.), px(0.)),
+                    size: crate::size(px(100.), px(100.)),
+                };
+            })
+            .unwrap();
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        // The background is no longer occluded and should re-render.
+        assert_eq!(
+            bg_paints.get(),
+            new_bg_paints + 1,
+            "the bg must re-render when it becomes visible again"
+        );
+    }
+
+    /// A backdrop filter poisons layers behind it — they must not be occluded.
+    #[gpui::test]
+    fn occlusion_backdrop_filter_poisons_layer_below(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let (window, bg_paints, fg_paints) =
+            two_layer_occlusion_window(cx, false, false, true);
+        let bg_painted_once = bg_paints.get();
+        let fg_painted_once = fg_paints.get();
+
+        // Both layers rendered on the first frame.
+        assert_eq!(bg_painted_once, 1);
+        assert_eq!(fg_painted_once, 1);
+
+        // On a clean frame, the foreground (with backdrop filter) must NOT
+        // occlude the background — the backdrop filter reads behind it.
+        clean_frame(cx, window.into());
+        assert_eq!(
+            bg_paints.get(),
+            bg_painted_once,
+            "the bg behind a backdrop filter must not be culled (but should \
+             still composite normally)"
+        );
+        assert_eq!(
+            fg_paints.get(),
+            fg_painted_once,
+            "the foreground composites normally"
+        );
+    }
+
+    /// Rounded corners prevent full occlusion — the foreground does not cover
+    /// its full bounds.
+    #[gpui::test]
+    fn occlusion_rounded_corners_prevent_full_occlusion(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let (window, bg_paints, fg_paints) =
+            two_layer_occlusion_window(cx, true, false, false);
+        let bg_painted_once = bg_paints.get();
+        let fg_painted_once = fg_paints.get();
+
+        // The foreground has rounded corners (border_radius 20px on a 200px box),
+        // so its `compute_opaque_region` insets by 20px. The resulting opaque
+        // region (160x160) does NOT cover the background's full 200x200 bounds,
+        // so the background should NOT be occluded.
+        assert_eq!(bg_painted_once, 1);
+        assert_eq!(fg_painted_once, 1);
+
+        let fg_key = window
+            .update(cx, |_, this, _| {
+                let mut keys: Vec<_> = this.layers.keys().copied().collect();
+                keys.sort();
+                let fg_key = keys[1];
+                let fg = this.layers.get(&fg_key).unwrap();
+                assert!(
+                    fg.opaque_bounds.is_some(),
+                    "a rounded foreground still sets opaque_bounds (inset by corner radius)"
+                );
+                if let Some(opaque) = fg.opaque_bounds {
+                    assert!(
+                        opaque.size.width < fg.cache_key.bounds.size.width
+                            || opaque.size.height < fg.cache_key.bounds.size.height,
+                        "the opaque region must be inset by the corner radius"
+                    );
+                }
+                fg_key
+            })
+            .unwrap();
+
+        let _ = fg_key;
+
+        // The background should not be culled because the foreground's
+        // conservative opaque region doesn't fully cover it.
+        clean_frame(cx, window.into());
+        assert_eq!(
+            bg_paints.get(),
+            bg_painted_once,
+            "the bg behind a rounded fg must not be culled"
+        );
+        assert_eq!(
+            fg_paints.get(),
+            fg_painted_once,
+            "the foreground composites"
+        );
+    }
+
+    /// Translucent element opacity prevents occlusion.
+    #[gpui::test]
+    fn occlusion_translucent_does_not_occlude(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let (window, bg_paints, fg_paints) =
+            two_layer_occlusion_window(cx, false, true, false);
+        let bg_painted_once = bg_paints.get();
+        let fg_painted_once = fg_paints.get();
+
+        // The foreground has `opacity(0.5)`, so element_opacity < 1.0 and
+        // `compute_opaque_region` returns None. The background should not be
+        // occluded.
+        let fg_key = window
+            .update(cx, |_, this, _| {
+                let mut keys: Vec<_> = this.layers.keys().copied().collect();
+                keys.sort();
+                let fg_key = keys[1];
+                let fg = this.layers.get(&fg_key).unwrap();
+                assert!(
+                    fg.opaque_bounds.is_none(),
+                    "a translucent foreground must not set opaque_bounds"
+                );
+                fg_key
+            })
+            .unwrap();
+
+        let _ = fg_key;
+
+        clean_frame(cx, window.into());
+        assert_eq!(
+            bg_paints.get(),
+            bg_painted_once,
+            "the bg behind a translucent fg must not be culled (composites)"
+        );
+        assert_eq!(
+            fg_paints.get(),
+            fg_painted_once,
+            "the foreground composites"
+        );
+    }
+
+    /// Hitboxes registered by an occluded layer survive the occlusion — visual
+    /// occlusion is not hit occlusion.
+    #[gpui::test]
+    fn occlusion_hitboxes_survive_culled_layer(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let (window, _bg_paints, _fg_paints) =
+            two_layer_occlusion_window(cx, false, false, false);
+
+        // After the initial render, count mouse listeners and cursor styles.
+        let baseline = window
+            .update(cx, |_, this, _| {
+                (
+                    this.rendered_frame.mouse_listeners.len(),
+                    this.rendered_frame.cursor_styles.len(),
+                )
+            })
+            .unwrap();
+
+        // On a clean frame, the bg is occluded (culled). But its hitboxes must
+        // survive — the cull path still calls `reuse_paint_except_scene`.
+        for round in 0..3 {
+            clean_frame(cx, window.into());
+            let after = window
+                .update(cx, |_, this, _| {
+                    (
+                        this.rendered_frame.mouse_listeners.len(),
+                        this.rendered_frame.cursor_styles.len(),
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                after, baseline,
+                "round {round}: occlusion culling dropped hitboxes from the occluded layer"
+            );
+        }
+    }
+
+    /// Partial overlap — foreground leaves part of the background uncovered.
+    #[gpui::test]
+    fn occlusion_partial_overlap_does_not_cull(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        // A foreground layer at (100, 0, 100, 200) only covers half of the
+        // background at (0, 0, 200, 200).
+        let bg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let bg_paints_for_view = bg_paints.clone();
+        let fg_paints_for_view = fg_paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| PartialOverlapView {
+                bg_paints: bg_paints_for_view,
+                fg_paints: fg_paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let bg_painted_once = bg_paints.get();
+        let fg_painted_once = fg_paints.get();
+
+        assert_eq!(bg_painted_once, 1);
+        assert_eq!(fg_painted_once, 1);
+
+        // On a clean frame the bg is NOT culled — the fg only covers its right half.
+        clean_frame(cx, window.into());
+        assert_eq!(
+            bg_paints.get(),
+            bg_painted_once,
+            "the partially-covered bg must not be culled (it composites)"
+        );
+        assert_eq!(fg_paints.get(), fg_painted_once, "the fg composites");
+    }
+
+    struct PartialOverlapView {
+        bg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        fg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for PartialOverlapView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let bg_paints = self.bg_paints.clone();
+            let fg_paints = self.fg_paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("bg")
+                    .layer()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(200.))
+                    .h(px(200.))
+                    .bg(crate::green())
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            bg_paints.set(bg_paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
+            .child(
+                crate::div()
+                    .id("fg")
+                    .layer()
+                    .absolute()
+                    .left(px(100.))
+                    .top(px(0.))
+                    .w(px(100.))
+                    .h(px(200.))
+                    .bg(crate::red())
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            fg_paints.set(fg_paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
+        }
+    }
+
+    /// Two occluders that together fully cover the target — one covers x 0-50,
+    /// the other covers x 50-100.
+    #[gpui::test]
+    fn occlusion_two_occluders_combine_to_cover(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let bg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fg1_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fg2_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let bg_paints_for_view = bg_paints.clone();
+        let fg1_paints_for_view = fg1_paints.clone();
+        let fg2_paints_for_view = fg2_paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| TwoOccluderView {
+                bg_paints: bg_paints_for_view,
+                fg1_paints: fg1_paints_for_view,
+                fg2_paints: fg2_paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let bg_painted_once = bg_paints.get();
+
+        // On a clean frame, the bg should be culled because fg1+fg2 cover it.
+        clean_frame(cx, window.into());
+        assert_eq!(
+            bg_paints.get(),
+            bg_painted_once,
+            "the bg covered by two fg layers must be culled"
+        );
+    }
+
+    struct TwoOccluderView {
+        bg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        fg1_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        fg2_paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for TwoOccluderView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let bg_paints = self.bg_paints.clone();
+            let fg1_paints = self.fg1_paints.clone();
+            let fg2_paints = self.fg2_paints.clone();
+            crate::div().size_full().child(
+                // Background layer at (0,0,100,200)
+                crate::div()
+                    .id("bg")
+                    .layer()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(100.))
+                    .h(px(200.))
+                    .bg(crate::green())
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            bg_paints.set(bg_paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
+            .child(
+                // Foreground 1 covers left half at (0,0,50,200)
+                crate::div()
+                    .id("fg1")
+                    .layer()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(50.))
+                    .h(px(200.))
+                    .bg(crate::red())
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            fg1_paints.set(fg1_paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
+            .child(
+                // Foreground 2 covers right half at (50,0,50,200)
+                crate::div()
+                    .id("fg2")
+                    .layer()
+                    .absolute()
+                    .left(px(50.))
+                    .top(px(0.))
+                    .w(px(50.))
+                    .h(px(200.))
+                    .bg(crate::red())
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            fg2_paints.set(fg2_paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
+        }
+    }
+
+    /// A zero-sized layer is always considered "covered" and culled.
+    #[gpui::test]
+    fn occlusion_zero_sized_layer_is_always_covered(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| ZeroSizedLayerView {
+                paints: paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let painted_once = paints.get();
+
+        clean_frame(cx, window.into());
+
+        // Zero-sized layer content is culled but should not crash.
+        assert_eq!(paints.get(), painted_once);
+    }
+
+    struct ZeroSizedLayerView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for ZeroSizedLayerView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("zero")
+                    .layer()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(0.))
+                    .h(px(0.))
+                    .bg(crate::red())
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            paints.set(paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
+        }
+    }
+
+    /// An occluded layer that is evicted must not leave dangling deferred_dirty
+    /// state — eviction clears the layer's content.
+    #[gpui::test]
+    fn occlusion_eviction_clears_deferred_dirty(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let (window, _bg_paints, _fg_paints) =
+            two_layer_occlusion_window(cx, false, false, false);
+
+        let bg_key = window
+            .update(cx, |_, this, _| {
+                let mut keys: Vec<_> = this.layers.keys().copied().collect();
+                keys.sort();
+                keys[0]
+            })
+            .unwrap();
+
+        // Mark the bg as deferred_dirty
+        window
+            .update(cx, |_, this, _| {
+                let bg = this.layers.get_mut(&bg_key).unwrap();
+                bg.deferred_dirty = true;
+            })
+            .unwrap();
+
+        // Evict the bg by aging it past its eviction threshold.
+        window
+            .update(cx, |_, this, _| {
+                let evict_after = this.layers[&bg_key].policy.evict_after_frames as u64;
+                this.layer_frame += evict_after + 1;
+                this.evict_stale_layers();
+            })
+            .unwrap();
+
+        window
+            .update(cx, |_, this, _| {
+                let bg = this.layers.get(&bg_key).unwrap();
+                assert!(
+                    !bg.deferred_dirty,
+                    "eviction must clear deferred_dirty"
+                );
+                assert!(
+                    !bg.has_content(),
+                    "eviction must drop retained content"
+                );
+                assert_eq!(
+                    bg.needs,
+                    Invalidation::all(),
+                    "evicted layer needs a full rebuild"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A layer occluded by a non-opaque element (e.g. a background gradient)
+    /// must not be culled.
+    #[gpui::test]
+    fn occlusion_non_solid_background_does_not_occlude(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let bg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let bg_paints_for_view = bg_paints.clone();
+        let fg_paints_for_view = fg_paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| NonSolidBgView {
+                bg_paints: bg_paints_for_view,
+                fg_paints: fg_paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let bg_painted_once = bg_paints.get();
+
+        // On a clean frame, the non-solid fg does not occlude the bg.
+        clean_frame(cx, window.into());
+        assert_eq!(
+            bg_paints.get(),
+            bg_painted_once,
+            "the bg behind a non-solid fg must not be culled (it composites)"
+        );
+    }
+
+    struct NonSolidBgView {
+        bg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        fg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for NonSolidBgView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let bg_paints = self.bg_paints.clone();
+            let fg_paints = self.fg_paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("bg")
+                    .layer()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(200.))
+                    .h(px(200.))
+                    .bg(crate::green())
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            bg_paints.set(bg_paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
+            .child(
+                crate::div()
+                    .id("fg")
+                    .layer()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(200.))
+                    .h(px(200.))
+                    // Linear gradient background — NOT a solid color, so
+                    // it does NOT qualify as an occluder.
+                    .bg(crate::linear_gradient(
+                        0.,
+                        crate::gradient_color_stop(crate::red(), 0.0),
+                        crate::gradient_color_stop(crate::blue(), 1.0),
+                    ))
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            fg_paints.set(fg_paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
+        }
+    }
 }
