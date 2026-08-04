@@ -1469,8 +1469,7 @@ mod tests {
                 thickness: px(4.),
                 color: Some(red()),
             }),
-            // TODO this does not seem right
-            fade_out: Some(0.),
+            fade_out: Some(0.5),
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),
             background_color: Some(green()),
