@@ -131,102 +131,102 @@ mod tests {
     use super::*;
     use crate::{point, px, size};
 
-    fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+    fn make_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
     }
 
     #[test]
     fn coverage_requires_every_point() {
-        let target = bounds(0., 0., 100., 100.);
-        assert!(fully_covered(target, &[bounds(0., 0., 100., 100.)]));
-        assert!(!fully_covered(target, &[bounds(0., 0., 50., 100.)]));
+        let target = make_bounds(0., 0., 100., 100.);
+        assert!(fully_covered(target, &[make_bounds(0., 0., 100., 100.)]));
+        assert!(!fully_covered(target, &[make_bounds(0., 0., 50., 100.)]));
         assert!(fully_covered(
             target,
-            &[bounds(0., 0., 50., 100.), bounds(50., 0., 50., 100.)]
+            &[make_bounds(0., 0., 50., 100.), make_bounds(50., 0., 50., 100.)]
         ));
     }
 
     #[test]
     fn coverage_with_gaps() {
-        let target = bounds(0., 0., 100., 100.);
+        let target = make_bounds(0., 0., 100., 100.);
         assert!(!fully_covered(
             target,
-            &[bounds(0., 0., 40., 100.), bounds(60., 0., 40., 100.)],
+            &[make_bounds(0., 0., 40., 100.), make_bounds(60., 0., 40., 100.)],
         ));
     }
 
     #[test]
     fn coverage_partial_y() {
-        let target = bounds(0., 0., 100., 100.);
-        assert!(!fully_covered(target, &[bounds(0., 0., 100., 50.)]));
+        let target = make_bounds(0., 0., 100., 100.);
+        assert!(!fully_covered(target, &[make_bounds(0., 0., 100., 50.)]));
     }
 
     #[test]
     fn zero_sized_target_is_covered() {
-        let target = bounds(0., 0., 0., 100.);
+        let target = make_bounds(0., 0., 0., 100.);
         assert!(fully_covered(target, &[]));
     }
 
     #[test]
     fn coverage_with_multiple_x_slices() {
-        let target = bounds(0., 0., 200., 100.);
+        let target = make_bounds(0., 0., 200., 100.);
         assert!(fully_covered(
             target,
             &[
-                bounds(0., 0., 50., 100.),
-                bounds(50., 0., 50., 50.),
-                bounds(50., 50., 150., 50.),
-                bounds(100., 0., 50., 50.),
+                make_bounds(0., 0., 50., 100.),
+                make_bounds(50., 0., 50., 50.),
+                make_bounds(50., 50., 150., 50.),
+                make_bounds(100., 0., 50., 50.),
             ],
         ));
     }
 
     #[test]
     fn opaque_region_rejects_transparent() {
-        let bounds = bounds(0., 0., 100., 100.);
+        let b = make_bounds(0., 0., 100., 100.);
         assert_eq!(
-            compute_opaque_region(bounds, 1.0, false, px(0.), false, px(0.), false),
+            compute_opaque_region(b, 1.0, false, px(0.), false, px(0.), false),
             None,
         );
     }
 
     #[test]
     fn opaque_region_rejects_non_one_opacity() {
-        let bounds = bounds(0., 0., 100., 100.);
+        let b = make_bounds(0., 0., 100., 100.);
         assert_eq!(
-            compute_opaque_region(bounds, 0.5, true, px(0.), false, px(0.), false),
+            compute_opaque_region(b, 0.5, true, px(0.), false, px(0.), false),
             None,
         );
     }
 
     #[test]
     fn opaque_region_insets_for_corner_radius() {
-        let bounds = bounds(0., 0., 100., 100.);
-        let region = compute_opaque_region(bounds, 1.0, true, px(10.), true, px(0.), false);
-        assert_eq!(region, Some(bounds(10., 10., 80., 80.)));
+        let b = make_bounds(0., 0., 100., 100.);
+        let region = compute_opaque_region(b, 1.0, true, px(10.), true, px(0.), false);
+        assert_eq!(region, Some(make_bounds(10., 10., 80., 80.)));
     }
 
     #[test]
     fn opaque_region_insets_for_border() {
-        let bounds = bounds(0., 0., 100., 100.);
-        let region = compute_opaque_region(bounds, 1.0, true, px(0.), false, px(5.), false);
-        assert_eq!(region, Some(bounds(5., 5., 90., 90.)));
+        let b = make_bounds(0., 0., 100., 100.);
+        let region = compute_opaque_region(b, 1.0, true, px(0.), false, px(5.), false);
+        assert_eq!(region, Some(make_bounds(5., 5., 90., 90.)));
     }
 
     #[test]
     fn opaque_region_rejects_backdrop_filter() {
-        let bounds = bounds(0., 0., 100., 100.);
+        let b = make_bounds(0., 0., 100., 100.);
         assert_eq!(
-            compute_opaque_region(bounds, 1.0, true, px(0.), true, px(0.), true),
+            compute_opaque_region(b, 1.0, true, px(0.), true, px(0.), true),
             None,
         );
     }
 
     #[test]
     fn opaque_region_returns_none_when_inset_removes_all() {
-        let bounds = bounds(0., 0., 5., 5.);
+        let b = make_bounds(0., 0., 5., 5.);
         assert_eq!(
-            compute_opaque_region(bounds, 1.0, true, px(5.), true, px(0.), false),
+            compute_opaque_region(b, 1.0, true, px(5.), true, px(0.), false),
             None,
         );
     }
