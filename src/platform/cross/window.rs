@@ -231,8 +231,8 @@ impl PlatformWindow for CrossWindow {
         match self.window().theme() {
             Some(winit::window::Theme::Light) => WindowAppearance::Light,
             Some(winit::window::Theme::Dark) => WindowAppearance::Dark,
-            // TODO(mdeand): Non-optimal catch-all.
-            None => WindowAppearance::default(),
+            // Fallback to Light as the most common appearance across platforms.
+            None => WindowAppearance::Light,
         }
     }
 
@@ -486,8 +486,7 @@ impl PlatformWindow for CrossWindow {
     }
 
     fn gpu_specs(&self) -> Option<crate::GpuSpecs> {
-        // TODO(mdeand): Retrieve GPU specs from the graphics context.
-        None
+        self.0.renderer.get().map(|renderer| renderer.borrow().gpu_specs())
     }
 
     fn update_ime_position(&self, _bounds: crate::Bounds<crate::Pixels>) {}
