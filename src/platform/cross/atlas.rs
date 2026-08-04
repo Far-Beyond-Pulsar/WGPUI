@@ -20,17 +20,13 @@ impl WgpuAtlas {
             context,
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: FxHashMap::default(),
-            initializations: Vec::new(),
+            
             uploads: Vec::new(),
         }))
     }
 
     pub fn before_frame(&self, encoder: &mut wgpu::CommandEncoder) {
         self.0.lock().flush(encoder);
-    }
-
-    pub fn after_frame(&self) {
-        // TODO(mdeand): Is this even necessary?
     }
 
     pub(crate) fn get_texture_info(&self, texture_id: AtlasTextureId) -> WgpuTextureInfo {
@@ -125,7 +121,7 @@ impl PlatformAtlas for WgpuAtlas {
 
                 match build()? {
                     Some((size, bytes)) => {
-                        let tile = atlas.allocate(size, key.texture_kind());
+                        let tile = atlas.allocate(size, key.texture_kind())?;
                         #[cfg(feature = "flamegraph")]
                         crate::record_atlas_tile_allocated();
 
@@ -161,7 +157,7 @@ impl PlatformAtlas for WgpuAtlas {
                     .free_list
                     .push(texture.id.index as usize);
 
-                // TODO(mdeand): Is this even necessary?
+                // Eagerly destroy to free GPU memory immediately.
                 texture.destroy(&atlas.context);
             } else {
                 *texture_slot = Some(texture);
@@ -176,12 +172,15 @@ struct WgpuAtlasState {
     context: Arc<WgpuContext>,
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
-    initializations: Vec<AtlasTextureId>,
     uploads: Vec<PendingUpload>,
 }
 
 impl WgpuAtlasState {
-    fn allocate(&mut self, size: Size<DevicePixels>, texture_kind: AtlasTextureKind) -> AtlasTile {
+    fn allocate(
+        &mut self,
+        size: Size<DevicePixels>,
+        texture_kind: AtlasTextureKind,
+    ) -> anyhow::Result<AtlasTile> {
         {
             let textures = &mut self.storage[texture_kind];
 
@@ -190,14 +189,21 @@ impl WgpuAtlasState {
                 .rev()
                 .find_map(|texture| texture.allocate(size))
             {
-                return tile;
+                return Ok(tile);
             }
         }
 
         let texture = self.push_texture(size, texture_kind);
 
-        // TODO(mdeand): Note this unwrap use.
-        texture.allocate(size).unwrap()
+        texture.allocate(size).ok_or_else(|| {
+            anyhow::anyhow!(
+                "newly created atlas texture of size {}x{} could not satisfy allocation of size {}x{}",
+                texture.raw.width(),
+                texture.raw.height(),
+                size.width.0,
+                size.height.0,
+            )
+        })
     }
 
     fn push_texture(
@@ -215,14 +221,12 @@ impl WgpuAtlasState {
         let (format, usage) = match texture_kind {
             AtlasTextureKind::Monochrome => (
                 wgpu::TextureFormat::R8Unorm,
-                // TODO(mdeand): Consider usages
                 wgpu::TextureUsages::COPY_SRC
                     | wgpu::TextureUsages::COPY_DST
                     | wgpu::TextureUsages::TEXTURE_BINDING,
             ),
             AtlasTextureKind::Polychrome => (
                 wgpu::TextureFormat::Rgba8Unorm,
-                // TODO(mdeand): Consider usages
                 wgpu::TextureUsages::COPY_SRC
                     | wgpu::TextureUsages::COPY_DST
                     | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -244,7 +248,6 @@ impl WgpuAtlasState {
                 dimension: wgpu::TextureDimension::D2,
                 format,
                 usage,
-                // TODO(mdeand): Create view formats?
                 view_formats: &[],
             });
 
@@ -276,9 +279,8 @@ impl WgpuAtlasState {
             live_atlas_keys: 0,
         };
 
-        self.initializations.push(atlas_texture.id);
-
-        // TODO(mdeand): This is weird
+        // If we popped a free slot from the free list, place the texture there;
+        // otherwise append to the end.
         match index {
             Some(index) => {
                 texture_list.textures[index] = Some(atlas_texture);
@@ -353,13 +355,7 @@ impl WgpuAtlasState {
         )
     }
 
-    fn flush_initializations(&mut self, _encoder: &mut wgpu::CommandEncoder) {
-        // TODO(mdeand): Does this function even need to exist?
-    }
-
     fn flush(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        self.flush_initializations(encoder);
-
         for upload in self.uploads.drain(..) {
             let texture = &self.storage[upload.texture_id];
 
@@ -421,13 +417,9 @@ impl WgpuAtlasTexture {
     }
 
     fn bytes_per_pixel(&self) -> u8 {
-        // TODO(mdeand): There's probably a better way to do this
-
-        match self.format {
-            wgpu::TextureFormat::R8Unorm => 1,
-            wgpu::TextureFormat::Rgba8Unorm => 4,
-            _ => panic!("Unsupported texture format"),
-        }
+        self.format
+            .block_copy_size(None)
+            .expect("atlas texture format should have a known block copy size") as u8
     }
 
     fn decrement_ref_count(&mut self) {
