@@ -251,8 +251,25 @@ impl CosmicTextSystemState {
         name: &str,
         features: &FontFeatures,
     ) -> Result<SmallVec<[FontId; 4]>> {
-        // TODO: Determine the proper system UI font.
-        let name = crate::text_system::font_name_with_fallbacks(name, "IBM Plex Sans");
+        let system_font = {
+            #[cfg(target_os = "windows")]
+            {
+                "Segoe UI"
+            }
+            #[cfg(target_os = "macos")]
+            {
+                "SF Pro"
+            }
+            #[cfg(target_os = "linux")]
+            {
+                "Noto Sans"
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+            {
+                "IBM Plex Sans"
+            }
+        };
+        let name = crate::text_system::font_name_with_fallbacks(name, system_font);
 
         let families = self
             .font_system
@@ -269,11 +286,14 @@ impl CosmicTextSystemState {
                 .get_font(font_id, weight)
                 .context("Could not load font")?;
 
-            // HACK: To let the storybook run and render Windows caption icons. We should actually do better font fallback.
+            #[cfg(target_os = "windows")]
             let allowed_bad_font_names = [
                 "SegoeFluentIcons", // NOTE: Segoe fluent icons postscript name is inconsistent
                 "Segoe Fluent Icons",
             ];
+
+            #[cfg(not(target_os = "windows"))]
+            let allowed_bad_font_names: [&str; 0] = [];
 
             if font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
