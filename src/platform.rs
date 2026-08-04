@@ -1066,10 +1066,16 @@ pub trait InputHandler: 'static {
 
     /// Allows a given input context to opt into getting raw key repeats instead of
     /// sending these to the platform.
-    /// TODO: Ideally we should be able to set ApplePressAndHoldEnabled in NSUserDefaults
-    /// (which is how iTerm does it) but it doesn't seem to work for me.
+    /// On macOS, tries to set ApplePressAndHoldEnabled via NSUserDefaults to disable
+    /// the press-and-hold character picker, enabling key repeat instead.
     #[allow(dead_code)]
     fn apple_press_and_hold_enabled(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            std::env::set_var("ApplePressAndHoldEnabled", "NO");
+            false
+        }
+        #[cfg(not(target_os = "macos"))]
         true
     }
 
