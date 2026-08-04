@@ -33,6 +33,7 @@ mod global;
 mod input;
 mod inspector;
 mod interactive;
+mod occlusion;
 mod key_dispatch;
 mod keymap;
 mod layer;

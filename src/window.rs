@@ -1357,6 +1357,7 @@ pub struct Window {
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+    pub(crate) retained_layer_stack: Vec<LayerKey>,
     pub(crate) hitbox_layer_stack: Vec<(LayerKey, Point<Pixels>)>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
@@ -1855,6 +1856,7 @@ impl Window {
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
+            retained_layer_stack: Vec::new(),
             hitbox_layer_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
@@ -2899,6 +2901,16 @@ impl Window {
             self.layer_frame = self.layer_frame.wrapping_add(1);
             self.draw_roots(cx);
             self.evict_stale_layers();
+
+            // Validate mode: logs that occlusion is active. The full
+            // double-render-and-diff is deferred — it needs the scene to be
+            // finished (which happens below in `next_frame.finish`), and
+            // re-running draw_roots requires resetting per-frame state. A
+            // future change can save the finished scene, re-run draw_roots
+            // with occlusion disabled, finish again, and diff the two scenes.
+            if crate::occlusion::validate_enabled() {
+                log::info!("occlusion validate mode active");
+            }
 
             #[cfg(any(feature = "inspector", debug_assertions))]
             {
@@ -4226,6 +4238,7 @@ impl Window {
                 layer.content_key == content_key
                 && layer.has_content()
                 && layer.needs.is_empty()
+                && !layer.deferred_dirty
                 && layer.cache_key == cache_key
                 && !layer.had_mouse
                 && !mouse_inside
@@ -4253,12 +4266,37 @@ impl Window {
             // correctly and stops responding to the mouse.
             let range = self.layers[&key].paint_range.clone();
             self.reuse_paint_except_scene(&range);
-            self.composite_layer(key);
+            if self.is_layer_occluded(key) {
+                crate::render_stats::count("occlusion: layers culled");
+                if let Some(layer) = self.layers.get_mut(&key) {
+                    layer.deferred_dirty = false;
+                }
+            } else {
+                self.composite_layer(key);
+            }
+            return None;
+        }
+
+        // Deferred dirty: if the layer has existing content and is occluded,
+        // skip the re-render and keep old content until it becomes visible.
+        if self.layers.get(&key).is_some_and(|layer| layer.has_content())
+            && self.is_layer_occluded(key)
+        {
+            crate::render_stats::count("occlusion: layers culled");
+            crate::render_stats::count("occlusion: layers deferred-dirty");
+            if let Some(layer) = self.layers.get_mut(&key) {
+                layer.deferred_dirty = true;
+            }
+            let range = self.layers[&key].paint_range.clone();
+            self.reuse_paint_except_scene(&range);
             return None;
         }
 
         let (result, accessed_entities) = cx.detect_accessed_entities(|cx| {
-            self.record_layer(key, cache_key, policy, |window| f(window, cx))
+            self.retained_layer_stack.push(key);
+            let result = self.record_layer(key, cache_key, policy, |window| f(window, cx));
+            self.retained_layer_stack.pop();
+            result
         });
 
         if let Some(layer) = self.layers.get_mut(&key) {
@@ -4318,12 +4356,71 @@ impl Window {
         // Rewritten by `with_retained_layer` when it owns the decision. A
         // caller that keeps its own invalidation record leaves these alone.
         layer.had_mouse = false;
+        layer.opaque_bounds = None;
+        layer.deferred_dirty = false;
+        layer.poisoned_bounds.clear();
 
         if crate::layer::layer_debug_enabled() {
             self.paint_layer_debug_tint(key, bounds, true);
         }
 
         result
+    }
+
+    /// Mark the current retained layer as fully opaque over `bounds`.
+    /// Callers must only use this for a solid, alpha-one, unrounded region.
+    pub(crate) fn mark_current_layer_opaque(&mut self, bounds: Bounds<Pixels>) {
+        let Some(key) = self.retained_layer_stack.last().copied() else {
+            return;
+        };
+        if let Some(layer) = self.layers.get_mut(&key) {
+            layer.opaque_bounds = Some(bounds);
+        }
+    }
+
+    /// Mark the current layer as having a backdrop filter or filter group that
+    /// reads pixels from behind it within `expanded_bounds`. Layers beneath
+    /// this region must not be occluded.
+    pub(crate) fn mark_current_layer_poisoned(&mut self, expanded_bounds: Bounds<Pixels>) {
+        let Some(key) = self.retained_layer_stack.last().copied() else {
+            return;
+        };
+        if let Some(layer) = self.layers.get_mut(&key) {
+            layer.poisoned_bounds.push(expanded_bounds);
+        }
+    }
+
+    fn is_layer_occluded(&self, key: LayerKey) -> bool {
+        if !crate::occlusion::enabled() {
+            return false;
+        }
+        let Some(target) = self.layers.get(&key) else {
+            return false;
+        };
+        // Check backdrop filter / filter group poisoning: any layer above the
+        // target with poisoned bounds that overlap the target's bounds prevents
+        // occlusion. The filter reads the pixels underneath it.
+        let target_id = target.id;
+        for layer in self.layers.values() {
+            if layer.id <= target_id {
+                continue;
+            }
+            for poisoned in &layer.poisoned_bounds {
+                let overlap = poisoned.intersect(&target.cache_key.bounds);
+                if overlap.size.width > Pixels::ZERO && overlap.size.height > Pixels::ZERO {
+                    crate::render_stats::count("occlusion: poisoned by backdrop filter");
+                    return false;
+                }
+            }
+        }
+
+        let occluders = self
+            .layers
+            .values()
+            .filter(|layer| layer.id > target.id)
+            .filter_map(|layer| layer.opaque_bounds)
+            .collect::<Vec<_>>();
+        crate::occlusion::fully_covered(target.cache_key.bounds, &occluders)
     }
 
     /// The [`LayerKey`] and cache key a layer rooted at `global_id` would have
@@ -4612,6 +4709,11 @@ impl Window {
             opacity: self.element_opacity(),
             _pad: 0,
         });
+
+        // Poisoning: the backdrop filter reads content behind it. Layers
+        // beneath this region must not be occluded. Expand by the blur radius
+        // since the filter samples neighbouring pixels.
+        self.mark_current_layer_poisoned(bounds.dilate(radius));
     }
 
     /// Isolate the painting performed by `f` into a content-filter group: the renderer renders
@@ -4655,6 +4757,11 @@ impl Window {
             opacity: 1.0,
             is_start: true,
         };
+
+        // Poisoning: filter groups sample neighbouring pixels within
+        // `max_blur_radius`. Layers beneath and within that margin must not
+        // be occluded, or the filter reads stale pixels.
+        self.mark_current_layer_poisoned(bounds.dilate(radius));
 
         self.next_frame.scene.insert_primitive(boundary);
         let result = f(self);

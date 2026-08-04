@@ -256,6 +256,14 @@ pub(crate) struct Layer {
     /// styles are hover-sensitive, a layer under the pointer — or one that was
     /// under it last frame — simply re-renders.
     pub had_mouse: bool,
+    /// A conservative opaque coverage region in window coordinates.
+    pub opaque_bounds: Option<Bounds<Pixels>>,
+    /// Set when invalidated while visually occluded; content is rebuilt when revealed.
+    pub deferred_dirty: bool,
+    /// Bounds of backdrop filters and filter groups above this layer that
+    /// read pixels behind them. Any layer whose content falls within these
+    /// bounds must not be occluded, or the filter would sample stale pixels.
+    pub poisoned_bounds: Vec<Bounds<Pixels>>,
 }
 
 impl Layer {
@@ -273,6 +281,9 @@ impl Layer {
             policy,
             last_visited: frame,
             had_mouse: false,
+            opaque_bounds: None,
+            deferred_dirty: false,
+            poisoned_bounds: Vec::new(),
         }
     }
 
