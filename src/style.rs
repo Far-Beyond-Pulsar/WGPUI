@@ -592,6 +592,7 @@ impl Style {
                 .is_some_and(|color| !color.is_transparent() && color.tag == crate::BackgroundTag::Solid)
         });
         if !has_solid_background {
+            eprintln!("DEBUG opaque_region: bg={:?}", self.background);
             return None;
         }
 
