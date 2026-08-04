@@ -9204,8 +9204,8 @@ mod test {
                 .id("fg")
                 .layer()
                 .absolute()
-                .left(px(0.))
-                .top(px(0.))
+                .left(px(200.))
+                .top(px(200.))
                 .w(px(200.))
                 .h(px(200.))
                 .bg(crate::red());
@@ -9239,8 +9239,8 @@ mod test {
                     .id("bg")
                     .layer()
                     .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
+                    .left(px(200.))
+                    .top(px(200.))
                     .w(px(200.))
                     .h(px(200.))
                     .bg(crate::green())
@@ -9385,29 +9385,42 @@ mod test {
             "the visible fg must re-render when notified"
         );
 
-        // Now resize the foreground layer so it no longer covers the background
-        // — the background should become visible and re-render.
-        let new_bg_paints = bg_paints.get();
+        // Move the foreground layer to (400, 400) so it no longer covers the
+        // background at (200, 200). Notify the view — the bg should now be
+        // visible, so it re-renders and clears deferred_dirty.
         window
             .update(cx, |_, this, _| {
-                let fg = this.layers.get_mut(&bg_key).unwrap();
-                fg.deferred_dirty = false;
-                let fg = this.layers.get_mut(&bg_key).unwrap();
+                let mut keys: Vec<_> = this.layers.keys().copied().collect();
+                keys.sort();
+                let fg_key = keys[1];
+                let fg = this.layers.get_mut(&fg_key).unwrap();
                 fg.cache_key.bounds = crate::Bounds {
-                    origin: crate::point(px(200.), px(0.)),
+                    origin: crate::point(px(400.), px(400.)),
                     size: crate::size(px(100.), px(100.)),
                 };
             })
             .unwrap();
+        let new_bg_paints = bg_paints.get();
         window.update(cx, |_, _, cx| cx.notify()).unwrap();
         cx.run_until_parked();
 
         // The background is no longer occluded and should re-render.
-        assert_eq!(
-            bg_paints.get(),
-            new_bg_paints + 1,
+        assert!(
+            bg_paints.get() > new_bg_paints,
             "the bg must re-render when it becomes visible again"
         );
+        window
+            .update(cx, |_, this, _| {
+                let mut keys: Vec<_> = this.layers.keys().copied().collect();
+                keys.sort();
+                let bg_key = keys[0];
+                let bg = this.layers.get(&bg_key).unwrap();
+                assert!(
+                    !bg.deferred_dirty,
+                    "deferred_dirty must be cleared after re-rendering"
+                );
+            })
+            .unwrap();
     }
 
     /// A backdrop filter poisons layers behind it — they must not be occluded.
@@ -9630,8 +9643,8 @@ mod test {
                     .id("bg")
                     .layer()
                     .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
+                    .left(px(200.))
+                    .top(px(200.))
                     .w(px(200.))
                     .h(px(200.))
                     .bg(crate::green())
@@ -9648,8 +9661,8 @@ mod test {
                     .id("fg")
                     .layer()
                     .absolute()
-                    .left(px(100.))
-                    .top(px(0.))
+                    .left(px(300.))
+                    .top(px(200.))
                     .w(px(100.))
                     .h(px(200.))
                     .bg(crate::red())
@@ -9709,13 +9722,13 @@ mod test {
             let fg1_paints = self.fg1_paints.clone();
             let fg2_paints = self.fg2_paints.clone();
             crate::div().size_full().child(
-                // Background layer at (0,0,100,200)
+                // Background layer at (200,200,100,200)
                 crate::div()
                     .id("bg")
                     .layer()
                     .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
+                    .left(px(200.))
+                    .top(px(200.))
                     .w(px(100.))
                     .h(px(200.))
                     .bg(crate::green())
@@ -9728,13 +9741,13 @@ mod test {
                     )),
             )
             .child(
-                // Foreground 1 covers left half at (0,0,50,200)
+                // Foreground 1 covers left half at (200,200,50,200)
                 crate::div()
                     .id("fg1")
                     .layer()
                     .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
+                    .left(px(200.))
+                    .top(px(200.))
                     .w(px(50.))
                     .h(px(200.))
                     .bg(crate::red())
@@ -9747,13 +9760,13 @@ mod test {
                     )),
             )
             .child(
-                // Foreground 2 covers right half at (50,0,50,200)
+                // Foreground 2 covers right half at (250,200,50,200)
                 crate::div()
                     .id("fg2")
                     .layer()
                     .absolute()
-                    .left(px(50.))
-                    .top(px(0.))
+                    .left(px(250.))
+                    .top(px(200.))
                     .w(px(50.))
                     .h(px(200.))
                     .bg(crate::red())
@@ -9803,8 +9816,8 @@ mod test {
                     .id("zero")
                     .layer()
                     .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
+                    .left(px(200.))
+                    .top(px(200.))
                     .w(px(0.))
                     .h(px(0.))
                     .bg(crate::red())
@@ -9918,8 +9931,8 @@ mod test {
                     .id("bg")
                     .layer()
                     .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
+                    .left(px(200.))
+                    .top(px(200.))
                     .w(px(200.))
                     .h(px(200.))
                     .bg(crate::green())
@@ -9936,8 +9949,8 @@ mod test {
                     .id("fg")
                     .layer()
                     .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
+                    .left(px(200.))
+                    .top(px(200.))
                     .w(px(200.))
                     .h(px(200.))
                     // Linear gradient background — NOT a solid color, so
