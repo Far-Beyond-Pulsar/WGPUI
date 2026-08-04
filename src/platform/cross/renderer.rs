@@ -1598,8 +1598,7 @@ impl WgpuRenderer {
             alpha_mode,
             color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
-            // TODO(mdeand): Make this configurable?
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: context.desired_maximum_frame_latency,
         };
 
         let atlas_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
