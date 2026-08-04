@@ -3251,9 +3251,14 @@ impl WgpuRenderer {
         self.surface_configuration.alpha_mode = if transparent {
             wgpu::CompositeAlphaMode::PreMultiplied
         } else {
-            // TODO(mdeand): Support for non-X11?
-            // wgpu::CompositeAlphaMode::Opaque
-            wgpu::CompositeAlphaMode::Inherit
+            #[cfg(target_os = "linux")]
+            {
+                wgpu::CompositeAlphaMode::Inherit
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                wgpu::CompositeAlphaMode::Opaque
+            }
         };
         self.reconfigure_surface();
     }
