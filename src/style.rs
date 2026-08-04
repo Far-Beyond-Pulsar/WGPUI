@@ -1469,7 +1469,7 @@ mod tests {
                 thickness: px(4.),
                 color: Some(red()),
             }),
-            fade_out: Some(0.5),
+            fade_out: Some(0.),
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),
             background_color: Some(green()),

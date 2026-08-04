@@ -4324,16 +4324,12 @@ impl Window {
         let id = self.next_layer_id;
         let frame = self.layer_frame;
 
-        // Initialize layer state before paint. The borrow of `self.layers` must be
-        // dropped before `f(self)` can borrow `self` again.
-        {
-            let layer = self.layers.entry(key).or_insert_with(|| {
-                crate::render_stats::count("layer: created");
-                Layer::new(LayerId(id), policy, frame)
-            });
-            layer.opaque_bounds = None;
-            layer.poisoned_bounds.clear();
-        }
+        // Clear occlusion state before paint runs. The paint may re-set
+        // `opaque_bounds` via `mark_current_layer_opaque` during `f(self)`.
+        let fill_layer = Layer::new(LayerId(id), policy, frame);
+        let layer = self.layers.entry(key).or_insert(fill_layer);
+        layer.opaque_bounds = None;
+        layer.poisoned_bounds.clear();
 
         self.next_frame.scene.begin_layer(key, scaled_bounds, true);
         let result = f(self);
@@ -4344,27 +4340,25 @@ impl Window {
             .expect("a recording layer must return its captured items");
 
         let paint_range = paint_start..self.paint_index();
-        if let Some(layer) = self.layers.get_mut(&key) {
-            if layer.id.0 == id {
-                self.next_layer_id = self.next_layer_id.wrapping_add(1);
-            }
-            layer.policy = policy;
-            layer.items = items;
-            layer.paint_range = paint_range;
-            let bounds = cache_key.bounds;
-            layer.cache_key = cache_key;
-            layer.transform = LayerTransform {
-                offset: bounds.origin,
-            };
-            layer.needs = Invalidation::empty();
-            layer.last_visited = frame;
-            layer.had_mouse = false;
-            layer.deferred_dirty = false;
-            layer.poisoned_bounds.clear();
+        if layer.id.0 == id {
+            self.next_layer_id = self.next_layer_id.wrapping_add(1);
+        }
+        layer.policy = policy;
+        layer.items = items;
+        layer.paint_range = paint_range;
+        let bounds = cache_key.bounds;
+        layer.cache_key = cache_key;
+        layer.transform = LayerTransform {
+            offset: bounds.origin,
+        };
+        layer.needs = Invalidation::empty();
+        layer.last_visited = frame;
+        layer.had_mouse = false;
+        layer.deferred_dirty = false;
+        layer.poisoned_bounds.clear();
 
-            if crate::layer::layer_debug_enabled() {
-                self.paint_layer_debug_tint(key, bounds, true);
-            }
+        if crate::layer::layer_debug_enabled() {
+            self.paint_layer_debug_tint(key, bounds, true);
         }
 
         result
