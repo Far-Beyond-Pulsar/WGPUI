@@ -1476,13 +1476,10 @@ pub(crate) struct ElementStateBox {
 }
 
 fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
-    // TODO, BUG: if you open a window with the currently active window
-    // on the stack, this will erroneously fallback to `None`
-    //
-    // TODO these should be the initial window bounds not considering maximized/fullscreen
-    let active_window_bounds = cx
-        .active_window()
-        .and_then(|w| w.update(cx, |_, window, _| window.window_bounds()).ok());
+    let window_bounds = cx
+        .windows()
+        .iter()
+        .find_map(|w| w.update(cx, |_, window, _| window.window_bounds()).ok());
 
     const CASCADE_OFFSET: f32 = 25.0;
 
@@ -1504,7 +1501,7 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
             size: base_size,
         },
         window_bounds_ctor,
-    ): (_, fn(Bounds<Pixels>) -> WindowBounds) = match active_window_bounds {
+    ): (_, fn(Bounds<Pixels>) -> WindowBounds) = match window_bounds {
         Some(bounds) => match bounds {
             WindowBounds::Windowed(bounds) => (bounds, WindowBounds::Windowed),
             WindowBounds::Maximized(bounds) => (bounds, WindowBounds::Maximized),
