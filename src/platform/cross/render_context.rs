@@ -188,8 +188,8 @@ impl WgpuContext {
 
             let quads_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Quads Buffer"),
-                // TODO(mdeand): Determine appropriate size
-                size: 8 * 1024 * 1024, // 1 MB buffer for quads, for now. (:
+                // Resized dynamically by ensure_buffer_size() when the initial allocation is exceeded.
+                size: 8 * 1024 * 1024,
                 usage: wgpu::BufferUsages::VERTEX
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::STORAGE
@@ -199,7 +199,7 @@ impl WgpuContext {
 
             let mono_sprites_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Monosprites Buffer"),
-                // TODO(mdeand): Determine appropriate size, or make resizable.
+                // Resized dynamically by ensure_buffer_size() when the initial allocation is exceeded.
                 size: 8 * 1024 * 1024,
                 usage: wgpu::BufferUsages::VERTEX
                     | wgpu::BufferUsages::COPY_DST
@@ -259,7 +259,8 @@ impl WgpuContext {
 
             let color_adjustments_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Color Adjustments Buffer"),
-                size: 1024 * 16, // TODO(mdeand): 16 KB buffer for color adjustments, for now. (:
+                // Resized dynamically by ensure_buffer_size() when the initial allocation is exceeded.
+                size: 1024 * 16,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::UNIFORM,
