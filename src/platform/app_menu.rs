@@ -230,9 +230,18 @@ impl Clone for OwnedMenuItem {
     }
 }
 
-// TODO: As part of the global selections refactor, these should
-// be moved to GPUI-provided actions that make this association
-// without leaking the platform details to GPUI users
+use crate as gpui;
+crate::actions!(
+    gpui,
+    [
+        Cut,
+        Copy,
+        Paste,
+        SelectAll,
+        Undo,
+        Redo,
+    ]
+);
 
 /// OS actions are actions that are recognized by the operating system
 /// This allows the operating system to provide specialized behavior for
