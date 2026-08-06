@@ -67,12 +67,17 @@ impl Element for Svg {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        // #93: computed before `self.interactivity.request_layout` borrows
+        // `self.interactivity` mutably — same reasoning as `Div::request_layout`.
+        let diff_key = self.diff_key(window);
         let layout_id = self.interactivity.request_layout(
             global_id,
             inspector_id,
             window,
             cx,
-            |style, window, cx| window.request_layout(style, None, cx),
+            |style, window, cx| {
+                window.request_layout_or_reuse(diff_key.as_deref(), style, None, cx)
+            },
         );
         (layout_id, ())
     }

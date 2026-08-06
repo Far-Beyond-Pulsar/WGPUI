@@ -15,7 +15,8 @@ use crate::{
     LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton,
     MouseDownEvent, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, ReconcileKey, Render,
+    RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScrollWheelEvent, Shadow,
     SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
@@ -1378,6 +1379,17 @@ pub struct Window {
     /// key) derived from it, for no benefit to systems that don't need instance
     /// identity.
     pub(crate) instance_id_stack: SmallVec<[ElementId; 32]>,
+    /// The `request_layout`-time counterpart of `hitbox_layer_stack` (#93):
+    /// which `.layer()` ancestor, if any, is currently being visited while
+    /// `instance_id_stack` reflects the element whose taffy node is about to
+    /// be requested. Pushed by a `.layer()` div's own `request_layout`,
+    /// mirroring exactly how `with_layer_hitbox_scope` pushes
+    /// `hitbox_layer_stack` during `prepaint`. Kept as its own stack rather
+    /// than reusing `hitbox_layer_stack` because the two are live during
+    /// different, non-overlapping draw phases (`request_layout` completes,
+    /// for the whole tree, before any element's `prepaint` begins) and
+    /// conflating them would make either one's invariants harder to state.
+    pub(crate) layout_layer_stack: Vec<LayerKey>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
@@ -1875,6 +1887,7 @@ impl Window {
             retained_layer_stack: Vec::new(),
             hitbox_layer_stack: Vec::new(),
             instance_id_stack: SmallVec::default(),
+            layout_layer_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
@@ -2958,7 +2971,18 @@ impl Window {
             self.platform_window.set_input_handler(input_handler);
         }
 
-        self.layout_engine.as_mut().unwrap().clear();
+        // #93: with persistent layout enabled, `end_frame` sweeps only the
+        // nodes this draw didn't touch — every element still visits
+        // `request_layout` unconditionally (see `instance.rs`'s module doc),
+        // so a node untouched this frame is unambiguously gone, not merely
+        // not-yet-reached. `WGPUI_PERSISTENT_LAYOUT=0` falls back to the
+        // pre-#93 `clear()`, wiping and recreating the whole tree every frame.
+        let layout_engine = self.layout_engine.as_mut().unwrap();
+        if crate::taffy::persistent_layout_enabled() {
+            layout_engine.end_frame();
+        } else {
+            layout_engine.clear();
+        }
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
@@ -5240,6 +5264,94 @@ impl Window {
             .request_measured_layout(style, rem_size, scale_factor, measure)
     }
 
+    /// The retained `LayoutId` this frame may reuse instead of creating a
+    /// fresh node, if `diff_key` proves it safe (#93).
+    ///
+    /// Reads `instance_id_stack`/`layout_layer_stack` exactly as they stand
+    /// at the call site — correct only because the caller (an element's own
+    /// `request_layout`) is invoked with its own segment already pushed by
+    /// its parent's child loop, mirroring the identical convention
+    /// `prepaint_reconciled_child` already relies on one phase later. Returns
+    /// `None` — meaning "create fresh, exactly as before this phase" — for
+    /// every case that isn't a proven-safe reuse: no layer, instances or
+    /// persistent layout disabled, first sight of this `InstanceKey`, or a
+    /// `diff_key` comparison whose axes include `LAYOUT`.
+    fn reusable_layout(&self, diff_key: Option<&dyn ReconcileKey>) -> Option<LayoutId> {
+        if !crate::taffy::persistent_layout_enabled() || !crate::instance::instances_enabled() {
+            return None;
+        }
+        let new_key = diff_key?;
+        let layer_key = self.current_layout_layer()?;
+        let key = self.current_instance_key();
+        let retained = self.layers.get(&layer_key)?.instances.get(&key)?;
+        if new_key.compare(retained.diff_key.as_ref()).contains(Invalidation::LAYOUT) {
+            return None;
+        }
+        Some(retained.layout)
+    }
+
+    /// [`Self::request_layout`], but reusing the retained node for the
+    /// current `InstanceKey` instead of creating a fresh one when `diff_key`
+    /// proves its `LAYOUT` axis is clean (#93) — the Taffy-level counterpart
+    /// to reconciliation's `prepaint`/`paint` skip.
+    ///
+    /// `diff_key` is computed by the caller (an element's own `request_layout`)
+    /// via its own `Element::diff_key`, once for this purpose and again,
+    /// independently, wherever the element's parent makes its own
+    /// `prepaint`-time reconciliation decision — recomputing rather than
+    /// threading a shared value between the two, since both are meant to be
+    /// cheap (see `instance.rs`'s module doc) and threading it would couple
+    /// two decisions that resolve at genuinely different times against
+    /// genuinely different criteria (this one only needs the `LAYOUT` bit;
+    /// the other also needs bounds, content mask and entity dependencies that
+    /// are not yet known this early).
+    #[must_use]
+    pub fn request_layout_or_reuse(
+        &mut self,
+        diff_key: Option<&dyn ReconcileKey>,
+        style: Style,
+        children: impl IntoIterator<Item = LayoutId>,
+        cx: &mut App,
+    ) -> LayoutId {
+        if let Some(id) = self.reusable_layout(diff_key)
+            && self.layout_engine.as_mut().unwrap().reuse(id)
+        {
+            crate::render_stats::count("taffy: node reused");
+            return id;
+        }
+        self.request_layout(style, children, cx)
+    }
+
+    /// [`Self::request_measured_layout`], but reusing the retained node for
+    /// the current `InstanceKey` the same way [`Self::request_layout_or_reuse`]
+    /// does (#93).
+    ///
+    /// Reusing a measured node without re-registering `measure` is sound
+    /// specifically *because* reuse only happens when `diff_key` proves
+    /// nothing this element's own content depends on has changed — the stale
+    /// `'static`-closure hazard the design doc's §2.5 describes is a hazard
+    /// for retaining a node *despite* a change, which this never does; the
+    /// closure captured last time it *did* change is still describing
+    /// current content.
+    pub fn request_measured_layout_or_reuse<F>(
+        &mut self,
+        diff_key: Option<&dyn ReconcileKey>,
+        style: Style,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        if let Some(id) = self.reusable_layout(diff_key)
+            && self.layout_engine.as_mut().unwrap().reuse(id)
+        {
+            crate::render_stats::count("taffy: node reused");
+            return id;
+        }
+        self.request_measured_layout(style, measure)
+    }
+
     /// Compute the layout for the given id within the given available space.
     /// This method is called for its side effect, typically by the framework prior to painting.
     /// After calling it, you can request the bounds of the given layout node id or any descendant.
@@ -5338,6 +5450,23 @@ impl Window {
     // doc comment for why re-deriving it independently at paint time would be
     // wrong. It travels from prepaint to paint inside `ChildReconciliation`
     // instead.
+
+    /// Run `f` with `key` pushed onto `layout_layer_stack` (#93). Mirrors
+    /// `with_layer_hitbox_scope`, one phase earlier — see
+    /// `Window::layout_layer_stack`'s doc comment for why they're separate
+    /// stacks rather than one.
+    pub(crate) fn with_layout_layer<R>(&mut self, key: LayerKey, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.layout_layer_stack.push(key);
+        let result = f(self);
+        self.layout_layer_stack.pop();
+        result
+    }
+
+    /// The layer a `.layer()` div's *children* are currently requesting
+    /// layout inside, if any (#93). See `Window::layout_layer_stack`.
+    pub(crate) fn current_layout_layer(&self) -> Option<LayerKey> {
+        self.layout_layer_stack.last().copied()
+    }
 
     /// Run `f` with `id` pushed onto `instance_id_stack`, so that any
     /// `InstanceKey` computed inside `f` — including one for a
@@ -9195,6 +9324,197 @@ mod test {
                 );
             })
             .unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Persistent Taffy layout tree (#93)
+    // -------------------------------------------------------------------
+
+    fn persistent_layout_off() -> bool {
+        !crate::taffy::persistent_layout_enabled()
+    }
+
+    /// The phase's headline acceptance: a reconciled child whose description
+    /// did not change keeps the *exact same* Taffy node across frames — not
+    /// merely an equal one — proving `request_layout_or_reuse` really skipped
+    /// node creation rather than recreating an indistinguishable node.
+    #[gpui::test]
+    fn an_unchanged_reconciled_child_keeps_its_taffy_node(cx: &mut TestAppContext) {
+        if layers_off() || instances_off() || persistent_layout_off() {
+            return;
+        }
+        let window = instance_view_window(cx);
+        let layout_before = window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().unwrap();
+                this.layers[&key].instances.values().next().unwrap().layout
+            })
+            .unwrap();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.unrelated += 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let layout_after = window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().unwrap();
+                this.layers[&key].instances.values().next().unwrap().layout
+            })
+            .unwrap();
+
+        assert_eq!(
+            layout_before, layout_after,
+            "an unrelated notify must not replace a reconciled child's Taffy node"
+        );
+    }
+
+    /// `TaffyLayoutEngine::end_frame` must not leak: rendering many frames,
+    /// alternating between an unrelated notify (everything reconciles) and a
+    /// real change (the changed subtree rebuilds), must settle rather than
+    /// grow the live node count without bound.
+    #[gpui::test]
+    fn taffy_node_count_does_not_grow_unboundedly(cx: &mut TestAppContext) {
+        if layers_off() || instances_off() || persistent_layout_off() {
+            return;
+        }
+        let window = instance_view_window(cx);
+
+        let node_count = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, this, _| {
+                    this.layout_engine.as_ref().unwrap().live_node_count()
+                })
+                .unwrap()
+        };
+
+        let after_first_frame = node_count(cx);
+
+        for round in 0..40 {
+            window
+                .update(cx, |view, _, cx| {
+                    if round % 2 == 0 {
+                        view.unrelated += 1;
+                    } else {
+                        view.visible = !view.visible;
+                    }
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+
+        let after_many_rounds = node_count(cx);
+        assert_eq!(
+            after_many_rounds, after_first_frame,
+            "the live Taffy node count must return to its steady-state value, not \
+             accumulate orphaned nodes across frames"
+        );
+    }
+
+    /// A real content change still produces geometrically correct output —
+    /// reuse is never allowed to let a stale size/position through. Resizing
+    /// the reconciled child (a genuine `LAYOUT`-axis change, unlike
+    /// `InstanceView`'s opacity-only change elsewhere in this module) must be
+    /// reflected in its resolved bounds.
+    struct ResizingView {
+        width: crate::Pixels,
+    }
+
+    impl crate::Render for ResizingView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(200.))
+                    .h(px(100.))
+                    .child(
+                        crate::div()
+                            .w(self.width)
+                            .h(px(20.))
+                            .bg(crate::red()),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_layout_change_still_resizes_the_reused_node(cx: &mut TestAppContext) {
+        if layers_off() || instances_off() || persistent_layout_off() {
+            return;
+        }
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| ResizingView {
+            width: px(20.),
+        });
+        cx.run_until_parked();
+
+        let width_before = window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().unwrap();
+                let layout = this.layers[&key].instances.values().next().unwrap().layout;
+                this.layout_engine.as_mut().unwrap().layout_bounds(layout, 1.0).size.width
+            })
+            .unwrap();
+        assert_eq!(width_before, px(20.));
+
+        window
+            .update(cx, |view, _, cx| {
+                view.width = px(60.);
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let width_after = window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().unwrap();
+                let layout = this.layers[&key].instances.values().next().unwrap().layout;
+                this.layout_engine.as_mut().unwrap().layout_bounds(layout, 1.0).size.width
+            })
+            .unwrap();
+        assert_eq!(
+            width_after,
+            px(60.),
+            "a genuine size change must resize the node, not replay the old size"
+        );
+    }
+
+    /// `WGPUI_PERSISTENT_LAYOUT=0` must reproduce pre-#93 behaviour exactly:
+    /// `Window::draw` calls `clear()`, never `end_frame()`, so the live node
+    /// count after any draw reflects only what that single draw created —
+    /// nothing survives from the frame before.
+    #[gpui::test]
+    fn disabling_persistent_layout_clears_every_frame(cx: &mut TestAppContext) {
+        if layers_off() || !persistent_layout_off() {
+            return;
+        }
+        let window = instance_view_window(cx);
+        let count_after_first = window
+            .update(cx, |_, this, _| {
+                this.layout_engine.as_ref().unwrap().live_node_count()
+            })
+            .unwrap();
+        assert!(count_after_first > 0, "the first frame creates nodes");
+
+        clean_frame(cx, window.into());
+
+        let count_after_second = window
+            .update(cx, |_, this, _| {
+                this.layout_engine.as_ref().unwrap().live_node_count()
+            })
+            .unwrap();
+        assert_eq!(
+            count_after_first, count_after_second,
+            "clear()-then-fully-rebuild must land on the same steady-state count, \
+             never accumulating across draws"
+        );
     }
 
     /// Regression test for the bug `DivDiffKey`'s recursive children fixes: a
