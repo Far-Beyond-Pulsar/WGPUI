@@ -19,11 +19,16 @@
 //!
 //! # What is retained in this phase
 //!
-//! Primitives only. A composited layer re-emits its recorded primitives with
-//! their recorded *layer-local* draw orders, which is what lets it skip both
-//! primitive emission and the per-primitive `BoundsTree` insert that dominates
-//! `Scene::insert_primitive`. Textures (#96) and retained element instances
-//! (#92) both live inside a layer later; neither exists yet.
+//! Primitives, at layer granularity: a composited layer re-emits its recorded
+//! primitives with their recorded *layer-local* draw orders, which is what
+//! lets it skip both primitive emission and the per-primitive `BoundsTree`
+//! insert that dominates `Scene::insert_primitive`.
+//!
+//! As of #92, a layer that *is* re-rendering can additionally reconcile at
+//! element granularity — see [`Layer::instances`] and [`crate::instance`] —
+//! so one changed child no longer forces every sibling through `prepaint`/
+//! `paint` again. Textures (#96) still live inside a layer later; that one
+//! doesn't exist yet.
 //!
 //! Hitboxes, dispatch nodes, tooltips and shaped text still travel through the
 //! old index-range replay path, which stays until #97 — see
@@ -47,10 +52,11 @@
 //! `WGPUI_LAYER_DEBUG=1` is how that gets diagnosed.
 
 use crate::{
-    Bounds, ContentMask, EntityId, GlobalElementId, Invalidation, Pixels, Point, Primitive, px,
-    size,
+    Bounds, ContentMask, EntityId, GlobalElementId, InstanceKey, Invalidation, Pixels, Point,
+    Primitive, px, size,
 };
-use collections::FxHashSet;
+use crate::instance::ElementInstance;
+use collections::{FxHashMap, FxHashSet};
 use std::hash::{Hash, Hasher};
 
 /// Identifies one retained layer for as long as the window keeps it.
@@ -171,6 +177,11 @@ impl LayerPolicy {
 /// composite of the outer layer reproduces the inner layer's *own* ordering
 /// scope. Inlining the inner layer's primitives would mix two local order
 /// spaces into one and silently reorder them.
+///
+/// `Clone` since #92: an `ElementInstance`'s own retained items are a cloned
+/// sub-slice of what a `.layer()` subtree captured, not a range into the
+/// layer's own `items` — see `ElementInstance::items`'s doc comment for why.
+#[derive(Clone)]
 pub(crate) enum LayerItem {
     /// A primitive carrying its layer-local draw order.
     Primitive(Primitive),
@@ -264,6 +275,17 @@ pub(crate) struct Layer {
     /// read pixels behind them. Any layer whose content falls within these
     /// bounds must not be occluded, or the filter would sample stale pixels.
     pub poisoned_bounds: Vec<Bounds<Pixels>>,
+    /// Retained per-element state for this layer's subtree, keyed by
+    /// [`crate::InstanceKey`] (#92).
+    ///
+    /// Lives here rather than in a window-global map so instance memory is
+    /// bounded by the same mark-and-sweep eviction that already bounds
+    /// `items`: instances are owned by their layer and die with it. Cleared
+    /// alongside `items` in `drop_content`, and — unlike `items`, which is
+    /// unconditionally overwritten every time this layer re-renders —
+    /// individual entries here are only overwritten for the children that
+    /// actually rebuilt; a reconciled child's entry is left untouched.
+    pub instances: FxHashMap<InstanceKey, ElementInstance>,
 }
 
 impl Layer {
@@ -284,6 +306,7 @@ impl Layer {
             opaque_bounds: None,
             deferred_dirty: false,
             poisoned_bounds: Vec::new(),
+            instances: FxHashMap::default(),
         }
     }
 
@@ -300,6 +323,11 @@ impl Layer {
         self.paint_range = crate::PaintIndex::default()..crate::PaintIndex::default();
         self.needs = Invalidation::all();
         self.deferred_dirty = false;
+        // #92: an evicted layer's ElementInstances describe content that no
+        // longer exists. Left in place they would be dead weight at best; at
+        // worst a later InstanceKey collision (extremely unlikely, but the
+        // failure mode matters) could reuse one against unrelated content.
+        self.instances.clear();
     }
 }
 

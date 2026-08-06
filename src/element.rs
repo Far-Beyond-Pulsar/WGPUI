@@ -33,8 +33,8 @@
 
 use crate::{
     App, ArenaBox, AvailableSpace, Bounds, ContentMask, Context, DispatchNodeId, DrawPhase, ElementId,
-    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
-    util::FluentBuilder, with_element_arena,
+    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, ReconcileKey, SharedString, Size, Style,
+    Window, util::FluentBuilder, with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -115,6 +115,26 @@ pub trait Element: 'static + IntoElement {
         _window: &mut Window,
         _cx: &mut App,
     ) {
+    }
+
+    /// A cheap, owned, arena-free fingerprint of this frame's description
+    /// (see [`crate::instance`]), compared against the previous frame's
+    /// fingerprint for the same [`crate::InstanceKey`] to decide whether
+    /// `prepaint`/`paint` may be skipped inside a `.layer()` subtree (#92).
+    ///
+    /// Takes `&Window` — read-only, never `&mut` — because an element's
+    /// rendered output can depend on ambient state that isn't part of `self`
+    /// at all: `Text`'s ambient `TextStyle` comes from `Window::text_style()`,
+    /// not from the string itself. Implementations that need it read through
+    /// this reference; implementations that don't (most of them) ignore it.
+    ///
+    /// The default implementation returns `None`, which opts this element
+    /// type out of reconciliation entirely: it is always treated as changed,
+    /// exactly as every element behaved before this method existed. Every
+    /// existing element compiles untouched. Only `Div`, `SharedString`/`&str`,
+    /// `Img` and `Svg` implement this in the phase that introduced it.
+    fn diff_key(&self, _window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        None
     }
 
     /// Convert this element into a dynamically-typed [`AnyElement`].
@@ -322,6 +342,17 @@ trait ElementObject {
     fn paint(&mut self, window: &mut Window, cx: &mut App);
 
     fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App);
+
+    /// The wrapped element's own [`Element::id`], not `AnyElement`'s (which is
+    /// always `None` — see its `Element` impl below). #92's `Div` child loop
+    /// needs this to build the child's `InstanceKey` segment: its own id if it
+    /// has one, or a positional `ElementId::InstanceSlot` if it doesn't.
+    fn inner_id(&self) -> Option<ElementId>;
+
+    /// The wrapped element's own [`Element::diff_key`]. See `inner_id` for why
+    /// this has to go through the trait object rather than `AnyElement`
+    /// itself implementing `Element` meaningfully here.
+    fn inner_diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>>;
 
     fn layout_as_root(
         &mut self,
@@ -731,6 +762,16 @@ where
     }
 
     #[inline]
+    fn inner_id(&self) -> Option<ElementId> {
+        self.element.id()
+    }
+
+    #[inline]
+    fn inner_diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        self.element.diff_key(window)
+    }
+
+    #[inline]
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -799,6 +840,17 @@ impl AnyElement {
     /// Runs on every frame, cached or not.
     pub fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App) {
         self.0.on_frame(geom, window, cx);
+    }
+
+    /// The wrapped element's own [`Element::id`] (#92). Not to be confused
+    /// with `<AnyElement as Element>::id`, which is always `None`.
+    pub(crate) fn inner_id(&self) -> Option<ElementId> {
+        self.0.inner_id()
+    }
+
+    /// The wrapped element's own [`Element::diff_key`] (#92).
+    pub(crate) fn inner_diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        self.0.inner_diff_key(window)
     }
 
     /// Prepaints this element at the given absolute origin.

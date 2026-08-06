@@ -269,6 +269,24 @@ pub struct ImgLayoutState {
     replacement: Option<AnyElement>,
 }
 
+// #92: `Img` does not implement `Element::diff_key`, staying at the trait's
+// `None` default — a deliberate scope narrowing from this phase's original
+// plan, discovered while implementing it, not an oversight.
+//
+// What `paint` shows for an `Img` depends on `ImgState` (per-element,
+// `with_optional_element_state`-keyed: `frame_index`, `started_loading`,
+// `last_frame_time`) and `ImgLayoutState.replacement` (a fallback/loading
+// `AnyElement` substituted in when `request_layout` finds no data yet) —
+// neither of which is reachable from `Img::diff_key(&self, _)`. Both can
+// change from one frame to the next with `self` — the `Img` value itself —
+// completely unchanged: a GIF's `frame_index` advances on a timer, and
+// `replacement` disappears the instant a loading image resolves. A `diff_key`
+// that only compares `source`/`style` would report "unchanged" across either
+// transition and paint would replay a stale frame or a stale loading
+// placeholder. Div and Svg have an analogous hazard from pseudo-state styling
+// and solve it by opting out *conditionally*; `Img`'s hazard applies to every
+// instance with more than one frame or any load latency, which in practice is
+// most of them, so it opts out unconditionally instead.
 impl Element for Img {
     type RequestLayoutState = ImgLayoutState;
     type PrepaintState = Option<Hitbox>;

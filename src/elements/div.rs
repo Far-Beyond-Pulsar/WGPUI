@@ -18,15 +18,17 @@
 use crate::util::ResultExt;
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
-    DispatchPhase, Display, Element, ElementGeometry, ElementId, Entity, FocusHandle,
-    FrameEffectCallback, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
-    InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
-    KeyboardClickEvent, LayerKey, LayerPolicy, LayoutId, ModifiersChangedEvent, MouseButton,
-    MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow, ParentElement, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
-    TooltipId, Visibility, Window, WindowControlArea, point, px, size,
+    ContentMask, DispatchPhase, Display, Element, ElementGeometry, ElementId, Entity, EntityId,
+    FocusHandle, FrameEffectCallback, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
+    InspectorElementId, InstanceKey, IntoElement, Invalidation, IsZero, KeyContext, KeyDownEvent,
+    KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayerKey, LayerPolicy, LayoutId,
+    ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Overflow, ParentElement, Pixels, Point, ReconcileKey, Render, ScrollWheelEvent,
+    SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId, Visibility, Window,
+    WindowControlArea, point, px, size,
 };
-use collections::HashMap;
+use crate::instance::ElementInstance;
+use collections::{FxHashSet, HashMap};
 use refineable::Refineable;
 use smallvec::SmallVec;
 use stacksafe::{StackSafe, stacksafe};
@@ -38,6 +40,7 @@ use std::{
     hash::{Hash, Hasher},
     marker::PhantomData,
     mem,
+    ops::Range,
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -1458,6 +1461,61 @@ pub struct DivFrameState {
     child_layout_ids: SmallVec<[LayoutId; 2]>,
 }
 
+/// [`Div`]'s [`Element::PrepaintState`] (#92).
+///
+/// Extended beyond a bare `Option<Hitbox>` to also carry, per child, the
+/// reconciliation decision `prepaint` made — see [`ChildReconciliation`] for
+/// why `paint` must reuse this rather than deciding again.
+pub struct DivPrepaintState {
+    hitbox: Option<Hitbox>,
+    child_reconciliation: SmallVec<[ChildReconciliation; 2]>,
+}
+
+/// What `prepaint_reconciled_child` decided for one child, for
+/// `paint_reconciled_child` to act on consistently (#92).
+///
+/// Threaded from `prepaint` to `paint` through [`DivPrepaintState`] rather
+/// than recomputed independently in `paint`: recomputing would read
+/// `Layer::instances` *after* `prepaint`'s own rebuild branch has already
+/// overwritten the entry for any rebuilt child, so a fresh comparison there
+/// would trivially "match" against itself regardless of what actually
+/// happened — silently desyncing from the decision `prepaint` already acted
+/// on and, for a child that was actually reused, tricking `paint` into
+/// calling `Element::paint` on a child whose `Drawable` phase state machine
+/// never advanced past `prepaint` this frame, which panics.
+enum ChildReconciliation {
+    /// No layer is active, instances are disabled, or this child opted out of
+    /// `diff_key`. `paint` must call `child.paint` normally, exactly as before
+    /// this phase existed.
+    Untracked,
+    /// `prepaint` found this child unchanged and skipped its `prepaint`
+    /// entirely. `paint` must likewise skip `child.paint` and instead replay
+    /// the retained items and paint range recorded under `key` in `layer`.
+    Reused { layer: LayerKey, key: InstanceKey },
+    /// `prepaint` ran this child's `prepaint` normally (rebuilding or seeing
+    /// it for the first time) and computed everything an `ElementInstance`
+    /// needs *except* what only `paint` can observe (`paint_range`, `items`).
+    ///
+    /// Carried by value rather than written into `Layer::instances` at
+    /// prepaint time, because the `Layer` record itself may not exist yet: it
+    /// is created lazily by `Window::record_layer`, called from `Div::paint`
+    /// — on a layer's *first* frame there is nothing in `Window::layers` to
+    /// write into until paint has run. `paint`'s own `Rebuilt` branch is
+    /// where the record is guaranteed to exist (it was just created, at the
+    /// latest, by the `record_layer` call this whole child walk is nested
+    /// inside), so that is where the complete `ElementInstance` is finally
+    /// constructed and inserted.
+    Rebuilt {
+        layer: LayerKey,
+        key: InstanceKey,
+        diff_key: Box<dyn ReconcileKey>,
+        bounds: Bounds<Pixels>,
+        content_mask: ContentMask<Pixels>,
+        prepaint_range: Range<crate::PrepaintStateIndex>,
+        accessed_entities: FxHashSet<EntityId>,
+    },
+}
+
 /// Interactivity state displayed an manipulated in the inspector.
 #[derive(Clone)]
 pub struct DivInspectorState {
@@ -1495,7 +1553,7 @@ impl ParentElement for Div {
 
 impl Element for Div {
     type RequestLayoutState = DivFrameState;
-    type PrepaintState = Option<Hitbox>;
+    type PrepaintState = DivPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         self.interactivity.element_id.clone()
@@ -1550,7 +1608,7 @@ impl Element for Div {
         request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Hitbox> {
+    ) -> DivPrepaintState {
         let has_prepaint_listener = self.prepaint_listener.is_some();
         let mut children_bounds = Vec::with_capacity(if has_prepaint_listener {
             request_layout.child_layout_ids.len()
@@ -1598,6 +1656,17 @@ impl Element for Div {
             .as_ref()
             .zip(global_id)
             .map(|(_, global_id)| LayerKey::from_global_element_id(global_id));
+
+        // Populated by the child loop below and carried out through the two
+        // enclosing closures via this `&mut` capture — `Div::paint`'s own
+        // child loop needs, per child, the exact same reuse-or-rebuild
+        // decision this one already made, not a fresh one (#92). Redeciding
+        // independently in `paint` would read `layer.instances[key]` *after*
+        // this loop has already overwritten it for rebuilt children, which
+        // would trivially "match" against itself and desync from what
+        // actually ran — see `ChildReconciliation`'s doc comment.
+        let mut child_reconciliation: SmallVec<[ChildReconciliation; 2]> = SmallVec::new();
+
         let prepaint = |window: &mut Window| {
             self.interactivity.prepaint(
                 global_id,
@@ -1612,8 +1681,19 @@ impl Element for Div {
                     }
 
                     window.with_element_offset(scroll_offset, |window| {
-                        for child in &mut self.children {
-                            child.prepaint(window, cx);
+                        for (index, (child, child_layout_id)) in self
+                            .children
+                            .iter_mut()
+                            .zip(request_layout.child_layout_ids.iter().copied())
+                            .enumerate()
+                        {
+                            child_reconciliation.push(prepaint_reconciled_child(
+                                index,
+                                child,
+                                child_layout_id,
+                                window,
+                                cx,
+                            ));
                         }
                     });
 
@@ -1626,9 +1706,14 @@ impl Element for Div {
             )
         };
 
-        match layer_key {
+        let hitbox = match layer_key {
             Some(key) => window.with_layer_hitbox_scope(key, bounds.origin, prepaint),
             None => prepaint(window),
+        };
+
+        DivPrepaintState {
+            hitbox,
+            child_reconciliation,
         }
     }
 
@@ -1639,7 +1724,7 @@ impl Element for Div {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        hitbox: &mut Option<Hitbox>,
+        prepaint_state: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -1647,6 +1732,15 @@ impl Element for Div {
             .image_cache
             .as_mut()
             .map(|provider| provider.provide(window, cx));
+
+        let hitbox = prepaint_state.hitbox.clone();
+        // Owned, not borrowed: `paint_reconciled_child`'s `Rebuilt` arm needs
+        // to move each `ChildReconciliation`'s captured `diff_key` (a
+        // `Box<dyn ReconcileKey>`, uncloneable by design) into the
+        // `ElementInstance` it finally constructs. `prepaint` runs exactly
+        // once before `paint` ever does, so nothing is lost by taking it here
+        // — `DivPrepaintState` does not outlive this call.
+        let child_reconciliation = mem::take(&mut prepaint_state.child_reconciliation);
 
         // A `.layer()` div paints inside its own retained layer, which may
         // decline to run this closure at all and composite last frame's
@@ -1665,7 +1759,12 @@ impl Element for Div {
             });
 
         window.with_image_cache(image_cache, |window| {
-            let paint = |this: &mut Self, window: &mut Window, cx: &mut App| {
+            let paint = move |this: &mut Self, window: &mut Window, cx: &mut App| {
+                // Split out of `this` before the call below, so the closure
+                // it takes can capture `children` (one field) by move without
+                // needing `this` itself — which the call already borrows,
+                // through `.interactivity`, for its own duration.
+                let children = &mut this.children;
                 this.interactivity.paint(
                     global_id,
                     inspector_id,
@@ -1673,14 +1772,15 @@ impl Element for Div {
                     hitbox.as_ref(),
                     window,
                     cx,
-                    |style, window, cx| {
+                    move |style, window, cx| {
                         // skip children
                         if style.display == Display::None {
                             return;
                         }
 
-                        for child in &mut this.children {
-                            child.paint(window, cx);
+                        for (child, reconciliation) in children.iter_mut().zip(child_reconciliation)
+                        {
+                            paint_reconciled_child(child, reconciliation, window, cx);
                         }
                     },
                 )
@@ -1721,6 +1821,394 @@ impl Element for Div {
         // last. A viewport stashing `geom.bounds` ended up holding an
         // ancestor's bounds, which is the exact defect this channel exists to
         // close.
+    }
+
+    fn diff_key(&self, _window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        // `Element::diff_key` hands us `&Window` precisely so an element that
+        // needs ambient context can read it — but resolving hover/focus/active
+        // pseudo-state correctly means reproducing
+        // `Interactivity::compute_style_internal`'s merge order exactly, and
+        // getting that wrong silently is worse than not trying. A div whose
+        // *authored* style is unchanged could still have a different
+        // *resolved* style this frame purely because the pointer moved onto
+        // or off of it — reconciliation must not miss that.
+        //
+        // Rather than duplicate that merge logic here (and risk it drifting
+        // out of sync with the real one), a div with any pseudo-state-
+        // conditional style opts out of reconciliation entirely: `None` here
+        // means "always changed," exactly the default every element had
+        // before this method existed. This is a disclosed, conservative
+        // limitation of this phase, not a correctness compromise — divs with
+        // static styling, which dominate any real layer's subtree, still
+        // benefit fully.
+        if self.interactivity.hover_style.is_some()
+            || self.interactivity.group_hover_style.is_some()
+            || self.interactivity.active_style.is_some()
+            || self.interactivity.group_active_style.is_some()
+            || self.interactivity.focus_style.is_some()
+            || self.interactivity.in_focus_style.is_some()
+            || self.interactivity.focus_visible_style.is_some()
+            || !self.interactivity.drag_over_styles.is_empty()
+            || !self.interactivity.group_drag_over_styles.is_empty()
+        {
+            return None;
+        }
+
+        let child_shape = self
+            .children
+            .iter()
+            .map(|child| child.inner_id())
+            .collect();
+
+        Some(Box::new(DivDiffKey {
+            style: (*self.interactivity.base_style).clone(),
+            child_shape,
+        }))
+    }
+}
+
+/// [`Div`]'s [`ReconcileKey`]: the authored style plus a cheap structural
+/// summary of its children.
+///
+/// Deliberately does *not* embed each child's own [`InstanceKey`] or content —
+/// per-child reconciliation is a separate, independent walk (see `Div`'s
+/// `prepaint`/`paint` child loops), not something this key needs to validate.
+/// This key only has to answer "should *this* div, as a unit, be treated as
+/// changed by whatever is looking it up" — which for a div is its own style,
+/// plus whether its child list changed shape at all (a structural change like
+/// an insertion or reorder is `LAYOUT | DISPLAY | HIT` for the parent, even
+/// though each *surviving* child still reconciles independently on its own
+/// next visit).
+struct DivDiffKey {
+    style: StyleRefinement,
+    child_shape: SmallVec<[Option<ElementId>; 4]>,
+}
+
+impl ReconcileKey for DivDiffKey {
+    fn compare(&self, previous: &dyn ReconcileKey) -> Invalidation {
+        let Some(previous) = previous.as_any().downcast_ref::<DivDiffKey>() else {
+            return Invalidation::all();
+        };
+
+        let mut axes = classify_style_change(&self.style, &previous.style);
+        if self.child_shape != previous.child_shape {
+            axes |= Invalidation::LAYOUT.union(Invalidation::DISPLAY).union(Invalidation::HIT);
+        }
+        axes
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Classify what changed between two [`StyleRefinement`]s into the axes it
+/// affects, per the style-impact split in `docs/retained-layers.md` §2.4.
+///
+/// Checked uniformly against every field this function knows about, and — if
+/// the two refinements differ but none of the checked groups caught it —
+/// falls back to `Invalidation::all()` rather than silently under-invalidating.
+/// This is the same "a miss becomes a rebuild, never wrong output" discipline
+/// `Window::invalid_reuse_range` documents for exactly the same reason: a
+/// hand-maintained field list is the kind of thing that quietly grows a gap
+/// when a new style field is added elsewhere and this function isn't updated
+/// to match.
+pub(crate) fn classify_style_change(new: &StyleRefinement, old: &StyleRefinement) -> Invalidation {
+    if new == old {
+        return Invalidation::empty();
+    }
+
+    let mut axes = Invalidation::empty();
+
+    let layout_changed = new.display != old.display
+        || new.size != old.size
+        || new.min_size != old.min_size
+        || new.max_size != old.max_size
+        || new.aspect_ratio != old.aspect_ratio
+        || new.margin != old.margin
+        || new.padding != old.padding
+        || new.border_widths != old.border_widths
+        || new.inset != old.inset
+        || new.position != old.position
+        || new.align_items != old.align_items
+        || new.align_self != old.align_self
+        || new.align_content != old.align_content
+        || new.justify_content != old.justify_content
+        || new.gap != old.gap
+        || new.flex_direction != old.flex_direction
+        || new.flex_wrap != old.flex_wrap
+        || new.flex_basis != old.flex_basis
+        || new.flex_grow != old.flex_grow
+        || new.flex_shrink != old.flex_shrink
+        || new.grid_cols != old.grid_cols
+        || new.grid_rows != old.grid_rows
+        || new.grid_location != old.grid_location
+        // Font/line-height changes affect intrinsic text size, which affects
+        // layout; color-only text changes are a harmless extra LAYOUT here.
+        || new.text != old.text;
+    if layout_changed {
+        axes |= Invalidation::LAYOUT;
+    }
+
+    let display_changed = new.background != old.background
+        || new.border_color != old.border_color
+        || new.border_style != old.border_style
+        || new.corner_radii != old.corner_radii
+        || new.box_shadow != old.box_shadow
+        || new.opacity != old.opacity
+        || new.filter != old.filter
+        || new.backdrop_filter != old.backdrop_filter
+        || new.visibility != old.visibility
+        || new.text != old.text;
+    if display_changed {
+        axes |= Invalidation::DISPLAY;
+    }
+
+    let hit_changed = new.mouse_cursor != old.mouse_cursor
+        || new.overflow != old.overflow
+        || new.scrollbar_width != old.scrollbar_width
+        || new.allow_concurrent_scroll != old.allow_concurrent_scroll
+        || new.restrict_scroll_to_axis != old.restrict_scroll_to_axis;
+    if hit_changed {
+        axes |= Invalidation::HIT;
+    }
+
+    if axes.is_empty() {
+        // The refinements are unequal (checked above) but nothing this
+        // function classifies caught it — e.g. the `cfg(debug_assertions)`
+        // `debug`/`debug_below` fields, or a field added later and not yet
+        // bucketed here. Never report "unchanged" for a style that isn't.
+        axes = Invalidation::all();
+    }
+    axes
+}
+
+/// Prepaint one child of a `.layer()` subtree, reconciling against its
+/// retained [`ElementInstance`] when eligible, and falling back to a normal
+/// `child.prepaint` for every case reconciliation does not safely cover
+/// (#92): outside any layer, `WGPUI_INSTANCES=0`, no `diff_key`, no retained
+/// instance yet, or the retained one no longer matches.
+///
+/// Mirrors `AnyView::prepaint`'s own reuse-or-rebuild branch (`view.rs`) —
+/// same shape, generalized from one retained slot per view to one per
+/// `InstanceKey`, and gated by `diff_key` equality instead of `dirty_views`
+/// membership.
+fn prepaint_reconciled_child(
+    index: usize,
+    child: &mut AnyElement,
+    child_layout_id: LayoutId,
+    window: &mut Window,
+    cx: &mut App,
+) -> ChildReconciliation {
+    let Some(layer_key) = window.current_prepaint_layer() else {
+        child.prepaint(window, cx);
+        return ChildReconciliation::Untracked;
+    };
+    if !crate::instance::instances_enabled() {
+        child.prepaint(window, cx);
+        return ChildReconciliation::Untracked;
+    }
+
+    let id = child
+        .inner_id()
+        .unwrap_or(ElementId::InstanceSlot(index as u32));
+
+    window.with_instance_slot(id, |window| {
+        let key = window.current_instance_key();
+        // Bounds come from the already-computed Taffy layout — available
+        // regardless of whether this child's own `prepaint` runs, since
+        // `request_layout` (and therefore layout) always runs unconditionally
+        // this phase (see `instance.rs`'s module doc, "What this phase does
+        // not do").
+        let bounds = window.layout_bounds(child_layout_id);
+        let content_mask = window.content_mask();
+        let new_diff_key = child.inner_diff_key(window);
+
+        // Attributes *why* reuse was rejected, purely for the `instance:
+        // rebuilt (*)` counters below — never consulted for the actual
+        // decision, which stays the single `reusable` bool.
+        enum RejectReason {
+            NoRetainedInstance,
+            DiffKeyChanged,
+            BoundsOrMaskChanged,
+            DependencyChanged,
+            StaleRange,
+        }
+
+        let mut reject_reason = RejectReason::NoRetainedInstance;
+        let reusable = new_diff_key.as_ref().is_some_and(|new_key| {
+            let Some(retained) = window
+                .layers
+                .get(&layer_key)
+                .and_then(|layer| layer.instances.get(&key))
+            else {
+                return false;
+            };
+            if new_key.compare(retained.diff_key.as_ref()) != Invalidation::empty() {
+                reject_reason = RejectReason::DiffKeyChanged;
+                return false;
+            }
+            // No partial-translate reuse in this phase — an exact match only,
+            // same as `AnyViewState::cache_key.bounds`.
+            if retained.bounds != bounds || retained.content_mask != content_mask {
+                reject_reason = RejectReason::BoundsOrMaskChanged;
+                return false;
+            }
+            if window.accessed_entity_invalidated(&retained.accessed_entities) {
+                reject_reason = RejectReason::DependencyChanged;
+                return false;
+            }
+            // Bounds-checked the same way `AnyView::prepaint` checks
+            // `AnyViewState`'s ranges before committing to reuse — a stale
+            // range is a rebuild, never a crash.
+            if window
+                .invalid_reuse_range(&retained.prepaint_range, &retained.paint_range)
+                .is_some()
+            {
+                reject_reason = RejectReason::StaleRange;
+                return false;
+            }
+            true
+        });
+
+        if reusable {
+            // Re-fetch rather than holding the borrow from `is_some_and`
+            // above across the mutation below.
+            let range = window.layers[&layer_key].instances[&key]
+                .prepaint_range
+                .clone();
+            crate::render_stats::count("instance: reused");
+            let _t = crate::render_stats::scope("instance: reuse");
+            window.reuse_prepaint(range.clone());
+            // `on_frame` effects must keep firing every frame regardless of
+            // reconciliation, for exactly the reason phase 3 introduced them
+            // — see `Element::on_frame`'s doc comment.
+            window.replay_frame_effects(&range, cx);
+            return ChildReconciliation::Reused {
+                layer: layer_key,
+                key,
+            };
+        }
+
+        let Some(diff_key) = new_diff_key else {
+            // This child's type opted out of `diff_key` entirely (returns
+            // `None` unconditionally, e.g. `Img`, or conditionally, e.g. a
+            // `Div` with hover styling). Nothing to retain; behave exactly as
+            // every element did before this phase.
+            child.prepaint(window, cx);
+            return ChildReconciliation::Untracked;
+        };
+
+        crate::render_stats::count("instance: rebuilt");
+        match reject_reason {
+            RejectReason::NoRetainedInstance => {
+                crate::render_stats::count("instance: rebuilt (first sight)")
+            }
+            RejectReason::DiffKeyChanged => {
+                crate::render_stats::count("instance: rebuilt (diff_key changed)")
+            }
+            RejectReason::BoundsOrMaskChanged => {
+                crate::render_stats::count("instance: rebuilt (bounds changed)")
+            }
+            RejectReason::DependencyChanged => {
+                crate::render_stats::count("instance: rebuilt (dependency changed)")
+            }
+            RejectReason::StaleRange => {
+                crate::render_stats::count("instance: rebuilt (stale range)")
+            }
+        }
+        let _t = crate::render_stats::scope("instance: rebuild");
+        let prepaint_start = window.prepaint_index();
+        let (_, accessed_entities) = cx.detect_accessed_entities(|cx| {
+            child.prepaint(window, cx);
+        });
+        let prepaint_end = window.prepaint_index();
+
+        // Not written into `layer.instances` here — see `ChildReconciliation::Rebuilt`'s
+        // doc comment for why that has to wait for `paint`.
+        ChildReconciliation::Rebuilt {
+            layer: layer_key,
+            key,
+            diff_key,
+            bounds,
+            content_mask,
+            prepaint_range: prepaint_start..prepaint_end,
+            accessed_entities,
+        }
+    })
+}
+
+/// Paint one child of a `.layer()` subtree, acting on the reconciliation
+/// decision `prepaint_reconciled_child` already made (#92). See
+/// [`ChildReconciliation`]'s doc comment for why this does not — and must
+/// not — decide again independently.
+fn paint_reconciled_child(
+    child: &mut AnyElement,
+    reconciliation: ChildReconciliation,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match reconciliation {
+        ChildReconciliation::Untracked => {
+            child.paint(window, cx);
+        }
+        ChildReconciliation::Reused { layer, key } => {
+            crate::render_stats::count("instance: reused (paint)");
+            // The layer record cannot have been evicted since `prepaint` saw
+            // it moments ago in this same draw — eviction only runs once, at
+            // the end of `Window::draw`, after both walks. Handled
+            // defensively rather than with an `expect`, in keeping with this
+            // phase's "a miss is a rebuild, never a crash" discipline: a
+            // vanished entry just paints nothing for this child this frame,
+            // which self-corrects next frame when its `diff_key` no longer
+            // matches anything and it rebuilds.
+            let Some((items, paint_range)) = window
+                .layers
+                .get(&layer)
+                .and_then(|layer| layer.instances.get(&key))
+                .map(|instance| (instance.items.clone(), instance.paint_range.clone()))
+            else {
+                return;
+            };
+            window.reuse_paint_except_scene(&paint_range);
+            window.replay_instance_items(&items);
+        }
+        ChildReconciliation::Rebuilt {
+            layer,
+            key,
+            diff_key,
+            bounds,
+            content_mask,
+            prepaint_range,
+            accessed_entities,
+        } => {
+            let paint_start = window.paint_index();
+            let items_start = window.captured_len();
+            child.paint(window, cx);
+            let paint_end = window.paint_index();
+            let items_end = window.captured_len();
+            let items = window.captured_slice(items_start..items_end);
+
+            // The `Layer` record is guaranteed to exist by now: this whole
+            // child walk is nested inside the `record_layer` call that
+            // creates it, at the latest moments ago, before `f` — the
+            // closure this is nested inside — ran at all. See
+            // `ChildReconciliation::Rebuilt`'s doc comment.
+            if let Some(layer) = window.layers.get_mut(&layer) {
+                layer.instances.insert(
+                    key,
+                    ElementInstance {
+                        diff_key,
+                        bounds,
+                        content_mask,
+                        prepaint_range,
+                        paint_range: paint_start..paint_end,
+                        items,
+                        accessed_entities,
+                    },
+                );
+            }
+        }
     }
 }
 

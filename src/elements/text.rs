@@ -1,13 +1,14 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, WhiteSpace, Window, WrappedLine, WrappedLineLayout,
+    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, Invalidation, LayoutId,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ReconcileKey, SharedString, Size,
+    TextOverflow, TextRun, TextStyle, TooltipId, WhiteSpace, Window, WrappedLine, WrappedLineLayout,
     register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use smallvec::SmallVec;
 use std::{
+    any::Any,
     borrow::Cow,
     cell::{Cell, RefCell},
     mem,
@@ -64,6 +65,13 @@ impl Element for &'static str {
         cx: &mut App,
     ) {
         text_layout.paint(self, window, cx)
+    }
+
+    fn diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        Some(Box::new(TextDiffKey {
+            text: SharedString::from(*self),
+            style: window.text_style(),
+        }))
     }
 }
 
@@ -131,12 +139,55 @@ impl Element for SharedString {
     ) {
         text_layout.paint(self.as_ref(), window, cx)
     }
+
+    fn diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        Some(Box::new(TextDiffKey {
+            text: self.clone(),
+            style: window.text_style(),
+        }))
+    }
 }
 
 impl IntoElement for SharedString {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// Shared [`ReconcileKey`] for `&'static str` and `SharedString` (#92).
+///
+/// `SharedString` wraps a `SmolStr`: short strings are stored inline, longer
+/// ones behind a reference-counted allocation, so comparing a clone of an
+/// unchanged string is cheap either way — nowhere near the cost of the
+/// shaping pass a text-content change requires.
+///
+/// A style change is treated as a full rebuild rather than split further:
+/// unlike `Div`'s style, almost every `TextStyle` field (font, size, weight,
+/// line height) affects shaping, so there is little left to gain from a
+/// finer split here.
+struct TextDiffKey {
+    text: SharedString,
+    style: TextStyle,
+}
+
+impl ReconcileKey for TextDiffKey {
+    fn compare(&self, previous: &dyn ReconcileKey) -> Invalidation {
+        let Some(previous) = previous.as_any().downcast_ref::<TextDiffKey>() else {
+            return Invalidation::all();
+        };
+        if self.style != previous.style {
+            return Invalidation::all();
+        }
+        if self.text == previous.text {
+            Invalidation::empty()
+        } else {
+            Invalidation::LAYOUT.union(Invalidation::DISPLAY)
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
         self
     }
 }

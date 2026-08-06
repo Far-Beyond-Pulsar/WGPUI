@@ -1,10 +1,10 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{any::Any, fs, path::Path, sync::Arc};
 
 use crate::{
     App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
-    StyleRefinement, Styled, TransformationMatrix, Window, geometry::Negate as _, point, px,
-    radians, size,
+    Interactivity, IntoElement, Invalidation, LayoutId, Pixels, Point, Radians, ReconcileKey,
+    SharedString, Size, StyleRefinement, Styled, TransformationMatrix, Window,
+    elements::div::classify_style_change, geometry::Negate as _, point, px, radians, size,
 };
 use crate::util::ResultExt;
 
@@ -160,6 +160,69 @@ impl Element for Svg {
                 }
             },
         )
+    }
+
+    fn diff_key(&self, _window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        // Same reasoning as `Div::diff_key`: resolving hover/focus/active
+        // pseudo-state correctly requires reproducing
+        // `Interactivity::compute_style_internal`'s merge order, which this
+        // method deliberately does not attempt to duplicate.
+        if self.interactivity.hover_style.is_some()
+            || self.interactivity.group_hover_style.is_some()
+            || self.interactivity.active_style.is_some()
+            || self.interactivity.group_active_style.is_some()
+            || self.interactivity.focus_style.is_some()
+            || self.interactivity.in_focus_style.is_some()
+            || self.interactivity.focus_visible_style.is_some()
+            || !self.interactivity.drag_over_styles.is_empty()
+            || !self.interactivity.group_drag_over_styles.is_empty()
+        {
+            return None;
+        }
+
+        // `external_path` resolves through `window.use_asset`, and `paint`
+        // paints nothing at all until that resolves (see the `let Some(bytes)
+        // = ... else { return; }` above). That readiness transition is
+        // invisible to a `&self`-only `diff_key`, for the same reason `Img`
+        // does not implement this method at all (see its module for the
+        // fuller explanation) — reconciling here could freeze an
+        // asset-in-flight SVG in its blank state indefinitely.
+        if self.external_path.is_some() {
+            return None;
+        }
+
+        Some(Box::new(SvgDiffKey {
+            path: self.path.clone(),
+            transformation: self.transformation,
+            style: (*self.interactivity.base_style).clone(),
+        }))
+    }
+}
+
+/// [`Svg`]'s [`ReconcileKey`] (#92). Scoped to the `path` (not `external_path`
+/// — see `diff_key`'s doc comment) case, where nothing about what gets
+/// painted depends on state this key can't see.
+struct SvgDiffKey {
+    path: Option<SharedString>,
+    transformation: Option<Transformation>,
+    style: StyleRefinement,
+}
+
+impl ReconcileKey for SvgDiffKey {
+    fn compare(&self, previous: &dyn ReconcileKey) -> Invalidation {
+        let Some(previous) = previous.as_any().downcast_ref::<SvgDiffKey>() else {
+            return Invalidation::all();
+        };
+
+        let mut axes = classify_style_change(&self.style, &previous.style);
+        if self.path != previous.path || self.transformation != previous.transformation {
+            axes |= Invalidation::DISPLAY;
+        }
+        axes
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

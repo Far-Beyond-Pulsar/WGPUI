@@ -351,8 +351,61 @@ impl Scene {
         }
         count_primitive(&primitive);
         self.push_to_array(&primitive);
+        // Symmetric with `insert_primitive`'s own capture-awareness (#92): if
+        // the innermost layer is actively recording, this replayed primitive
+        // has to land in its new item list too, or the layer's next composite
+        // would be missing it. `composite_layer`, this method's original and
+        // still only caller before #92, always calls `begin_layer(record:
+        // false)`, so `capture_stack.last()`'s items is `None` there and this
+        // is a no-op for it — this only fires for `Window::replay_instance_items`,
+        // called from inside an actively-recording layer while a reconciled
+        // child's paint is being skipped and its retained items re-emitted.
+        if let Some((_, Some(items))) = self.capture_stack.last_mut() {
+            items.push(LayerItem::Primitive(primitive.clone()));
+        }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
+    }
+
+    /// Re-register a raw [`LayerItem`] — specifically a nested-layer reference
+    /// — in the innermost recording layer's item list, without touching any
+    /// primitive array or draw order (#92).
+    ///
+    /// The counterpart to `push_retained` for the other half of
+    /// `Window::replay_instance_items`: a reconciled child's own subtree may
+    /// contain a nested `.layer()` div, which contributes a
+    /// `LayerItem::Nested` reference (see `end_layer`) rather than a
+    /// primitive. Re-registering it here — rather than visiting the nested
+    /// layer to re-derive it — is what lets a reconciled parent skip its
+    /// child's `paint` entirely; the nested layer's own record persists
+    /// independently in `Window::layers` regardless.
+    pub(crate) fn push_captured_item(&mut self, item: LayerItem) {
+        if let Some((_, Some(items))) = self.capture_stack.last_mut() {
+            items.push(item);
+        }
+    }
+
+    /// How many items the innermost recording layer has captured so far
+    /// (#92). Bracketing a reconciled child's contribution — `captured_len`
+    /// before its `paint`, `captured_len` after — is how `Div`'s child loop
+    /// learns which of the capture's items are this child's own, without a
+    /// second, parallel list.
+    pub(crate) fn captured_len(&self) -> usize {
+        self.capture_stack
+            .last()
+            .and_then(|(_, items)| items.as_ref())
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    /// Clone the items the innermost recording layer captured within `range`
+    /// (#92). Paired with `captured_len`; see its doc comment.
+    pub(crate) fn captured_slice(&self, range: Range<usize>) -> Vec<LayerItem> {
+        self.capture_stack
+            .last()
+            .and_then(|(_, items)| items.as_ref())
+            .map(|items| items[range].to_vec())
+            .unwrap_or_default()
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
