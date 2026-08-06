@@ -1774,11 +1774,40 @@ fn winit_mouse_button_to_gpui(button: winit::event::MouseButton) -> MouseButton 
 }
 
 #[derive(Debug)]
-struct CrossDisplay {
+pub(crate) struct CrossDisplay {
     id: crate::DisplayId,
     uuid: uuid::Uuid,
     bounds: crate::Bounds<Pixels>,
     refresh_rate_millihertz: Option<u32>,
+}
+
+impl CrossDisplay {
+    pub(crate) fn from_monitor(monitor: &winit::monitor::MonitorHandle) -> Self {
+        let fingerprint = monitor_fingerprint(monitor);
+
+        Self {
+            id: stable_display_id(&fingerprint, &mut HashSet::new()),
+            uuid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &fingerprint),
+            bounds: Self::display_bounds(monitor),
+            refresh_rate_millihertz: monitor.refresh_rate_millihertz(),
+        }
+    }
+
+    fn display_bounds(monitor: &winit::monitor::MonitorHandle) -> crate::Bounds<Pixels> {
+        let scale_factor = monitor.scale_factor() as f32;
+        let position = monitor.position();
+        let size = monitor.size();
+        crate::Bounds::new(
+            point(
+                Pixels(position.x as f32 / scale_factor),
+                Pixels(position.y as f32 / scale_factor),
+            ),
+            crate::Size {
+                width: Pixels(size.width as f32 / scale_factor),
+                height: Pixels(size.height as f32 / scale_factor),
+            },
+        )
+    }
 }
 
 impl crate::PlatformDisplay for CrossDisplay {
@@ -1821,25 +1850,10 @@ fn collect_displays(
                 primary_display_id = Some(display_id);
             }
 
-            let scale_factor = monitor.scale_factor() as f32;
-            let position = monitor.position();
-            let size = monitor.size();
-            let bounds = crate::Bounds::new(
-                point(
-                    Pixels(position.x as f32 / scale_factor),
-                    Pixels(position.y as f32 / scale_factor),
-                ),
-                crate::Size {
-                    width: Pixels(size.width as f32 / scale_factor),
-                    height: Pixels(size.height as f32 / scale_factor),
-                },
-            );
-            let uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &fingerprint);
-
             Rc::new(CrossDisplay {
                 id: display_id,
-                uuid,
-                bounds,
+                uuid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &fingerprint),
+                bounds: CrossDisplay::display_bounds(&monitor),
                 refresh_rate_millihertz: monitor.refresh_rate_millihertz(),
             }) as Rc<dyn crate::PlatformDisplay>
         })

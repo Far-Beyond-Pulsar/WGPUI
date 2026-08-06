@@ -1,7 +1,7 @@
 use crate::{
     platform::cross::{
-        atlas::WgpuAtlas, dispatcher::CrossEvent, render_context::WgpuContext,
-        renderer::WgpuRenderer, resize_detector::ResizeDetector,
+        atlas::WgpuAtlas, dispatcher::CrossEvent, platform::CrossDisplay,
+        render_context::WgpuContext, renderer::WgpuRenderer, resize_detector::ResizeDetector,
     },
     Bounds, Capslock, Decorations, Modifiers, Pixels, PlatformInputHandler, PlatformWindow, Point,
     ResizeEdge, Size, WgpuSurfaceHandle, WindowAppearance, WindowBackgroundAppearance,
@@ -237,8 +237,8 @@ impl PlatformWindow for CrossWindow {
     }
 
     fn display(&self) -> Option<std::rc::Rc<dyn crate::PlatformDisplay>> {
-        // TODO(mdeand): Add support for querying the display.
-        None
+        let monitor = self.window().current_monitor()?;
+        Some(std::rc::Rc::new(CrossDisplay::from_monitor(&monitor)))
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
