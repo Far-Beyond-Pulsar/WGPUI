@@ -22,16 +22,20 @@
 //!
 //! # What this phase does not do
 //!
-//! `request_layout` — and therefore Taffy node creation, and therefore
-//! `render()` for nested views — still runs unconditionally for every
-//! element, every frame, including reconciled ones. `TaffyLayoutEngine::clear()`
-//! is still called unconditionally at the top of every `Window::draw` until
-//! phase 8 (#93) makes the tree persistent, so a `LayoutId` from last frame is
-//! a dangling handle into a tree that no longer exists this frame. What gets
-//! skipped here is `prepaint` and `paint`: text shaping, primitive emission,
-//! `BoundsTree` insertion, hitbox/dispatch-node registration — reused via the
-//! same bounds-checked index-range-replay mechanism `AnyViewState` (`view.rs`)
-//! already uses for whole views, just keyed at element granularity instead.
+//! `request_layout` — and therefore `render()` for nested views — still runs
+//! unconditionally for every element, every frame, including reconciled
+//! ones; description building was never what this phase (or #93) skips. What
+//! gets skipped here is `prepaint` and `paint`: text shaping, primitive
+//! emission, `BoundsTree` insertion, hitbox/dispatch-node registration —
+//! reused via the same bounds-checked index-range-replay mechanism
+//! `AnyViewState` (`view.rs`) already uses for whole views, just keyed at
+//! element granularity instead.
+//!
+//! Taffy node reuse itself — an `ElementInstance` retaining its `layout:
+//! LayoutId` across frames, and `TaffyLayoutEngine` no longer being
+//! unconditionally cleared — is phase 8 (#93), layered on top of the
+//! `InstanceKey`/`ReconcileKey` machinery this module defines. See
+//! `Window::request_layout_or_reuse` and `TaffyLayoutEngine::end_frame`.
 //!
 //! Reconciliation is also scoped to content painted inside a `.layer()` div's
 //! subtree. `ElementInstance`s live in [`crate::layer::Layer::instances`], so
@@ -42,7 +46,10 @@
 //! ancestor gets no benefit from this phase; it rebuilds every frame exactly
 //! as it does today.
 
-use crate::{Bounds, ContentMask, ElementId, EntityId, Invalidation, PaintIndex, Pixels, PrepaintStateIndex};
+use crate::{
+    Bounds, ContentMask, ElementId, EntityId, Invalidation, LayoutId, PaintIndex, Pixels,
+    PrepaintStateIndex,
+};
 use crate::layer::LayerItem;
 use collections::FxHashSet;
 use std::any::Any;
@@ -112,12 +119,17 @@ pub trait ReconcileKey: Any {
 /// Retained state for one element, from the last frame it was visited.
 ///
 /// Lives in [`crate::layer::Layer::instances`], keyed by [`InstanceKey`].
-/// Note what is *not* here: a `LayoutId`. Retaining one would be retaining a
-/// handle into a Taffy tree that gets cleared every frame until #93 — see the
-/// module doc's "What this phase does not do".
 pub(crate) struct ElementInstance {
     /// Last frame's fingerprint, compared against this frame's fresh one.
     pub diff_key: Box<dyn ReconcileKey>,
+    /// This element's own Taffy node (#93). Valid to hand back to
+    /// `TaffyLayoutEngine::reuse` for as long as this entry survives — which
+    /// is exactly as long as the node itself does, since both die together:
+    /// a rebuild that replaces this entry also creates a fresh node (the old
+    /// one simply goes untouched and is swept at end of frame, see
+    /// `TaffyLayoutEngine::end_frame`), and a layer eviction that clears this
+    /// entry leaves the node to be swept the same way.
+    pub layout: LayoutId,
     /// Resolved bounds at last prepaint. Reuse requires an exact match — no
     /// partial-translate reuse in this phase; that is `TRANSFORM`-axis
     /// territory a future phase can add without changing this shape.

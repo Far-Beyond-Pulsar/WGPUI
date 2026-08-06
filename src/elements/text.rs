@@ -38,7 +38,8 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, window, cx);
+        let diff_key = self.diff_key(window);
+        let layout_id = state.layout(SharedString::from(*self), None, diff_key.as_deref(), window, cx);
         (layout_id, state)
     }
 
@@ -111,7 +112,8 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, window, cx);
+        let diff_key = self.diff_key(window);
+        let layout_id = state.layout(self.clone(), None, diff_key.as_deref(), window, cx);
         (layout_id, state)
     }
 
@@ -321,7 +323,11 @@ impl Element for StyledText {
             })
         });
 
-        let layout_id = self.layout.layout(self.text.clone(), runs, window, cx);
+        // `StyledText` does not implement `Element::diff_key` (out of scope
+        // for #92 — highlight ranges are not covered by `TextDiffKey`), so
+        // `None` here — never eligible for #93 reuse — is simply correct,
+        // not a shortcut around computing something.
+        let layout_id = self.layout.layout(self.text.clone(), runs, None, window, cx);
         (layout_id, ())
     }
 
@@ -377,6 +383,7 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
+        diff_key: Option<&dyn ReconcileKey>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -391,7 +398,7 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        window.request_measured_layout(Default::default(), {
+        window.request_measured_layout_or_reuse(diff_key, Default::default(), {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {

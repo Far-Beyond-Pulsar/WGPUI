@@ -1513,6 +1513,12 @@ enum ChildReconciliation {
         content_mask: ContentMask<Pixels>,
         prepaint_range: Range<crate::PrepaintStateIndex>,
         accessed_entities: FxHashSet<EntityId>,
+        /// This child's own Taffy node for this frame (#93) — whatever
+        /// `request_layout.child_layout_ids[i]` already resolved to, whether
+        /// freshly created or itself reused. Carried through rather than
+        /// re-derived so `ElementInstance::layout` always names the node this
+        /// frame actually used, matching every other field here.
+        layout: LayoutId,
     },
 }
 
@@ -1572,12 +1578,31 @@ impl Element for Div {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut child_layout_ids = SmallVec::new();
+
+        // #93: computed up front, before `self.interactivity` is borrowed by
+        // the `request_layout` call below — `Element::diff_key` takes `&self`
+        // as a whole (it reads `self.children` too, for the recursive
+        // fingerprint), which would conflict with that call's own `&mut
+        // self.interactivity` borrow if computed from inside it.
+        let diff_key = self.diff_key(window);
+
         let image_cache = self
             .image_cache
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
-        let layout_id = window.with_image_cache(image_cache, |window| {
+        // #93: same identity this div would use as a `.layer()` root for
+        // `prepaint`/`paint` (see `Div::prepaint`'s `layer_key`) — computed
+        // here too so `layout_layer_stack` can mirror `hitbox_layer_stack`'s
+        // scoping one phase earlier.
+        let layer_key = self
+            .interactivity
+            .layer
+            .as_ref()
+            .zip(global_id)
+            .map(|(_, global_id)| LayerKey::from_global_element_id(global_id));
+
+        let mut request = |window: &mut Window| {
             self.interactivity.request_layout(
                 global_id,
                 inspector_id,
@@ -1588,12 +1613,39 @@ impl Element for Div {
                         child_layout_ids = self
                             .children
                             .iter_mut()
-                            .map(|child| child.request_layout(window, cx))
+                            .enumerate()
+                            .map(|(index, child)| {
+                                let id = child
+                                    .inner_id()
+                                    .unwrap_or(ElementId::InstanceSlot(index as u32));
+                                // #93: pushed for the sole purpose of letting
+                                // this child's own `request_layout` — several
+                                // stack frames down, inside `child.request_layout`
+                                // — resolve `window.current_instance_key()` to
+                                // its own path when it reaches its own
+                                // `request_layout_or_reuse` call. Mirrors
+                                // `prepaint_reconciled_child`'s identical push,
+                                // one phase earlier, for the identical reason.
+                                window.with_instance_slot(id, |window| {
+                                    child.request_layout(window, cx)
+                                })
+                            })
                             .collect::<SmallVec<_>>();
-                        window.request_layout(style, child_layout_ids.iter().copied(), cx)
+
+                        window.request_layout_or_reuse(
+                            diff_key.as_deref(),
+                            style,
+                            child_layout_ids.iter().copied(),
+                            cx,
+                        )
                     })
                 },
             )
+        };
+
+        let layout_id = window.with_image_cache(image_cache, |window| match layer_key {
+            Some(key) => window.with_layout_layer(key, request),
+            None => request(window),
         });
 
         (layout_id, DivFrameState { child_layout_ids })
@@ -2187,6 +2239,7 @@ fn prepaint_reconciled_child(
             content_mask,
             prepaint_range: prepaint_start..prepaint_end,
             accessed_entities,
+            layout: child_layout_id,
         }
     })
 }
@@ -2234,6 +2287,7 @@ fn paint_reconciled_child(
             content_mask,
             prepaint_range,
             accessed_entities,
+            layout,
         } => {
             let paint_start = window.paint_index();
             let items_start = window.captured_len();
@@ -2258,6 +2312,7 @@ fn paint_reconciled_child(
                         paint_range: paint_start..paint_end,
                         items,
                         accessed_entities,
+                        layout,
                     },
                 );
             }
