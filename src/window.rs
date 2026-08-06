@@ -9018,13 +9018,12 @@ mod test {
     // Element instances + reconciliation (#92)
     // -------------------------------------------------------------------
 
-    /// A view with a `.layer()` div wrapping a reconciled `Div` child around a
-    /// canvas that counts its own paints — same technique `LayerView`'s canvas
-    /// uses for "composited vs re-rendered", one level finer: this counter
-    /// distinguishes "this *instance* was skipped" from "this instance
-    /// rebuilt", inside a layer that is itself re-rendering.
+    /// A view with a `.layer()` div wrapping a reconciled `Div` child — a
+    /// leaf with static-shaped, no-pseudo-state styling, so it is eligible
+    /// for `diff_key` and, unlike a `canvas` (which has no `diff_key` at all
+    /// and, per the recursion fix, would force every ancestor above it to
+    /// always be treated as changed), can legitimately be judged reusable.
     struct InstanceView {
-        child_paints: std::rc::Rc<std::cell::Cell<usize>>,
         /// Drives the reconciled child's own style, so changing it is a real
         /// content change from that child's point of view.
         visible: bool,
@@ -9036,7 +9035,6 @@ mod test {
 
     impl crate::Render for InstanceView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let child_paints = self.child_paints.clone();
             let opacity = if self.visible { 1.0 } else { 0.5 };
             crate::div().size_full().child(
                 crate::div()
@@ -9055,64 +9053,74 @@ mod test {
                             .opacity(opacity)
                             .w(px(50.))
                             .h(px(50.))
-                            .child(crate::canvas(
-                                |_, _, _| (),
-                                move |bounds, _, window, _| {
-                                    child_paints.set(child_paints.get() + 1);
-                                    window.paint_quad(crate::fill(bounds, crate::blue()));
-                                },
-                            )),
+                            .bg(crate::red()),
                     ),
             )
         }
     }
 
-    fn instance_view_window(
-        cx: &mut TestAppContext,
-    ) -> (
-        crate::WindowHandle<InstanceView>,
-        std::rc::Rc<std::cell::Cell<usize>>,
-    ) {
-        let child_paints = std::rc::Rc::new(std::cell::Cell::new(0));
-        let child_paints_for_view = child_paints.clone();
+    fn instance_view_window(cx: &mut TestAppContext) -> crate::WindowHandle<InstanceView> {
         let window = cx.open_window(size(px(800.), px(600.)), move |_, _| InstanceView {
-            child_paints: child_paints_for_view,
             visible: true,
             unrelated: 0,
         });
         cx.run_until_parked();
-        (window, child_paints)
+        window
     }
 
     fn instances_off() -> bool {
         !crate::instance::instances_enabled()
     }
 
+    /// The address of the `diff_key` allocation the window's one
+    /// `.layer()` subtree's single `ElementInstance` currently holds.
+    ///
+    /// A mechanical, unambiguous reuse signal — unlike comparing recorded
+    /// *values* (a paint range, say), which can coincidentally match across
+    /// a rebuild whenever two frames happen to paint the same amount of
+    /// content at the same scene offset. `Layer::instances`'s entry for a
+    /// reused child is never touched at all (see `prepaint_reconciled_child`'s
+    /// `Reused` branch — no `.insert()` call on that path), so its `diff_key`
+    /// `Box` survives with the same address; a rebuild always replaces the
+    /// entry with a freshly allocated one.
+    fn the_instance_diff_key_address(
+        window: crate::WindowHandle<InstanceView>,
+        cx: &mut TestAppContext,
+    ) -> usize {
+        window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().expect("the layer exists");
+                let instance = this.layers[&key]
+                    .instances
+                    .values()
+                    .next()
+                    .expect("the reconciled child retained an ElementInstance");
+                std::ptr::from_ref(instance.diff_key.as_ref()) as *const () as usize
+            })
+            .unwrap()
+    }
+
     /// The phase's headline acceptance: inside a layer that *is* re-rendering
     /// (because its view was notified), a child whose own description did not
-    /// change skips `prepaint`/`paint` — it does not merely happen to look
-    /// unchanged, it is not walked at all, which the paint counter proves
-    /// directly, the same way `an_unchanged_layer_composites_instead_of_re_rendering`
-    /// proves layer-level compositing.
+    /// change skips `prepaint`/`paint` entirely — its `ElementInstance` entry
+    /// is left untouched, not merely rebuilt to an equivalent value — while a
+    /// child whose description genuinely changed gets a freshly recorded one.
     #[gpui::test]
     fn an_unchanged_child_inside_a_re_rendering_layer_skips_paint(cx: &mut TestAppContext) {
         if layers_off() || instances_off() {
             return;
         }
-        let (window, child_paints) = instance_view_window(cx);
-        let painted_once = child_paints.get();
-        assert_eq!(painted_once, 1, "the first frame paints the reconciled child");
-
+        let window = instance_view_window(cx);
         window
             .update(cx, |_, this, _| {
                 assert_eq!(this.layers.len(), 1, "the `.layer()` div created a layer");
-                let key = *this.layers.keys().next().unwrap();
                 assert!(
-                    !this.layers[&key].instances.is_empty(),
+                    !this.layers.values().next().unwrap().instances.is_empty(),
                     "the first frame must retain an ElementInstance for the reconciled child"
                 );
             })
             .unwrap();
+        let address_after_first_frame = the_instance_diff_key_address(window, cx);
 
         // Force the layer to re-render — not composite — by notifying its
         // owning view, without touching anything the reconciled child's
@@ -9126,14 +9134,15 @@ mod test {
         cx.run_until_parked();
 
         assert_eq!(
-            child_paints.get(),
-            painted_once,
+            the_instance_diff_key_address(window, cx),
+            address_after_first_frame,
             "an unrelated notify that forces the layer to re-render must not repaint a \
-             child whose own description is unchanged"
+             child whose own description is unchanged — its ElementInstance entry must \
+             be left untouched, not merely rebuilt to an equivalent value"
         );
 
         // Now change what the reconciled child's own style actually is, and
-        // notify again — this must repaint.
+        // notify again — this must repaint, recording a fresh range.
         window
             .update(cx, |view, _, cx| {
                 view.visible = false;
@@ -9142,32 +9151,32 @@ mod test {
             .unwrap();
         cx.run_until_parked();
 
-        assert_eq!(
-            child_paints.get(),
-            painted_once + 1,
-            "a real change to the reconciled child's own style must still repaint it"
-        );
-
-        // And a further clean round (no notify at all) must not repaint it
-        // again — this is the ordinary layer-composite path taking over now
-        // that nothing has been notified.
-        clean_frame(cx, window.into());
-        assert_eq!(
-            child_paints.get(),
-            painted_once + 1,
-            "a clean frame must not repaint anything"
+        assert_ne!(
+            the_instance_diff_key_address(window, cx),
+            address_after_first_frame,
+            "a real change to the reconciled child's own style must still repaint it, \
+             recording a freshly allocated ElementInstance entry"
         );
     }
 
-    /// `WGPUI_INSTANCES=0` must reproduce pre-#92 behaviour exactly: every
-    /// notified layer re-renders every child in it, every time.
+    /// `WGPUI_INSTANCES=0` must reproduce pre-#92 behaviour exactly: no
+    /// `ElementInstance` is ever retained, notified or not.
     #[gpui::test]
     fn disabling_instances_rebuilds_every_child_on_every_notify(cx: &mut TestAppContext) {
         if layers_off() || !instances_off() {
             return;
         }
-        let (window, child_paints) = instance_view_window(cx);
-        let painted_once = child_paints.get();
+        let window = instance_view_window(cx);
+
+        window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().unwrap();
+                assert!(
+                    this.layers[&key].instances.is_empty(),
+                    "WGPUI_INSTANCES=0 must retain no ElementInstances at all"
+                );
+            })
+            .unwrap();
 
         window
             .update(cx, |view, _, cx| {
@@ -9177,12 +9186,92 @@ mod test {
             .unwrap();
         cx.run_until_parked();
 
+        window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().unwrap();
+                assert!(
+                    this.layers[&key].instances.is_empty(),
+                    "WGPUI_INSTANCES=0 must never start retaining ElementInstances"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Regression test for the bug `DivDiffKey`'s recursive children fixes: a
+    /// `Div` with no id and static style, wrapping a `Text` child whose
+    /// content is driven by view state. Before the fix, `DivDiffKey` only
+    /// snapshotted the wrapper's own style plus a per-slot identity/type
+    /// shape — it never looked at what each child's *own* description
+    /// contained, so a content-only change several levels down (here: the
+    /// text) went undetected and the whole subtree replayed stale.
+    struct GrandchildTextView {
+        text: std::rc::Rc<std::cell::RefCell<crate::SharedString>>,
+        wrapper_paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for GrandchildTextView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let text = self.text.borrow().clone();
+            let wrapper_paints = self.wrapper_paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(100.))
+                    .h(px(100.))
+                    .child(
+                        // The reconciled unit under test: static style, no
+                        // id, one text child whose *content* varies. The
+                        // canvas sibling counts every time this div's own
+                        // `paint` actually runs — the same technique
+                        // `LayerView`/`InstanceView` already use, just one
+                        // level deeper.
+                        crate::div().w(px(90.)).h(px(90.)).child(text).child(
+                            crate::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    wrapper_paints.set(wrapper_paints.get() + 1);
+                                    window.paint_quad(crate::fill(bounds, crate::blue()));
+                                },
+                            )
+                            .w(px(1.))
+                            .h(px(1.)),
+                        ),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_grandchild_content_change_is_not_missed(cx: &mut TestAppContext) {
+        if layers_off() || instances_off() {
+            return;
+        }
+        let text = std::rc::Rc::new(std::cell::RefCell::new(crate::SharedString::from("AAAA")));
+        let wrapper_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let text_for_view = text.clone();
+        let wrapper_paints_for_view = wrapper_paints.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| GrandchildTextView {
+            text: text_for_view,
+            wrapper_paints: wrapper_paints_for_view,
+        });
+        cx.run_until_parked();
+        let painted_once = wrapper_paints.get();
+        assert_eq!(painted_once, 1, "the first frame paints the wrapper once");
+
+        *text.borrow_mut() = crate::SharedString::from("this is a much longer string of text");
+        window.update(cx, |view, _, cx| { let _ = view; cx.notify(); }).unwrap();
+        cx.run_until_parked();
+
         assert_eq!(
-            child_paints.get(),
+            wrapper_paints.get(),
             painted_once + 1,
-            "with instances disabled, a notify that re-renders the layer must repaint \
-             every child in it, unchanged or not — the exact pre-#92 behaviour \
-             WGPUI_INSTANCES=0 exists to preserve"
+            "a text grandchild's content change must still repaint its ancestor \
+             even when the ancestor's own style and per-slot identity/type shape \
+             are unchanged"
         );
     }
 

@@ -1854,34 +1854,58 @@ impl Element for Div {
             return None;
         }
 
-        let child_shape = self
+        let children = self
             .children
             .iter()
-            .map(|child| child.inner_id())
+            .map(|child| ChildFingerprint {
+                id: child.inner_id(),
+                diff_key: child.inner_diff_key(_window),
+            })
             .collect();
 
         Some(Box::new(DivDiffKey {
             style: (*self.interactivity.base_style).clone(),
-            child_shape,
+            children,
         }))
     }
 }
 
-/// [`Div`]'s [`ReconcileKey`]: the authored style plus a cheap structural
-/// summary of its children.
+/// One child's contribution to its parent's [`DivDiffKey`]: identity plus the
+/// child's *own* fingerprint, so a content-only change several levels down a
+/// static-shaped tree still surfaces at every ancestor that has to decide
+/// whether it can skip its own `prepaint`/`paint`.
 ///
-/// Deliberately does *not* embed each child's own [`InstanceKey`] or content —
-/// per-child reconciliation is a separate, independent walk (see `Div`'s
-/// `prepaint`/`paint` child loops), not something this key needs to validate.
-/// This key only has to answer "should *this* div, as a unit, be treated as
-/// changed by whatever is looking it up" — which for a div is its own style,
-/// plus whether its child list changed shape at all (a structural change like
-/// an insertion or reorder is `LAYOUT | DISPLAY | HIT` for the parent, even
-/// though each *surviving* child still reconciles independently on its own
-/// next visit).
+/// A fix for a real bug (found while designing #93): the previous version of
+/// this key recorded only `Option<ElementId>` per slot — identity and type,
+/// never content. A `Div` with no id and static style, wrapping a `Text`
+/// child whose *content* changed, compared equal against last frame and
+/// skipped its whole subtree, replaying the stale text. See
+/// `window.rs`'s `a_grandchild_content_change_is_not_missed` test.
+struct ChildFingerprint {
+    id: Option<ElementId>,
+    diff_key: Option<Box<dyn ReconcileKey>>,
+}
+
+/// [`Div`]'s [`ReconcileKey`]: the authored style, plus each child's own
+/// fingerprint (recursively — see [`ChildFingerprint`]).
+///
+/// This key has to answer "should *this* div, as a unit, be treated as
+/// changed by whatever is looking it up" — and since a div's own rendered
+/// output *is* its children's rendered output, that question cannot be
+/// answered from the div's own style and child identities alone; it requires
+/// knowing whether anything *inside* those children changed too. This is the
+/// same reason `React.memo` compares props recursively rather than by
+/// reference identity of the element itself — a parent's "nothing to redo"
+/// claim is only sound if it is a claim about everything it contains, not
+/// just about itself.
+///
+/// The recursive walk costs about what building this frame's `Description`
+/// already costs — both walk the same tree, touching only plain fields, no
+/// layout/prepaint/paint/shaping — which is the "genuinely cheap" work this
+/// phase was never trying to skip (`instance.rs`'s module doc).
 struct DivDiffKey {
     style: StyleRefinement,
-    child_shape: SmallVec<[Option<ElementId>; 4]>,
+    children: SmallVec<[ChildFingerprint; 4]>,
 }
 
 impl ReconcileKey for DivDiffKey {
@@ -1891,9 +1915,38 @@ impl ReconcileKey for DivDiffKey {
         };
 
         let mut axes = classify_style_change(&self.style, &previous.style);
-        if self.child_shape != previous.child_shape {
-            axes |= Invalidation::LAYOUT.union(Invalidation::DISPLAY).union(Invalidation::HIT);
+
+        if self.children.len() != previous.children.len() {
+            // A structural change (insertion/removal) — no per-slot
+            // comparison is meaningful, and every axis a child could have
+            // affected must be assumed touched.
+            return axes.union(Invalidation::all());
         }
+
+        for (new_child, old_child) in self.children.iter().zip(previous.children.iter()) {
+            if new_child.id != old_child.id {
+                // A different identity/type at this slot — same "cannot
+                // reuse across a type change" rule `ReconcileKey::compare`'s
+                // own contract states; the mismatch is caught here rather
+                // than via a failed downcast because the type only differs
+                // one level down, invisible to *this* key's own downcast.
+                axes |= Invalidation::all();
+                continue;
+            }
+            match (&new_child.diff_key, &old_child.diff_key) {
+                (Some(new_key), Some(old_key)) => {
+                    axes |= new_key.compare(old_key.as_ref());
+                }
+                // Either side (or both) opted out of `diff_key` entirely —
+                // most commonly `Img`, or a `Div`/`Svg` with pseudo-state
+                // styling. Nothing proves this slot is unchanged, so assume
+                // it is — the same conservative default `diff_key`'s own
+                // `None` case establishes at the top level, just applied one
+                // level down instead of only at the root of the comparison.
+                _ => axes |= Invalidation::all(),
+            }
+        }
+
         axes
     }
 
