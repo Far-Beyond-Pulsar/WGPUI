@@ -10,7 +10,7 @@ use crate::{
     Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, ElementGeometry, Entity, EntityId,
     EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId, GlyphId,
-    GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    GpuSpecs, Hsla, InputHandler, InstanceKey, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     KeyUpEvent, Keystroke, KeystrokeEvent, LayerId, LayerKey, LayerPolicy, LayerTransform,
     LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton,
     MouseDownEvent, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
@@ -107,13 +107,21 @@ impl DispatchPhase {
 /// a self-perpetuating frame cost and should be visible rather than silent.
 const DEFERRED_NOTIFY_LOOP_WARN_DRAWS: u32 = 120;
 
-/// Identifies one retained element instance.
+/// Identifies one retained element instance, for the purpose of naming it in
+/// an explicit [`InvalidationRequest`].
 ///
 /// Defined alongside [`InvalidationScope`] rather than with the machinery that
 /// will produce it, so that the scope enum is complete from the start and later
 /// phases add behaviour to a variant instead of reshaping the type and every
-/// match on it. Nothing constructs one yet; the representation is provisional.
-/// [`LayerKey`], defined the same way, is now real — see [`crate::layer`].
+/// match on it. **Still nothing constructs one** — #92 gave retained element
+/// instances a real, address-by-value key, [`InstanceKey`] (`instance.rs`),
+/// but reconciliation decides reuse by comparing `diff_key`s at prepaint/paint
+/// time, not by consulting an explicit invalidation request naming an
+/// `InstanceId`. Wiring an `Instance`-scoped `InvalidationRequest` producer —
+/// for a future caller that wants to force one specific instance dirty
+/// directly, the way `Window::invalidate_layer` does for a whole layer — is
+/// separable follow-up work, not something #92 needed. `LayerKey`, defined the
+/// same way as this type once was, is now real — see [`crate::layer`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InstanceId(pub u64);
 
@@ -1359,6 +1367,17 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) retained_layer_stack: Vec<LayerKey>,
     pub(crate) hitbox_layer_stack: Vec<(LayerKey, Point<Pixels>)>,
+    /// Parallel to `element_id_stack`, but pushed only around a `.layer()`
+    /// subtree's children (#92) and never read by anything predating this
+    /// phase. Each entry is either a child's own `ElementId` or a synthetic
+    /// `ElementId::InstanceSlot` for a child that has none, which is what lets
+    /// `InstanceKey` address elements — bare `div()`, all of `Text` — that
+    /// never call `.id(...)`. Kept separate from `element_id_stack` on purpose:
+    /// folding positional segments into that stack would shift every existing
+    /// `GlobalElementId` (and therefore every `LayerKey` and `with_element_state`
+    /// key) derived from it, for no benefit to systems that don't need instance
+    /// identity.
+    pub(crate) instance_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
@@ -1855,6 +1874,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             retained_layer_stack: Vec::new(),
             hitbox_layer_stack: Vec::new(),
+            instance_id_stack: SmallVec::default(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
@@ -4574,8 +4594,9 @@ impl Window {
     /// same identity instead of being seen as new. The record itself is dropped
     /// after a further interval.
     ///
-    /// This is what will bound retained *instance* memory in #92: instances are
-    /// owned by layers and die with them.
+    /// This is also what bounds retained *instance* memory (#92,
+    /// [`Layer::instances`]): instances are owned by layers and die with them,
+    /// via `Layer::drop_content` below.
     fn evict_stale_layers(&mut self) {
         let frame = self.layer_frame;
         let mut dropped_content = 0usize;
@@ -5300,6 +5321,81 @@ impl Window {
         let result = f(self);
         self.hitbox_layer_stack.pop();
         result
+    }
+
+    /// The layer a `.layer()` div's *children* are currently being prepainted
+    /// inside, if any (#92). Read from `hitbox_layer_stack`, which
+    /// `with_layer_hitbox_scope` already keeps correctly scoped to exactly
+    /// this — see that method's own doc comment.
+    pub(crate) fn current_prepaint_layer(&self) -> Option<LayerKey> {
+        self.hitbox_layer_stack.last().map(|(key, _)| *key)
+    }
+
+    // A paint-time counterpart (`current_paint_layer`, reading
+    // `retained_layer_stack`) is deliberately not exposed: `paint_reconciled_child`
+    // (div.rs, #92) needs the *same* `LayerKey` `prepaint_reconciled_child`
+    // already resolved, not a freshly re-queried one — see `ChildReconciliation`'s
+    // doc comment for why re-deriving it independently at paint time would be
+    // wrong. It travels from prepaint to paint inside `ChildReconciliation`
+    // instead.
+
+    /// Run `f` with `id` pushed onto `instance_id_stack`, so that any
+    /// `InstanceKey` computed inside `f` — including one for a
+    /// grandchild several levels deeper — includes this segment in its path
+    /// (#92). Mirrors `element_id_stack`'s own push/pop discipline
+    /// (`with_id`), kept as a separate stack for the reasons given on
+    /// `Window::instance_id_stack`'s doc comment.
+    pub(crate) fn with_instance_slot<R>(&mut self, id: ElementId, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.instance_id_stack.push(id);
+        let result = f(self);
+        self.instance_id_stack.pop();
+        result
+    }
+
+    /// The `InstanceKey` for the element addressed by the current
+    /// `instance_id_stack` (#92). Call this right after `with_instance_slot`
+    /// has pushed the element's own segment, before recursing further into
+    /// it — the stack at that point is exactly this element's path.
+    pub(crate) fn current_instance_key(&self) -> InstanceKey {
+        InstanceKey::from_path(&self.instance_id_stack)
+    }
+
+    /// Re-emit a reconciled `ElementInstance`'s retained items into the layer
+    /// currently being (re-)recorded, preserving the layer-local draw orders
+    /// they were recorded with (#92).
+    ///
+    /// Mirrors `composite_layer`'s replay of a *whole* layer, at instance
+    /// granularity: a retained primitive goes through `Scene::push_retained`
+    /// (no `BoundsTree` insert, no re-derivation of z), and a nested `.layer()`
+    /// reference is re-registered as-is so the enclosing recorder still learns
+    /// it was nested here. Must only be called while a layer is actively
+    /// recording (`Scene::begin_layer(.., record: true)` open) — i.e. from
+    /// inside the same paint walk `current_paint_layer` reports as active —
+    /// or the re-emitted items are silently dropped on the floor instead of
+    /// landing in the new capture, exactly as `push_retained`'s own
+    /// capture-awareness requires.
+    pub(crate) fn replay_instance_items(&mut self, items: &[LayerItem]) {
+        for item in items {
+            match item {
+                LayerItem::Primitive(primitive) => self.next_frame.scene.push_retained(primitive),
+                LayerItem::Nested(key) => self.next_frame.scene.push_captured_item(LayerItem::Nested(*key)),
+            }
+        }
+    }
+
+    /// How many items the innermost recording layer has captured so far
+    /// (#92). Bracket a child's own contribution to a layer's retained
+    /// `items` — `captured_len` before its `paint`, `captured_len` after —
+    /// the same way `paint_index` brackets its contribution to the other
+    /// paint-phase arrays. See `Scene::captured_len`.
+    pub(crate) fn captured_len(&self) -> usize {
+        self.next_frame.scene.captured_len()
+    }
+
+    /// Clone the items the innermost recording layer captured within `range`
+    /// (#92). Paired with `captured_len`; see `Scene::captured_slice`.
+    pub(crate) fn captured_slice(&self, range: Range<usize>) -> Vec<LayerItem> {
+        self.next_frame.scene.captured_slice(range)
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
@@ -7096,6 +7192,17 @@ pub enum ElementId {
     NamedChild(Arc<ElementId>, SharedString),
     /// A byte array ID (used for text-anchors)
     OpaqueId([u8; 20]),
+    /// A synthetic, framework-assigned positional identity for an element
+    /// that has no author-supplied [`ElementId`].
+    ///
+    /// Framework-internal (#92): pushed only onto [`Window::instance_id_stack`],
+    /// never onto [`Window::element_id_stack`], and never constructed by any
+    /// public `From` impl — so it can never collide with an author's own
+    /// `ElementId::Integer`. It exists so [`InstanceKey`](crate::instance::InstanceKey)
+    /// can address the majority of elements (bare `div()`, all of `Text`) that
+    /// never call `.id(...)`, the same way [`LayerKey`] addresses elements that
+    /// do.
+    InstanceSlot(u32),
 }
 
 impl ElementId {
@@ -7118,6 +7225,7 @@ impl Display for ElementId {
             ElementId::CodeLocation(location) => write!(f, "{}", location)?,
             ElementId::NamedChild(id, name) => write!(f, "{}-{}", id, name)?,
             ElementId::OpaqueId(opaque_id) => write!(f, "{:x?}", opaque_id)?,
+            ElementId::InstanceSlot(slot) => write!(f, "#{}", slot)?,
         }
 
         Ok(())
@@ -8904,6 +9012,178 @@ mod test {
                 );
             })
             .unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Element instances + reconciliation (#92)
+    // -------------------------------------------------------------------
+
+    /// A view with a `.layer()` div wrapping a reconciled `Div` child around a
+    /// canvas that counts its own paints — same technique `LayerView`'s canvas
+    /// uses for "composited vs re-rendered", one level finer: this counter
+    /// distinguishes "this *instance* was skipped" from "this instance
+    /// rebuilt", inside a layer that is itself re-rendering.
+    struct InstanceView {
+        child_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        /// Drives the reconciled child's own style, so changing it is a real
+        /// content change from that child's point of view.
+        visible: bool,
+        /// Bumped and notified to force the *layer* to re-render — without
+        /// touching anything the reconciled child's `diff_key` reads — so a
+        /// round can distinguish "notified but unchanged" from "changed".
+        unrelated: usize,
+    }
+
+    impl crate::Render for InstanceView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let child_paints = self.child_paints.clone();
+            let opacity = if self.visible { 1.0 } else { 0.5 };
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    // Positioned away from the test platform's (0,0) mouse
+                    // position, the same reason `LayerView` does this: a
+                    // layer under the pointer always re-renders.
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(100.))
+                    .h(px(100.))
+                    .child(
+                        crate::div()
+                            .opacity(opacity)
+                            .w(px(50.))
+                            .h(px(50.))
+                            .child(crate::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    child_paints.set(child_paints.get() + 1);
+                                    window.paint_quad(crate::fill(bounds, crate::blue()));
+                                },
+                            )),
+                    ),
+            )
+        }
+    }
+
+    fn instance_view_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        crate::WindowHandle<InstanceView>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let child_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let child_paints_for_view = child_paints.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| InstanceView {
+            child_paints: child_paints_for_view,
+            visible: true,
+            unrelated: 0,
+        });
+        cx.run_until_parked();
+        (window, child_paints)
+    }
+
+    fn instances_off() -> bool {
+        !crate::instance::instances_enabled()
+    }
+
+    /// The phase's headline acceptance: inside a layer that *is* re-rendering
+    /// (because its view was notified), a child whose own description did not
+    /// change skips `prepaint`/`paint` — it does not merely happen to look
+    /// unchanged, it is not walked at all, which the paint counter proves
+    /// directly, the same way `an_unchanged_layer_composites_instead_of_re_rendering`
+    /// proves layer-level compositing.
+    #[gpui::test]
+    fn an_unchanged_child_inside_a_re_rendering_layer_skips_paint(cx: &mut TestAppContext) {
+        if layers_off() || instances_off() {
+            return;
+        }
+        let (window, child_paints) = instance_view_window(cx);
+        let painted_once = child_paints.get();
+        assert_eq!(painted_once, 1, "the first frame paints the reconciled child");
+
+        window
+            .update(cx, |_, this, _| {
+                assert_eq!(this.layers.len(), 1, "the `.layer()` div created a layer");
+                let key = *this.layers.keys().next().unwrap();
+                assert!(
+                    !this.layers[&key].instances.is_empty(),
+                    "the first frame must retain an ElementInstance for the reconciled child"
+                );
+            })
+            .unwrap();
+
+        // Force the layer to re-render — not composite — by notifying its
+        // owning view, without touching anything the reconciled child's
+        // `diff_key` reads (`visible` stays put).
+        window
+            .update(cx, |view, _, cx| {
+                view.unrelated += 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            child_paints.get(),
+            painted_once,
+            "an unrelated notify that forces the layer to re-render must not repaint a \
+             child whose own description is unchanged"
+        );
+
+        // Now change what the reconciled child's own style actually is, and
+        // notify again — this must repaint.
+        window
+            .update(cx, |view, _, cx| {
+                view.visible = false;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            child_paints.get(),
+            painted_once + 1,
+            "a real change to the reconciled child's own style must still repaint it"
+        );
+
+        // And a further clean round (no notify at all) must not repaint it
+        // again — this is the ordinary layer-composite path taking over now
+        // that nothing has been notified.
+        clean_frame(cx, window.into());
+        assert_eq!(
+            child_paints.get(),
+            painted_once + 1,
+            "a clean frame must not repaint anything"
+        );
+    }
+
+    /// `WGPUI_INSTANCES=0` must reproduce pre-#92 behaviour exactly: every
+    /// notified layer re-renders every child in it, every time.
+    #[gpui::test]
+    fn disabling_instances_rebuilds_every_child_on_every_notify(cx: &mut TestAppContext) {
+        if layers_off() || !instances_off() {
+            return;
+        }
+        let (window, child_paints) = instance_view_window(cx);
+        let painted_once = child_paints.get();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.unrelated += 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            child_paints.get(),
+            painted_once + 1,
+            "with instances disabled, a notify that re-renders the layer must repaint \
+             every child in it, unchanged or not — the exact pre-#92 behaviour \
+             WGPUI_INSTANCES=0 exists to preserve"
+        );
     }
 
     /// A layer-scope invalidation marks exactly the layer it names, and that
