@@ -484,6 +484,15 @@ impl PlatformWindow for CrossWindow {
         }
     }
 
+    fn completed_frame(&self) {
+        // Input handlers are rebuilt during painting. Synchronize IME here so
+        // temporary take_input_handler() calls during key dispatch do not
+        // spuriously toggle IME state.
+        let ime_allowed =
+            self.window().has_focus() && self.0.state.input_handler.borrow().is_some();
+        self.window().set_ime_allowed(ime_allowed);
+    }
+
     fn create_wgpu_surface(
         &self,
         width: u32,
@@ -545,7 +554,20 @@ impl PlatformWindow for CrossWindow {
         None
     }
 
-    fn update_ime_position(&self, _bounds: crate::Bounds<crate::Pixels>) {}
+    fn update_ime_position(&self, bounds: crate::Bounds<crate::Pixels>) {
+        let window = self.window();
+        let scale_factor = window.scale_factor() as f64;
+        window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(
+                bounds.origin.x.0 as f64 * scale_factor,
+                bounds.origin.y.0 as f64 * scale_factor,
+            ),
+            winit::dpi::PhysicalSize::new(
+                (bounds.size.width.0 as f64 * scale_factor).round().max(1.0) as u32,
+                (bounds.size.height.0 as f64 * scale_factor).round().max(1.0) as u32,
+            ),
+        );
+    }
 
     fn start_window_move(&self) {
         let _ = self.window().drag_window();

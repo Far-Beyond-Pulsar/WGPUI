@@ -1311,6 +1311,12 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
             }
 
             winit::event::WindowEvent::Focused(active) => {
+                if !active {
+                    // Disable IME immediately on OS focus loss. Enabling is
+                    // synchronized after a completed frame, once we know a
+                    // focused text input handler is actually installed.
+                    window.window().set_ime_allowed(false);
+                }
                 if active {
                     self.active_window_id.set(Some(window_id));
                 } else if self.active_window_id.get() == Some(window_id) {
@@ -1645,6 +1651,10 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     });
             }
 
+            winit::event::WindowEvent::Ime(ime) => {
+                handle_ime_event(&window, &ime);
+            }
+
             _ => (),
         }
 
@@ -1706,6 +1716,54 @@ fn winit_mouse_button_to_gpui(button: winit::event::MouseButton) -> MouseButton 
             MouseButton::Navigate(crate::NavigationDirection::Forward)
         }
         winit::event::MouseButton::Other(_) => MouseButton::Left,
+    }
+}
+
+/// Convert a byte offset into a UTF-8 string into the equivalent offset in
+/// UTF-16 code units. winit's IME preedit cursor is byte-wise indexed, whereas
+/// GPUI's input handler API uses UTF-16 ranges (matching macOS' text input
+/// contracts), so we translate here.
+fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
+    let byte_offset = byte_offset.min(text.len());
+    let mut utf16 = 0;
+    for (index, character) in text.char_indices() {
+        if index >= byte_offset {
+            break;
+        }
+        utf16 += character.len_utf16();
+    }
+    utf16
+}
+
+/// Forward a winit `Ime` event to the window's platform input handler, bridging
+/// winit's IME protocol onto GPUI's `InputHandler` (the `NSTextInputClient`-style
+/// API). Without this, IME composition/commit text never reaches the editor and
+/// the candidate window is never positioned.
+fn handle_ime_event(window: &CrossWindow, ime: &winit::event::Ime) {
+    let mut handler = window.0.state.input_handler.borrow_mut();
+    let Some(input_handler) = handler.as_mut() else {
+        // No focused text input to route IME state to; nothing to do.
+        return;
+    };
+
+    match ime {
+        winit::event::Ime::Enabled => {
+            input_handler.update_ime_cursor();
+        }
+        winit::event::Ime::Preedit(text, cursor) => {
+            let selected_range = cursor.map(|(start, end)| {
+                byte_to_utf16_offset(text, start)..byte_to_utf16_offset(text, end)
+            });
+            input_handler.replace_and_mark_text_in_range(None, text, selected_range);
+            input_handler.update_ime_cursor();
+        }
+        winit::event::Ime::Commit(text) => {
+            input_handler.replace_text_in_range(None, text);
+            input_handler.update_ime_cursor();
+        }
+        winit::event::Ime::Disabled => {
+            input_handler.unmark_text();
+        }
     }
 }
 

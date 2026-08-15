@@ -889,7 +889,7 @@ impl PlatformInputHandler {
             .flatten()
     }
 
-    fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
+    pub(crate) fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
         self.cx
             .update(|window, cx| {
                 self.handler
@@ -917,9 +917,28 @@ impl PlatformInputHandler {
             .ok();
     }
 
-    fn unmark_text(&mut self) {
+    pub(crate) fn unmark_text(&mut self) {
         self.cx
             .update(|window, cx| self.handler.unmark_text(window, cx))
+            .ok();
+    }
+
+    /// Reposition the platform IME candidate/composing window at the current
+    /// text selection. Called after the input handler's selection changes so that
+    /// winit can be told the new caret location for IME candidate placement.
+    pub(crate) fn update_ime_cursor(&mut self) {
+        self.cx
+            .update(|window, cx| {
+                let selection = self.handler.selected_text_range(true, window, cx)?;
+                let range = if selection.reversed {
+                    selection.range.start..selection.range.start
+                } else {
+                    selection.range.end..selection.range.end
+                };
+                let bounds = self.handler.bounds_for_range(range, window, cx)?;
+                window.platform_window.update_ime_position(bounds);
+                Some(())
+            })
             .ok();
     }
 
