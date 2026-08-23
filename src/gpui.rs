@@ -44,6 +44,7 @@ pub mod prelude;
 mod queue;
 pub mod render_stats;
 mod scene;
+mod scene_pack;
 mod shared_string;
 mod shared_uri;
 mod style;

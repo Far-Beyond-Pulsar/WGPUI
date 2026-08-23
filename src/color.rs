@@ -267,7 +267,7 @@ impl TryFrom<&'_ str> for Rgba {
 }
 
 /// An HSLA color
-#[derive(Default, Copy, Clone, Debug)]
+#[derive(Default, Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct Hsla {
     /// Hue, in a range from 0 to 1
@@ -652,12 +652,30 @@ impl<'de> Deserialize<'de> for Hsla {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    bytemuck::NoUninit,
+)]
+/// Which kind of paint a [`Background`] carries. Tag of a `NoUninit` GPU
+/// union — discriminants are part of the wire format.
 #[repr(C)]
-pub(crate) enum BackgroundTag {
+pub enum BackgroundTag {
+    /// A single flat color (`solid`).
     Solid = 0,
+    /// A two-stop linear gradient along `param0/param1` (start) →
+    /// `param2/param3` (end), colors in `colors`.
     LinearGradient = 1,
+    /// A diagonal slash hatch pattern tinted by the gradient colors.
     PatternSlash = 2,
+    /// A radial gradient centered at `param0/param1` with radius `param2`.
     RadialGradient = 3,
 }
 
@@ -666,7 +684,18 @@ pub(crate) enum BackgroundTag {
 /// References:
 /// - <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>
 /// - <https://www.w3.org/TR/css-color-4/#typedef-color-space>
-#[derive(Debug, Clone, Copy, PartialEq, Hash, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Hash,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    bytemuck::NoUninit,
+)]
 #[repr(C)]
 pub enum ColorSpace {
     #[default]
@@ -686,17 +715,30 @@ impl Display for ColorSpace {
 }
 
 /// A background color, which can be either a solid color or a linear gradient.
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+///
+/// Not `Pod`: the tag enums are not valid for arbitrary bit patterns, but every byte is
+/// initialized, so `NoUninit` suffices for serializing slices of it for GPU upload.
+#[derive(
+    Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, bytemuck::NoUninit,
+)]
 #[repr(C)]
 pub struct Background {
-    pub(crate) tag: BackgroundTag,
-    pub(crate) color_space: ColorSpace,
-    pub(crate) solid: Hsla,
-    pub(crate) param0: f32,
-    pub(crate) param1: f32,
-    pub(crate) param2: f32,
-    pub(crate) param3: f32,
-    pub(crate) colors: [GradientStop; 2],
+    /// Which variant of the union is active.
+    pub tag: BackgroundTag,
+    /// Color space used to interpolate gradient stops.
+    pub color_space: ColorSpace,
+    /// Flat color; only meaningful for [`BackgroundTag::Solid`].
+    pub solid: Hsla,
+    /// Gradient/pattern parameter — see [`BackgroundTag`] for per-variant meaning.
+    pub param0: f32,
+    /// Gradient/pattern parameter — see [`BackgroundTag`] for per-variant meaning.
+    pub param1: f32,
+    /// Gradient/pattern parameter — see [`BackgroundTag`] for per-variant meaning.
+    pub param2: f32,
+    /// Gradient/pattern parameter — see [`BackgroundTag`] for per-variant meaning.
+    pub param3: f32,
+    /// The two gradient stops; only meaningful for the non-solid variants.
+    pub colors: [GradientStop; 2],
 }
 
 impl std::fmt::Debug for Background {
@@ -826,7 +868,18 @@ pub fn radial_gradient(
 /// A color stop for a gradient.
 ///
 /// <https://developer.mozilla.org/en-US/docs/Web/CSS/gradient/linear-gradient#linear-color-stop>
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
+)]
 #[repr(C)]
 pub struct GradientStop {
     /// The color of the color stop.
@@ -858,7 +911,18 @@ impl GradientStop {
 /// A linear color stop for text gradients.
 ///
 /// Similar to GradientStop but uses "percentage" terminology for text gradients.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
+)]
 #[repr(C)]
 pub struct LinearColorStop {
     /// The color of the color stop.
@@ -946,7 +1010,17 @@ impl From<Rgba> for Background {
 }
 
 /// The tag for a text color, determining which rendering path to use.
-#[derive(Debug, Clone, Copy, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    bytemuck::NoUninit,
+)]
 #[repr(C)]
 pub enum TextColorTag {
     /// A solid color.
@@ -956,16 +1030,23 @@ pub enum TextColorTag {
 }
 
 /// A text color, which can be either a solid color or a linear gradient.
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema, bytemuck::NoUninit)]
 #[repr(C)]
 pub struct TextColor {
-    pub(crate) tag: TextColorTag,
-    pub(crate) color_space: ColorSpace,
-    pub(crate) solid: Hsla,
-    pub(crate) gradient_angle_or_reserved: f32,
-    pub(crate) colors: [LinearColorStop; 2],
+    /// Which variant of the union is active.
+    pub tag: TextColorTag,
+    /// Color space used to interpolate gradient stops.
+    pub color_space: ColorSpace,
+    /// Flat color; only meaningful for [`TextColorTag::Solid`].
+    pub solid: Hsla,
+    /// Angle of the gradient in degrees; only meaningful for
+    /// [`TextColorTag::LinearGradient`].
+    pub gradient_angle_or_reserved: f32,
+    /// The two gradient stops; only meaningful for
+    /// [`TextColorTag::LinearGradient`].
+    pub colors: [LinearColorStop; 2],
     /// Padding for alignment for repr(C) layout.
-    pub(crate) pad: u32,
+    pub pad: u32,
 }
 
 impl std::fmt::Debug for TextColor {

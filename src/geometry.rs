@@ -88,6 +88,17 @@ pub struct Point<T: Clone + Debug + Default + PartialEq> {
     pub y: T,
 }
 
+// bytemuck's derive refuses generic structs because it cannot statically verify
+// their padding, so these impls are written out instead. Soundness: every field is
+// `T` and `size_of::<T>()` is always a multiple of `align_of::<T>()`, so these
+// homogeneous `#[repr(C)]` structs have no padding when `T: Pod`, and each
+// all-`T`-field struct is valid for any bit pattern and zeroable exactly when `T` is.
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Pod for Point<T> {}
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Zeroable
+    for Point<T>
+{
+}
+
 /// Constructs a new `Point<T>` with the given x and y coordinates.
 ///
 /// # Arguments
@@ -401,6 +412,12 @@ pub struct Size<T: Clone + Debug + Default + PartialEq> {
     pub width: T,
     /// The height component of the size.
     pub height: T,
+}
+
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Pod for Size<T> {}
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Zeroable
+    for Size<T>
+{
 }
 
 impl<T: Clone + Debug + Default + PartialEq> Size<T> {
@@ -756,6 +773,12 @@ pub struct Bounds<T: Clone + Debug + Default + PartialEq> {
     pub origin: Point<T>,
     /// The size of the rectangle.
     pub size: Size<T>,
+}
+
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Pod for Bounds<T> {}
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Zeroable
+    for Bounds<T>
+{
 }
 
 /// Create a bounds with the given origin and size
@@ -1710,6 +1733,12 @@ pub struct Edges<T: Clone + Debug + Default + PartialEq> {
     pub left: T,
 }
 
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Pod for Edges<T> {}
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Zeroable
+    for Edges<T>
+{
+}
+
 impl<T> Mul for Edges<T>
 where
     T: Mul<Output = T> + Clone + Debug + Default + PartialEq,
@@ -2189,6 +2218,12 @@ pub struct Corners<T: Clone + Debug + Default + PartialEq> {
     pub bottom_left: T,
 }
 
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Pod for Corners<T> {}
+unsafe impl<T: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Zeroable
+    for Corners<T>
+{
+}
+
 impl<T> Corners<T>
 where
     T: Clone + Debug + Default + PartialEq,
@@ -2566,6 +2601,8 @@ impl From<Percentage> for Radians {
     Serialize,
     Deserialize,
     JsonSchema,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
 )]
 #[repr(transparent)]
 pub struct Pixels(pub(crate) f32);
@@ -2866,6 +2903,8 @@ impl From<usize> for Pixels {
     SubAssign,
     Serialize,
     Deserialize,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
 )]
 #[repr(transparent)]
 pub struct DevicePixels(pub i32);
@@ -2959,7 +2998,7 @@ impl From<usize> for DevicePixels {
 /// a single logical pixel may correspond to multiple physical pixels. By using `ScaledPixels`,
 /// dimensions and positions can be specified in a way that scales appropriately across different
 /// display resolutions.
-#[derive(Clone, Copy, Default, Add, AddAssign, Sub, SubAssign, Div, DivAssign, PartialEq)]
+#[derive(Clone, Copy, Default, Add, AddAssign, Sub, SubAssign, Div, DivAssign, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(transparent)]
 pub struct ScaledPixels(pub(crate) f32);
 

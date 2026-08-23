@@ -1048,7 +1048,7 @@ pub(crate) enum PrimitiveBatch<'a> {
     FilterBoundary(usize),
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Copy, bytemuck::NoUninit)]
 #[repr(C)]
 pub(crate) struct Quad {
     pub order: DrawOrder,
@@ -1061,13 +1061,17 @@ pub(crate) struct Quad {
     pub border_widths: Edges<ScaledPixels>,
 }
 
+// Stride expected by `array<Quad>` in quads.wgsl's storage buffer.
+const _: () = assert!(std::mem::size_of::<Quad>() == 168);
+const _: () = assert!(std::mem::offset_of!(Quad, background) == 40);
+
 impl From<Quad> for Primitive {
     fn from(quad: Quad) -> Self {
         Primitive::Quad(quad)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub(crate) struct Underline {
     pub order: DrawOrder,
@@ -1079,13 +1083,16 @@ pub(crate) struct Underline {
     pub wavy: u32,
 }
 
+// Stride expected by `array<Underline>` in underlines.wgsl's storage buffer.
+const _: () = assert!(std::mem::size_of::<Underline>() == 64);
+
 impl From<Underline> for Primitive {
     fn from(underline: Underline) -> Self {
         Primitive::Underline(underline)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub(crate) struct Shadow {
     pub order: DrawOrder,
@@ -1096,6 +1103,9 @@ pub(crate) struct Shadow {
     pub color: Hsla,
 }
 
+// Stride expected by `array<Shadow>` in shadows.wgsl's storage buffer.
+const _: () = assert!(std::mem::size_of::<Shadow>() == 72);
+
 impl From<Shadow> for Primitive {
     fn from(shadow: Shadow) -> Self {
         Primitive::Shadow(shadow)
@@ -1105,7 +1115,7 @@ impl From<Shadow> for Primitive {
 /// A backdrop filter blurs (and may otherwise filter) the content already rendered behind
 /// `bounds`, compositing the result into a rounded rectangle — the frosted-glass effect.
 /// Emitted by [`crate::Window::paint_backdrop_filter`]; produces the CSS `backdrop-filter` effect.
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub(crate) struct BackdropFilter {
     pub order: DrawOrder,
@@ -1127,6 +1137,9 @@ pub(crate) struct BackdropFilter {
     /// derives for `array<BackdropFilter>` — see the note on `blur_radius` above.
     pub _pad: u32,
 }
+
+// Stride expected by `array<BackdropFilter>` in backdrop_blur.wgsl's storage buffer.
+const _: () = assert!(std::mem::size_of::<BackdropFilter>() == 64);
 
 impl From<BackdropFilter> for Primitive {
     fn from(filter: BackdropFilter) -> Self {
@@ -1158,8 +1171,23 @@ impl From<FilterBoundary> for Primitive {
 }
 
 /// The style of a border.
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[repr(C)]
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    bytemuck::NoUninit,
+)]
+// Fixed integer repr: `Quad` is `bytemuck::NoUninit`, and bytemuck only
+// accepts fieldless enums with an explicit integer representation (not
+// `repr(C)`, whose size is platform-chosen).
+#[repr(u32)]
 pub enum BorderStyle {
     /// A solid border.
     #[default]
@@ -1169,7 +1197,7 @@ pub enum BorderStyle {
 }
 
 /// A data type representing a 2 dimensional transformation that can be applied to an element.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct TransformationMatrix {
     /// 2x2 matrix containing rotation and scale,
@@ -1271,7 +1299,7 @@ impl Default for TransformationMatrix {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Copy, bytemuck::NoUninit)]
 #[repr(C)]
 pub(crate) struct MonochromeSprite {
     pub order: DrawOrder,
@@ -1283,24 +1311,37 @@ pub(crate) struct MonochromeSprite {
     pub transformation: TransformationMatrix,
 }
 
+// Stride expected by `array<MonochromeSprite>` in mono_sprites.wgsl's storage buffer.
+const _: () = assert!(std::mem::size_of::<MonochromeSprite>() == 168);
+const _: () = assert!(std::mem::offset_of!(MonochromeSprite, tile) == 112);
+const _: () = assert!(std::mem::offset_of!(MonochromeSprite, transformation) == 144);
+
 impl From<MonochromeSprite> for Primitive {
     fn from(sprite: MonochromeSprite) -> Self {
         Primitive::MonochromeSprite(sprite)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Copy, bytemuck::NoUninit)]
 #[repr(C)]
 pub(crate) struct PolychromeSprite {
     pub order: DrawOrder,
     pub pad: u32, // align to 8 bytes
-    pub grayscale: bool,
+    /// Stored as `u32` because the WGSL struct reads it as a `u32` at this
+    /// offset (and masks the low byte, `grayscale & 0xFFu`); as a `bool` it
+    /// would leave three padding bytes here, which bytemuck rejects for
+    /// `NoUninit` types. Layout is unchanged.
+    pub grayscale: u32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
 }
+
+// Stride expected by `array<PolychromeSprite>` in poly_sprites.wgsl's storage buffer.
+const _: () = assert!(std::mem::size_of::<PolychromeSprite>() == 96);
+const _: () = assert!(std::mem::offset_of!(PolychromeSprite, tile) == 64);
 
 impl From<PolychromeSprite> for Primitive {
     fn from(sprite: PolychromeSprite) -> Self {

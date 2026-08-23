@@ -799,7 +799,7 @@ impl<T> AtlasTextureList<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::NoUninit)]
 #[repr(C)]
 pub(crate) struct AtlasTile {
     pub(crate) texture_id: AtlasTextureId,
@@ -808,7 +808,7 @@ pub(crate) struct AtlasTile {
     pub(crate) bounds: Bounds<DevicePixels>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::NoUninit)]
 #[repr(C)]
 pub(crate) struct AtlasTextureId {
     // We use u32 instead of usize for Metal Shader Language compatibility
@@ -825,12 +825,13 @@ pub(crate) struct AtlasTextureId {
     ),
     allow(dead_code)
 )]
+#[derive(bytemuck::NoUninit)]
 pub(crate) enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub(crate) struct TileId(pub(crate) u32);
 

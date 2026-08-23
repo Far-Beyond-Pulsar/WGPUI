@@ -200,6 +200,10 @@ struct GlobalParams {
     pad: u32,
 }
 
+// Size of `Globals` in the uniform address space, where WGSL rounds a struct's
+// byte size up to a multiple of its 16-byte binding alignment.
+const _: () = assert!(std::mem::size_of::<GlobalParams>() == 16);
+
 impl GlobalParams {
     const VERTEX_ATTRIBUTES: &'static [wgpu::VertexAttribute; 3] = &[
         wgpu::VertexAttribute {
@@ -411,6 +415,9 @@ struct GpuPathVertex {
     content_mask_origin: [f32; 2], // offset 32
     content_mask_size: [f32; 2],   // offset 40
 } // stride  48
+
+// Stride expected by `array<GpuPathVertex>` in paths.wgsl's storage buffer.
+const _: () = assert!(std::mem::size_of::<GpuPathVertex>() == 48);
 
 struct UnderlinesData {
     globals: GlobalParams,
@@ -663,6 +670,10 @@ struct ColorAdjustments {
     grayscale_enhanced_contrast: f32,
     _padding: [f32; 3],
 }
+
+// Size of the `ColorAdjustments` uniform in mono_sprites.wgsl, rounded up to
+// the 16-byte uniform binding alignment (the `_padding` field supplies it).
+const _: () = assert!(std::mem::size_of::<ColorAdjustments>() == 32);
 
 struct WgpuPipelines {
     color_targets: Vec<Option<wgpu::ColorTargetState>>,
@@ -1843,17 +1854,8 @@ impl WgpuRenderer {
             bytemuck::bytes_of(&globals),
         );
 
-        unsafe fn as_bytes<T>(slice: &[T]) -> &[u8] {
-            unsafe {
-                std::slice::from_raw_parts(
-                    slice.as_ptr() as *const u8,
-                    slice.len() * std::mem::size_of::<T>(),
-                )
-            }
-        }
-
         if !scene.quads.is_empty() {
-            let data = unsafe { as_bytes(&scene.quads) };
+            let data = bytemuck::cast_slice(&scene.quads);
             ensure_buffer_size(
                 &self.context.device,
                 &self.context.quads_buffer,
@@ -1868,7 +1870,7 @@ impl WgpuRenderer {
                 .write_buffer(&self.context.quads_buffer.lock(), 0, data);
         }
         if !scene.shadows.is_empty() {
-            let data = unsafe { as_bytes(&scene.shadows) };
+            let data = bytemuck::cast_slice(&scene.shadows);
             ensure_buffer_size(
                 &self.context.device,
                 &self.context.shadows_buffer,
@@ -1883,7 +1885,7 @@ impl WgpuRenderer {
                 .write_buffer(&self.context.shadows_buffer.lock(), 0, data);
         }
         if !scene.backdrop_filters.is_empty() {
-            let data = unsafe { as_bytes(&scene.backdrop_filters) };
+            let data = bytemuck::cast_slice(&scene.backdrop_filters);
             ensure_buffer_size(
                 &self.context.device,
                 &self.context.backdrop_filters_buffer,
@@ -1898,7 +1900,7 @@ impl WgpuRenderer {
             );
         }
         if !scene.underlines.is_empty() {
-            let data = unsafe { as_bytes(&scene.underlines) };
+            let data = bytemuck::cast_slice(&scene.underlines);
             ensure_buffer_size(
                 &self.context.device,
                 &self.context.underlines_buffer,
@@ -1915,7 +1917,7 @@ impl WgpuRenderer {
             );
         }
         if !scene.monochrome_sprites.is_empty() {
-            let data = unsafe { as_bytes(&scene.monochrome_sprites) };
+            let data = bytemuck::cast_slice(&scene.monochrome_sprites);
             ensure_buffer_size(
                 &self.context.device,
                 &self.context.mono_sprites_buffer,
@@ -1932,7 +1934,7 @@ impl WgpuRenderer {
             );
         }
         if !scene.polychrome_sprites.is_empty() {
-            let data = unsafe { as_bytes(&scene.polychrome_sprites) };
+            let data = bytemuck::cast_slice(&scene.polychrome_sprites);
             ensure_buffer_size(
                 &self.context.device,
                 &self.context.poly_sprites_buffer,
@@ -2572,7 +2574,9 @@ impl WgpuRenderer {
                             let composite_buffer = self.context.device.create_buffer_init(
                                 &wgpu::util::BufferInitDescriptor {
                                     label: Some("filter_group_composite_buffer"),
-                                    contents: unsafe { as_bytes(std::slice::from_ref(&composite)) },
+                                    contents: bytemuck::cast_slice(std::slice::from_ref(
+                                        &composite,
+                                    )),
                                     usage: wgpu::BufferUsages::STORAGE,
                                 },
                             );
