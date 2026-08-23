@@ -12,7 +12,10 @@ use std::{
     mem,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
+use crate::platform::cross::slab::SlabKind;
+use crate::scene_pack::PackedLayer;
 
 #[allow(non_camel_case_types, unused)]
 pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
@@ -128,6 +131,11 @@ pub(crate) struct Scene {
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
     pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
     pub(crate) surfaces: Vec<PaintSurface>,
+    /// Spliced slab references recorded this frame, in reservation order;
+    /// sorted by resolved global order in [`Scene::finish`]. The renderer
+    /// resolves each against its own registry at draw time — the scene never
+    /// holds GPU state, only the marker plus the packed bytes that back it.
+    pub(crate) layer_slab_spans: Vec<LayerSlabSpan>,
 }
 
 impl Default for Scene {
@@ -152,6 +160,7 @@ impl Default for Scene {
             monochrome_sprites: Vec::new(),
             polychrome_sprites: Vec::new(),
             surfaces: Vec::new(),
+            layer_slab_spans: Vec::new(),
         }
     }
 }
@@ -180,6 +189,7 @@ impl Scene {
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.layer_slab_spans.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -398,6 +408,16 @@ impl Scene {
             .unwrap_or(0)
     }
 
+    /// Whether an enclosing layer is actively recording. Slab splicing must
+    /// not run inside a recording context: a recording parent captures its
+    /// nested composite's primitives as its own future content, and spans
+    /// would leave that capture empty.
+    pub(crate) fn innermost_layer_is_recording(&self) -> bool {
+        self.capture_stack
+            .last()
+            .is_some_and(|(_, items)| items.is_some())
+    }
+
     /// Clone the items the innermost recording layer captured within `range`
     /// (#92). Paired with `captured_len`; see its doc comment.
     pub(crate) fn captured_slice(&self, range: Range<usize>) -> Vec<LayerItem> {
@@ -420,6 +440,54 @@ impl Scene {
     pub fn pop_layer(&mut self) {
         self.clip_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
+    }
+
+    /// Record a slab splice marker: the layer's content is drawn from the
+    /// renderer's per-layer slabs instead of this frame's primitive arrays.
+    ///
+    /// The marker reserves one draw-order slot strictly above everything
+    /// painted so far in the active scope — the same reservation a layer
+    /// boundary gets — so surrounding content sorts around it exactly where
+    /// the layer would have sat. `bounds` should be the layer's composited
+    /// bounds; they only shape the order slot, never clip anything.
+    ///
+    /// A clean layer's composite emits one of these per maximal run of its own
+    /// primitives (nested layers split it), carrying the packed bytes as ground
+    /// truth: the renderer compares `content_token` against its registry to
+    /// decide between zero uploads and re-uploading exactly this layer's
+    /// ranges.
+    pub fn push_layer_slab_span(
+        &mut self,
+        bounds: Bounds<ScaledPixels>,
+        key: LayerKey,
+        content_token: u64,
+        origin: [f32; 2],
+        totals: [u32; SlabKind::COUNT],
+        runs: Vec<SlabRun>,
+        packed: Arc<PackedLayer>,
+    ) {
+        let scope = self.active_scope();
+        let local_order = self.scopes[scope].tree.insert_above_all(bounds);
+        self.note_order(local_order, bounds);
+        self.layer_slab_spans.push(LayerSlabSpan {
+            key,
+            content_token,
+            origin,
+            totals,
+            runs,
+            packed,
+            reservation_bounds: bounds,
+            order_scope: scope,
+            local_order,
+            order: 0,
+        });
+        let span = self.layer_slab_spans.last().expect("just pushed").clone();
+        self.paint_operations.push(PaintOperation::LayerSlab(span));
+    }
+
+    /// How many slab spans this frame carries.
+    pub fn slab_span_count(&self) -> usize {
+        self.layer_slab_spans.len()
     }
 
     /// Raise the draw-order floor so every primitive inserted afterwards sorts above everything
@@ -514,6 +582,20 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::LayerSlab(span) => {
+                    // Re-reserve the order slot in this frame's scope layout;
+                    // everything else about the marker is frame-independent.
+                    let mut span = span.clone();
+                    let scope = self.active_scope();
+                    let local_order = self
+                        .scopes[scope]
+                        .tree
+                        .insert_above_all(span.reservation_bounds);
+                    self.note_order(local_order, span.reservation_bounds);
+                    span.order_scope = scope;
+                    span.local_order = local_order;
+                    self.layer_slab_spans.push(span);
+                }
             }
         }
     }
@@ -611,6 +693,17 @@ impl Scene {
                 map(&mut surface.order);
             }
         }
+
+        // Slab spans order exactly like a one-primitive scope entry: through
+        // the same local→global mapping their reserving scope received.
+        for span in &mut self.layer_slab_spans {
+            span.order = self
+                .scopes
+                .get(span.order_scope)
+                .and_then(|scope| scope.global.get(span.local_order as usize))
+                .copied()
+                .unwrap_or(DrawOrder::MAX);
+        }
     }
 
     pub fn finish(&mut self) {
@@ -650,8 +743,13 @@ impl Scene {
         // the start (false = 0) ahead of the end (true = 1) so the pair stays well-formed.
         self.filter_boundaries
             .sort_by_key(|boundary| (boundary.order, !boundary.is_start));
+        self.layer_slab_spans
+            .sort_by_key(|span| span.order);
     }
 
+    // Production draws through `frame_batches`; this remains the legacy
+    // oracle consumed by scene_pack's and slab-splice's golden-model tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn batches(&self) -> impl Iterator<Item = PrimitiveBatch<'_>> {
         BatchIterator {
             shadows: &self.shadows,
@@ -683,6 +781,230 @@ impl Scene {
             filter_boundaries_iter: self.filter_boundaries.iter().peekable(),
         }
     }
+
+    /// The frame's draw stream with [`LayerSlabSpan`]s spliced in at the
+    /// positions their reservations earned — one iterator covering both the
+    /// legacy primitive batches and the slab references, ordered by global
+    /// draw order.
+    pub(crate) fn frame_batches(&self) -> FrameBatchIterator<'_> {
+        FrameBatchIterator {
+            queued: std::collections::VecDeque::new(),
+            legacy: BatchIterator {
+                shadows: &self.shadows,
+                shadows_start: 0,
+                shadows_iter: self.shadows.iter().peekable(),
+                quads: &self.quads,
+                quads_start: 0,
+                quads_iter: self.quads.iter().peekable(),
+                paths: &self.paths,
+                paths_start: 0,
+                paths_iter: self.paths.iter().peekable(),
+                underlines: &self.underlines,
+                underlines_start: 0,
+                underlines_iter: self.underlines.iter().peekable(),
+                monochrome_sprites: &self.monochrome_sprites,
+                monochrome_sprites_start: 0,
+                monochrome_sprites_iter: self.monochrome_sprites.iter().peekable(),
+                polychrome_sprites: &self.polychrome_sprites,
+                polychrome_sprites_start: 0,
+                polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+                surfaces: &self.surfaces,
+                surfaces_start: 0,
+                surfaces_iter: self.surfaces.iter().peekable(),
+                backdrop_filters: &self.backdrop_filters,
+                backdrop_filters_start: 0,
+                backdrop_filters_iter: self.backdrop_filters.iter().peekable(),
+                filter_boundaries: &self.filter_boundaries,
+                filter_boundaries_start: 0,
+                filter_boundaries_iter: self.filter_boundaries.iter().peekable(),
+            },
+            pending: None,
+            next_span: 0,
+            scene: self,
+        }
+    }
+}
+
+/// One entry of the merged draw stream: either a legacy primitive batch or a
+/// spliced slab reference.
+#[derive(Debug)]
+pub(crate) enum SceneBatch<'a> {
+    Primitives(PrimitiveBatch<'a>),
+    LayerSlab(usize),
+}
+
+pub(crate) struct FrameBatchIterator<'a> {
+    legacy: BatchIterator<'a>,
+    /// Head-of-line legacy batches waiting to be yielded, plus any tails
+    /// produced when a span splits a same-kind batch around its position.
+    queued: std::collections::VecDeque<SceneBatch<'a>>,
+    pending: Option<PrimitiveBatch<'a>>,
+    next_span: usize,
+    scene: &'a Scene,
+}
+
+/// Split a slice-carrying batch at the first element whose order is
+/// `>= boundary`, returning `(head, tail)`. Single-element batches
+/// (`FilterBoundary`) cannot straddle a span and are returned whole.
+fn split_batch_at<'a>(
+    batch: PrimitiveBatch<'a>,
+    boundary: DrawOrder,
+    filter_boundaries: &[FilterBoundary],
+) -> (Option<PrimitiveBatch<'a>>, Option<PrimitiveBatch<'a>>) {
+    let partition = |orders: &dyn Fn(usize) -> DrawOrder, len: usize| {
+        let mut point = 0;
+        while point < len && orders(point) < boundary {
+            point += 1;
+        }
+        (point, len)
+    };
+    match batch {
+        PrimitiveBatch::Shadows(slice) => {
+            let (point, _) = partition(&|i| slice[i].order, slice.len());
+            (
+                Some(PrimitiveBatch::Shadows(&slice[..point])),
+                Some(PrimitiveBatch::Shadows(&slice[point..])),
+            )
+        }
+        PrimitiveBatch::Quads(slice) => {
+            let (point, _) = partition(&|i| slice[i].order, slice.len());
+            (
+                Some(PrimitiveBatch::Quads(&slice[..point])),
+                Some(PrimitiveBatch::Quads(&slice[point..])),
+            )
+        }
+        PrimitiveBatch::Paths(slice) => {
+            let (point, _) = partition(&|i| slice[i].order, slice.len());
+            (
+                Some(PrimitiveBatch::Paths(&slice[..point])),
+                Some(PrimitiveBatch::Paths(&slice[point..])),
+            )
+        }
+        PrimitiveBatch::Underlines(slice) => {
+            let (point, _) = partition(&|i| slice[i].order, slice.len());
+            (
+                Some(PrimitiveBatch::Underlines(&slice[..point])),
+                Some(PrimitiveBatch::Underlines(&slice[point..])),
+            )
+        }
+        PrimitiveBatch::MonochromeSprites { texture_id, sprites } => {
+            let (point, _) = partition(&|i| sprites[i].order, sprites.len());
+            (
+                Some(PrimitiveBatch::MonochromeSprites {
+                    texture_id,
+                    sprites: &sprites[..point],
+                }),
+                Some(PrimitiveBatch::MonochromeSprites {
+                    texture_id,
+                    sprites: &sprites[point..],
+                }),
+            )
+        }
+        PrimitiveBatch::PolychromeSprites { texture_id, sprites } => {
+            let (point, _) = partition(&|i| sprites[i].order, sprites.len());
+            (
+                Some(PrimitiveBatch::PolychromeSprites {
+                    texture_id,
+                    sprites: &sprites[..point],
+                }),
+                Some(PrimitiveBatch::PolychromeSprites {
+                    texture_id,
+                    sprites: &sprites[point..],
+                }),
+            )
+        }
+        PrimitiveBatch::Surfaces(slice) => {
+            let (point, _) = partition(&|i| slice[i].order, slice.len());
+            (
+                Some(PrimitiveBatch::Surfaces(&slice[..point])),
+                Some(PrimitiveBatch::Surfaces(&slice[point..])),
+            )
+        }
+        PrimitiveBatch::BackdropFilters(slice) => {
+            let (point, _) = partition(&|i| slice[i].order, slice.len());
+            (
+                Some(PrimitiveBatch::BackdropFilters(&slice[..point])),
+                Some(PrimitiveBatch::BackdropFilters(&slice[point..])),
+            )
+        }
+        // One marker, one order: it either precedes the span or follows it.
+        PrimitiveBatch::FilterBoundary(index) => {
+            let order = filter_boundaries[index].order;
+            if order < boundary {
+                (Some(PrimitiveBatch::FilterBoundary(index)), None)
+            } else {
+                (None, Some(PrimitiveBatch::FilterBoundary(index)))
+            }
+        }
+    }
+}
+
+impl<'a> FrameBatchIterator<'a> {
+    fn batch_lead_order(batch: &PrimitiveBatch<'a>) -> Option<DrawOrder> {
+        match batch {
+            PrimitiveBatch::Shadows(s) => s.first().map(|p| p.order),
+            PrimitiveBatch::Quads(q) => q.first().map(|p| p.order),
+            PrimitiveBatch::Paths(p) => p.first().map(|p| p.order),
+            PrimitiveBatch::Underlines(u) => u.first().map(|p| p.order),
+            PrimitiveBatch::MonochromeSprites { sprites, .. } => sprites.first().map(|p| p.order),
+            PrimitiveBatch::PolychromeSprites { sprites, .. } => sprites.first().map(|p| p.order),
+            PrimitiveBatch::Surfaces(s) => s.first().map(|p| p.order),
+            PrimitiveBatch::BackdropFilters(f) => f.first().map(|p| p.order),
+            PrimitiveBatch::FilterBoundary(_) => None,
+        }
+    }
+}
+
+impl<'a> Iterator for FrameBatchIterator<'a> {
+    type Item = SceneBatch<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(queued) = self.queued.pop_front() {
+                return Some(queued);
+            }
+            if self.pending.is_none() {
+                self.pending = self.legacy.next();
+            }
+
+            let next_span = self
+                .scene
+                .layer_slab_spans
+                .get(self.next_span)
+                .map(|span| (self.next_span, span.order));
+
+            match (self.pending.take(), next_span) {
+                (None, Some((index, _))) => {
+                    self.next_span += 1;
+                    return Some(SceneBatch::LayerSlab(index));
+                }
+                (None, None) => return None,
+                (Some(batch), Some((index, span_order))) => {
+                    // A span's reservation owns its own global order value, so
+                    // it never ties with surrounding content. When it lands
+                    // strictly inside a same-kind batch, the batch splits
+                    // around it so every element draws at its own position.
+                    let lead = Self::batch_lead_order(&batch);
+                    if lead.is_none_or(|lead| lead >= span_order) {
+                        self.next_span += 1;
+                        self.pending = Some(batch);
+                        return Some(SceneBatch::LayerSlab(index));
+                    }
+                    let (head, tail) =
+                        split_batch_at(batch, span_order, &self.scene.filter_boundaries);
+                    self.next_span += 1;
+                    self.queued.push_back(SceneBatch::LayerSlab(index));
+                    if let Some(tail) = tail {
+                        self.queued.push_back(SceneBatch::Primitives(tail));
+                    }
+                    if let Some(head) = head {
+                        return Some(SceneBatch::Primitives(head));
+                    }
+                }
+                (Some(batch), None) => return Some(SceneBatch::Primitives(batch)),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
@@ -708,6 +1030,55 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    /// A spliced slab reference. Replayed by re-reserving an order slot and
+    /// re-registering the same marker — the packed bytes ride along behind an
+    /// `Arc`, so replay costs one reference count, not a re-pack.
+    LayerSlab(LayerSlabSpan),
+}
+
+/// One instanced draw the renderer issues from a layer's slab, with `start`
+/// already offset to point into the layer's concatenated per-kind stream (all
+/// of a layer's stretches share its slab ranges).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlabRun {
+    pub kind: SlabKind,
+    pub start: u32,
+    pub count: u32,
+    pub texture_id: Option<AtlasTextureId>,
+}
+
+/// A splice marker plus everything the renderer needs to draw it without
+/// consulting the window: identity, content token, transform origin,
+/// allocation totals, per-kind runs, and the packed bytes themselves.
+///
+/// Cloning is cheap on purpose (`Arc` over the pack): paint operations replay
+/// these verbatim when a recorded index range is reused.
+#[derive(Clone)]
+pub(crate) struct LayerSlabSpan {
+    pub key: LayerKey,
+    pub content_token: u64,
+    /// The layer's composited origin in scaled pixels; the renderer uploads
+    /// this into the layer's 64-byte transform slot and the shaders translate
+    /// by it in the vertex stage.
+    pub origin: [f32; 2],
+    /// Per-kind instance totals across ALL spans of this layer, so whichever
+    /// span arrives first can size the layer's reservations.
+    pub totals: [u32; SlabKind::COUNT],
+    /// This stretch's draws, `start` offset into the layer-wide streams.
+    pub runs: Vec<SlabRun>,
+    /// This stretch's packed arrays — the upload source of truth.
+    pub packed: Arc<PackedLayer>,
+    reservation_bounds: Bounds<ScaledPixels>,
+    order_scope: usize,
+    local_order: DrawOrder,
+    /// Resolved global draw order, filled in during [`Scene::finish`].
+    order: DrawOrder,
+}
+
+impl LayerSlabSpan {
+    pub fn order(&self) -> DrawOrder {
+        self.order
+    }
 }
 
 #[derive(Clone)]
@@ -2000,5 +2371,537 @@ mod tests {
             })
             .collect();
         assert_eq!(inner_orders, vec![1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod slab_splice_tests {
+    use super::*;
+    use crate::layer::LayerItem;
+    use crate::platform::cross::slab::SlabKind;
+    use crate::window::build_slab_segments;
+    use crate::{px, TileId};
+
+    fn sp(value: f32) -> ScaledPixels {
+        ScaledPixels(value)
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point { x: sp(x), y: sp(y) },
+            size: Size { width: sp(w), height: sp(h) },
+        }
+    }
+
+    /// Wide enough that nothing inserted is clipped empty.
+    fn mask() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: rect(-1000., -1000., 10_000., 10_000.),
+        }
+    }
+
+    fn quad_marked(bounds: Bounds<ScaledPixels>, marker: u32) -> Quad {
+        Quad {
+            bounds,
+            content_mask: mask(),
+            corner_radii: Corners { top_left: sp(marker as f32), ..Corners::default() },
+            ..Default::default()
+        }
+    }
+
+    fn shadow_marked(bounds: Bounds<ScaledPixels>, marker: u32) -> Shadow {
+        Shadow {
+            order: 0,
+            blur_radius: sp(4.),
+            bounds,
+            corner_radii: Corners { top_left: sp(marker as f32), ..Corners::default() },
+            content_mask: mask(),
+            color: Hsla::default(),
+        }
+    }
+
+    fn underline_marked(bounds: Bounds<ScaledPixels>, marker: u32) -> Underline {
+        Underline {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: mask(),
+            color: Hsla::default(),
+            thickness: sp(marker as f32),
+            wavy: 0,
+        }
+    }
+
+    fn mono_sprite_marked(bounds: Bounds<ScaledPixels>, texture_index: u32, tile_number: u32, marker: u32) -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: mask(),
+            text_color: crate::TextColor {
+                tag: crate::TextColorTag::Solid,
+                color_space: crate::ColorSpace::Srgb,
+                solid: Hsla { h: marker as f32, s: 1., l: 0.5, a: 1. },
+                gradient_angle_or_reserved: 0.,
+                colors: Default::default(),
+                pad: 0,
+            },
+            tile: crate::AtlasTile {
+                texture_id: AtlasTextureId { index: texture_index, kind: crate::AtlasTextureKind::Monochrome },
+                tile_id: TileId(tile_number),
+                padding: 0,
+                bounds: Bounds {
+                    origin: point(crate::DevicePixels(0), crate::DevicePixels(0)),
+                    size: crate::Size { width: crate::DevicePixels(8), height: crate::DevicePixels(8) },
+                },
+            },
+            transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    fn path_marked(marker: u32, origin: (f32, f32), triangle_count: usize) -> Path<ScaledPixels> {
+        let (x, y) = origin;
+        let mut pixels_path = Path::new(point(px(x), px(y)));
+        pixels_path.content_mask = ContentMask {
+            bounds: Bounds {
+                origin: point(px(-1000.), px(-1000.)),
+                size: Size { width: px(10_000.), height: px(10_000.) },
+            },
+        };
+        pixels_path.move_to(point(px(x), px(y)));
+        for step in 0..triangle_count {
+            let offset = (step + 2) as f32 * 20.;
+            let lift = if step % 2 == 0 { 15. } else { 0. };
+            pixels_path.line_to(point(px(x + offset), px(y + lift)));
+        }
+        let mut scaled = pixels_path.scale(1.0);
+        scaled.color = Background::default();
+        scaled.color.solid.h = marker as f32;
+        scaled.vertices[0].st_position.x = marker as f32;
+        scaled
+    }
+
+    /// One identified element of a draw stream: slab kind plus unique marker.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Entry {
+        Quad(u32),
+        Shadow(u32),
+        Underline(u32),
+        Mono(u32),
+        Path(u32),
+    }
+
+    fn quad_entry(quad: &Quad) -> Entry {
+        Entry::Quad(quad.corner_radii.top_left.0 as u32)
+    }
+
+    fn shadow_entry(shadow: &Shadow) -> Entry {
+        Entry::Shadow(shadow.corner_radii.top_left.0 as u32)
+    }
+
+    fn underline_entry(underline: &Underline) -> Entry {
+        Entry::Underline(underline.thickness.0 as u32)
+    }
+
+    fn mono_entry(sprite: &MonochromeSprite) -> Entry {
+        Entry::Mono(sprite.text_color.solid.h as u32)
+    }
+
+    fn path_entry(path: &Path<ScaledPixels>) -> Entry {
+        Entry::Path(path.color.solid.h as u32)
+    }
+
+    /// Expand the legacy batch stream to identified entries.
+    fn legacy_stream(scene: &Scene) -> Vec<Entry> {
+        let mut stream = Vec::new();
+        for batch in scene.batches() {
+            match batch {
+                PrimitiveBatch::Quads(quads) => stream.extend(quads.iter().map(quad_entry)),
+                PrimitiveBatch::Shadows(shadows) => stream.extend(shadows.iter().map(shadow_entry)),
+                PrimitiveBatch::Paths(paths) => stream.extend(paths.iter().map(path_entry)),
+                PrimitiveBatch::Underlines(underlines) => {
+                    stream.extend(underlines.iter().map(underline_entry))
+                }
+                PrimitiveBatch::MonochromeSprites { sprites, .. } => {
+                    stream.extend(sprites.iter().map(mono_entry))
+                }
+                _ => {}
+            }
+        }
+        stream
+    }
+
+    /// Expand `frame_batches` — spliced spans included — to identified
+    /// entries, walking each span's runs against its packed arrays.
+    fn spliced_stream(scene: &Scene) -> Vec<Entry> {
+        let mut stream = Vec::new();
+        for batch in scene.frame_batches() {
+            match batch {
+                SceneBatch::Primitives(primitives) => match primitives {
+                    PrimitiveBatch::Quads(quads) => stream.extend(quads.iter().map(quad_entry)),
+                    PrimitiveBatch::Shadows(shadows) => {
+                        stream.extend(shadows.iter().map(shadow_entry))
+                    }
+                    PrimitiveBatch::Paths(paths) => stream.extend(paths.iter().map(path_entry)),
+                    PrimitiveBatch::Underlines(underlines) => {
+                        stream.extend(underlines.iter().map(underline_entry))
+                    }
+                    PrimitiveBatch::MonochromeSprites { sprites, .. } => {
+                        stream.extend(sprites.iter().map(mono_entry))
+                    }
+                    _ => {}
+                },
+                SceneBatch::LayerSlab(index) => {
+                    let span = &scene.layer_slab_spans[index];
+                    let packed = &span.packed;
+                    for run in &span.runs {
+                        // Runs address the layer-wide concatenated streams;
+                        // this single-stretch test layer starts at zero, so
+                        // local slicing recovers the same elements.
+                        let (start, count) = (run.start as usize, run.count as usize);
+                        match run.kind {
+                            SlabKind::Quads => stream.extend(
+                                packed.quads[start..start + count].iter().map(quad_entry),
+                            ),
+                            SlabKind::Shadows => stream.extend(
+                                packed.shadows[start..start + count].iter().map(shadow_entry),
+                            ),
+                            SlabKind::Underlines => stream.extend(
+                                packed.underlines[start..start + count]
+                                    .iter()
+                                    .map(underline_entry),
+                            ),
+                            SlabKind::MonoSprites => stream.extend(
+                                packed.mono_sprites[start..start + count].iter().map(mono_entry),
+                            ),
+                            SlabKind::PolySprites => {}
+                            SlabKind::Paths => {
+                                // Walk the flattened vertex stream's prefix
+                                // sums to recover whole paths.
+                                let mut offset = 0u32;
+                                for path in &packed.paths {
+                                    let len = path.vertices.len() as u32;
+                                    if len > 0
+                                        && offset < run.start + run.count
+                                        && offset + len > run.start
+                                    {
+                                        stream.push(path_entry(path));
+                                    }
+                                    offset += len;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stream
+    }
+
+    /// Record one scene whose layers hold marked primitives, then composite
+    /// it twice from the SAME captures: once through the legacy replay, once
+    /// through the slab splice. Returns both finished scenes.
+    fn twin_scenes() -> (Scene, Scene) {
+        let panel = rect(0., 0., 400., 400.);
+        let mut recording = Scene::default();
+        // Root content before the layer.
+        recording.insert_primitive(quad_marked(rect(0., 0., 800., 600.), 900));
+        // The layer: mixed kinds, overlapping so orders increase with paint.
+        recording.begin_layer(LayerKey(11), panel, true);
+        recording.insert_primitive(quad_marked(panel, 901));
+        recording.insert_primitive(shadow_marked(panel, 902));
+        recording.insert_primitive(path_marked(903, (0., 0.), 1));
+        recording.insert_primitive(underline_marked(panel, 904));
+        recording.insert_primitive(mono_sprite_marked(panel, 0, 1, 905));
+        recording.insert_primitive(quad_marked(rect(10., 10., 200., 200.), 906));
+        let items = recording.end_layer().unwrap();
+        // Root content painted after the layer, overlapping its overflow.
+        recording.insert_primitive(quad_marked(rect(300., 300., 200., 200.), 907));
+        recording.finish();
+        assert!(matches!(items[5], LayerItem::Primitive(_)));
+
+        // Legacy twin: push_retained replay.
+        let mut legacy = Scene::default();
+        legacy.insert_primitive(quad_marked(rect(0., 0., 800., 600.), 900));
+        legacy.begin_layer(LayerKey(11), panel, false);
+        for item in &items {
+            match item {
+                LayerItem::Primitive(primitive) => legacy.push_retained(primitive),
+                LayerItem::Nested(_) => unreachable!(),
+            }
+        }
+        legacy.end_layer();
+        legacy.insert_primitive(quad_marked(rect(300., 300., 200., 200.), 907));
+        legacy.finish();
+
+        // Spliced twin: one span per maximal stretch of the layer's items.
+        let mut spliced = Scene::default();
+        spliced.insert_primitive(quad_marked(rect(0., 0., 800., 600.), 900));
+        spliced.begin_layer(LayerKey(11), panel, false);
+        let segments = build_slab_segments(&items, [0.; 2]).expect("the layer must be packable");
+        let mut totals = [0u32; SlabKind::COUNT];
+        for segment in &segments {
+            if let crate::window::SlabSegment::Stretch(_, packed) = segment {
+                totals[SlabKind::Quads.index()] += packed.quads.len() as u32;
+                totals[SlabKind::Shadows.index()] += packed.shadows.len() as u32;
+                totals[SlabKind::Paths.index()] += packed.total_path_vertices();
+                totals[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
+                totals[SlabKind::MonoSprites.index()] += packed.mono_sprites.len() as u32;
+                totals[SlabKind::PolySprites.index()] += packed.poly_sprites.len() as u32;
+            }
+        }
+        for segment in segments {
+            let crate::window::SlabSegment::Stretch(_, packed) = segment else {
+                continue;
+            };
+            let mut offsets = [0u32; SlabKind::COUNT];
+            let mut runs = Vec::new();
+            for run in &packed.runs {
+                let index = run.kind.index();
+                runs.push(SlabRun {
+                    kind: run.kind,
+                    start: offsets[index] + run.start,
+                    count: run.count,
+                    texture_id: run.texture_id,
+                });
+            }
+            spliced.push_layer_slab_span(
+                panel,
+                LayerKey(11),
+                1,
+                [panel.origin.x.0, panel.origin.y.0],
+                totals,
+                runs,
+                Arc::from(packed),
+            );
+        }
+        spliced.end_layer();
+        spliced.insert_primitive(quad_marked(rect(300., 300., 200., 200.), 907));
+        spliced.finish();
+
+        (legacy, spliced)
+    }
+
+    #[test]
+    fn spliced_mixed_scene_matches_the_legacy_batch_stream_entry_for_entry() {
+        let (legacy, spliced) = twin_scenes();
+
+        // Sanity: the splice actually happened and no primitives leaked into
+        // the frame arrays.
+        assert_eq!(spliced.slab_span_count(), 1);
+        assert_eq!(spliced.quads.len(), 2, "only the root quads remain");
+        assert_eq!(spliced.shadows.len(), 0);
+
+        assert_eq!(
+            spliced_stream(&spliced),
+            legacy_stream(&legacy),
+            "the spliced draw stream must equal the legacy batch stream"
+        );
+    }
+
+    #[test]
+    fn a_span_sorts_exactly_where_its_layer_was_painted() {
+        // Overlapping-after root content must draw ABOVE every span entry;
+        // before-content BELOW. The equivalence test covers this implicitly;
+        // here it is asserted directly on global orders.
+        let (_, spliced) = twin_scenes();
+        let span_order = spliced.layer_slab_spans[0].order();
+        let after_quad = spliced.quads.last().unwrap();
+        assert!(
+            span_order < after_quad.order,
+            "content painted after the layer must sort above the span"
+        );
+        let first_root_quad = &spliced.quads[0];
+        assert!(
+            first_root_quad.order < span_order,
+            "content painted before the layer must sort below the span"
+        );
+    }
+
+    #[test]
+    fn nested_layers_split_a_layer_into_stretches_that_keep_their_positions() {
+        let outer = rect(0., 0., 500., 500.);
+        let inner = rect(20., 20., 100., 100.);
+        let mut recording = Scene::default();
+        recording.begin_layer(LayerKey(21), outer, true);
+        recording.insert_primitive(quad_marked(outer, 801));
+        recording.insert_primitive(quad_marked(outer, 802));
+        recording.begin_layer(LayerKey(22), inner, true);
+        recording.insert_primitive(shadow_marked(inner, 803));
+        let inner_items = recording.end_layer().unwrap();
+        recording.insert_primitive(underline_marked(outer, 804));
+        let outer_items = recording.end_layer().unwrap();
+        recording.finish();
+        assert!(matches!(outer_items[2], LayerItem::Nested(LayerKey(22))));
+
+        // Spliced composite of the OUTER layer only, with the nested child's
+        // shadow composited legacy-style between the stretches.
+        let mut spliced = Scene::default();
+        spliced.begin_layer(LayerKey(21), outer, false);
+        let mut cursor = 0usize;
+        let segments = build_slab_segments(&outer_items, [0.; 2]).expect("packable");
+        let mut totals = [0u32; SlabKind::COUNT];
+        for segment in &segments {
+            if let crate::window::SlabSegment::Stretch(_, packed) = segment {
+                totals[SlabKind::Quads.index()] += packed.quads.len() as u32;
+                totals[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
+            }
+        }
+        for segment in segments {
+            match segment {
+                crate::window::SlabSegment::Stretch(range, packed) => {
+                    assert_eq!(range.start, cursor, "stretches are contiguous");
+                    cursor = range.end;
+                    let mut offsets = [0u32; SlabKind::COUNT];
+                    let mut runs = Vec::new();
+                    for run in &packed.runs {
+                        let index = run.kind.index();
+                        runs.push(SlabRun {
+                            kind: run.kind,
+                            start: offsets[index] + run.start,
+                            count: run.count,
+                            texture_id: run.texture_id,
+                        });
+                        offsets[index] += match run.kind {
+                            SlabKind::Quads => packed.quads.len() as u32,
+                            SlabKind::Underlines => packed.underlines.len() as u32,
+                            _ => unreachable!("test uses two kinds"),
+                        };
+                    }
+                    spliced.push_layer_slab_span(
+                        outer,
+                        LayerKey(21),
+                        1,
+                        [0.; 2],
+                        totals,
+                        runs,
+                        Arc::from(packed),
+                    );
+                }
+                crate::window::SlabSegment::Nested(key) => {
+                    cursor += 1;
+                    spliced.begin_layer(key, inner, false);
+                    for item in &inner_items {
+                        match item {
+                            LayerItem::Primitive(primitive) => spliced.push_retained(primitive),
+                            LayerItem::Nested(_) => unreachable!(),
+                        }
+                    }
+                    spliced.end_layer();
+                }
+            }
+        }
+        spliced.end_layer();
+        spliced.finish();
+
+        // Expected interleaving: quads 801/802, then the child's shadow 803,
+        // then the parent's underline 804 — exactly what the legacy replay
+        // produces.
+        let entries = spliced_stream(&spliced);
+        assert_eq!(
+            entries,
+            vec![
+                Entry::Quad(801),
+                Entry::Quad(802),
+                Entry::Shadow(803),
+                Entry::Underline(804),
+            ],
+            "nested content must sit between its parent's stretches"
+        );
+    }
+
+    #[test]
+    fn replaying_a_range_reregisters_slab_spans() {
+        // A recorded range that contains a span op must survive the
+        // index-range replay path: the fallback after a failed try_composite
+        // depends on it.
+        let panel = rect(0., 0., 200., 200.);
+        let mut source = Scene::default();
+        source.insert_primitive(quad_marked(panel, 701));
+        source.begin_layer(LayerKey(31), panel, true);
+        source.insert_primitive(quad_marked(panel, 702));
+        source.insert_primitive(shadow_marked(panel, 703));
+        let items = source.end_layer().unwrap();
+
+        let mut recorded = Scene::default();
+        recorded.insert_primitive(quad_marked(panel, 701));
+        recorded.begin_layer(LayerKey(31), panel, false);
+        let start = recorded.len();
+        let segments = build_slab_segments(&items, [0.; 2]).expect("packable");
+        for segment in segments {
+            let crate::window::SlabSegment::Stretch(_, packed) = segment else {
+                continue;
+            };
+            let mut runs = Vec::new();
+            for run in &packed.runs {
+                runs.push(SlabRun {
+                    kind: run.kind,
+                    start: run.start,
+                    count: run.count,
+                    texture_id: run.texture_id,
+                });
+            }
+            recorded.push_layer_slab_span(
+                panel,
+                LayerKey(31),
+                1,
+                [0.; 2],
+                [
+                    packed.quads.len() as u32,
+                    packed.shadows.len() as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                runs,
+                Arc::from(packed),
+            );
+        }
+        recorded.end_layer();
+        let end = recorded.len();
+        recorded.finish();
+        assert_eq!(recorded.slab_span_count(), 1);
+
+        // Replay the range into a fresh scene.
+        let mut replayed = Scene::default();
+        replayed.replay(start..end, &recorded);
+        replayed.finish();
+
+        assert_eq!(
+            replayed.slab_span_count(),
+            1,
+            "replay must re-register the span"
+        );
+        assert!(
+            replayed.layer_slab_spans[0].order() >= 1,
+            "the re-reserved slot must resolve through the new scope layout"
+        );
+
+        // And packing still rejects unsupported primitives through the same
+        // window helper the composite hook uses.
+        let mut rejected = Scene::default();
+        rejected.begin_layer(LayerKey(41), panel, true);
+        rejected.insert_primitive(crate::scene::FilterBoundary {
+            order: 0,
+            bounds: panel,
+            content_mask: mask(),
+            corner_radii: Corners::default(),
+            blur_radius: sp(8.),
+            opacity: 1.,
+            is_start: true,
+        });
+        rejected.insert_primitive(quad_marked(panel, 704));
+        rejected.insert_primitive(crate::scene::FilterBoundary {
+            order: 0,
+            bounds: panel,
+            content_mask: mask(),
+            corner_radii: Corners::default(),
+            blur_radius: sp(8.),
+            opacity: 1.,
+            is_start: false,
+        });
+        let boundary_items = rejected.end_layer().unwrap();
+        assert!(build_slab_segments(&boundary_items, [0.; 2]).is_none());
     }
 }

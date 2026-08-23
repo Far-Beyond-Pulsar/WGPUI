@@ -1,6 +1,8 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 use crate::layer::{Layer, LayerCacheKey, LayerItem};
+use crate::platform::cross::slab::SlabKind;
+use crate::scene_pack::{PackedLayer, pack_layer_items, validate_packable};
 use crate::time_ext::Instant;
 use crate::util::post_inc;
 use crate::util::{ResultExt, measure};
@@ -57,6 +59,111 @@ use std::{
 use uuid::Uuid;
 
 mod prompts;
+
+/// One maximal run of a layer's own packable primitives, plus where nested
+/// layers sat between them.
+pub(crate) enum SlabSegment {
+    /// Item-index range (all primitives) with its packed form.
+    Stretch(Range<usize>, Box<PackedLayer>),
+    Nested(LayerKey),
+}
+
+/// Pack one stretch of consecutive primitive items, rejecting the whole
+/// layer on any packing rejection. The result is stored relative to the
+/// layer's composited `origin` (see `make_packed_relative`).
+fn pack_stretch(
+    items: &[LayerItem],
+    start: usize,
+    end: usize,
+    origin: [f32; 2],
+) -> Option<Box<PackedLayer>> {
+    validate_packable(&items[start..end]).ok()?;
+    match pack_layer_items(&items[start..end]) {
+        crate::scene_pack::PackOutcome::Packed(mut packed) => {
+            crate::platform::cross::slab_gpu::make_packed_relative(&mut packed, origin);
+            Some(packed)
+        }
+        crate::scene_pack::PackOutcome::FellBack(_) => None,
+    }
+}
+
+/// Split a layer's items into slab segments: stretches of its own primitives
+/// separated by nested-layer references. `None` when nothing is packable —
+/// including layers whose items are all nested references — which routes the
+/// caller to the legacy composite path.
+pub(crate) fn build_slab_segments(
+    items: &[LayerItem],
+    origin: [f32; 2],
+) -> Option<Vec<SlabSegment>> {
+    let mut segments: Vec<SlabSegment> = Vec::new();
+    let mut stretch_start: Option<usize> = None;
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            LayerItem::Primitive(_) => {
+                stretch_start.get_or_insert(index);
+            }
+            LayerItem::Nested(nested) => {
+                if let Some(start) = stretch_start.take() {
+                    let packed = pack_stretch(items, start, index, origin)?;
+                    segments.push(SlabSegment::Stretch(start..index, packed));
+                }
+                segments.push(SlabSegment::Nested(*nested));
+            }
+        }
+    }
+    if let Some(start) = stretch_start.take() {
+        let packed = pack_stretch(items, start, items.len(), origin)?;
+        segments.push(SlabSegment::Stretch(start..items.len(), packed));
+    }
+
+    let has_stretch = segments
+        .iter()
+        .any(|segment| matches!(segment, SlabSegment::Stretch(..)));
+    if !has_stretch {
+        return None;
+    }
+    Some(segments)
+}
+
+/// The pre-slab composite replay: re-emit every retained primitive through
+/// `push_retained`, recursing into nested layers.
+fn composite_layer_legacy(
+    scene: &mut Scene,
+    layers: &mut FxHashMap<LayerKey, Layer>,
+    key: LayerKey,
+    frame: u64,
+    scale_factor: f32,
+) {
+    let Some(layer) = layers.get_mut(&key) else {
+        // A nested layer evicted out from under its parent. The parent was
+        // judged clean, so this cannot produce wrong pixels on its own — but
+        // it does mean content silently vanished, so make it visible rather
+        // than merely absent.
+        crate::render_stats::count("layer: nested reference missing");
+        return;
+    };
+    layer.last_visited = frame;
+    let bounds = layer.cache_key.bounds.scale(scale_factor);
+    // Taken out so the recursive call can borrow the map; put back below. A
+    // layer never appears twice in one composite tree, so nothing can observe
+    // the gap.
+    let items = mem::take(&mut layer.items);
+
+    scene.begin_layer(key, bounds, false);
+    for item in &items {
+        match item {
+            LayerItem::Primitive(primitive) => scene.push_retained(primitive),
+            LayerItem::Nested(nested) => {
+                composite_layer_legacy(scene, layers, *nested, frame, scale_factor)
+            }
+        }
+    }
+    scene.end_layer();
+
+    if let Some(layer) = layers.get_mut(&key) {
+        layer.items = items;
+    }
+}
 
 use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
@@ -1407,6 +1514,11 @@ pub struct Window {
     /// counts draws this window performed, so a window that stops drawing stops
     /// ageing its layers.
     pub(crate) layer_frame: u64,
+    /// Content tokens handed to the renderer's slab registry: bumped every
+    /// time a layer's items are replaced, read at composite time. A token the
+    /// registry has not seen means "upload this layer's slab".
+    slab_tokens: FxHashMap<LayerKey, u64>,
+    next_slab_token: u64,
     next_layer_id: u32,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
@@ -1895,6 +2007,8 @@ impl Window {
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             layers: FxHashMap::default(),
             layer_frame: 0,
+            slab_tokens: FxHashMap::default(),
+            next_slab_token: 0,
             next_layer_id: 0,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
@@ -2900,6 +3014,23 @@ impl Window {
         );
 
         self.apply_invalidations();
+
+        // Slab-driven re-records (spec #94): the renderer discovers atlas
+        // evictions under resident layers at frame start and posts them here.
+        // Draining before draw_roots is what makes invalidation-before-draw
+        // hold — the affected layer rebuilds (fresh tiles, fresh token) before
+        // its span is recorded again, so stale tiles can never reach the GPU.
+        if crate::scene_pack::slabs_enabled() {
+            for layer_key in crate::platform::cross::slab_gpu::take_rerecord_requests() {
+                if self.layers.contains_key(&layer_key) {
+                    self.invalidator
+                        .invalidate_layer(layer_key, Invalidation::all());
+                } else {
+                    self.slab_tokens.remove(&layer_key);
+                }
+            }
+        }
+
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
@@ -4315,6 +4446,15 @@ impl Window {
             // handlers, tab stops, shaped text, accessed element state — comes
             // from the recorded range. Without this a composited panel renders
             // correctly and stops responding to the mouse.
+            //
+            // The replacement range is stamped around BOTH halves: a `PaintIndex`
+            // spans every array, so only the full reuse+composite extent stays a
+            // valid source for the next frame's replay. With slabs, compositing
+            // no longer appends the recorded primitives to the frame arrays, and
+            // leaving the recording-era range in place would read as out-of-bounds
+            // against composited frames' shorter scenes and force an eternal
+            // re-render.
+            let composite_start = self.paint_index();
             let range = self.layers[&key].paint_range.clone();
             self.reuse_paint_except_scene(&range);
             if self.is_layer_occluded(key) {
@@ -4322,8 +4462,14 @@ impl Window {
                 if let Some(layer) = self.layers.get_mut(&key) {
                     layer.deferred_dirty = false;
                 }
+                // Occluded frames emit nothing new; the previous range still
+                // describes the last visible extent.
             } else {
                 self.composite_layer(key);
+                let composite_end = self.paint_index();
+                if let Some(layer) = self.layers.get_mut(&key) {
+                    layer.paint_range = composite_start..composite_end;
+                }
             }
             return None;
         }
@@ -4408,6 +4554,10 @@ impl Window {
             layer.transform = LayerTransform {
                 offset: bounds.origin,
             };
+            // Fresh items mean fresh content: the next composite of this
+            // layer must re-upload its slab, which the new token forces.
+            self.slab_tokens.insert(key, self.next_slab_token);
+            self.next_slab_token += 1;
             layer.needs = Invalidation::empty();
             layer.last_visited = frame;
             layer.had_mouse = false;
@@ -4529,47 +4679,17 @@ impl Window {
         true
     }
 
-    /// Re-emit `key`'s retained primitives, and those of every layer nested
+    /// Re-emit `key`'s retained content, and that of every layer nested
     /// inside it, without re-running any element code.
+    ///
+    /// With slabs enabled and the layer's own items packable, each maximal
+    /// stretch of its own primitives is recorded as a scene slab span — no
+    /// primitives are re-cloned into the frame arrays, and the renderer draws
+    /// them from persistent per-layer buffers. Nested layers split stretches
+    /// so their own ordering scopes sit exactly where they were painted. Any
+    /// packing rejection takes the legacy replay path for the whole layer,
+    /// which is correct rebuild behaviour, not an error.
     fn composite_layer(&mut self, key: LayerKey) {
-        fn composite(
-            scene: &mut Scene,
-            layers: &mut FxHashMap<LayerKey, Layer>,
-            key: LayerKey,
-            frame: u64,
-            scale_factor: f32,
-        ) {
-            let Some(layer) = layers.get_mut(&key) else {
-                // A nested layer evicted out from under its parent. The parent
-                // was judged clean, so this cannot produce wrong pixels on its
-                // own — but it does mean content silently vanished, so make it
-                // visible rather than merely absent.
-                crate::render_stats::count("layer: nested reference missing");
-                return;
-            };
-            layer.last_visited = frame;
-            let bounds = layer.cache_key.bounds.scale(scale_factor);
-            // Taken out so the recursive call can borrow the map; put back
-            // below. A layer never appears twice in one composite tree, so
-            // nothing can observe the gap.
-            let items = mem::take(&mut layer.items);
-
-            scene.begin_layer(key, bounds, false);
-            for item in &items {
-                match item {
-                    LayerItem::Primitive(primitive) => scene.push_retained(primitive),
-                    LayerItem::Nested(nested) => {
-                        composite(scene, layers, *nested, frame, scale_factor)
-                    }
-                }
-            }
-            scene.end_layer();
-
-            if let Some(layer) = layers.get_mut(&key) {
-                layer.items = items;
-            }
-        }
-
         crate::render_stats::count("layer: composited");
         let _t = crate::render_stats::scope("layer: composite");
         let frame = self.layer_frame;
@@ -4579,7 +4699,21 @@ impl Window {
             .get(&key)
             .map(|layer| layer.cache_key.bounds)
             .unwrap_or_default();
-        composite(
+
+        if crate::scene_pack::slabs_enabled()
+            && !self.next_frame.scene.innermost_layer_is_recording()
+        {
+            let composited_as_slab =
+                self.try_composite_layer_into_scene_as_slab(key, frame, scale_factor);
+            if composited_as_slab {
+                if crate::layer::layer_debug_enabled() {
+                    self.paint_layer_debug_tint(key, bounds, false);
+                }
+                return;
+            }
+        }
+
+        composite_layer_legacy(
             &mut self.next_frame.scene,
             &mut self.layers,
             key,
@@ -4592,6 +4726,120 @@ impl Window {
         }
     }
 
+    /// The slab splice half of [`Self::composite_layer`]: record one span per
+    /// maximal stretch of `key`'s own primitives, recursing into nested layers
+    /// between stretches. Returns `false` when the layer must composite
+    /// through the legacy path instead (nothing packable, or a packing
+    /// rejection).
+    fn try_composite_layer_into_scene_as_slab(
+        &mut self,
+        key: LayerKey,
+        frame: u64,
+        scale_factor: f32,
+    ) -> bool {
+        let Some(layer) = self.layers.get(&key) else {
+            return false;
+        };
+        if !layer.has_content() {
+            return false;
+        }
+        let scaled_bounds = layer.cache_key.bounds.scale(scale_factor);
+        let scaled_origin = [scaled_bounds.origin.x.0, scaled_bounds.origin.y.0];
+        let Some(segments) = build_slab_segments(&layer.items, scaled_origin) else {
+            return false;
+        };
+
+        let token = self.slab_tokens.get(&key).copied().unwrap_or(0);
+        let bounds = scaled_bounds;
+        let origin = scaled_origin;
+        // Per-kind instance totals across all stretches: what whichever span
+        // arrives first reserves from the allocator. Paths count vertices —
+        // their slab holds the flattened stream, not path structs.
+        let mut totals = [0u32; SlabKind::COUNT];
+        for segment in &segments {
+            let SlabSegment::Stretch(_, packed) = segment else {
+                continue;
+            };
+            totals[SlabKind::Quads.index()] += packed.quads.len() as u32;
+            totals[SlabKind::Shadows.index()] += packed.shadows.len() as u32;
+            totals[SlabKind::Paths.index()] += packed.total_path_vertices();
+            totals[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
+            totals[SlabKind::MonoSprites.index()] += packed.mono_sprites.len() as u32;
+            totals[SlabKind::PolySprites.index()] += packed.poly_sprites.len() as u32;
+        }
+        // Running per-kind offsets: every stretch draws out of the same slab
+        // ranges, so a later stretch's runs start where earlier ones' bytes end.
+        let mut offsets = [0u32; SlabKind::COUNT];
+
+        self.next_frame.scene.begin_layer(key, bounds, false);
+        crate::render_stats::count("layer: composited (slab)");
+        for segment in segments {
+            match segment {
+                SlabSegment::Stretch(range, packed) => {
+                    debug_assert!(
+                        range.end <= self.layers.get(&key).map(|l| l.items.len()).unwrap_or(0),
+                        "stretch range must stay inside its layer's items"
+                    );
+                    let mut runs = Vec::with_capacity(packed.runs.len());
+                    for run in &packed.runs {
+                        let index = run.kind.index();
+                        runs.push(crate::scene::SlabRun {
+                            kind: run.kind,
+                            start: offsets[index] + run.start,
+                            count: run.count,
+                            texture_id: run.texture_id,
+                        });
+                    }
+                    offsets[SlabKind::Quads.index()] += packed.quads.len() as u32;
+                    offsets[SlabKind::Shadows.index()] += packed.shadows.len() as u32;
+                    offsets[SlabKind::Paths.index()] += packed.total_path_vertices();
+                    offsets[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
+                    offsets[SlabKind::MonoSprites.index()] += packed.mono_sprites.len() as u32;
+                    offsets[SlabKind::PolySprites.index()] += packed.poly_sprites.len() as u32;
+                    self.next_frame.scene.push_layer_slab_span(
+                        bounds,
+                        key,
+                        token,
+                        origin,
+                        totals,
+                        runs,
+                        Arc::from(packed),
+                    );
+                }
+                SlabSegment::Nested(nested) => {
+                    self.composite_nested_layer_for_slab(nested, frame, scale_factor);
+                }
+            }
+        }
+        self.next_frame.scene.end_layer();
+        if let Some(layer) = self.layers.get_mut(&key) {
+            layer.last_visited = frame;
+        }
+        true
+    }
+
+    /// Recurse into a nested layer from the slab path. The child decides its
+    /// own representation independently — slabbed children splice spans into
+    /// their own scope inside the parent's, legacy children replay inline.
+    fn composite_nested_layer_for_slab(&mut self, nested: LayerKey, frame: u64, scale_factor: f32) {
+        let exists = self
+            .layers
+            .get(&nested)
+            .is_some_and(|layer| layer.has_content());
+        if !exists {
+            crate::render_stats::count("layer: nested reference missing");
+            return;
+        }
+        if crate::scene_pack::slabs_enabled()
+            && !self.next_frame.scene.innermost_layer_is_recording()
+            && self.try_composite_layer_into_scene_as_slab(nested, frame, scale_factor)
+        {
+            return;
+        }
+        let scene = &mut self.next_frame.scene;
+        let layers = &mut self.layers;
+        composite_layer_legacy(scene, layers, nested, frame, scale_factor);
+    }
     /// Tint `bounds` by the layer's id, at full strength on a frame it
     /// re-rendered.
     ///
@@ -4635,11 +4883,13 @@ impl Window {
         let frame = self.layer_frame;
         let mut dropped_content = 0usize;
         let mut dropped_records = 0usize;
+        let mut forgotten_keys: Vec<LayerKey> = Vec::new();
         self.layers.retain(|key, layer| {
             let age = frame.saturating_sub(layer.last_visited);
             let evict_after = layer.policy.evict_after_frames as u64;
             if age > evict_after.saturating_mul(2) {
                 dropped_records += 1;
+                forgotten_keys.push(*key);
                 log::trace!(
                     "layer {key:?} ({:?}) forgotten after {age} frames",
                     layer.id
@@ -4656,6 +4906,9 @@ impl Window {
             }
             true
         });
+        for key in &forgotten_keys {
+            self.slab_tokens.remove(key);
+        }
         for _ in 0..dropped_content + dropped_records {
             crate::render_stats::count("layer: evicted");
         }

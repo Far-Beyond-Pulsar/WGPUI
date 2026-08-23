@@ -5,7 +5,7 @@ pub mod platform;
 pub mod render_context;
 pub mod renderer;
 pub mod resize_detector;
-pub mod slab;
+pub mod slab_gpu;
 pub mod surface_registry;
 pub mod text_system;
 pub mod window;
