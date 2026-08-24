@@ -921,3 +921,649 @@ fn a_transform_only_moved_span_renders_shifted_without_reuploading_instances()
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+// State-dedup / cross-span merged flushing.
+//
+// These tests drive every readback through a bounded-wait poll: sibling GPU
+// tests share this process's driver, and an indefinite poll can wedge the
+// whole suite when they overlap. Time out loudly instead of hanging.
+// ---------------------------------------------------------------------
+
+/// A synthetic scene whose one layer is split across TWO adjacent spans with
+/// exactly contiguous quad runs (the shape nested layers produce), including
+/// an intra-span adjacent run pair, followed by a SECOND layer whose same-kind
+/// instances do NOT continue the first layer's stretch. Cross-layer runs sit
+/// adjacent in the kind buffer yet must never merge: their transform slots
+/// differ, so merging would move pixels.
+///
+/// Returns `(legacy_composite, spliced)` like [`build_frames`].
+fn build_multi_span_frames(origin: (f32, f32)) -> anyhow::Result<(Scene, Scene)> {
+    const KEY_A: LayerKey = LayerKey(202);
+    const KEY_B: LayerKey = LayerKey(203);
+    let panel_a = rect(origin.0, origin.1, 240., 80.);
+    let panel_b = rect(origin.0, origin.1 + 90., 120., 70.);
+
+    let mut recording = Scene::default();
+    recording.insert_primitive(background_quad());
+    recording.begin_layer(KEY_A, panel_a, true);
+    for index in 0..8u32 {
+        recording.insert_primitive(quad_solid(
+            rect(origin.0 + 8. + index as f32 * 26., origin.1 + 12., 34., 56.),
+            Hsla { h: index as f32 * 0.125, s: 0.85, l: 0.5, a: if index % 2 == 0 { 1. } else { 0.72 } },
+        ));
+    }
+    let items_a = recording.end_layer().unwrap();
+    recording.begin_layer(KEY_B, panel_b, true);
+    for index in 0..3u32 {
+        recording.insert_primitive(quad_solid(
+            rect(origin.0 + 12. + index as f32 * 38., origin.1 + 104., 44., 44.),
+            Hsla { h: 0.5 + index as f32 * 0.1, s: 0.7, l: 0.42, a: 0.9 },
+        ));
+    }
+    let items_b = recording.end_layer().unwrap();
+
+    let mut legacy = Scene::default();
+    legacy.insert_primitive(background_quad());
+    legacy.begin_layer(KEY_A, panel_a, false);
+    for item in &items_a {
+        match item {
+            crate::layer::LayerItem::Primitive(primitive) => legacy.push_retained(primitive),
+            crate::layer::LayerItem::Nested(_) => unreachable!(),
+        }
+    }
+    legacy.end_layer();
+    legacy.begin_layer(KEY_B, panel_b, false);
+    for item in &items_b {
+        match item {
+            crate::layer::LayerItem::Primitive(primitive) => legacy.push_retained(primitive),
+            crate::layer::LayerItem::Nested(_) => unreachable!(),
+        }
+    }
+    legacy.end_layer();
+    legacy.finish();
+
+    let pack =
+        |items: &[crate::layer::LayerItem]| -> anyhow::Result<Box<crate::scene_pack::PackedLayer>> {
+            match crate::scene_pack::pack_layer_items(items) {
+                crate::scene_pack::PackOutcome::Packed(packed) => Ok(packed),
+                crate::scene_pack::PackOutcome::FellBack(reason) => {
+                    anyhow::bail!("recipe unexpectedly fell back: {reason:?}")
+                }
+            }
+        };
+
+    let mut packed_a = pack(&items_a)?;
+    let mut packed_b = pack(&items_b)?;
+    crate::platform::cross::slab_gpu::make_packed_relative(&mut packed_a, origin_arr(origin));
+    crate::platform::cross::slab_gpu::make_packed_relative(&mut packed_b, origin_arr(origin));
+
+    // The synthetic recipes are quads-only; anything else means the split
+    // bookkeeping below would silently drop instances.
+    for packed in [&packed_a, &packed_b] {
+        assert!(packed.shadows.is_empty() && packed.paths.is_empty()
+            && packed.underlines.is_empty() && packed.mono_sprites.is_empty()
+            && packed.poly_sprites.is_empty());
+    }
+
+    // Split layer A's quad stream across two spans: the head carries [0..4),
+    // the tail carries [4..8) as TWO adjacent runs. Layer B stays whole. All
+    // spans of one layer carry the layer-wide totals.
+    let totals_a = [packed_a.quads.len() as u32, 0, 0, 0, 0, 0];
+    let totals_b = [packed_b.quads.len() as u32, 0, 0, 0, 0, 0];
+    let mid = 4u32;
+    let head = Box::new(crate::scene_pack::PackedLayer {
+        quads: packed_a.quads[..mid as usize].to_vec(),
+        shadows: Vec::new(),
+        paths: Vec::new(),
+        underlines: Vec::new(),
+        mono_sprites: Vec::new(),
+        poly_sprites: Vec::new(),
+        runs: vec![crate::scene_pack::KindRun {
+            kind: SlabKind::Quads,
+            start: 0,
+            count: mid,
+            texture_id: None,
+        }],
+    });
+    let tail = Box::new(crate::scene_pack::PackedLayer {
+        quads: packed_a.quads[mid as usize..].to_vec(),
+        shadows: Vec::new(),
+        paths: Vec::new(),
+        underlines: Vec::new(),
+        mono_sprites: Vec::new(),
+        poly_sprites: Vec::new(),
+        runs: vec![
+            crate::scene_pack::KindRun { kind: SlabKind::Quads, start: mid, count: 2, texture_id: None },
+            crate::scene_pack::KindRun { kind: SlabKind::Quads, start: mid + 2, count: 2, texture_id: None },
+        ],
+    });
+
+    let mut spliced = Scene::default();
+    spliced.insert_primitive(background_quad());
+    spliced.begin_layer(KEY_A, panel_a, false);
+    spliced.push_layer_slab_span(
+        panel_a,
+        KEY_A,
+        1,
+        origin_arr(origin),
+        totals_a,
+        vec![crate::scene::SlabRun { kind: SlabKind::Quads, start: 0, count: mid, texture_id: None }],
+        std::sync::Arc::from(head),
+    );
+    spliced.push_layer_slab_span(
+        panel_a,
+        KEY_A,
+        1,
+        origin_arr(origin),
+        totals_a,
+        vec![
+            crate::scene::SlabRun { kind: SlabKind::Quads, start: mid, count: 2, texture_id: None },
+            crate::scene::SlabRun { kind: SlabKind::Quads, start: mid + 2, count: 2, texture_id: None },
+        ],
+        std::sync::Arc::from(tail),
+    );
+    spliced.end_layer();
+    spliced.begin_layer(KEY_B, panel_b, false);
+    spliced.push_layer_slab_span(
+        panel_b,
+        KEY_B,
+        1,
+        origin_arr(origin),
+        totals_b,
+        vec![crate::scene::SlabRun {
+            kind: SlabKind::Quads,
+            start: 0,
+            count: totals_b[0],
+            texture_id: None,
+        }],
+        std::sync::Arc::from(packed_b),
+    );
+    spliced.end_layer();
+    spliced.finish();
+
+    Ok((legacy, spliced))
+}
+
+impl PixelHarness {
+    /// Render through one of two slab-flushing strategies and read back:
+    ///
+    /// - `production = true`: the production draw loop — shared bind-state
+    ///   tracker, cross-span merged stretches flushed via
+    ///   `flush_slab_run_with_state`.
+    /// - `production = false`: the naive baseline — per-span pending runs
+    ///   flushed through the untracked wrapper, exactly like the pre-existing
+    ///   readback helper drives them.
+    ///
+    /// Both share this method's bounded-wait readback so a wedged driver call
+    /// can never hang the suite from here. Returns the pixels plus how many
+    /// slab draws were issued.
+    fn render_and_read_back_mode(
+        &self,
+        scene: &Scene,
+        groups: Option<&SlabDrawGroups>,
+        production: bool,
+    ) -> (Vec<u8>, usize) {
+        let stride = self.buffers.transform_slot_stride;
+        let mut state = super::PassBindState::default();
+        let mut open: Option<super::OpenSlabRun> = None;
+        let mut slab_draws = 0usize;
+
+        let target = self.context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pixel test target"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let quads_bg =
+            self.buffer_group(&self.pipelines.quads_bind_group_layout, &self.context.quads_buffer);
+        let paths_bg = self.buffer_group(
+            &self.pipelines.paths_bind_group_layout,
+            &self.context.paths_vertices_buffer,
+        );
+
+        let mut encoder = self
+            .context
+            .device
+            .create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pixel test mode pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    resolve_target: None,
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            let mut quads_first: u32 = 0;
+            let mut paths_offset: u32 = 0;
+
+            // Legacy draws read the identity slot; without slab groups this
+            // method binds its own transform group, exactly like the original
+            // helper.
+            let legacy_only_transform = self.layer_transform_bind_group();
+            let transform_for_legacy_draws: &wgpu::BindGroup = match groups {
+                Some(groups) => &groups.layer_transform,
+                None => &legacy_only_transform,
+            };
+
+            for frame_batch in scene.frame_batches() {
+                match frame_batch {
+                    crate::scene::SceneBatch::Primitives(batch) => {
+                        if production
+                            && primitive_batch_instance_count(&batch) > 0
+                            && open.is_some()
+                        {
+                            slab_draws += 1;
+                            super::flush_open_slab_run(
+                                &self.pipelines,
+                                stride,
+                                &mut pass,
+                                groups.expect("production mode carries slab groups"),
+                                &mut state,
+                                &mut open,
+                            );
+                        }
+                        match batch {
+                            PrimitiveBatch::Quads(quads) => {
+                                let count = quads.len() as u32;
+                                state.set_pipeline(
+                                    &mut pass,
+                                    super::DrawPipelineId::Quads,
+                                    &self.pipelines.quads_pipeline,
+                                );
+                                state.set_bind_group(
+                                    &mut pass,
+                                    0,
+                                    super::BoundGroupId::Globals,
+                                    &self.pipelines.globals_bind_group,
+                                    &[],
+                                );
+                                state.set_bind_group(
+                                    &mut pass,
+                                    1,
+                                    super::BoundGroupId::LegacyBuffer(super::LegacyBuffer::Quads),
+                                    &quads_bg,
+                                    &[],
+                                );
+                                state.set_bind_group(
+                                    &mut pass,
+                                    2,
+                                    super::BoundGroupId::LayerTransform(0),
+                                    transform_for_legacy_draws,
+                                    &[0],
+                                );
+                                pass.draw(0..4, quads_first..quads_first + count);
+                                quads_first += count;
+                            }
+                            PrimitiveBatch::Paths(paths) => {
+                                let vertex_count: u32 =
+                                    paths.iter().map(|p| p.vertices.len() as u32).sum();
+                                if vertex_count > 0 {
+                                    state.set_pipeline(
+                                        &mut pass,
+                                        super::DrawPipelineId::Paths,
+                                        &self.pipelines.paths_pipeline,
+                                    );
+                                    state.set_bind_group(
+                                        &mut pass,
+                                        0,
+                                        super::BoundGroupId::Globals,
+                                        &self.pipelines.globals_bind_group,
+                                        &[],
+                                    );
+                                    state.set_bind_group(
+                                        &mut pass,
+                                        1,
+                                        super::BoundGroupId::LegacyBuffer(
+                                            super::LegacyBuffer::PathVertices,
+                                        ),
+                                        &paths_bg,
+                                        &[],
+                                    );
+                                    state.set_bind_group(
+                                        &mut pass,
+                                        2,
+                                        super::BoundGroupId::LayerTransform(0),
+                                        transform_for_legacy_draws,
+                                        &[0],
+                                    );
+                                    pass.draw(paths_offset..paths_offset + vertex_count, 0..1);
+                                    paths_offset += vertex_count;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    crate::scene::SceneBatch::LayerSlab(index) => {
+                        let groups = match groups {
+                            Some(groups) => groups,
+                            // The legacy composite carries no spans.
+                            None => continue,
+                        };
+                        if !production {
+                            // Naive baseline: per-span pending runs flushed
+                            // through the untracked wrapper, exactly like the
+                            // pre-existing helper drives them.
+                            let span = &scene.layer_slab_spans[index];
+                            let slabs = self.registry.entry_slabs(span.key).unwrap();
+                            let slot = self.registry.transform_slot(span.key).unwrap();
+                            let mut pending: Option<SlabPendingRun> = None;
+                            for run in &span.runs {
+                                match pending.as_mut() {
+                                    Some(open)
+                                        if open.kind == run.kind
+                                            && open.texture_id == run.texture_id
+                                            && open.start + open.count == run.start =>
+                                    {
+                                        open.count += run.count;
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                                if let Some(open) = pending.take() {
+                                    slab_draws += 1;
+                                    super::flush_slab_run(
+                                        &self.pipelines,
+                                        stride,
+                                        &mut pass,
+                                        &slabs,
+                                        groups,
+                                        slot,
+                                        &open,
+                                    );
+                                }
+                                pending = Some(SlabPendingRun {
+                                    kind: run.kind,
+                                    texture_id: run.texture_id,
+                                    start: run.start,
+                                    count: run.count,
+                                });
+                            }
+                            if let Some(open) = pending.take() {
+                                slab_draws += 1;
+                                super::flush_slab_run(
+                                    &self.pipelines,
+                                    stride,
+                                    &mut pass,
+                                    &slabs,
+                                    groups,
+                                    slot,
+                                    &open,
+                                );
+                            }
+                            continue;
+                        }
+                        let span = &scene.layer_slab_spans[index];
+                        let slabs = self.registry.entry_slabs(span.key).unwrap();
+                        let slot = self.registry.transform_slot(span.key).unwrap();
+                        for run in &span.runs {
+                            if let Some(open) = open.as_mut()
+                                && open.accepts(span.key, &slabs, run)
+                            {
+                                open.count += run.count;
+                                continue;
+                            }
+                            if open.is_some() {
+                                slab_draws += 1;
+                                super::flush_open_slab_run(
+                                    &self.pipelines,
+                                    stride,
+                                    &mut pass,
+                                    groups,
+                                    &mut state,
+                                    &mut open,
+                                );
+                            }
+                            open = Some(super::OpenSlabRun {
+                                key: span.key,
+                                slabs,
+                                transform_slot: slot,
+                                kind: run.kind,
+                                texture_id: run.texture_id,
+                                start: run.start,
+                                count: run.count,
+                            });
+                        }
+                    }
+                }
+            }
+            if production && open.is_some() {
+                slab_draws += 1;
+                super::flush_open_slab_run(
+                    &self.pipelines,
+                    stride,
+                    &mut pass,
+                    groups.expect("production mode carries slab groups"),
+                    &mut state,
+                    &mut open,
+                );
+            }
+        }
+
+        // Readback with row padding stripped, under a bounded wait.
+        let bytes_per_pixel = 4u32;
+        let unpadded_row = WIDTH * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_row = unpadded_row.div_ceil(align) * align;
+        let staging = self.context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pixel test staging"),
+            size: (padded_row * HEIGHT) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.context.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let map_result = Arc::new(std::sync::Mutex::new(None::<String>));
+        let map_sink = map_result.clone();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            if let Err(error) = result {
+                *map_sink.lock().expect("map result mutex") = Some(format!("{error}"));
+            }
+        });
+        let mut mapped = false;
+        for _ in 0..60 {
+            match self.context.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(500)),
+            }) {
+                Ok(_) => {}
+                Err(wgpu::PollError::Timeout) => continue,
+                Err(error) => panic!("device poll failed during readback: {error:?}"),
+            }
+            if let Some(error) = map_result.lock().expect("map result mutex").as_ref() {
+                panic!("readback map failed: {error}");
+            }
+            mapped = true;
+            break;
+        }
+        assert!(
+            mapped,
+            "readback never mapped within 30s; the headless device wedged"
+        );
+        let data = slice.get_mapped_range().expect("staging map succeeded");
+        let mut out = Vec::with_capacity((unpadded_row * HEIGHT) as usize);
+        for row in 0..HEIGHT {
+            let start = (row * padded_row) as usize;
+            out.extend_from_slice(&data[start..start + unpadded_row as usize]);
+        }
+        drop(data);
+        staging.unmap();
+        (out, slab_draws)
+    }
+}
+
+#[test]
+fn merged_state_tracked_flush_renders_identically_to_naive_flush() -> anyhow::Result<()> {
+    let Some(mut harness) = headless_harness() else {
+        eprintln!(
+            "skipping merged_state_tracked_flush_renders_identically...: no wgpu adapter"
+        );
+        return Ok(());
+    };
+
+    let (legacy, spliced) = build_multi_span_frames((8., 6.))?;
+
+    harness.upload_legacy_arrays(&legacy);
+    let legacy_bytes = harness.render_and_read_back_mode(&legacy, None, false).0;
+
+    let groups = harness.prepare_spans(&spliced);
+    harness.upload_legacy_arrays(&spliced);
+    let naive_bytes = harness.render_and_read_back_mode(&spliced, Some(&groups), false).0;
+    let (production_bytes, production_draws) =
+        harness.render_and_read_back_mode(&spliced, Some(&groups), true);
+
+    // Pixel evidence: the merged/deduped production loop is byte-identical to
+    // BOTH the naive per-run slab loop and the pure legacy composite.
+    let naive_vs_production: Vec<usize> = naive_bytes
+        .iter()
+        .zip(production_bytes.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        naive_vs_production.is_empty(),
+        "{} differing bytes between naive and merged/deduped slab flushing; \
+         first at byte {}",
+        naive_vs_production.len(),
+        naive_vs_production.first().copied().unwrap_or(usize::MAX)
+    );
+    let legacy_vs_production: Vec<usize> = legacy_bytes
+        .iter()
+        .zip(production_bytes.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        legacy_vs_production.is_empty(),
+        "{} differing bytes between the legacy composite and the merged slab \
+         render; first at byte {}",
+        legacy_vs_production.len(),
+        legacy_vs_production.first().copied().unwrap_or(usize::MAX)
+    );
+
+    // Guard against a trivially-blank comparison: the last quad of layer B
+    // sits near (98, 122); its pixel must not be the clear color.
+    let probe = ((126 + 130 * HEIGHT as usize) * 4)..((126 + 130 * HEIGHT as usize) * 4 + 4);
+    assert_ne!(&production_bytes[probe], &[0, 0, 0, 255][..]);
+
+    // Draw-call evidence: layer A's two spans merge into one stretch (its
+    // intra-span pair folds in too), and the tracker skips redundant state
+    // for layer B's separate draw. The naive loop issues one draw PER SPAN
+    // after intra-span merging (three here); production issues two — the
+    // cross-layer boundary cannot merge (different transform slots).
+    assert_eq!(
+        production_draws, 2,
+        "adjacent same-layer spans must merge; cross-layer spans must not"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cached_slab_groups_survive_clean_only_frames_and_invalidate_per_buffer() -> anyhow::Result<()> {
+    let Some(harness) = headless_harness() else {
+        eprintln!(
+            "skipping cached_slab_groups_survive_clean_only_frames...: no wgpu adapter"
+        );
+        return Ok(());
+    };
+    let tile = insert_tile(&harness, 11)?;
+    let (_, spliced) = build_frames((24., 16.), tile)?;
+    let device = &harness.context.device;
+
+    let mut cache = SlabGroupCache::default();
+    let frame_groups = |cache: &mut SlabGroupCache, scene: &Scene| {
+        cache.frame_groups(
+            device,
+            &harness.pipelines,
+            &harness.buffers,
+            &harness.atlas,
+            &harness.atlas_sampler,
+            scene,
+        )
+    };
+
+    let first = frame_groups(&mut cache, &spliced);
+    // Six kind buffers + the transform uniform + the scene's one atlas page.
+    assert_eq!(
+        cache.creation_count(),
+        6 + 1 + 1,
+        "the first frame builds every group exactly once"
+    );
+    assert_eq!(first.sprite_textures.len(), 1);
+
+    // A Clean-only frame: identical scene, nothing recreated, handles reused.
+    let second = frame_groups(&mut cache, &spliced);
+    assert_eq!(
+        cache.creation_count(),
+        6 + 1 + 1,
+        "Clean-only frames must not rebuild any bind groups"
+    );
+    assert_eq!(second.sprite_textures.len(), 1);
+
+    // An empty-span frame changes the referenced-page set to nothing: the
+    // page map drops its entries without rebuilding buffer groups.
+    let mut empty_scene = Scene::default();
+    empty_scene.finish();
+    let third = frame_groups(&mut cache, &empty_scene);
+    assert_eq!(cache.creation_count(), 6 + 1 + 1);
+    assert!(
+        third.sprite_textures.is_empty(),
+        "the stale page binding must be released once no span references it"
+    );
+
+    // Back to the tiled scene: exactly the missing page group is rebuilt.
+    let fourth = frame_groups(&mut cache, &spliced);
+    assert_eq!(cache.creation_count(), 6 + 1 + 2);
+    assert_eq!(fourth.sprite_textures.len(), 1);
+
+    // A recreated kind buffer invalidates exactly that kind's group.
+    cache.invalidate_kind(SlabKind::Shadows);
+    let _fifth = frame_groups(&mut cache, &spliced);
+    assert_eq!(cache.creation_count(), 6 + 1 + 3);
+
+    // A recreated transform uniform invalidates its group.
+    cache.invalidate_transforms();
+    let _sixth = frame_groups(&mut cache, &spliced);
+    assert_eq!(cache.creation_count(), 6 + 1 + 4);
+
+    Ok(())
+}

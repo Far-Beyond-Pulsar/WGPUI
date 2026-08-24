@@ -1572,9 +1572,382 @@ struct SlabPendingRun {
     count: u32,
 }
 
+/// Which render pipeline is currently bound, as a semantic identity the bind
+/// tracker can compare without touching wgpu resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawPipelineId {
+    Quads,
+    Shadows,
+    Paths,
+    Underlines,
+    MonoSprites,
+    PolySprites,
+}
+
+/// Which legacy fixed buffer a bind group wraps, per kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyBuffer {
+    Quads,
+    Shadows,
+    Underlines,
+    MonoSprites,
+    PolySprites,
+    PathVertices,
+}
+
+/// Semantic identity of one bindable resource at one bind-group slot.
+///
+/// Two draws whose ids agree at every slot bind byte-identical GPU state, so
+/// the second set is skippable without any pixel effect. Resources this
+/// module does not model (per-surface groups, filter composites) are never
+/// given an id: those draw paths reset the tracker instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundGroupId {
+    Globals,
+    ColorAdjustments,
+    /// The layer transform uniform at a specific dynamic offset. Legacy
+    /// draws always use offset 0 (the identity slot); slab draws use
+    /// `slot * stride` for their layer.
+    LayerTransform(u32),
+    LegacyBuffer(LegacyBuffer),
+    SlabStorage(SlabKind),
+    SpriteTexture(u32, crate::AtlasTextureKind),
+}
+
+/// Upper bound on bind-group slots any pipeline here uses (mono sprites: 5).
+const PASS_BIND_SLOTS: usize = 5;
+
+/// What the current render pass has bound, so redundant
+/// `set_pipeline`/`set_bind_group` calls can be skipped.
+///
+/// wgpu offers no way to query a pass's bound state, and driver-side state
+/// churn is exactly what this tracks: consecutive same-kind runs (and split
+/// legacy batches) re-issue identical binds today. Ids are semantic rather
+/// than pointer-based, which keeps skipping sound even when equal-content
+/// bind groups are distinct objects. Anything unmodeled must call [`Self::reset`]
+/// before tracked draws resume.
+#[derive(Default)]
+struct PassBindState {
+    pipeline: Option<DrawPipelineId>,
+    groups: [Option<BoundGroupId>; PASS_BIND_SLOTS],
+}
+
+impl PassBindState {
+    fn reset(&mut self) {
+        self.pipeline = None;
+        self.groups = [None; PASS_BIND_SLOTS];
+    }
+
+    fn set_pipeline(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        id: DrawPipelineId,
+        pipeline: &wgpu::RenderPipeline,
+    ) {
+        if self.pipeline == Some(id) {
+            return;
+        }
+        pass.set_pipeline(pipeline);
+        self.pipeline = Some(id);
+    }
+
+    fn set_bind_group(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        index: u32,
+        id: BoundGroupId,
+        group: &wgpu::BindGroup,
+        offsets: &[wgpu::DynamicOffset],
+    ) {
+        let slot = index as usize;
+        if slot < PASS_BIND_SLOTS && self.groups[slot] == Some(id) {
+            return;
+        }
+        pass.set_bind_group(index, group, offsets);
+        if slot < PASS_BIND_SLOTS {
+            self.groups[slot] = Some(id);
+        }
+    }
+}
+
+/// One merged slab stretch opened by a span that may stay open across span
+/// boundaries until a non-continuing draw forces its flush.
+///
+/// Merging requires more than instance contiguity: both stretches must draw
+/// through the same transform uniform offset, i.e. belong to the same layer.
+/// Different layers occupy different transform slots, so their instances can
+/// sit adjacent in a kind buffer yet still need separate draws — cross-layer
+/// merging is impossible without changing pixels (or relocating resident
+/// bytes to co-locate layers, a buffer reshuffle this deliberately avoids).
+struct OpenSlabRun {
+    key: LayerKey,
+    slabs: crate::platform::cross::slab::LayerSlabs,
+    transform_slot: u32,
+    kind: SlabKind,
+    texture_id: Option<AtlasTextureId>,
+    start: u32,
+    count: u32,
+}
+
+impl OpenSlabRun {
+    /// Whether `run` continues this stretch: same layer, same kind, same
+    /// texture, and exactly contiguous in the layer-wide instance stream.
+    fn accepts(
+        &self,
+        key: LayerKey,
+        slabs: &crate::platform::cross::slab::LayerSlabs,
+        run: &crate::scene::SlabRun,
+    ) -> bool {
+        self.key == key
+            && &self.slabs == slabs
+            && self.kind == run.kind
+            && self.texture_id == run.texture_id
+            && self.start + self.count == run.start
+    }
+
+    fn as_pending(&self) -> SlabPendingRun {
+        SlabPendingRun {
+            kind: self.kind,
+            texture_id: self.texture_id,
+            start: self.start,
+            count: self.count,
+        }
+    }
+}
+
+/// Frame-to-frame cache of the slab bind state: the six per-kind storage
+/// groups plus the transform-uniform group are rebuilt only when
+/// [`SlabGpuBuffers`] recreates their buffer, and atlas-page groups refresh
+/// only when the referenced-page set changes. On a Clean-only frame this
+/// costs a few handle clones instead of eight `create_bind_group` calls.
+struct SlabGroupCache {
+    kind_groups: [Option<wgpu::BindGroup>; SlabKind::COUNT],
+    transforms: Option<wgpu::BindGroup>,
+    /// The canonical (sorted) page set `sprite_textures` was built from.
+    pages: Vec<(u32, crate::AtlasTextureKind)>,
+    page_scratch: Vec<(u32, crate::AtlasTextureKind)>,
+    sprite_textures: FxHashMap<(u32, crate::AtlasTextureKind), wgpu::BindGroup>,
+    #[cfg(test)]
+    creations: u64,
+}
+
+impl Default for SlabGroupCache {
+    fn default() -> Self {
+        SlabGroupCache {
+            kind_groups: std::array::from_fn(|_| None),
+            transforms: None,
+            pages: Vec::new(),
+            page_scratch: Vec::new(),
+            sprite_textures: FxHashMap::default(),
+            #[cfg(test)]
+            creations: 0,
+        }
+    }
+}
+
+impl SlabGroupCache {
+    #[cfg(test)]
+    fn creation_count(&self) -> u64 {
+        self.creations
+    }
+
+    fn invalidate_kind(&mut self, kind: SlabKind) {
+        self.kind_groups[kind.index()] = None;
+    }
+
+    fn invalidate_transforms(&mut self) {
+        self.transforms = None;
+    }
+
+    fn kind_layout(pipelines: &WgpuPipelines, kind: SlabKind) -> &wgpu::BindGroupLayout {
+        match kind {
+            SlabKind::Quads => &pipelines.quads_bind_group_layout,
+            SlabKind::Shadows => &pipelines.shadows_bind_group_layout,
+            SlabKind::Paths => &pipelines.paths_bind_group_layout,
+            SlabKind::Underlines => &pipelines.underlines_bind_group_layout,
+            SlabKind::MonoSprites => &pipelines.mono_sprites_bind_group_layout,
+            SlabKind::PolySprites => &pipelines.poly_sprites_bind_group_layout,
+        }
+    }
+
+    fn ensure_kind_group(
+        &mut self,
+        device: &wgpu::Device,
+        pipelines: &WgpuPipelines,
+        buffers: &slab_gpu::SlabGpuBuffers,
+        kind: SlabKind,
+    ) {
+        let index = kind.index();
+        if self.kind_groups[index].is_some() {
+            return;
+        }
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slab_kind_bind_group"),
+            layout: Self::kind_layout(pipelines, kind),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: buffers.kind_buffer(kind),
+                    offset: 0,
+                    size: None,
+                }),
+            }],
+        });
+        self.kind_groups[index] = Some(group);
+        #[cfg(test)]
+        {
+            self.creations += 1;
+        }
+    }
+
+    fn ensure_transforms_group(
+        &mut self,
+        device: &wgpu::Device,
+        pipelines: &WgpuPipelines,
+        buffers: &slab_gpu::SlabGpuBuffers,
+    ) {
+        if self.transforms.is_some() {
+            return;
+        }        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("layer_transform_bind_group"),
+            layout: &pipelines.layer_transform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: buffers.transforms_buffer(),
+                    offset: 0,
+                    size: Some(std::num::NonZeroU64::new(
+                        std::mem::size_of::<GpuLayerTransform>() as u64,
+                    )
+                    .expect("non-zero transform size")),
+                }),
+            }],
+        });
+        self.transforms = Some(group);
+        #[cfg(test)]
+        {
+            self.creations += 1;
+        }
+    }
+
+    /// The cached transform-uniform bind group, recreated only after the
+    /// uniform buffer was. Legacy draws share this group with slab draws:
+    /// both bind the same uniform, selecting slots via dynamic offsets.
+    fn transforms_group(
+        &mut self,
+        device: &wgpu::Device,
+        pipelines: &WgpuPipelines,
+        buffers: &slab_gpu::SlabGpuBuffers,
+    ) -> wgpu::BindGroup {
+        self.ensure_transforms_group(device, pipelines, buffers);
+        self.transforms.as_ref().expect("just ensured").clone()
+    }
+
+    /// Rebuild the page map only when this frame's referenced-page set differs
+    /// from the cached one. Pages whose layers were poisoned by eviction stay
+    /// in the map but are never bound: poisoned layers skip their draws before
+    /// the texture check runs.
+    fn sync_sprite_pages(
+        &mut self,
+        device: &wgpu::Device,
+        pipelines: &WgpuPipelines,
+        atlas: &WgpuAtlas,
+        atlas_sampler: &wgpu::Sampler,
+        scene: &Scene,
+    ) {
+        self.page_scratch.clear();
+        for span in &scene.layer_slab_spans {
+            for run in &span.runs {
+                if let Some(texture_id) = run.texture_id {
+                    let key = (texture_id.index, texture_id.kind);
+                    if !self.page_scratch.contains(&key) {
+                        self.page_scratch.push(key);
+                    }
+                }
+            }
+        }
+        // Sorted so bind-group creation order stays deterministic under fuzzing.
+        self.page_scratch.sort_by_key(|&(index, kind)| (index, kind as u8));
+        if self.pages == self.page_scratch {
+            return;
+        }
+        self.sprite_textures.clear();
+        #[cfg(test)]
+        let rebuilt = self.page_scratch.len() as u64;
+        for &(texture_index, texture_kind) in &self.page_scratch {
+            let tex_info = atlas.get_texture_info(AtlasTextureId {
+                index: texture_index,
+                kind: texture_kind,
+            });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("slab_sprite_texture_bind_group"),
+                layout: &pipelines.sprites_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&tex_info.raw_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(atlas_sampler),
+                    },
+                ],
+            });
+            self.sprite_textures.insert((texture_index, texture_kind), group);
+        }
+        std::mem::swap(&mut self.pages, &mut self.page_scratch);
+        #[cfg(test)]
+        {
+            self.creations += rebuilt;
+        }
+    }
+
+    /// The frame's slab bind state, cloned out of the cache.
+    fn frame_groups(
+        &mut self,
+        device: &wgpu::Device,
+        pipelines: &WgpuPipelines,
+        buffers: &slab_gpu::SlabGpuBuffers,
+        atlas: &WgpuAtlas,
+        atlas_sampler: &wgpu::Sampler,
+        scene: &Scene,
+    ) -> SlabDrawGroups {
+        for kind in SlabKind::ALL {
+            self.ensure_kind_group(device, pipelines, buffers, kind);
+        }
+        self.ensure_transforms_group(device, pipelines, buffers);
+        self.sync_sprite_pages(device, pipelines, atlas, atlas_sampler, scene);
+        let [quads, shadows, paths_vertices, underlines, mono_sprites, poly_sprites] =
+            &self.kind_groups;
+        SlabDrawGroups {
+            quads: quads.as_ref().expect("kind group ensured above").clone(),
+            shadows: shadows.as_ref().expect("kind group ensured above").clone(),
+            paths_vertices: paths_vertices
+                .as_ref()
+                .expect("kind group ensured above")
+                .clone(),
+            underlines: underlines
+                .as_ref()
+                .expect("kind group ensured above")
+                .clone(),
+            mono_sprites: mono_sprites
+                .as_ref()
+                .expect("kind group ensured above")
+                .clone(),
+            poly_sprites: poly_sprites
+                .as_ref()
+                .expect("kind group ensured above")
+                .clone(),
+            layer_transform: self.transforms.as_ref().expect("transform group ensured above").clone(),
+            sprite_textures: self.sprite_textures.clone(),
+        }
+    }
+}
+
 /// Bind state for one frame's slab draws, created only when the frame
-/// actually carries spans. Free-standing so the GPU-tier tests drive the
-/// exact production construction.
+/// actually carries slots. Free-standing so the GPU-tier tests drive the
+/// exact production construction; the frame path uses [`SlabGroupCache`].
+#[cfg(test)]
 fn build_slab_draw_groups(
     device: &wgpu::Device,
     pipelines: &WgpuPipelines,
@@ -1673,6 +2046,48 @@ fn build_slab_draw_groups(
         layer_transform: layer_transform_bind_group.clone(),
         sprite_textures,
     }
+}
+
+/// Instances a legacy primitive batch would draw. Zero-instance batches
+/// (the empty split halves `FrameBatchIterator` queues around spans) draw
+/// nothing, so they must not break an open slab stretch's adjacency.
+fn primitive_batch_instance_count(batch: &PrimitiveBatch<'_>) -> u32 {
+    match batch {
+        PrimitiveBatch::Quads(quads) => quads.len() as u32,
+        PrimitiveBatch::Shadows(shadows) => shadows.len() as u32,
+        PrimitiveBatch::Paths(paths) => paths.iter().map(|p| p.vertices.len() as u32).sum(),
+        PrimitiveBatch::Underlines(underlines) => underlines.len() as u32,
+        PrimitiveBatch::MonochromeSprites { sprites, .. } => sprites.len() as u32,
+        PrimitiveBatch::PolychromeSprites { sprites, .. } => sprites.len() as u32,
+        PrimitiveBatch::Surfaces(surfaces) => surfaces.len() as u32,
+        PrimitiveBatch::BackdropFilters(backdrop_filters) => backdrop_filters.len() as u32,
+        // One marker, one (degenerate) draw.
+        PrimitiveBatch::FilterBoundary(_) => 1,
+    }
+}
+
+/// One shared pass over the scene's spans, grouping every referenced atlas
+/// page by owning layer.
+///
+/// Replaces the per-synced-layer rescan of all spans (O(spans²) with the
+/// filter inside the sync loop); residency bookkeeping consumes the result
+/// without changing what is recorded per layer.
+fn collect_referenced_pages_by_layer(
+    scene: &Scene,
+) -> FxHashMap<LayerKey, Vec<(u32, crate::AtlasTextureKind)>> {
+    let mut pages: FxHashMap<LayerKey, Vec<(u32, crate::AtlasTextureKind)>> =
+        FxHashMap::default();
+    for span in &scene.layer_slab_spans {
+        for run in &span.runs {
+            if let Some(texture_id) = run.texture_id {
+                pages
+                    .entry(span.key)
+                    .or_default()
+                    .push((texture_id.index, texture_id.kind));
+            }
+        }
+    }
+    pages
 }
 
 fn append_packed_kind_bytes(
@@ -1830,6 +2245,13 @@ pub struct WgpuRenderer {
     // dirty layers upload exactly their own slab.
     slab_registry: SlabRegistry,
     slab_buffers: SlabGpuBuffers,
+    /// Frame-to-frame cache of slab bind groups; invalidated when the
+    /// underlying buffers are recreated (see `ensure_slab_buffer_capacities`).
+    slab_group_cache: SlabGroupCache,
+    /// Reusable byte scratch for dirty-layer slab uploads.
+    slab_upload_scratch: Vec<u8>,
+    /// Reusable storage for per-frame dirty transform drains.
+    transform_scratch: Vec<(u32, GpuLayerTransform)>,
     // Last values pushed into the frame-constant uniform buffers, so an idle
     // window issues zero `write_buffer` calls at all.
     uploaded_globals: Option<GlobalParams>,
@@ -2036,6 +2458,9 @@ impl WgpuRenderer {
             layout_version: Arc::new(AtomicU64::new(0)),
             slab_registry: SlabRegistry::new(),
             slab_buffers,
+            slab_group_cache: SlabGroupCache::default(),
+            slab_upload_scratch: Vec::new(),
+            transform_scratch: Vec::new(),
             uploaded_globals: None,
             uploaded_color_adjustments: None,
             #[cfg(feature = "flamegraph")]
@@ -2092,6 +2517,9 @@ impl WgpuRenderer {
                 .ensure_kind_capacity(&self.context.device, kind, elements)
             {
                 recreated_any_kind = true;
+                // The bind group still targets the orphaned buffer until it is
+                // rebuilt against the new one.
+                self.slab_group_cache.invalidate_kind(kind);
             }
         }
         if recreated_any_kind {
@@ -2105,6 +2533,7 @@ impl WgpuRenderer {
             .ensure_transform_capacity(&self.context.device, slots_needed)
         {
             self.slab_registry.mark_all_transforms_dirty();
+            self.slab_group_cache.invalidate_transforms();
         }
     }
 
@@ -2112,6 +2541,7 @@ impl WgpuRenderer {
     /// `write_buffer`s; a dirty layer uploads exactly its own slab ranges.
     /// Runs before the render pass so the pass below only draws.
     fn resolve_slab_spans(&mut self, scene: &Scene) {
+        let pages_by_layer = collect_referenced_pages_by_layer(scene);
         let mut synced_layers: FxHashSet<LayerKey> = FxHashSet::default();
         for span in &scene.layer_slab_spans {
             if self.slab_registry.is_awaiting_rerecord(span.key) {
@@ -2136,34 +2566,37 @@ impl WgpuRenderer {
             }
             self.slab_registry.set_layer_translate(span.key, span.origin);
 
-            let pages = scene.layer_slab_spans.iter().filter(|s| s.key == span.key).flat_map(|span| {
-                span.runs.iter().filter_map(|run| {
-                    run.texture_id
-                        .map(|id| (id.index, id.kind))
-                })
-            });
-            self.slab_registry.note_referenced_pages(span.key, pages);
+            if let Some(pages) = pages_by_layer.get(&span.key) {
+                self.slab_registry.note_referenced_pages(span.key, pages.iter().copied());
+            }
         }
 
         let transforms_buffer = self.slab_buffers.transforms_buffer().clone();
         let stride = self.slab_buffers.transform_slot_stride;
         let queue = &self.context.queue;
-        for (slot, transform) in self.slab_registry.take_dirty_transforms() {
+        let mut dirty_transforms = std::mem::take(&mut self.transform_scratch);
+        self.slab_registry.take_dirty_transforms_into(&mut dirty_transforms);
+        for &(slot, transform) in &dirty_transforms {
             queue.write_buffer(
                 &transforms_buffer,
                 slot as u64 * stride,
                 bytemuck::bytes_of(&transform),
             );
         }
+        self.transform_scratch = dirty_transforms;
     }
 
     /// Upload every occupied kind range of one layer from its spans' packed
     /// arrays, at byte offsets derived from element-unit bases.
+    ///
+    /// The byte scratch is renderer-owned and reused across dirty syncs: a
+    /// steady-state window re-uploads some layer every few frames, so a fresh
+    /// `Vec` per sync would churn the allocator for bytes it just freed.
     fn upload_layer_slab_bytes(&mut self, scene: &Scene, key: LayerKey) {
         let Some(slabs) = self.slab_registry.entry_slabs(key) else {
             return;
         };
-        let mut scratch: Vec<u8> = Vec::new();
+        let mut scratch = std::mem::take(&mut self.slab_upload_scratch);
         for kind in SlabKind::ALL {
             scratch.clear();
             for span in &scene.layer_slab_spans {
@@ -2189,38 +2622,45 @@ impl WgpuRenderer {
             );
             crate::render_stats::add(slab_gpu::COUNTER_BYTES_UPLOADED, scratch.len() as u64);
         }
+        self.slab_upload_scratch = scratch;
     }
 
     /// Bind groups for one frame's slab draws: per-kind storage bindings over
     /// the slab buffers plus every distinct atlas texture any span references.
-    fn create_slab_draw_groups(
-        &self,
-        scene: &Scene,
-        layer_transform_bind_group: &wgpu::BindGroup,
-    ) -> SlabDrawGroups {
-        build_slab_draw_groups(
+    ///
+    /// Sourced from [`Self::slab_group_cache`], so a Clean-only frame clones
+    /// handles instead of rebuilding bind groups; the cache is invalidated by
+    /// [`Self::ensure_slab_buffer_capacities`] whenever a backing buffer is
+    /// recreated, and page groups refresh only when the page set changes.
+    fn slab_draw_groups_for_frame(&mut self, scene: &Scene) -> SlabDrawGroups {
+        self.slab_group_cache.frame_groups(
             &self.context.device,
             &self.pipelines,
             &self.slab_buffers,
             &self.atlas,
             &self.atlas_sampler,
-            layer_transform_bind_group,
             scene,
         )
     }
 
     /// Draw one spliced layer's runs as instanced draws into the batch
-    /// stream, merging adjacent same-kind same-state runs where free.
+    /// stream, merging adjacent same-kind same-state runs where free —
+    /// including stretches that continue across consecutive span boundaries
+    /// of the same layer via `open_run`.
     ///
     /// Any state that would produce wrong pixels — an entry awaiting a
     /// re-record after eviction, missing registry state — skips the draws
     /// loudly instead; the posted re-record request rebuilds the layer.
+    #[allow(clippy::too_many_arguments)]
     fn draw_layer_slab_span(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         scene: &Scene,
         span_index: usize,
         groups: &SlabDrawGroups,
+        transform_slot_stride: u64,
+        state: &mut PassBindState,
+        open_run: &mut Option<OpenSlabRun>,
     ) {
         let Some(span) = scene.layer_slab_spans.get(span_index) else {
             debug_assert!(false, "frame_batches yielded an out-of-range span index");
@@ -2251,54 +2691,40 @@ impl WgpuRenderer {
             }
         }
 
-        let mut pending: Option<SlabPendingRun> = None;
         for run in &span.runs {
-            match pending.as_mut() {
-                // Merge adjacent same-kind same-texture runs: their instances
-                // are contiguous in the concatenated stream by construction.
-                Some(open)
-                    if open.kind == run.kind
-                        && open.texture_id == run.texture_id
-                        && open.start + open.count == run.start =>
-                {
-                    open.count += run.count;
-                    continue;
-                }
-                _ => {}
+            // Continue an open stretch: same layer, same kind, same texture,
+            // exactly contiguous in the layer-wide instance stream. Their
+            // instances draw as one call because everything bound between
+            // them is identical.
+            if let Some(open) = open_run
+                && open.accepts(span.key, &slabs, run)
+            {
+                open.count += run.count;
+                continue;
             }
-            if let Some(open) = pending.take() {
-                flush_slab_run(
+            flush_open_slab_run(
                 &self.pipelines,
-                self.slab_buffers.transform_slot_stride,
+                transform_slot_stride,
                 pass,
-                &slabs,
                 groups,
-                transform_slot,
-                &open,
+                state,
+                open_run,
             );
-            }
-            pending = Some(SlabPendingRun {
+            *open_run = Some(OpenSlabRun {
+                key: span.key,
+                slabs,
+                transform_slot,
                 kind: run.kind,
                 texture_id: run.texture_id,
                 start: run.start,
                 count: run.count,
             });
         }
-        if let Some(open) = pending.take() {
-            flush_slab_run(
-                &self.pipelines,
-                self.slab_buffers.transform_slot_stride,
-                pass,
-                &slabs,
-                groups,
-                transform_slot,
-                &open,
-            );
-        }
     }
 
     pub fn draw(&mut self, scene: &Scene) {
-        log::debug!("Renderer::draw: starting frame");
+        profiling::scope!("wgpui: renderer draw");
+        log::trace!("Renderer::draw: starting frame");
 
         let mut command_encoder =
             self.context
@@ -2377,9 +2803,22 @@ impl WgpuRenderer {
         }
         self.slab_registry.begin_frame();
         self.ensure_slab_buffer_capacities();
-        if slab_gpu::compaction_enabled() && self.slab_registry.should_compact(0.35) {
+        // Advisory compaction, gated three ways (all scheduling, never
+        // correctness): kill switch, utilization heuristic, and — since the
+        // arenas never shrink and GC keeps utilization low regardless — a
+        // zero-move backoff plus an uploads-in-flight deferral so an idle
+        // window stops rebuilding empty plans every frame.
+        if slab_gpu::compaction_enabled()
+            && self.slab_registry.should_compact(0.35)
+            && self.slab_registry.compaction_gate_open()
+        {
             let plan = self.slab_registry.compaction_plan();
             let moves = self.slab_registry.apply_compaction(&plan);
+            if moves.is_empty() {
+                self.slab_registry.note_zero_move_plan();
+            } else {
+                self.slab_registry.note_moves_applied();
+            }
             for (kind, src, dst) in moves {
                 let stride = slab_gpu::instance_stride(kind);
                 command_encoder.copy_buffer_to_buffer(
@@ -2407,179 +2846,182 @@ impl WgpuRenderer {
         // swapchain image is acquired — with slabs live this is the residual
         // cost for legacy (unspliced) content only; clean slabbed layers
         // contribute nothing.
-        let gpu_upload_timer = crate::render_stats::scope("frame: gpu upload");
+        {
+            profiling::scope!("wgpui: gpu upload");
+            let gpu_upload_timer = crate::render_stats::scope("frame: gpu upload");
 
-        let color_adjustments = ColorAdjustments {
-            gamma_ratios: self.rendering_parameters.gamma_ratios,
-            grayscale_enhanced_contrast: self.rendering_parameters.grayscale_enhanced_contrast,
-            _padding: [0.0; 3],
-        };
-        if self.uploaded_color_adjustments != Some(color_adjustments) {
-            self.context.queue.write_buffer(
-                &self.context.color_adjustments_buffer,
-                0,
-                bytemuck::bytes_of(&color_adjustments),
-            );
-            self.uploaded_color_adjustments = Some(color_adjustments);
-        }
-
-        let globals = GlobalParams {
-            viewport_size: [
-                self.surface_configuration.width as f32,
-                self.surface_configuration.height as f32,
-            ],
-            premultimated_alpha: match self.surface_configuration.alpha_mode {
-                wgpu::CompositeAlphaMode::PreMultiplied => 1,
-                _ => 0,
-            },
-            pad: 0,
-        };
-
-        if self.uploaded_globals != Some(globals) {
-            self.context.queue.write_buffer(
-                &self.context.globals_buffer,
-                0,
-                bytemuck::bytes_of(&globals),
-            );
-            self.uploaded_globals = Some(globals);
-        }
-
-        if !scene.quads.is_empty() {
-            let data = bytemuck::cast_slice(&scene.quads);
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.quads_buffer,
-                data.len() as u64,
-                "Quads Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context
-                .queue
-                .write_buffer(&self.context.quads_buffer.lock(), 0, data);
-        }
-        if !scene.shadows.is_empty() {
-            let data = bytemuck::cast_slice(&scene.shadows);
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.shadows_buffer,
-                data.len() as u64,
-                "Shadows Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context
-                .queue
-                .write_buffer(&self.context.shadows_buffer.lock(), 0, data);
-        }
-        if !scene.backdrop_filters.is_empty() {
-            let data = bytemuck::cast_slice(&scene.backdrop_filters);
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.backdrop_filters_buffer,
-                data.len() as u64,
-                "Backdrop Filters Buffer",
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            );
-            self.context.queue.write_buffer(
-                &self.context.backdrop_filters_buffer.lock(),
-                0,
-                data,
-            );
-        }
-        if !scene.underlines.is_empty() {
-            let data = bytemuck::cast_slice(&scene.underlines);
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.underlines_buffer,
-                data.len() as u64,
-                "Underlines Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context.queue.write_buffer(
-                &self.context.underlines_buffer.lock(),
-                0,
-                data,
-            );
-        }
-        if !scene.monochrome_sprites.is_empty() {
-            let data = bytemuck::cast_slice(&scene.monochrome_sprites);
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.mono_sprites_buffer,
-                data.len() as u64,
-                "Monosprites Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context.queue.write_buffer(
-                &self.context.mono_sprites_buffer.lock(),
-                0,
-                data,
-            );
-        }
-        if !scene.polychrome_sprites.is_empty() {
-            let data = bytemuck::cast_slice(&scene.polychrome_sprites);
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.poly_sprites_buffer,
-                data.len() as u64,
-                "Poly Sprites Buffer",
-                wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::STORAGE,
-            );
-            self.context.queue.write_buffer(
-                &self.context.poly_sprites_buffer.lock(),
-                0,
-                data,
-            );
-        }
-
-        // Build flat vertex array for all paths (color + content mask baked per-vertex)
-        let mut flat_path_vertices: Vec<GpuPathVertex> = Vec::new();
-        for path in &scene.paths {
-            let color = path.color.solid;
-            let cm = &path.content_mask.bounds;
-            let cm_origin = [cm.origin.x.0, cm.origin.y.0];
-            let cm_size = [cm.size.width.0, cm.size.height.0];
-            for vertex in &path.vertices {
-                flat_path_vertices.push(GpuPathVertex {
-                    xy_position: [vertex.xy_position.x.0, vertex.xy_position.y.0],
-                    st_position: [vertex.st_position.x, vertex.st_position.y],
-                    hsla: [color.h, color.s, color.l, color.a],
-                    content_mask_origin: cm_origin,
-                    content_mask_size: cm_size,
-                });
+            let color_adjustments = ColorAdjustments {
+                gamma_ratios: self.rendering_parameters.gamma_ratios,
+                grayscale_enhanced_contrast: self.rendering_parameters.grayscale_enhanced_contrast,
+                _padding: [0.0; 3],
+            };
+            if self.uploaded_color_adjustments != Some(color_adjustments) {
+                self.context.queue.write_buffer(
+                    &self.context.color_adjustments_buffer,
+                    0,
+                    bytemuck::bytes_of(&color_adjustments),
+                );
+                self.uploaded_color_adjustments = Some(color_adjustments);
             }
-        }
-        if !flat_path_vertices.is_empty() {
-            let data = bytemuck::cast_slice(&flat_path_vertices);
-            ensure_buffer_size(
-                &self.context.device,
-                &self.context.paths_vertices_buffer,
-                data.len() as u64,
-                "Path Vertices Buffer",
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            );
-            self.context.queue.write_buffer(
-                &self.context.paths_vertices_buffer.lock(),
-                0,
-                data,
-            );
-        }
 
-        // Slab span resolution happens inside the upload timer's scope: it is
-        // exactly the per-frame upload work, and clean layers resolve here
-        // with zero queue writes.
-        self.resolve_slab_spans(scene);
+            let globals = GlobalParams {
+                viewport_size: [
+                    self.surface_configuration.width as f32,
+                    self.surface_configuration.height as f32,
+                ],
+                premultimated_alpha: match self.surface_configuration.alpha_mode {
+                    wgpu::CompositeAlphaMode::PreMultiplied => 1,
+                    _ => 0,
+                },
+                pad: 0,
+            };
 
-        drop(gpu_upload_timer);
+            if self.uploaded_globals != Some(globals) {
+                self.context.queue.write_buffer(
+                    &self.context.globals_buffer,
+                    0,
+                    bytemuck::bytes_of(&globals),
+                );
+                self.uploaded_globals = Some(globals);
+            }
+
+            if !scene.quads.is_empty() {
+                let data = bytemuck::cast_slice(&scene.quads);
+                ensure_buffer_size(
+                    &self.context.device,
+                    &self.context.quads_buffer,
+                    data.len() as u64,
+                    "Quads Buffer",
+                    wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::STORAGE,
+                );
+                self.context
+                    .queue
+                    .write_buffer(&self.context.quads_buffer.lock(), 0, data);
+            }
+            if !scene.shadows.is_empty() {
+                let data = bytemuck::cast_slice(&scene.shadows);
+                ensure_buffer_size(
+                    &self.context.device,
+                    &self.context.shadows_buffer,
+                    data.len() as u64,
+                    "Shadows Buffer",
+                    wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::STORAGE,
+                );
+                self.context
+                    .queue
+                    .write_buffer(&self.context.shadows_buffer.lock(), 0, data);
+            }
+            if !scene.backdrop_filters.is_empty() {
+                let data = bytemuck::cast_slice(&scene.backdrop_filters);
+                ensure_buffer_size(
+                    &self.context.device,
+                    &self.context.backdrop_filters_buffer,
+                    data.len() as u64,
+                    "Backdrop Filters Buffer",
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                );
+                self.context.queue.write_buffer(
+                    &self.context.backdrop_filters_buffer.lock(),
+                    0,
+                    data,
+                );
+            }
+            if !scene.underlines.is_empty() {
+                let data = bytemuck::cast_slice(&scene.underlines);
+                ensure_buffer_size(
+                    &self.context.device,
+                    &self.context.underlines_buffer,
+                    data.len() as u64,
+                    "Underlines Buffer",
+                    wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::STORAGE,
+                );
+                self.context.queue.write_buffer(
+                    &self.context.underlines_buffer.lock(),
+                    0,
+                    data,
+                );
+            }
+            if !scene.monochrome_sprites.is_empty() {
+                let data = bytemuck::cast_slice(&scene.monochrome_sprites);
+                ensure_buffer_size(
+                    &self.context.device,
+                    &self.context.mono_sprites_buffer,
+                    data.len() as u64,
+                    "Monosprites Buffer",
+                    wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::STORAGE,
+                );
+                self.context.queue.write_buffer(
+                    &self.context.mono_sprites_buffer.lock(),
+                    0,
+                    data,
+                );
+            }
+            if !scene.polychrome_sprites.is_empty() {
+                let data = bytemuck::cast_slice(&scene.polychrome_sprites);
+                ensure_buffer_size(
+                    &self.context.device,
+                    &self.context.poly_sprites_buffer,
+                    data.len() as u64,
+                    "Poly Sprites Buffer",
+                    wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::STORAGE,
+                );
+                self.context.queue.write_buffer(
+                    &self.context.poly_sprites_buffer.lock(),
+                    0,
+                    data,
+                );
+            }
+
+            // Build flat vertex array for all paths (color + content mask baked per-vertex)
+            let mut flat_path_vertices: Vec<GpuPathVertex> = Vec::new();
+            for path in &scene.paths {
+                let color = path.color.solid;
+                let cm = &path.content_mask.bounds;
+                let cm_origin = [cm.origin.x.0, cm.origin.y.0];
+                let cm_size = [cm.size.width.0, cm.size.height.0];
+                for vertex in &path.vertices {
+                    flat_path_vertices.push(GpuPathVertex {
+                        xy_position: [vertex.xy_position.x.0, vertex.xy_position.y.0],
+                        st_position: [vertex.st_position.x, vertex.st_position.y],
+                        hsla: [color.h, color.s, color.l, color.a],
+                        content_mask_origin: cm_origin,
+                        content_mask_size: cm_size,
+                    });
+                }
+            }
+            if !flat_path_vertices.is_empty() {
+                let data = bytemuck::cast_slice(&flat_path_vertices);
+                ensure_buffer_size(
+                    &self.context.device,
+                    &self.context.paths_vertices_buffer,
+                    data.len() as u64,
+                    "Path Vertices Buffer",
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                );
+                self.context.queue.write_buffer(
+                    &self.context.paths_vertices_buffer.lock(),
+                    0,
+                    data,
+                );
+            }
+
+            // Slab span resolution happens inside the upload timer's scope: it is
+            // exactly the per-frame upload work, and clean layers resolve here
+            // with zero queue writes.
+            self.resolve_slab_spans(scene);
+
+            drop(gpu_upload_timer);
+        }
 
         // Acquire the next swapchain image.  On the first frame after window
         // creation (or after a resize races with the GPU) the surface can be
@@ -2622,6 +3064,18 @@ impl WgpuRenderer {
         // IMPORTANT: Only increment after successful swapchain acquisition
         // If we skip the frame, bounds remain valid
         self.layout_version.fetch_add(1, Ordering::Release);
+
+        // Slab bind state comes from the frame-to-frame cache, which needs
+        // `&mut` access to the cache field — built before the legacy buffer
+        // locks below are held for the rest of the function.
+        let layer_transform_bind_group = self
+            .slab_group_cache
+            .transforms_group(&self.context.device, &self.pipelines, &self.slab_buffers);
+
+        // Only frames that actually carry spans pay for slab bind state; the
+        // cache makes even those frames cheap when nothing was recreated.
+        let slab_groups =
+            (scene.slab_span_count() > 0).then(|| self.slab_draw_groups_for_frame(scene));
 
         // Borrow buffers for bind group creation - these borrows must live until bind groups are done
         let quads_buffer_ref = self.context.quads_buffer.lock();
@@ -2764,30 +3218,6 @@ impl WgpuRenderer {
                 }],
             });
 
-        let layer_transform_bind_group =
-            self.context
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("layer_transform_bind_group"),
-                    layout: &self.pipelines.layer_transform_bind_group_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: self.slab_buffers.transforms_buffer(),
-                            offset: 0,
-                            size: Some(std::num::NonZeroU64::new(
-                                std::mem::size_of::<GpuLayerTransform>() as u64,
-                            )
-                            .expect("non-zero transform size")),
-                        }),
-                    }],
-                });
-
-        // Only frames that actually carry spans pay for slab bind state.
-        let slab_groups = (scene.slab_span_count() > 0).then(|| {
-            self.create_slab_draw_groups(scene, &layer_transform_bind_group)
-        });
-
         {
             #[cfg(feature = "flamegraph")]
             let flamegraph_main_pass =
@@ -2840,12 +3270,48 @@ impl WgpuRenderer {
             #[cfg(feature = "flamegraph")]
             let mut current_pass_label: &'static str = "main";
 
+            // Bind-state tracker and cross-span merge slot for the whole
+            // main pass. Both must reset wherever the pass is dropped and
+            // re-begun (backdrop filters, filter groups) or where draws use
+            // bind groups this module does not model (surfaces, filter
+            // composites).
+            let transform_slot_stride = self.slab_buffers.transform_slot_stride;
+            let mut pass_state = PassBindState::default();
+            let mut open_slab_run: Option<OpenSlabRun> = None;
+
             for frame_batch in scene.frame_batches() {
                 let batch = match frame_batch {
-                    crate::scene::SceneBatch::Primitives(batch) => batch,
+                    crate::scene::SceneBatch::Primitives(batch) => {
+                        // A pending slab stretch precedes this draw in paint
+                        // order; flush it into the same pass before anything
+                        // else renders. Zero-instance batches (empty split
+                        // halves) draw nothing and must not break adjacency.
+                        if primitive_batch_instance_count(&batch) > 0
+                            && open_slab_run.is_some()
+                            && let Some(groups) = slab_groups.as_ref()
+                        {
+                            flush_open_slab_run(
+                                &self.pipelines,
+                                transform_slot_stride,
+                                &mut pass,
+                                groups,
+                                &mut pass_state,
+                                &mut open_slab_run,
+                            );
+                        }
+                        batch
+                    }
                     crate::scene::SceneBatch::LayerSlab(span_index) => {
                         if let Some(groups) = slab_groups.as_ref() {
-                            self.draw_layer_slab_span(&mut pass, scene, span_index, groups);
+                            self.draw_layer_slab_span(
+                                &mut pass,
+                                scene,
+                                span_index,
+                                groups,
+                                transform_slot_stride,
+                                &mut pass_state,
+                                &mut open_slab_run,
+                            );
                         }
                         continue;
                     }
@@ -2853,12 +3319,12 @@ impl WgpuRenderer {
                 match batch {
                     PrimitiveBatch::Quads(quads) => {
                         let count = quads.len() as u32;
-                        pass.set_pipeline(&self.pipelines.quads_pipeline);
-                        pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
-                        pass.set_bind_group(1, &quads_bind_group, &[]);
+                        pass_state.set_pipeline(&mut pass, DrawPipelineId::Quads, &self.pipelines.quads_pipeline);
+                        pass_state.set_bind_group(&mut pass, 0, BoundGroupId::Globals, &self.pipelines.globals_bind_group, &[]);
+                        pass_state.set_bind_group(&mut pass, 1, BoundGroupId::LegacyBuffer(LegacyBuffer::Quads), &quads_bind_group, &[]);
                         // Dynamic offset 0: the permanently-zero identity
                         // slot, so absolute legacy coordinates draw unshifted.
-                        pass.set_bind_group(2, &layer_transform_bind_group, &[0]);
+                        pass_state.set_bind_group(&mut pass, 2, BoundGroupId::LayerTransform(0), &layer_transform_bind_group, &[0]);
                         pass.draw(0..4, quads_first_instance..quads_first_instance + count);
                         quads_first_instance += count;
                         #[cfg(feature = "flamegraph")]
@@ -2908,12 +3374,18 @@ impl WgpuRenderer {
                                     ],
                                 });
 
-                        pass.set_pipeline(&self.pipelines.mono_sprites_pipeline);
-                        pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
-                        pass.set_bind_group(1, &self.pipelines.color_adjustments_bind_group, &[]);
-                        pass.set_bind_group(2, &sprites_texture_bind_group, &[]);
-                        pass.set_bind_group(3, &mono_sprites_bind_group, &[]);
-                        pass.set_bind_group(4, &layer_transform_bind_group, &[0]);
+                        pass_state.set_pipeline(&mut pass, DrawPipelineId::MonoSprites, &self.pipelines.mono_sprites_pipeline);
+                        pass_state.set_bind_group(&mut pass, 0, BoundGroupId::Globals, &self.pipelines.globals_bind_group, &[]);
+                        pass_state.set_bind_group(&mut pass, 1, BoundGroupId::ColorAdjustments, &self.pipelines.color_adjustments_bind_group, &[]);
+                        pass_state.set_bind_group(
+                            &mut pass,
+                            2,
+                            BoundGroupId::SpriteTexture(texture_id.index, texture_id.kind),
+                            &sprites_texture_bind_group,
+                            &[],
+                        );
+                        pass_state.set_bind_group(&mut pass, 3, BoundGroupId::LegacyBuffer(LegacyBuffer::MonoSprites), &mono_sprites_bind_group, &[]);
+                        pass_state.set_bind_group(&mut pass, 4, BoundGroupId::LayerTransform(0), &layer_transform_bind_group, &[0]);
                         pass.draw(
                             0..4,
                             mono_sprites_first_instance..mono_sprites_first_instance + count,
@@ -2965,11 +3437,17 @@ impl WgpuRenderer {
                                     ],
                                 });
 
-                        pass.set_pipeline(&self.pipelines.poly_sprites_pipeline);
-                        pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
-                        pass.set_bind_group(1, &sprites_texture_bind_group, &[]);
-                        pass.set_bind_group(2, &poly_sprites_bind_group, &[]);
-                        pass.set_bind_group(3, &layer_transform_bind_group, &[0]);
+                        pass_state.set_pipeline(&mut pass, DrawPipelineId::PolySprites, &self.pipelines.poly_sprites_pipeline);
+                        pass_state.set_bind_group(&mut pass, 0, BoundGroupId::Globals, &self.pipelines.globals_bind_group, &[]);
+                        pass_state.set_bind_group(
+                            &mut pass,
+                            1,
+                            BoundGroupId::SpriteTexture(texture_id.index, texture_id.kind),
+                            &sprites_texture_bind_group,
+                            &[],
+                        );
+                        pass_state.set_bind_group(&mut pass, 2, BoundGroupId::LegacyBuffer(LegacyBuffer::PolySprites), &poly_sprites_bind_group, &[]);
+                        pass_state.set_bind_group(&mut pass, 3, BoundGroupId::LayerTransform(0), &layer_transform_bind_group, &[0]);
                         pass.draw(
                             0..4,
                             poly_sprites_first_instance..poly_sprites_first_instance + count,
@@ -2994,10 +3472,10 @@ impl WgpuRenderer {
                     }
                     PrimitiveBatch::Shadows(shadows) => {
                         let count = shadows.len() as u32;
-                        pass.set_pipeline(&self.pipelines.shadows_pipeline);
-                        pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
-                        pass.set_bind_group(1, &shadows_bind_group, &[]);
-                        pass.set_bind_group(2, &layer_transform_bind_group, &[0]);
+                        pass_state.set_pipeline(&mut pass, DrawPipelineId::Shadows, &self.pipelines.shadows_pipeline);
+                        pass_state.set_bind_group(&mut pass, 0, BoundGroupId::Globals, &self.pipelines.globals_bind_group, &[]);
+                        pass_state.set_bind_group(&mut pass, 1, BoundGroupId::LegacyBuffer(LegacyBuffer::Shadows), &shadows_bind_group, &[]);
+                        pass_state.set_bind_group(&mut pass, 2, BoundGroupId::LayerTransform(0), &layer_transform_bind_group, &[0]);
                         pass.draw(0..4, shadows_first_instance..shadows_first_instance + count);
                         shadows_first_instance += count;
                         #[cfg(feature = "flamegraph")]
@@ -3071,6 +3549,8 @@ impl WgpuRenderer {
                         {
                             current_pass_label = "main_resumed";
                         }
+                        // Fresh pass: nothing is bound anymore.
+                        pass_state.reset();
 
                         // Now render the backdrop blur quads
                         pass.set_pipeline(&self.pipelines.backdrop_filters_pipeline);
@@ -3139,6 +3619,8 @@ impl WgpuRenderer {
                                 {
                                     current_pass_label = "filter_group";
                                 }
+                                // Fresh pass: nothing is bound anymore.
+                                pass_state.reset();
 
                                 filter_stack.push((boundary, Some(depth)));
                             }
@@ -3192,6 +3674,8 @@ impl WgpuRenderer {
                             {
                                 current_pass_label = "filter_group_resumed";
                             }
+                            // Fresh pass: nothing is bound anymore.
+                            pass_state.reset();
 
                             // Composite the blurred group content back over the parent using
                             // the same backdrop-filter pipeline, sampling from the group's
@@ -3260,10 +3744,10 @@ impl WgpuRenderer {
                     }
                     PrimitiveBatch::Underlines(underlines) => {
                         let count = underlines.len() as u32;
-                        pass.set_pipeline(&self.pipelines.underlines_pipeline);
-                        pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
-                        pass.set_bind_group(1, &underlines_bind_group, &[]);
-                        pass.set_bind_group(2, &layer_transform_bind_group, &[0]);
+                        pass_state.set_pipeline(&mut pass, DrawPipelineId::Underlines, &self.pipelines.underlines_pipeline);
+                        pass_state.set_bind_group(&mut pass, 0, BoundGroupId::Globals, &self.pipelines.globals_bind_group, &[]);
+                        pass_state.set_bind_group(&mut pass, 1, BoundGroupId::LegacyBuffer(LegacyBuffer::Underlines), &underlines_bind_group, &[]);
+                        pass_state.set_bind_group(&mut pass, 2, BoundGroupId::LayerTransform(0), &layer_transform_bind_group, &[0]);
                         pass.draw(
                             0..4,
                             underlines_first_instance..underlines_first_instance + count,
@@ -3287,7 +3771,7 @@ impl WgpuRenderer {
                         }
                     }
                     PrimitiveBatch::Surfaces(surfaces) => {
-                        log::debug!("Renderer: processing {} surface(s)", surfaces.len());
+                        log::trace!("Renderer: processing {} surface(s)", surfaces.len());
                         for surface in surfaces {
                             if let crate::SurfaceContent::Wgpu(surface_id) = &surface.content {
                                 // Swap ready → display ONLY if the external renderer produced
@@ -3413,6 +3897,10 @@ impl WgpuRenderer {
                                     pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
                                     pass.set_bind_group(1, &surface_bind_group, &[]);
                                     pass.draw(0..4, 0..1);
+                                    // Per-surface groups are unique objects this
+                                    // tracker does not model; drop all tracked
+                                    // state so later draws rebind conservatively.
+                                    pass_state.reset();
                                     #[cfg(feature = "flamegraph")]
                                     crate::record_draw_call(crate::DrawCallKind::Surfaces, 1);
                                     #[cfg(feature = "flamegraph")]
@@ -3450,10 +3938,10 @@ impl WgpuRenderer {
                     PrimitiveBatch::Paths(paths) => {
                         let vertex_count: u32 = paths.iter().map(|p| p.vertices.len() as u32).sum();
                         if vertex_count > 0 {
-                            pass.set_pipeline(&self.pipelines.paths_pipeline);
-                            pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
-                            pass.set_bind_group(1, &paths_bind_group, &[]);
-                            pass.set_bind_group(2, &layer_transform_bind_group, &[0]);
+                            pass_state.set_pipeline(&mut pass, DrawPipelineId::Paths, &self.pipelines.paths_pipeline);
+                            pass_state.set_bind_group(&mut pass, 0, BoundGroupId::Globals, &self.pipelines.globals_bind_group, &[]);
+                            pass_state.set_bind_group(&mut pass, 1, BoundGroupId::LegacyBuffer(LegacyBuffer::PathVertices), &paths_bind_group, &[]);
+                            pass_state.set_bind_group(&mut pass, 2, BoundGroupId::LayerTransform(0), &layer_transform_bind_group, &[0]);
                             pass.draw(
                                 paths_vertex_offset..paths_vertex_offset + vertex_count,
                                 0..1,
@@ -3478,6 +3966,19 @@ impl WgpuRenderer {
                         }
                     }
                 }
+            }
+
+            // The final span's merged stretch flushes here: nothing may keep
+            // an open run across the pass end.
+            if let Some(groups) = slab_groups.as_ref() {
+                flush_open_slab_run(
+                    &self.pipelines,
+                    transform_slot_stride,
+                    &mut pass,
+                    groups,
+                    &mut pass_state,
+                    &mut open_slab_run,
+                );
             }
         }
 
@@ -3552,9 +4053,9 @@ impl WgpuRenderer {
             )
         });
 
-        log::debug!("Renderer::draw: submitting command buffer");
+        log::trace!("Renderer::draw: submitting command buffer");
         self.context.queue.submit(Some(command_encoder.finish()));
-        log::debug!("Renderer::draw: presenting surface");
+        log::trace!("Renderer::draw: presenting surface");
         self.context.queue.present(surface_texture);
 
         // Start the async readback now that the resolve/copy commands above
@@ -3580,7 +4081,7 @@ impl WgpuRenderer {
             *self.deep_capture.lock() = Some(pending);
         }
 
-        log::debug!("Renderer::draw: frame complete");
+        log::trace!("Renderer::draw: frame complete");
     }
 
     /// Fast path: blit all visible surfaces in a single swapchain pass.
@@ -3797,7 +4298,7 @@ impl WgpuRenderer {
     pub fn present_framebuffer_only(&self) {
         // NOTE: Fast blit already presented to swapchain, so this is a no-op
         // When we implement persistent framebuffer properly, this will blit framebuffer → swapchain
-        log::debug!("Present framebuffer only (no compositor) - fast blit already presented");
+        log::trace!("Present framebuffer only (no compositor) - fast blit already presented");
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
@@ -3957,7 +4458,11 @@ impl WgpuRenderer {
 /// Issue one merged slab run's instanced draw with full bind state.
 ///
 /// Free-standing (rather than a `WgpuRenderer` method) so the GPU-tier tests
-/// can drive the exact production draw path against a headless device.
+/// can drive the exact production draw function against a headless device.
+/// Every call rebinds everything, which is what makes it the naive baseline;
+/// production goes through [`flush_slab_run_with_state`] so redundant binds
+/// are skipped instead.
+#[cfg(test)]
 fn flush_slab_run(
     pipelines: &WgpuPipelines,
     transform_slot_stride: u64,
@@ -3967,73 +4472,114 @@ fn flush_slab_run(
     transform_slot: u32,
     run: &SlabPendingRun,
 ) {
+    let mut untracked = PassBindState::default();
+    flush_slab_run_with_state(
+        pipelines,
+        transform_slot_stride,
+        pass,
+        slabs,
+        groups,
+        transform_slot,
+        run,
+        &mut untracked,
+    );
+}
+
+/// [`flush_slab_run`] with bind-state tracking: pipeline and bind-group sets
+/// that would repeat what the pass already holds are skipped. Skipping is
+/// pixel-neutral because tracked ids match only when the bound resource,
+/// layout slot, and dynamic offsets are all identical.
+fn flush_slab_run_with_state(
+    pipelines: &WgpuPipelines,
+    transform_slot_stride: u64,
+    pass: &mut wgpu::RenderPass<'_>,
+    slabs: &crate::platform::cross::slab::LayerSlabs,
+    groups: &SlabDrawGroups,
+    transform_slot: u32,
+    run: &SlabPendingRun,
+    state: &mut PassBindState,
+) {
+    profiling::scope!("wgpui: flush slab run");
     let dynamic_offsets = [(transform_slot as u64 * transform_slot_stride) as u32];
+    let transform_id = BoundGroupId::LayerTransform(dynamic_offsets[0]);
     let range_base = slabs.slab(run.kind).base + run.start;
     match run.kind {
         SlabKind::Quads => {
-            pass.set_pipeline(&pipelines.quads_pipeline);
-            pass.set_bind_group(0, &pipelines.globals_bind_group, &[]);
-            pass.set_bind_group(1, &groups.quads, &[]);
-            pass.set_bind_group(2, &groups.layer_transform, &dynamic_offsets);
+            state.set_pipeline(pass, DrawPipelineId::Quads, &pipelines.quads_pipeline);
+            state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+            state.set_bind_group(pass, 1, BoundGroupId::SlabStorage(SlabKind::Quads), &groups.quads, &[]);
+            state.set_bind_group(pass, 2, transform_id, &groups.layer_transform, &dynamic_offsets);
             pass.draw(0..4, range_base..range_base + run.count);
         }
         SlabKind::Shadows => {
-            pass.set_pipeline(&pipelines.shadows_pipeline);
-            pass.set_bind_group(0, &pipelines.globals_bind_group, &[]);
-            pass.set_bind_group(1, &groups.shadows, &[]);
-            pass.set_bind_group(2, &groups.layer_transform, &dynamic_offsets);
+            state.set_pipeline(pass, DrawPipelineId::Shadows, &pipelines.shadows_pipeline);
+            state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+            state.set_bind_group(pass, 1, BoundGroupId::SlabStorage(SlabKind::Shadows), &groups.shadows, &[]);
+            state.set_bind_group(pass, 2, transform_id, &groups.layer_transform, &dynamic_offsets);
             pass.draw(0..4, range_base..range_base + run.count);
         }
             SlabKind::Underlines => {
-                pass.set_pipeline(&pipelines.underlines_pipeline);
-                pass.set_bind_group(0, &pipelines.globals_bind_group, &[]);
-                pass.set_bind_group(1, &groups.underlines, &[]);
-                pass.set_bind_group(2, &groups.layer_transform, &dynamic_offsets);
+                state.set_pipeline(pass, DrawPipelineId::Underlines, &pipelines.underlines_pipeline);
+                state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+                state.set_bind_group(pass, 1, BoundGroupId::SlabStorage(SlabKind::Underlines), &groups.underlines, &[]);
+                state.set_bind_group(pass, 2, transform_id, &groups.layer_transform, &dynamic_offsets);
                 pass.draw(0..4, range_base..range_base + run.count);
             }
             SlabKind::MonoSprites => {
-                let Some(texture_group) = run
-                    .texture_id
-                    .as_ref()
-                    .map(|id| (id.index, id.kind))
-                    .and_then(|key| groups.sprite_textures.get(&key))
+                let Some(texture_id) = run.texture_id else {
+                    debug_assert!(false, "sprite runs carry a texture id");
+                    return;
+                };
+                let Some(texture_group) = groups.sprite_textures.get(&(texture_id.index, texture_id.kind))
                 else {
                     debug_assert!(false, "sprite textures validated before drawing");
                     return;
                 };
-                pass.set_pipeline(&pipelines.mono_sprites_pipeline);
-                pass.set_bind_group(0, &pipelines.globals_bind_group, &[]);
-                pass.set_bind_group(1, &pipelines.color_adjustments_bind_group, &[]);
-                pass.set_bind_group(2, texture_group, &[]);
-                pass.set_bind_group(3, &groups.mono_sprites, &[]);
-                pass.set_bind_group(4, &groups.layer_transform, &dynamic_offsets);
+                state.set_pipeline(pass, DrawPipelineId::MonoSprites, &pipelines.mono_sprites_pipeline);
+                state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+                state.set_bind_group(pass, 1, BoundGroupId::ColorAdjustments, &pipelines.color_adjustments_bind_group, &[]);
+                state.set_bind_group(
+                    pass,
+                    2,
+                    BoundGroupId::SpriteTexture(texture_id.index, texture_id.kind),
+                    texture_group,
+                    &[],
+                );
+                state.set_bind_group(pass, 3, BoundGroupId::SlabStorage(SlabKind::MonoSprites), &groups.mono_sprites, &[]);
+                state.set_bind_group(pass, 4, transform_id, &groups.layer_transform, &dynamic_offsets);
                 pass.draw(0..4, range_base..range_base + run.count);
             }
             SlabKind::PolySprites => {
-                let Some(texture_group) = run
-                    .texture_id
-                    .as_ref()
-                    .map(|id| (id.index, id.kind))
-                    .and_then(|key| groups.sprite_textures.get(&key))
+                let Some(texture_id) = run.texture_id else {
+                    debug_assert!(false, "sprite runs carry a texture id");
+                    return;
+                };
+                let Some(texture_group) = groups.sprite_textures.get(&(texture_id.index, texture_id.kind))
                 else {
                     debug_assert!(false, "sprite textures validated before drawing");
                     return;
                 };
-                pass.set_pipeline(&pipelines.poly_sprites_pipeline);
-                pass.set_bind_group(0, &pipelines.globals_bind_group, &[]);
-                pass.set_bind_group(1, texture_group, &[]);
-                pass.set_bind_group(2, &groups.poly_sprites, &[]);
-                pass.set_bind_group(3, &groups.layer_transform, &dynamic_offsets);
+                state.set_pipeline(pass, DrawPipelineId::PolySprites, &pipelines.poly_sprites_pipeline);
+                state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+                state.set_bind_group(
+                    pass,
+                    1,
+                    BoundGroupId::SpriteTexture(texture_id.index, texture_id.kind),
+                    texture_group,
+                    &[],
+                );
+                state.set_bind_group(pass, 2, BoundGroupId::SlabStorage(SlabKind::PolySprites), &groups.poly_sprites, &[]);
+                state.set_bind_group(pass, 3, transform_id, &groups.layer_transform, &dynamic_offsets);
                 pass.draw(0..4, range_base..range_base + run.count);
             }
             // Path runs address vertices, not instances: the layer's vertex
             // block sits at its Paths range inside the shared stream.
             SlabKind::Paths => {
                 let base = slabs.slab(SlabKind::Paths).base;
-                pass.set_pipeline(&pipelines.paths_pipeline);
-                pass.set_bind_group(0, &pipelines.globals_bind_group, &[]);
-                pass.set_bind_group(1, &groups.paths_vertices, &[]);
-                pass.set_bind_group(2, &groups.layer_transform, &dynamic_offsets);
+                state.set_pipeline(pass, DrawPipelineId::Paths, &pipelines.paths_pipeline);
+                state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+                state.set_bind_group(pass, 1, BoundGroupId::SlabStorage(SlabKind::Paths), &groups.paths_vertices, &[]);
+                state.set_bind_group(pass, 2, transform_id, &groups.layer_transform, &dynamic_offsets);
                 pass.draw(base + run.start..base + run.start + run.count, 0..1);
             }
         }
@@ -4041,6 +4587,31 @@ fn flush_slab_run(
         #[cfg(feature = "flamegraph")]
         crate::record_draw_call(flamegraph_kind(run.kind), run.count);
     }
+
+/// Flush an open cross-span slab stretch, if any, with the shared bind-state
+/// tracker. Called before any non-continuing draw and at end of pass.
+fn flush_open_slab_run(
+    pipelines: &WgpuPipelines,
+    transform_slot_stride: u64,
+    pass: &mut wgpu::RenderPass<'_>,
+    groups: &SlabDrawGroups,
+    state: &mut PassBindState,
+    open: &mut Option<OpenSlabRun>,
+) {
+    if let Some(open) = open.take() {
+        let pending = open.as_pending();
+        flush_slab_run_with_state(
+            pipelines,
+            transform_slot_stride,
+            pass,
+            &open.slabs,
+            groups,
+            open.transform_slot,
+            &pending,
+            state,
+        );
+    }
+}
 
 #[cfg(feature = "flamegraph")]
 fn flamegraph_kind(kind: SlabKind) -> crate::DrawCallKind {

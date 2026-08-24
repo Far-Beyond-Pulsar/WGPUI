@@ -19,10 +19,9 @@
 //! # Kill switch
 //!
 //! Everything here sits behind [`slabs_enabled`] (`WGPUI_SLABS`, default on,
-//! read once — the `WGPUI_LAYERS` precedent). This slice wires no consumers:
-//! nothing in the frame path calls into this module yet, so with the switch
-//! off the packing code is simply never reached, and any future caller checks
-//! the switch before doing work.
+//! read once — the `WGPUI_LAYERS` precedent). Every frame-path consumer
+//! checks the switch before doing work, so with it off the packing code is
+//! simply never reached and the legacy per-frame path stands.
 //!
 //! # Fail-loud policy
 //!
@@ -67,17 +66,17 @@
 //! - `LayerItem::Nested` references are never packed here; a nested layer is
 //!   its own retained record, packed independently under its own key.
 
-// The renderer consumes this in a later phase; until then the lib target sees
-// no references outside cfg(test), which keeps the API honest without
-// dead-code noise. Wiring it up later means deleting one line.
+// The renderer consumes `PackedLayer` through the scene's spans; the
+// `dead_code` allowance stays because not every helper here has a non-test
+// caller yet.
 #![allow(dead_code)]
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use collections::FxHashSet;
 
-use crate::layer::LayerItem;
+use crate::layer::{LayerItem, LayerKey};
 use crate::platform::cross::slab::SlabKind;
 use crate::scene::{
     DrawOrder, MonochromeSprite, Path, PathId, PolychromeSprite, Primitive, PrimitiveKind, Quad,
@@ -175,6 +174,44 @@ pub(crate) struct KindRun {
     pub texture_id: Option<AtlasTextureId>,
 }
 
+/// A layer's own content, packed once at record time and spliced by every
+/// subsequent composite until the next record or eviction.
+///
+/// Stretches of the layer's own primitives sit in paint order alongside the
+/// nested-layer references that separated them — the cached analog of
+/// `Window::build_slab_segments`' segmentation. Everything that does not vary
+/// between frames is precomputed here: the per-kind totals, and each
+/// stretch's runs already offset into the layer-wide streams. A composite
+/// then costs one span emission per stretch, with no packing arithmetic —
+/// which is the point, since the same content composites many times between
+/// re-records.
+///
+/// Held behind an [`Arc`] on the layer so span emission clones references,
+/// not bytes; see `Layer::packed` for the lifecycle.
+pub(crate) struct RecordedSlabPack {
+    /// Per-kind instance totals across ALL stretches: what whichever span
+    /// arrives first reserves from the allocator. Paths count vertices —
+    /// their slab holds the flattened stream, not path structs.
+    pub totals: [u32; SlabKind::COUNT],
+    /// The layer's content in paint order.
+    pub pieces: Vec<SlabPackPiece>,
+}
+
+/// One piece of a [`RecordedSlabPack`].
+pub(crate) enum SlabPackPiece {
+    /// A maximal stretch of the layer's own primitives: its draws,
+    /// `start`-offset into the layer-wide concatenated streams, over the
+    /// packed bytes themselves (origin-relative; see `make_packed_relative`).
+    Stretch {
+        runs: Vec<crate::scene::SlabRun>,
+        packed: Arc<PackedLayer>,
+    },
+    /// A layer painted inside this one. Never packed into the parent; it is
+    /// composited recursively under its own key, choosing its own
+    /// representation.
+    Nested(LayerKey),
+}
+
 /// Check a layer's items against the packing contract without side effects.
 ///
 /// Production entry points report rejections loudly (warn-once, counter,
@@ -202,6 +239,27 @@ pub(crate) fn validate_packable(items: &[LayerItem]) -> Result<(), FallbackReaso
         }
     }
     Ok(())
+}
+
+/// The cheapest possible packability answer: does any item hold a primitive
+/// no slab encodes?
+///
+/// Unlike [`validate_packable`] this never allocates — it cannot check
+/// path-id consistency, which needs the id set — so the rejection that is
+/// both common and permanent for a given layer (a backdrop filter, a surface)
+/// short-circuits before any packing work. Side-effect-free on purpose:
+/// probes (tests, `build_slab_segments`) must stay quiet; production entry
+/// points that decide to fall back report via [`report_rejection`].
+pub(crate) fn first_unsupported_kind(items: &[LayerItem]) -> Option<FallbackReason> {
+    items.iter().find_map(|item| {
+        let LayerItem::Primitive(primitive) = item else {
+            // A nested layer packs independently under its own key.
+            return None;
+        };
+        slab_kind(primitive).is_none().then(|| {
+            FallbackReason::UnsupportedPrimitive(primitive_discriminant(primitive))
+        })
+    })
 }
 
 /// Pack one layer's recorded items into per-kind slab arrays plus the
@@ -272,10 +330,15 @@ fn primitive_discriminant(primitive: &Primitive) -> PrimitiveKind {
 static UNSUPPORTED_WARNED: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
 static INCONSISTENT_IDS_WARNED: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
 
-/// Warn once per reason and bump the corresponding counter. Never asserts:
-/// the debug assertion lives at the production entry point, so tests can
-/// exercise reporting directly.
-fn report_rejection(reason: FallbackReason) {
+/// Warn once per reason and bump the corresponding counter.
+///
+/// Production entry points call this when *they* have decided to fall back —
+/// typically after [`first_unsupported_kind`] rejected a layer before any
+/// packing work. The debug assertion deliberately does not live here: a
+/// record-time fallback is a supported outcome (the layer composites through
+/// the legacy path), and `pack_layer_items` keeps its own assertion for the
+/// producer-bug case where rejection is discovered mid-pack.
+pub(crate) fn report_rejection(reason: FallbackReason) {
     match reason {
         FallbackReason::UnsupportedPrimitive(discriminant) => {
             if !UNSUPPORTED_WARNED.swap(true, Ordering::AcqRel) {

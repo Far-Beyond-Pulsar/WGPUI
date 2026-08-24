@@ -2,7 +2,10 @@
 use crate::Inspector;
 use crate::layer::{Layer, LayerCacheKey, LayerItem};
 use crate::platform::cross::slab::SlabKind;
-use crate::scene_pack::{PackedLayer, pack_layer_items, validate_packable};
+use crate::scene_pack::{
+    FallbackReason, PackedLayer, RecordedSlabPack, SlabPackPiece, first_unsupported_kind,
+    pack_layer_items,
+};
 use crate::time_ext::Instant;
 use crate::util::post_inc;
 use crate::util::{ResultExt, measure};
@@ -68,16 +71,19 @@ pub(crate) enum SlabSegment {
     Nested(LayerKey),
 }
 
-/// Pack one stretch of consecutive primitive items, rejecting the whole
-/// layer on any packing rejection. The result is stored relative to the
-/// layer's composited `origin` (see `make_packed_relative`).
+/// Pack one stretch of consecutive primitive items. The result is stored
+/// relative to the layer's composited `origin` (see `make_packed_relative`).
+///
+/// Unsupported kinds were rejected for the whole layer before segmentation
+/// (see `build_slab_segments`), and `pack_layer_items` still guards its own
+/// contract, so this is the gather-and-sort step only — the pre-slab
+/// redundant full validation pass is gone.
 fn pack_stretch(
     items: &[LayerItem],
     start: usize,
     end: usize,
     origin: [f32; 2],
 ) -> Option<Box<PackedLayer>> {
-    validate_packable(&items[start..end]).ok()?;
     match pack_layer_items(&items[start..end]) {
         crate::scene_pack::PackOutcome::Packed(mut packed) => {
             crate::platform::cross::slab_gpu::make_packed_relative(&mut packed, origin);
@@ -104,9 +110,31 @@ fn is_transform_only_move(previous: &LayerCacheKey, incoming: &LayerCacheKey) ->
 
 /// Split a layer's items into slab segments: stretches of its own primitives
 /// separated by nested-layer references. `None` when nothing is packable —
-/// including layers whose items are all nested references — which routes the
-/// caller to the legacy composite path.
+/// including layers holding a primitive with no slab kind, or items that are
+/// all nested references.
+///
+/// Test-only probe today: production packs at record time via
+/// [`pack_layer_at_record`], and the composite path splices cached bytes. It
+/// keeps the unsupported-kind rejection side-effect-free so probes stay
+/// quiet (a `debug_assert` in this position would fire for the supported
+/// backdrop-filter-inside-a-layer configuration, which exists precisely to
+/// exercise the fallback); production reporting happens in
+/// `pack_layer_at_record`.
+#[cfg(test)]
 pub(crate) fn build_slab_segments(
+    items: &[LayerItem],
+    origin: [f32; 2],
+) -> Option<Vec<SlabSegment>> {
+    // `None` from the scan means "no rejection"; `?` would invert that into
+    // rejecting exactly the packable layers.
+    if first_unsupported_kind(items).is_some() {
+        return None;
+    }
+    build_slab_stretches(items, origin)
+}
+
+/// Segmentation proper, after the caller has handled unsupported kinds.
+fn build_slab_stretches(
     items: &[LayerItem],
     origin: [f32; 2],
 ) -> Option<Vec<SlabSegment>> {
@@ -138,6 +166,95 @@ pub(crate) fn build_slab_segments(
         return None;
     }
     Some(segments)
+}
+
+impl RecordedSlabPack {
+    /// Absorb `build_slab_segments`' output: hoist the per-kind totals and
+    /// each stretch's offset runs out of what used to be the per-frame
+    /// emission loop, so a composite only clones them.
+    fn from_segments(segments: Vec<SlabSegment>) -> Self {
+        let mut totals = [0u32; SlabKind::COUNT];
+        for segment in &segments {
+            let SlabSegment::Stretch(_, packed) = segment else {
+                continue;
+            };
+            totals[SlabKind::Quads.index()] += packed.quads.len() as u32;
+            totals[SlabKind::Shadows.index()] += packed.shadows.len() as u32;
+            totals[SlabKind::Paths.index()] += packed.total_path_vertices();
+            totals[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
+            totals[SlabKind::MonoSprites.index()] += packed.mono_sprites.len() as u32;
+            totals[SlabKind::PolySprites.index()] += packed.poly_sprites.len() as u32;
+        }
+        // Running per-kind offsets: every stretch draws out of the same slab
+        // ranges, so a later stretch's runs start where earlier ones' bytes
+        // end.
+        let mut offsets = [0u32; SlabKind::COUNT];
+        // Stretches arrive contiguous and ascending — nested references sit
+        // between them, never inside — which the offset accumulation below
+        // depends on.
+        #[cfg(debug_assertions)]
+        let mut stretch_cursor = 0usize;
+        let pieces = segments
+            .into_iter()
+            .map(|segment| match segment {
+                SlabSegment::Stretch(range, packed) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        debug_assert!(
+                            range.start >= stretch_cursor,
+                            "stretch ranges must ascend"
+                        );
+                        stretch_cursor = range.end;
+                    }
+                    let runs = packed
+                        .runs
+                        .iter()
+                        .map(|run| crate::scene::SlabRun {
+                            kind: run.kind,
+                            start: offsets[run.kind.index()] + run.start,
+                            count: run.count,
+                            texture_id: run.texture_id,
+                        })
+                        .collect();
+                    offsets[SlabKind::Quads.index()] += packed.quads.len() as u32;
+                    offsets[SlabKind::Shadows.index()] += packed.shadows.len() as u32;
+                    offsets[SlabKind::Paths.index()] += packed.total_path_vertices();
+                    offsets[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
+                    offsets[SlabKind::MonoSprites.index()] += packed.mono_sprites.len() as u32;
+                    offsets[SlabKind::PolySprites.index()] += packed.poly_sprites.len() as u32;
+                    SlabPackPiece::Stretch {
+                        runs,
+                        packed: Arc::from(packed),
+                    }
+                }
+                SlabSegment::Nested(nested) => SlabPackPiece::Nested(nested),
+            })
+            .collect();
+        RecordedSlabPack { totals, pieces }
+    }
+}
+
+/// Pack a freshly-recorded layer's own content once, for every composite
+/// until the next record to splice from.
+///
+/// `Some(Err)` caches a fallback verdict after reporting it — warn-once plus
+/// counter, once per record rather than once per frame. The report is
+/// deliberately NOT accompanied by the `debug_assert` that guards
+/// `pack_layer_items` itself: an unsupported kind at record time is a
+/// supported outcome (the layer composites through the legacy path), not a
+/// producer bug. `None` when nothing was packable at all — empty layers and
+/// nested-reference-only layers have always composited legacy-style.
+fn pack_layer_at_record(
+    items: &[LayerItem],
+    origin: [f32; 2],
+) -> Option<Result<Arc<RecordedSlabPack>, FallbackReason>> {
+    profiling::scope!("wgpui: pack layer at record");
+    if let Some(reason) = first_unsupported_kind(items) {
+        crate::scene_pack::report_rejection(reason);
+        return Some(Err(reason));
+    }
+    let segments = build_slab_stretches(items, origin)?;
+    Some(Ok(Arc::new(RecordedSlabPack::from_segments(segments))))
 }
 
 /// The pre-slab composite replay: re-emit every retained primitive through
@@ -416,6 +533,60 @@ pub(crate) struct WindowInvalidator {
     inner: Rc<RefCell<WindowInvalidatorInner>>,
 }
 
+static NOTIFY_ATTRIBUTION_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("WGPUI_NOTIFY_ATTRIBUTION")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+});
+
+struct NotifyAttributionState {
+    counts: FxHashMap<EntityId, u64>,
+    last_report: Instant,
+}
+
+static NOTIFY_ATTRIBUTION: std::sync::LazyLock<parking_lot::Mutex<NotifyAttributionState>> =
+    std::sync::LazyLock::new(|| {
+        parking_lot::Mutex::new(NotifyAttributionState {
+            counts: FxHashMap::default(),
+            last_report: Instant::now(),
+        })
+    });
+
+/// Attribute entity invalidations to their source ids when
+/// `WGPUI_NOTIFY_ATTRIBUTION` is set, so a notify storm can be traced to the
+/// entities causing it instead of only being visible as frame cost. One warn
+/// line per second names the top offenders; disabled costs a single atomic
+/// load per invalidation.
+fn record_notify_attribution(entity: EntityId) {
+    if !*NOTIFY_ATTRIBUTION_ENABLED {
+        return;
+    }
+    let mut state = NOTIFY_ATTRIBUTION.lock();
+    *state.counts.entry(entity).or_insert(0) += 1;
+    if state.last_report.elapsed() >= Duration::from_secs(1) {
+        let mut top: Vec<(u64, u64)> = state
+            .counts
+            .iter()
+            .map(|(id, count)| (id.as_u64(), *count))
+            .collect();
+        top.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+        top.truncate(10);
+        let total: u64 = state.counts.values().sum();
+        log::warn!(
+            target: "notify_attribution",
+            "{} entity invalidations in the last second across {} entities; top: {}",
+            total,
+            state.counts.len(),
+            top.iter()
+                .map(|(id, count)| format!("entity {id}: {count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        state.counts.clear();
+        state.last_report = Instant::now();
+    }
+}
+
 impl WindowInvalidator {
     pub fn new() -> Self {
         WindowInvalidator {
@@ -520,6 +691,7 @@ impl WindowInvalidator {
 
     fn invalidate_entity(&self, entity: EntityId, cx: &mut App) -> bool {
         crate::render_stats::count("invalidate: entity");
+        record_notify_attribution(entity);
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
@@ -3011,8 +3183,8 @@ impl Window {
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
-    #[profiling::function]
     pub fn draw<'app>(&mut self, cx: &'app mut App) -> ArenaClearNeeded<'app> {
+        profiling::scope!("wgpui: draw");
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
@@ -3228,6 +3400,7 @@ impl Window {
     /// Turn everything recorded since the last draw into the per-draw state the
     /// element walk reads: window-scope axes, and the entity-scope dirty sets.
     fn apply_invalidations(&mut self) {
+        profiling::scope!("wgpui: apply_invalidations");
         self.window_invalidation = self.invalidator.take_window_axes();
 
         // Layer-scope requests mark exactly the layer they name — no ancestor
@@ -3262,8 +3435,8 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
-    #[profiling::function]
     fn present(&self) {
+        profiling::scope!("wgpui: present");
         #[cfg(feature = "flamegraph")]
         let _present_span = crate::enter_span(
             crate::SpanName::Static("Window::present"),
@@ -3283,8 +3456,8 @@ impl Window {
     }
 
     /// Present only the cached framebuffer (fast path - no compositor)
-    #[profiling::function]
     fn present_framebuffer_only(&self) {
+        profiling::scope!("wgpui: present_framebuffer_only");
         #[cfg(feature = "flamegraph")]
         let _present_span = crate::enter_span(
             crate::SpanName::Static("Window::present_framebuffer_only"),
@@ -3338,49 +3511,61 @@ impl Window {
         // `prepaint_as_root` split into its two halves so layout and prepaint can
         // be timed apart; the pair is exactly what that method does.
         {
+            profiling::scope!("wgpui: layout");
             let _t = crate::render_stats::scope("frame: layout");
             root_element.layout_as_root(root_size.into(), self, cx);
         }
 
-        let prepaint_timer = crate::render_stats::scope("frame: prepaint");
-        root_element.prepaint_at(Point::default(), self, cx);
+        let _inspector_element;
+        let mut sorted_deferred_draws;
+        let mut prompt_element;
+        let mut active_drag_element;
+        let mut tooltip_element;
+        {
+            profiling::scope!("wgpui: prepaint");
+            let prepaint_timer = crate::render_stats::scope("frame: prepaint");
+            root_element.prepaint_at(Point::default(), self, cx);
 
-        #[cfg(any(feature = "inspector", debug_assertions))]
-        let inspector_element = self.prepaint_inspector(inspector_width, cx);
+            #[cfg(any(feature = "inspector", debug_assertions))]
+            {
+                _inspector_element = self.prepaint_inspector(inspector_width, cx);
+            }
 
-        let mut sorted_deferred_draws =
-            (0..self.next_frame.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
-        sorted_deferred_draws.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
-        self.prepaint_deferred_draws(&sorted_deferred_draws, cx);
+            sorted_deferred_draws =
+                (0..self.next_frame.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
+            sorted_deferred_draws.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
+            self.prepaint_deferred_draws(&sorted_deferred_draws, cx);
 
-        let mut prompt_element = None;
-        let mut active_drag_element = None;
-        let mut tooltip_element = None;
-        if let Some(prompt) = self.prompt.take() {
-            let mut element = prompt.view.any_view().into_any();
-            element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
-            prompt_element = Some(element);
-            self.prompt = Some(prompt);
-        } else if let Some(active_drag) = cx.active_drag.take() {
-            let mut element = active_drag.view.clone().into_any();
-            let offset = self.mouse_position() - active_drag.cursor_offset;
-            element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
-            active_drag_element = Some(element);
-            cx.active_drag = Some(active_drag);
-        } else {
-            tooltip_element = self.prepaint_tooltip(cx);
+            prompt_element = None;
+            active_drag_element = None;
+            tooltip_element = None;
+            if let Some(prompt) = self.prompt.take() {
+                let mut element = prompt.view.any_view().into_any();
+                element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+                prompt_element = Some(element);
+                self.prompt = Some(prompt);
+            } else if let Some(active_drag) = cx.active_drag.take() {
+                let mut element = active_drag.view.clone().into_any();
+                let offset = self.mouse_position() - active_drag.cursor_offset;
+                element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
+                active_drag_element = Some(element);
+                cx.active_drag = Some(active_drag);
+            } else {
+                tooltip_element = self.prepaint_tooltip(cx);
+            }
+
+            self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position, &self.layers);
+            drop(prepaint_timer);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position, &self.layers);
-        drop(prepaint_timer);
-
         // Now actually paint the elements.
+        profiling::scope!("wgpui: paint");
         let paint_timer = crate::render_stats::scope("frame: paint");
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
-        self.paint_inspector(inspector_element, cx);
+        self.paint_inspector(_inspector_element, cx);
 
         self.paint_deferred_draws(&sorted_deferred_draws, cx);
 
@@ -4558,6 +4743,7 @@ impl Window {
         policy: LayerPolicy,
         f: impl FnOnce(&mut Window) -> R,
     ) -> R {
+        profiling::scope!("wgpui: record layer");
         crate::render_stats::count("layer: re-rendered");
         let scaled_bounds = cache_key.bounds.scale(cache_key.scale_factor);
         let paint_start = self.paint_index();
@@ -4598,6 +4784,20 @@ impl Window {
             // layer must re-upload its slab, which the new token forces.
             self.slab_tokens.insert(key, self.next_slab_token);
             self.next_slab_token += 1;
+            // Pack once per content generation: every composite until the
+            // next record splices spans straight from this pack, so the
+            // validate/gather/sort work runs here instead of per frame.
+            // Content is origin-relative to THIS record's origin, which is
+            // exactly what a clean composite re-emits.
+            layer.packed = if crate::scene_pack::slabs_enabled() {
+                let scaled_origin = [
+                    scaled_bounds.origin.x.0,
+                    scaled_bounds.origin.y.0,
+                ];
+                pack_layer_at_record(&layer.items, scaled_origin)
+            } else {
+                None
+            };
             layer.needs = Invalidation::empty();
             layer.last_visited = frame;
             layer.had_mouse = false;
@@ -4730,6 +4930,7 @@ impl Window {
     /// packing rejection takes the legacy replay path for the whole layer,
     /// which is correct rebuild behaviour, not an error.
     fn composite_layer(&mut self, key: LayerKey) {
+        profiling::scope!("wgpui: layer composite");
         crate::render_stats::count("layer: composited");
         let _t = crate::render_stats::scope("layer: composite");
         let frame = self.layer_frame;
@@ -4766,37 +4967,45 @@ impl Window {
         }
     }
 
-    /// The slab splice half of [`Self::composite_layer`]: record one span per
-    /// maximal stretch of `key`'s own primitives, recursing into nested layers
-    /// between stretches. Returns `false` when the layer must composite
-    /// through the legacy path instead (nothing packable, or a packing
-    /// rejection).
+    /// The slab splice half of [`Self::composite_layer`]: emit one span per
+    /// maximal stretch of `key`'s own primitives from the pack cached at
+    /// record time, recursing into nested layers between stretches. Returns
+    /// `false` when the layer must composite through the legacy path instead
+    /// (nothing cached: nothing packable, a packing rejection, or slabs off
+    /// at record time).
+    ///
+    /// No packing happens here — the bytes were built once at record, so a
+    /// clean frame's composite is span emission only and the renderer reads
+    /// the unchanged token as Clean (zero uploads).
     fn try_composite_layer_into_scene_as_slab(
         &mut self,
         key: LayerKey,
         frame: u64,
         scale_factor: f32,
     ) -> bool {
-        let Some(layer) = self.layers.get(&key) else {
+        profiling::scope!("wgpui: slab splice");
+        let Some((scaled_bounds, scaled_origin, pack)) = self.layers.get(&key).and_then(|layer| {
+            if !layer.has_content() {
+                return None;
+            }
+            let pack = match &layer.packed {
+                Some(Ok(pack)) => Arc::clone(pack),
+                _ => return None,
+            };
+            let scaled_bounds = layer.cache_key.bounds.scale(scale_factor);
+            let scaled_origin = [scaled_bounds.origin.x.0, scaled_bounds.origin.y.0];
+            Some((scaled_bounds, scaled_origin, pack))
+        }) else {
             return false;
         };
-        if !layer.has_content() {
-            return false;
-        }
-        let scaled_bounds = layer.cache_key.bounds.scale(scale_factor);
-        let scaled_origin = [scaled_bounds.origin.x.0, scaled_bounds.origin.y.0];
-        let segments = build_slab_segments(&layer.items, scaled_origin);
-        match segments {
-            Some(segments) => self.emit_layer_slab_segments(
-                key,
-                frame,
-                scale_factor,
-                scaled_bounds,
-                scaled_origin,
-                segments,
-            ),
-            None => false,
-        }
+        self.emit_layer_slab_spans(
+            key,
+            frame,
+            scale_factor,
+            scaled_bounds,
+            scaled_origin,
+            &pack,
+        )
     }
 
     /// The #94 headline path: composite a layer whose only change since its
@@ -4837,7 +5046,10 @@ impl Window {
         let scale_factor = self.scale_factor();
         let scaled_bounds = cache_key.bounds.scale(scale_factor);
         let scaled_origin = [scaled_bounds.origin.x.0, scaled_bounds.origin.y.0];
-        let segments = {
+        // Packed bytes are origin-relative, so a pure translation leaves them
+        // byte-identical: the record-time cache is reused as-is under the
+        // SAME token — no repack, no uploads, one transform slot renderer-side.
+        let pack = {
             let Some(layer) = self.layers.get(&key) else {
                 return false;
             };
@@ -4848,10 +5060,12 @@ impl Window {
             {
                 return false;
             }
-            build_slab_segments(&layer.items, scaled_origin)
-        };
-        let Some(segments) = segments else {
-            return false;
+            let Some(Ok(pack)) = layer.packed.as_ref() else {
+                // Never packed or an unsupported-kind fallback: decline so the
+                // caller falls back to a full re-record, which rebuilds it.
+                return false;
+            };
+            Arc::clone(pack)
         };
 
         // Stamp everything a re-record would have stamped, minus the record:
@@ -4892,13 +5106,13 @@ impl Window {
         }
 
         crate::render_stats::count("layer: composited (transform-only)");
-        self.emit_layer_slab_segments(
+        self.emit_layer_slab_spans(
             key,
             frame,
             scale_factor,
             scaled_bounds,
             scaled_origin,
-            segments,
+            &pack,
         );
         let composite_end = self.paint_index();
         if let Some(layer) = self.layers.get_mut(&key) {
@@ -4910,77 +5124,45 @@ impl Window {
         true
     }
 
-    /// The slab splice half of [`Self::try_composite_layer_into_scene_as_slab`],
-    /// shared with [`Self::try_composite_transform_only_move`]: record one
-    /// span per maximal stretch of `key`'s own primitives, recursing into
-    /// nested layers between stretches. The segments are expected to have
-    /// been built at `origin`.
-    fn emit_layer_slab_segments(
+    /// The slab splice half shared by [`Self::try_composite_layer_into_scene_as_slab`]
+    /// and [`Self::try_composite_transform_only_move`]: record one span per
+    /// stretch of the layer's own primitives from `pack`, recursing into
+    /// nested layers between stretches.
+    ///
+    /// The pack was built at `origin` (record time for a clean composite, the
+    /// move for the transform-only path), so spans reference cached bytes
+    /// whose reference origin equals the origin they declare — the renderer
+    /// reads an unchanged token as Clean and uploads nothing. Everything the
+    /// spans carry besides bounds/key/token/origin is precomputed in the
+    /// pack; this loop only clones runs and Arcs.
+    fn emit_layer_slab_spans(
         &mut self,
         key: LayerKey,
         frame: u64,
         scale_factor: f32,
         bounds: Bounds<ScaledPixels>,
         origin: [f32; 2],
-        segments: Vec<SlabSegment>,
+        pack: &RecordedSlabPack,
     ) -> bool {
         let token = self.slab_tokens.get(&key).copied().unwrap_or(0);
-        // Per-kind instance totals across all stretches: what whichever span
-        // arrives first reserves from the allocator. Paths count vertices —
-        // their slab holds the flattened stream, not path structs.
-        let mut totals = [0u32; SlabKind::COUNT];
-        for segment in &segments {
-            let SlabSegment::Stretch(_, packed) = segment else {
-                continue;
-            };
-            totals[SlabKind::Quads.index()] += packed.quads.len() as u32;
-            totals[SlabKind::Shadows.index()] += packed.shadows.len() as u32;
-            totals[SlabKind::Paths.index()] += packed.total_path_vertices();
-            totals[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
-            totals[SlabKind::MonoSprites.index()] += packed.mono_sprites.len() as u32;
-            totals[SlabKind::PolySprites.index()] += packed.poly_sprites.len() as u32;
-        }
-        // Running per-kind offsets: every stretch draws out of the same slab
-        // ranges, so a later stretch's runs start where earlier ones' bytes end.
-        let mut offsets = [0u32; SlabKind::COUNT];
 
         self.next_frame.scene.begin_layer(key, bounds, false);
         crate::render_stats::count("layer: composited (slab)");
-        for segment in segments {
-            match segment {
-                SlabSegment::Stretch(range, packed) => {
-                    debug_assert!(
-                        range.end <= self.layers.get(&key).map(|l| l.items.len()).unwrap_or(0),
-                        "stretch range must stay inside its layer's items"
-                    );
-                    let mut runs = Vec::with_capacity(packed.runs.len());
-                    for run in &packed.runs {
-                        let index = run.kind.index();
-                        runs.push(crate::scene::SlabRun {
-                            kind: run.kind,
-                            start: offsets[index] + run.start,
-                            count: run.count,
-                            texture_id: run.texture_id,
-                        });
-                    }
-                    offsets[SlabKind::Quads.index()] += packed.quads.len() as u32;
-                    offsets[SlabKind::Shadows.index()] += packed.shadows.len() as u32;
-                    offsets[SlabKind::Paths.index()] += packed.total_path_vertices();
-                    offsets[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
-                    offsets[SlabKind::MonoSprites.index()] += packed.mono_sprites.len() as u32;
-                    offsets[SlabKind::PolySprites.index()] += packed.poly_sprites.len() as u32;
+        for piece in &pack.pieces {
+            match piece {
+                SlabPackPiece::Stretch { runs, packed } => {
                     self.next_frame.scene.push_layer_slab_span(
                         bounds,
                         key,
                         token,
                         origin,
-                        totals,
-                        runs,
-                        Arc::from(packed),
+                        pack.totals,
+                        runs.clone(),
+                        Arc::clone(packed),
                     );
                 }
-                SlabSegment::Nested(nested) => {
-                    self.composite_nested_layer_for_slab(nested, frame, scale_factor);
+                SlabPackPiece::Nested(nested) => {
+                    self.composite_nested_layer_for_slab(*nested, frame, scale_factor);
                 }
             }
         }
@@ -5053,6 +5235,7 @@ impl Window {
     /// [`Layer::instances`]): instances are owned by layers and die with them,
     /// via `Layer::drop_content` below.
     fn evict_stale_layers(&mut self) {
+        profiling::scope!("wgpui: evict_stale_layers");
         let frame = self.layer_frame;
         let mut dropped_content = 0usize;
         let mut dropped_records = 0usize;

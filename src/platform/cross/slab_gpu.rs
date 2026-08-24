@@ -58,6 +58,8 @@ pub(crate) const COUNTER_BYTES_UPLOADED: &str = "slab: bytes uploaded";
 pub(crate) const COUNTER_LAYERS_REALLOCATED: &str = "slab: layers reallocated";
 pub(crate) const COUNTER_COMPACTIONS: &str = "slab: compactions";
 pub(crate) const COUNTER_DRAW_CALLS: &str = "slab: draw calls";
+pub(crate) const COUNTER_COMPACTION_PLANS_DEFERRED: &str = "slab: compaction plans deferred";
+pub(crate) const COUNTER_ZERO_MOVE_PLANS: &str = "slab: compaction plans moved nothing";
 const COUNTER_SPANS_DRAWN_CLEAN: &str = "slab: spans drawn clean";
 const COUNTER_SPANS_SKIPPED_EVICTED: &str = "slab: spans skipped (awaiting re-record)";
 const COUNTER_SYNC_OVERFLOWS: &str = "slab: sync overflowed";
@@ -135,6 +137,9 @@ pub(crate) struct TransformTable {
     free_slots: Vec<u32>,
     values: Vec<GpuLayerTransform>,
     dirty: FxHashSet<u32>,
+    /// Bounded scratch for [`TransformTable::drain_dirty_into`], so steady
+    /// state drains never allocate.
+    drain_scratch: Vec<u32>,
 }
 
 impl TransformTable {
@@ -184,18 +189,30 @@ impl TransformTable {
     }
 
     /// Take the dirty set, paired with each slot's current value.
+    #[cfg(test)]
     pub fn drain_dirty(&mut self) -> Vec<(u32, GpuLayerTransform)> {
-        let mut dirty: Vec<u32> = self.dirty.drain().collect();
+        let mut out = Vec::new();
+        self.drain_dirty_into(&mut out);
+        out
+    }
+
+    /// [`Self::drain_dirty`] into caller-owned storage: after a warm-up drain,
+    /// the vector's capacity is reused every frame instead of reallocating.
+    pub fn drain_dirty_into(&mut self, out: &mut Vec<(u32, GpuLayerTransform)>) {
+        out.clear();
+        let mut dirty = std::mem::take(&mut self.drain_scratch);
+        dirty.clear();
+        dirty.extend(self.dirty.drain());
         dirty.sort_unstable();
-        dirty.iter()
-            .map(|&slot| (slot, self.values[slot as usize]))
-            .collect()
+        out.extend(dirty.iter().map(|&slot| (slot, self.values[slot as usize])));
+        self.drain_scratch = dirty;
     }
 
     /// Mark every occupied slot for re-upload (uniform buffer recreated).
     pub fn mark_all_dirty(&mut self) {
-        let occupied: Vec<u32> = (1u32..self.values.len() as u32).collect();
-        self.dirty.extend(occupied);
+        // Slot 0 holds the permanent identity legacy draws read; it is already
+        // zero, so re-marking it would only cost a redundant uniform write.
+        self.dirty.extend(1..self.values.len() as u32);
     }
 
     pub fn release(&mut self, key: LayerKey) {
@@ -215,6 +232,21 @@ impl TransformTable {
 /// never churn; a freed-then-referenced layer simply re-uploads from the
 /// marker's own bytes, so correctness never depends on the interval.
 const GC_IDLE_FRAMES: u64 = 600;
+
+/// Compaction cooldown schedule. A plan that moves nothing means the arenas
+/// are sparse but already packed — exactly the steady state of an idle
+/// window — so planning again immediately would rebuild the same empty plan
+/// every frame. The first zero-move plan imposes a one-frame cooldown that
+/// doubles per consecutive zero-move plan, capping at
+/// `COMPACTION_BACKOFF_BASE_FRAMES << COMPACTION_BACKOFF_MAX_SHIFT` frames.
+/// Any plan that moves something resets the schedule.
+const COMPACTION_BACKOFF_BASE_FRAMES: u32 = 1;
+const COMPACTION_BACKOFF_MAX_SHIFT: u32 = 8;
+
+#[cfg(test)]
+pub(crate) fn compaction_backoff_cap_frames() -> u32 {
+    COMPACTION_BACKOFF_BASE_FRAMES << COMPACTION_BACKOFF_MAX_SHIFT
+}
 
 struct RegistryEntry {
     content_token: u64,
@@ -243,6 +275,17 @@ pub(crate) struct SlabRegistry {
     entries: FxHashMap<LayerKey, RegistryEntry>,
     transforms: TransformTable,
     frame: u64,
+    /// Remaining frames during which advisory compaction is suppressed by the
+    /// zero-move backoff. Correctness never depends on compaction running, so
+    /// a nonzero value only delays defragmentation.
+    compaction_cooldown_frames: u32,
+    /// Consecutive plans that moved nothing; drives the exponential backoff.
+    zero_move_streak: u32,
+    /// Layers uploaded since the last time the compaction gate was evaluated.
+    /// Compaction planning is skipped while upload traffic is flowing: fresh
+    /// allocations make any plan instantly stale and the CPU work competes
+    /// with the upload path.
+    uploads_since_last_plan: u32,
 }
 
 impl Default for SlabRegistry {
@@ -252,6 +295,9 @@ impl Default for SlabRegistry {
             entries: FxHashMap::default(),
             transforms: TransformTable::new(),
             frame: 0,
+            compaction_cooldown_frames: 0,
+            zero_move_streak: 0,
+            uploads_since_last_plan: 0,
         }
     }
 }
@@ -356,6 +402,7 @@ impl SlabRegistry {
         if relocated_any_kind {
             crate::render_stats::count(COUNTER_LAYERS_REALLOCATED);
         }
+        self.uploads_since_last_plan = self.uploads_since_last_plan.saturating_add(1);
 
         Ok(SyncPlan::UploadAllOccupied)
     }
@@ -440,6 +487,52 @@ impl SlabRegistry {
         self.allocator.should_compact(utilization_threshold)
     }
 
+    /// Whether the caller may build and apply a compaction plan this frame.
+    ///
+    /// Three independent gates, all pure scheduling (never correctness):
+    ///
+    /// - the zero-move backoff cooldown ([`Self::note_zero_move_plan`]);
+    /// - upload traffic since the last evaluation — planning while layers are
+    ///   being uploaded produces instantly-stale plans and steals CPU from
+    ///   the upload path.
+    ///
+    /// Evaluating the gate consumes the upload signal: a closed gate defers
+    /// planning by exactly one frame rather than parking it forever.
+    pub fn compaction_gate_open(&mut self) -> bool {
+        let uploaded_since_last_plan = std::mem::take(&mut self.uploads_since_last_plan) > 0;
+        if self.compaction_cooldown_frames > 0 {
+            self.compaction_cooldown_frames -= 1;
+            crate::render_stats::count(COUNTER_COMPACTION_PLANS_DEFERRED);
+            return false;
+        }
+        if uploaded_since_last_plan {
+            crate::render_stats::count(COUNTER_COMPACTION_PLANS_DEFERRED);
+            return false;
+        }
+        true
+    }
+
+    /// Record that a plan was built and applied zero moves. The arenas were
+    /// sparse but already packed — idle-window steady state — so back off
+    /// before planning again.
+    pub fn note_zero_move_plan(&mut self) {
+        self.zero_move_streak = self.zero_move_streak.saturating_add(1);
+        let shift = self.zero_move_streak.saturating_sub(1).min(COMPACTION_BACKOFF_MAX_SHIFT);
+        self.compaction_cooldown_frames = COMPACTION_BACKOFF_BASE_FRAMES << shift;
+        crate::render_stats::count(COUNTER_ZERO_MOVE_PLANS);
+    }
+
+    /// Record that a plan moved something; reset the backoff schedule.
+    pub fn note_moves_applied(&mut self) {
+        self.zero_move_streak = 0;
+        self.compaction_cooldown_frames = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compaction_cooldown_frames(&self) -> u32 {
+        self.compaction_cooldown_frames
+    }
+
     pub fn compaction_plan(&self) -> CompactionPlan<LayerKey> {
         self.allocator.compaction_plan()
     }
@@ -510,8 +603,20 @@ impl SlabRegistry {
         changed
     }
 
+    /// [`TransformTable::drain_dirty_into`] passthrough into caller-owned
+    /// storage, so the per-frame drain reuses the renderer's scratch vector
+    /// instead of allocating.
+    pub fn take_dirty_transforms_into(&mut self, out: &mut Vec<(u32, GpuLayerTransform)>) {
+        self.transforms.drain_dirty_into(out);
+    }
+
+    /// Allocating variant of [`Self::take_dirty_transforms_into`], kept for
+    /// the GPU-tier test harness's span preparation.
+    #[cfg(test)]
     pub fn take_dirty_transforms(&mut self) -> Vec<(u32, GpuLayerTransform)> {
-        self.transforms.drain_dirty()
+        let mut out = Vec::new();
+        self.take_dirty_transforms_into(&mut out);
+        out
     }
 
     fn drop_entry(&mut self, key: &LayerKey) {
@@ -1051,7 +1156,9 @@ mod tests {
                     registry.note_referenced_pages(frame.key, []);
                 }
             }
-            for (slot, _) in registry.take_dirty_transforms() {
+            let mut dirty_transforms = Vec::new();
+            registry.take_dirty_transforms_into(&mut dirty_transforms);
+            for &(slot, _) in &dirty_transforms {
                 self.writes.push(RecordedWrite::Transform(slot));
             }
             registry.begin_frame();
@@ -1187,5 +1294,117 @@ mod tests {
         assert_eq!(std::mem::size_of::<GpuLayerTransform>(), 64);
         let default = GpuLayerTransform::default();
         assert_eq!(default.translate, [0.0, 0.0]);
+    }
+
+    // -----------------------------------------------------------------
+    // Compaction scheduling: the gate is pure scheduling, so these drive
+    // only decision state — no allocator traffic needed to prove that a
+    // zero-move plan backs off exponentially and upload traffic defers
+    // planning.
+    // -----------------------------------------------------------------
+
+    fn big_counts() -> [u32; SlabKind::COUNT] {
+        counts_of(&[(SlabKind::Quads, MIN_CLASS * 128)])
+    }
+
+    #[test]
+    fn zero_move_plans_engage_an_exponential_backoff() {
+        let mut registry = SlabRegistry::new();
+        registry.plan_sync(KEY, 1, big_counts()).unwrap();
+
+        // The setup upload defers planning once; consume that deferral.
+        assert!(!registry.compaction_gate_open(), "upload defers planning");
+        assert!(registry.compaction_gate_open(), "next evaluation opens");
+
+        registry.note_zero_move_plan();
+        assert_eq!(registry.compaction_cooldown_frames(), 1);
+
+        assert!(!registry.compaction_gate_open(), "cooldown suppresses");
+        assert!(
+            registry.compaction_gate_open(),
+            "a one-frame cooldown expires after one gated evaluation"
+        );
+
+        // Each additional zero-move plan doubles the suppression window.
+        registry.note_zero_move_plan();
+        assert_eq!(registry.compaction_cooldown_frames(), 2);
+        for _ in 0..2 {
+            assert!(!registry.compaction_gate_open());
+        }
+        assert!(registry.compaction_gate_open());
+
+        registry.note_zero_move_plan();
+        assert_eq!(registry.compaction_cooldown_frames(), 4);
+
+        for _ in 0..64 {
+            registry.note_zero_move_plan();
+        }
+        assert_eq!(
+            registry.compaction_cooldown_frames(),
+            compaction_backoff_cap_frames(),
+            "the backoff saturates instead of overflowing"
+        );
+    }
+
+    #[test]
+    fn applied_moves_reset_the_backoff() {
+        let mut registry = SlabRegistry::new();
+        registry.plan_sync(KEY, 1, big_counts()).unwrap();
+        // Drain the setup upload's deferral so the gate state is purely the
+        // backoff under test.
+        registry.compaction_gate_open();
+        registry.compaction_gate_open();
+
+        registry.note_zero_move_plan();
+        registry.note_zero_move_plan();
+        assert!(registry.compaction_cooldown_frames() > 0);
+
+        registry.note_moves_applied();
+        assert_eq!(registry.compaction_cooldown_frames(), 0);
+        assert!(
+            registry.compaction_gate_open(),
+            "a plan that moved something reopens planning immediately"
+        );
+    }
+
+    #[test]
+    fn uploads_since_the_last_evaluation_defer_planning_one_frame() {
+        let mut registry = SlabRegistry::new();
+        registry.plan_sync(KEY, 1, big_counts()).unwrap();
+
+        let open = registry.compaction_gate_open();
+        assert!(!open, "an upload since the last evaluation closes the gate");
+        assert!(
+            registry.compaction_gate_open(),
+            "the deferral is consumed: the next evaluation opens again"
+        );
+    }
+
+    #[test]
+    fn dirty_drain_reuses_caller_storage_without_reallocation() {
+        let mut table = TransformTable::new();
+        let slot = table.slot_for(KEY);
+        table.set_translate(KEY, [1.0, 2.0]);
+
+        let mut drained: Vec<(u32, GpuLayerTransform)> = Vec::new();
+        table.drain_dirty_into(&mut drained);
+        assert_eq!(drained.len(), 1);
+        let pointer = drained.as_ptr();
+        let capacity = drained.capacity();
+
+        // A second drain after more dirt lands must neither reallocate nor
+        // grow: same storage, same contents discipline (sorted by slot).
+        let other = table.slot_for(OTHER);
+        table.set_translate(KEY, [3.0, 4.0]);
+        table.set_translate(OTHER, [5.0, 6.0]);
+        table.drain_dirty_into(&mut drained);
+        assert_eq!(drained.as_ptr(), pointer, "capacity must be reused");
+        assert!(drained.capacity() >= capacity);
+        assert_eq!(
+            drained.iter().map(|&(slot, _)| slot).collect::<Vec<u32>>(),
+            vec![slot.min(other), slot.max(other)],
+            "drained slots stay sorted ascending"
+        );
+        assert!(table.dirty.is_empty(), "the drain must be total");
     }
 }

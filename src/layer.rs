@@ -56,8 +56,10 @@ use crate::{
     Primitive, px, size,
 };
 use crate::instance::ElementInstance;
+use crate::scene_pack::{FallbackReason, RecordedSlabPack};
 use collections::{FxHashMap, FxHashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// Identifies one retained layer for as long as the window keeps it.
 ///
@@ -286,6 +288,20 @@ pub(crate) struct Layer {
     /// individual entries here are only overwritten for the children that
     /// actually rebuilt; a reconciled child's entry is left untouched.
     pub instances: FxHashMap<InstanceKey, ElementInstance>,
+    /// This layer's own content, packed into slab-ready form once at record
+    /// time (`Some(Ok)`), or why packing fell back to the legacy composite
+    /// path (`Some(Err)`). `None` when slabs are off or nothing was packable.
+    ///
+    /// Derived from `items` at the origin that record used, and cleared with
+    /// them in [`Self::drop_content`]. The pack clones every primitive into
+    /// per-kind arrays, so caching it keeps a second copy of the layer's
+    /// geometry alive between records — the price of taking validate/gather/
+    /// sort out of every composite. That copy is bounded by the same
+    /// mark-and-sweep eviction that bounds `items` (it dies with the layer's
+    /// content, and a re-record replaces it wholesale), exactly like
+    /// `instances`; a layer is only worth compositing if it survives long
+    /// enough to amortise one extra copy.
+    pub packed: Option<Result<Arc<RecordedSlabPack>, FallbackReason>>,
 }
 
 impl Layer {
@@ -307,6 +323,7 @@ impl Layer {
             deferred_dirty: false,
             poisoned_bounds: Vec::new(),
             instances: FxHashMap::default(),
+            packed: None,
         }
     }
 
@@ -328,6 +345,9 @@ impl Layer {
         // worst a later InstanceKey collision (extremely unlikely, but the
         // failure mode matters) could reuse one against unrelated content.
         self.instances.clear();
+        // The pack describes exactly the dropped items; keeping it would pin
+        // the cloned geometry with nothing left to splice it against.
+        self.packed = None;
     }
 }
 

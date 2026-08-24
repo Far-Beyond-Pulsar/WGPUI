@@ -610,6 +610,7 @@ impl Scene {
     /// everything painted before the layer in its parent, and below everything
     /// the parent painted afterwards that overlaps it.
     fn resolve_orders(&mut self) {
+        profiling::scope!("wgpui: resolve_orders");
         fn assign(scopes: &mut Vec<OrderScope>, index: usize, counter: &mut DrawOrder) {
             let max_local = scopes[index].max_local;
             // Taken out so the recursive call can borrow `scopes` mutably;
@@ -707,6 +708,7 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
+        profiling::scope!("wgpui: scene finish");
         let _t = crate::render_stats::scope("frame: scene finish");
         debug_assert_eq!(
             self.scope_stack.len(),
