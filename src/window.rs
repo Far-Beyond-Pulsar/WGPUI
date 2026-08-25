@@ -4767,6 +4767,23 @@ impl Window {
             .end_layer()
             .expect("a recording layer must return its captured items");
 
+        // Instance-tier occlusion (#95): drop this layer's own primitives that
+        // are fully covered by opaque quads painted above them in the same
+        // layer, before anything downstream sees them. One decision upstream
+        // of both consumers — `pack_layer_at_record` below and the legacy
+        // replay in `composite_layer_legacy` — so packed and legacy outputs
+        // agree by construction.
+        //
+        // This runs only while the layer is re-rendering (dirty anyway), and
+        // only against same-layer occluders: any change to those occluders
+        // re-records the layer through this very path, so a baked decision
+        // cannot go stale silently and a clean layer's slab never churns
+        // because an occluder moved. The retained items are rebuilt wholesale
+        // on every record; reconciled children's owned `ElementInstance::items`
+        // were captured during the walk above and stay complete, so a later
+        // record replays them intact once they are no longer covered.
+        let items = crate::occlusion::cull_covered_instances(items);
+
         let paint_range = paint_start..self.paint_index();
         if let Some(layer) = self.layers.get_mut(&key) {
             if layer.id.0 == id {
@@ -10400,16 +10417,616 @@ mod test {
                             .w(px(200.))
                             .h(px(200.))
                             .bg(crate::red())
-                            .child(crate::canvas(
-                                |_, _, _| (),
-                                move |bounds, _, window, _| {
-                                    fg_paints.set(fg_paints.get() + 1);
-                                    window.paint_quad(crate::fill(bounds, crate::blue()));
-                                },
-                            )),
-                    )
-            }
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            fg_paints.set(fg_paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Instance-tier occlusion culling (#95)
+    // -------------------------------------------------------------------
+
+    /// Quads of a layer's retained items whose background matches `color`.
+    fn quads_with_background(items: &[crate::layer::LayerItem], color: crate::Hsla) -> usize {
+        items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    crate::layer::LayerItem::Primitive(crate::scene::Primitive::Quad(quad))
+                        if quad.background.solid == color
+                )
+            })
+            .count()
+    }
+
+    /// A layer holding two canvases; an opaque sibling painted between them
+    /// fully covers the first and leaves the second alone.
+    struct CoveredInstanceView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for CoveredInstanceView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(200.))
+                    .h(px(200.))
+                    // The covered cullee.
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                paints.set(paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(0.))
+                        .w(px(40.))
+                        .h(px(40.)),
+                    )
+                    // Opaque sibling painted after it.
+                    .child(
+                        crate::div()
+                            .absolute()
+                            .left(px(0.))
+                            .top(px(0.))
+                            .w(px(60.))
+                            .h(px(60.))
+                            .bg(crate::red()),
+                    )
+                    // Control: same kind of content, outside the cover.
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                window.paint_quad(crate::fill(bounds, crate::green()));
+                            },
+                        )
+                        .absolute()
+                        .left(px(100.))
+                        .top(px(100.))
+                        .w(px(40.))
+                        .h(px(40.)),
+                    ),
+            )
+        }
+    }
+
+    /// Occluded instances inside a dirty layer emit no primitives on the next
+    /// record, and the reserved counter demonstrates it.
+    #[gpui::test]
+    fn occluded_instances_inside_a_dirty_layer_emit_no_primitives(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| CoveredInstanceView {
+                paints: paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let painted_once = paints.get();
+        assert_eq!(painted_once, 1, "setup: the canvas painted once");
+
+        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let counter = "occlusion: instances culled";
+        crate::render_stats::set_force_enabled(true);
+        let before = crate::render_stats::snapshot();
+        let before_culled = before.counters.get(counter).copied().unwrap_or(0);
+
+        // Dirty the layer without touching its content: the record runs again,
+        // and the sweep drops the covered canvas's quad.
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        let after = crate::render_stats::snapshot();
+        crate::render_stats::set_force_enabled(false);
+        let culled = after
+            .counters
+            .get(counter)
+            .copied()
+            .unwrap_or(0)
+            - before_culled;
+
+        assert_eq!(
+            paints.get(),
+            painted_once + 1,
+            "setup: the dirty layer re-rendered"
+        );
+        assert!(culled >= 1, "the sweep must report the covered instance");
+
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(window.layers.len(), 1, "setup: exactly one layer");
+                let layer = window.layers.values().next().expect("the layer exists");
+                assert_eq!(
+                    quads_with_background(&layer.items, crate::blue()),
+                    0,
+                    "the fully covered canvas must not emit"
+                );
+                assert!(
+                    quads_with_background(&layer.items, crate::red()) >= 1,
+                    "the occluder itself still emits"
+                );
+                assert!(
+                    quads_with_background(&layer.items, crate::green()) >= 1,
+                    "the uncovered control still emits"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A static bottom layer under an animating opaque top layer: the trap
+    /// this phase exists to avoid. The animation churns the TOP layer's slab
+    /// every frame while the bottom layer's bytes never move — it neither
+    /// re-renders nor repacks, so the renderer keeps judging its slab Clean
+    /// and uploads zero bytes for it (the CPU-decision half of `slab: bytes
+    /// uploaded`; the renderer-side half is pinned by slab_gpu's own tests).
+    ///
+    /// The two layers live under separate views: a notified view re-renders
+    /// every non-deferred layer beneath it, so sharing one view would make
+    /// the bottom layer re-record for reasons unrelated to occlusion.
+    struct TrapStaticBottomView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for TrapStaticBottomView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div()
+                .id("bottom")
+                .layer()
+                .absolute()
+                .left(px(150.))
+                .top(px(150.))
+                .w(px(300.))
+                .h(px(300.))
+                .bg(crate::green())
+                .child(crate::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        paints.set(paints.get() + 1);
+                        window.paint_quad(crate::fill(bounds, crate::blue()));
+                    },
+                ))
+        }
+    }
+
+    struct TrapAnimatedOccluderView {
+        origin: std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for TrapAnimatedOccluderView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let origin = self.origin.get();
+            let paints = self.paints.clone();
+            crate::div()
+                .id("top")
+                .layer()
+                .absolute()
+                .left(origin.x)
+                .top(origin.y)
+                .w(px(120.))
+                .h(px(120.))
+                .bg(crate::red())
+                .child(crate::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        paints.set(paints.get() + 1);
+                        window.paint_quad(crate::fill(bounds, crate::blue()));
+                    },
+                ))
+        }
+    }
+
+    struct TrapRootView {
+        bottom: crate::Entity<TrapStaticBottomView>,
+        occluder: crate::Entity<TrapAnimatedOccluderView>,
+    }
+
+    impl crate::Render for TrapRootView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div()
+                .size_full()
+                .child(self.bottom.clone())
+                .child(self.occluder.clone())
+        }
+    }
+
+    /// THE trap test: an occluder animating over a clean layer never forces
+    /// that layer's repack or upload, even though the covered regions shift
+    /// every frame.
+    #[gpui::test]
+    fn an_animated_occluder_never_churns_the_clean_layer_it_moves_over(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let bottom_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let top_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(160.), px(160.))));
+        let origin_for_view = origin.clone();
+        let bottom_paints_for_view = bottom_paints.clone();
+        let top_paints_for_view = top_paints.clone();
+
+        let occluder = cx.update(|cx| {
+            cx.new(|_| TrapAnimatedOccluderView {
+                origin: origin_for_view,
+                paints: top_paints_for_view,
+            })
+        });
+        let bottom = cx.update(|cx| {
+            cx.new(|_| TrapStaticBottomView {
+                paints: bottom_paints_for_view,
+            })
+        });
+        let window =
+            cx.open_window(size(px(800.), px(600.)), move |_, _| TrapRootView { bottom, occluder });
+        cx.run_until_parked();
+
+        // The bottom layer is the wider one (300px vs the 120px occluder).
+        fn read_bottom(
+            window: &crate::WindowHandle<TrapRootView>,
+            cx: &mut TestAppContext,
+        ) -> (u64, Option<u64>, usize, usize) {
+            window
+                .update(cx, |_, window, _| {
+                    let key = *window
+                        .layers
+                        .iter()
+                        .find(|(_, layer)| layer.cache_key.bounds.size.width == px(300.))
+                        .map(|(key, _)| key)
+                        .expect("the static bottom layer was recorded");
+                    let layer = &window.layers[&key];
+                    let pack_ptr = match &layer.packed {
+                        Some(Ok(pack)) => std::sync::Arc::as_ptr(pack) as *const () as usize,
+                        _ => 0,
+                    };
+                    (
+                        layer.last_visited,
+                        window.slab_tokens.get(&key).copied(),
+                        pack_ptr,
+                        layer.cache_key.bounds.size.width.0 as usize,
+                    )
+                })
+                .unwrap()
+        }
+
+        let bottom_painted_once = bottom_paints.get();
+        let top_painted_once = top_paints.get();
+        let (visited_once, token_before, pack_before, _) = read_bottom(&window, cx);
+
+        for _round in 0..4 {
+            let old = origin.get();
+            origin.set(crate::Point::new(old.x + px(30.), old.y + px(20.)));
+            cx.run_until_parked();
+
+            assert_eq!(
+                bottom_paints.get(),
+                bottom_painted_once,
+                "the animated occluder must never force the clean layer to re-render"
+            );
+        }
+
+        let (visited_after, token_after, pack_after, _) = read_bottom(&window, cx);
+        assert_eq!(
+            visited_after, visited_once,
+            "setup drift: the bottom layer should be judged clean throughout"
+        );
+        assert_eq!(
+            token_before, token_after,
+            "a stable token is what makes the renderer treat the bottom \
+             slab as Clean (zero uploads)"
+        );
+        if crate::scene_pack::slabs_enabled() {
+            assert_ne!(pack_before, 0, "the bottom layer must have packed");
+            assert_eq!(
+                pack_before, pack_after,
+                "the bottom layer's packed bytes were replaced: its slab would \
+                 have to re-upload"
+            );
+        }
+        assert_eq!(
+            top_paints.get(),
+            top_painted_once + 4,
+            "setup: the animating layer re-recorded every frame"
+        );
+    }
+
+    /// An instance culled while covered comes back exactly once when the
+    /// occluder moves away inside the same layer: the move dirties the layer
+    /// through ordinary element invalidation, one re-record recomputes the
+    /// sweep with fresh geometry, and the cullee's primitives are emitted
+    /// again — identical to what a full rebuild would have painted.
+    struct InstanceRevealView {
+        occluder_origin: std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for InstanceRevealView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let occluder_origin = self.occluder_origin.get();
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    .absolute()
+                    .left(px(150.))
+                    .top(px(150.))
+                    .w(px(300.))
+                    .h(px(300.))
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                paints.set(paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .absolute()
+                        .left(px(20.))
+                        .top(px(20.))
+                        .w(px(40.))
+                        .h(px(40.)),
+                    )
+                    .child(
+                        crate::div()
+                            .absolute()
+                            .left(occluder_origin.x)
+                            .top(occluder_origin.y)
+                            .w(px(80.))
+                            .h(px(80.))
+                            .bg(crate::red()),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn an_instance_culled_under_a_moving_occluder_comes_back_when_revealed(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(10.), px(10.))));
+        let origin_for_view = origin.clone();
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| InstanceRevealView {
+                occluder_origin: origin_for_view,
+                paints: paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let painted_once = paints.get();
+
+        fn blue_quads(window: &Window) -> usize {
+            window
+                .layers
+                .values()
+                .map(|layer| quads_with_background(&layer.items, crate::blue()))
+                .sum()
+        }
+
+        // Covered: the canvas quad is baked out of the retained record.
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(
+                    blue_quads(window),
+                    0,
+                    "setup: the covered cullee must be culled on record"
+                );
+            })
+            .unwrap();
+
+        // Move the occluder away inside the layer; ordinary invalidation
+        // re-records it once.
+        origin.set(crate::point(px(220.), px(220.)));
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            paints.get(),
+            painted_once + 1,
+            "the reveal must cost exactly one re-record"
+        );
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(
+                    blue_quads(window),
+                    1,
+                    "revealed: the previously culled instance emits again"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Visual occlusion is not hit occlusion (#95 §"Must not skip hit
+    /// registration"). Two identical buttons in one layer; an opaque sibling
+    /// fully covers the first (its primitives are culled) and leaves the
+    /// second alone. Hitboxes, listeners and dispatch nodes must behave
+    /// identically for both — the internal differential for the Phase 5
+    /// hit-test pattern, run with culling enabled.
+    ///
+    /// This is also the spec's explicit tab-panel case: a nested panel whose
+    /// sibling covers it emits nothing yet stays fully clickable while its
+    /// covering overlay carries no `BlockMouse`.
+    struct ClickableUnderOverlayView {
+        clicks_a: std::rc::Rc<std::cell::Cell<usize>>,
+        clicks_b: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for ClickableUnderOverlayView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let clicks_a = self.clicks_a.clone();
+            let clicks_b = self.clicks_b.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    .absolute()
+                    .left(px(150.))
+                    .top(px(150.))
+                    .w(px(400.))
+                    .h(px(300.))
+                    // Button A sits under a deeply nested "tab panel".
+                    .child(
+                        crate::div()
+                            .absolute()
+                            .left(px(0.))
+                            .top(px(0.))
+                            .w(px(200.))
+                            .h(px(200.))
+                            .child(
+                                crate::div().child(
+                                    crate::div()
+                                        .id("button-a")
+                                        .absolute()
+                                        .left(px(20.))
+                                        .top(px(20.))
+                                        .w(px(60.))
+                                        .h(px(60.))
+                                        .bg(crate::red())
+                                        .on_mouse_down(crate::MouseButton::Left,
+                                            move |_, _, _| clicks_a.set(clicks_a.get() + 1)),
+                                ),
+                            ),
+                    )
+                    // Opaque overlay painted after A: covers it completely.
+                    .child(
+                        crate::div()
+                            .absolute()
+                            .left(px(0.))
+                            .top(px(0.))
+                            .w(px(200.))
+                            .h(px(200.))
+                            .bg(crate::blue()),
+                    )
+                    // Button B is never covered.
+                    .child(
+                        crate::div()
+                            .id("button-b")
+                            .absolute()
+                            .left(px(240.))
+                            .top(px(20.))
+                            .w(px(60.))
+                            .h(px(60.))
+                            .bg(crate::red())
+                            .on_mouse_down(crate::MouseButton::Left,
+                                move |_, _, _| clicks_b.set(clicks_b.get() + 1)),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn culling_leaves_hit_testing_and_clicks_identical(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let clicks_a = std::rc::Rc::new(std::cell::Cell::new(0));
+        let clicks_b = std::rc::Rc::new(std::cell::Cell::new(0));
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            {
+                let clicks_a = clicks_a.clone();
+                let clicks_b = clicks_b.clone();
+                move |_, _| ClickableUnderOverlayView { clicks_a, clicks_b }
+            },
+        );
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(
+                    quads_with_background(&window.layers.values().next().expect("layer").items, crate::red()),
+                    0,
+                    "setup: the covered button's quads are culled"
+                );
+            })
+            .unwrap();
+
+        // Click the centers of both buttons: covered A at window (200, 200),
+        // uncovered B at (420, 200).
+        for position in [
+            crate::point(px(200.), px(200.)),
+            crate::point(px(420.), px(200.)),
+        ] {
+            window
+                .update(cx, |_, window, cx| {
+                    window.dispatch_event(
+                        crate::PlatformInput::MouseDown(crate::MouseDownEvent {
+                            button: crate::MouseButton::Left,
+                            position,
+                            modifiers: Default::default(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+        }
+        cx.run_until_parked();
+
+        assert_eq!(
+            clicks_a.get(),
+            1,
+            "the culled-but-not-blocked button must still receive the click"
+        );
+        assert_eq!(
+            clicks_b.get(),
+            1,
+            "the uncovered control must behave as always"
+        );
+
+        // The Phase 5 differential half: hitboxes stay registered for culled
+        // content at the same positions.
+        window
+            .update(cx, |_, window, _| {
+                let hit_over_culled = window.rendered_frame.hit_test(
+                    crate::point(px(200.), px(200.)),
+                    &window.layers,
+                );
+                let hit_over_control = window.rendered_frame.hit_test(
+                    crate::point(px(420.), px(200.)),
+                    &window.layers,
+                );
+                assert!(
+                    !hit_over_culled.ids.is_empty(),
+                    "culled content keeps its hitboxes"
+                );
+                assert!(
+                    !hit_over_control.ids.is_empty(),
+                    "setup: the control registers hitboxes"
+                );
+            })
+            .unwrap();
+    }
 
         let fg_origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(200.), px(200.))));
         let bg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
