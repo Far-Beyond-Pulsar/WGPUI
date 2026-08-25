@@ -69,6 +69,14 @@ impl Chunk {
     }
 }
 
+/// A bump allocator used for per-frame element storage. Grows in fixed-size
+/// chunks as needed and is reset (not deallocated) via [`Arena::clear`],
+/// reusing already-grown chunks for the next frame's allocations instead of
+/// freeing and reallocating them.
+///
+/// Named externally (via [`crate::App::element_arena`]) so DLL-loaded
+/// plugin code can enter the host's arena scope explicitly — see
+/// [`crate::ElementArenaScope`].
 pub struct Arena {
     chunks: Vec<Chunk>,
     elements: Vec<ArenaElement>,
@@ -84,6 +92,8 @@ impl Drop for Arena {
 }
 
 impl Arena {
+    /// Create a new arena whose chunks grow in increments of `chunk_size`
+    /// bytes.
     pub fn new(chunk_size: usize) -> Self {
         let chunk_size = NonZeroUsize::try_from(chunk_size).unwrap();
         Self {
@@ -95,10 +105,15 @@ impl Arena {
         }
     }
 
+    /// Total bytes currently reserved across all chunks this arena has
+    /// grown to (its high-water mark), not the bytes currently in use.
     pub fn capacity(&self) -> usize {
         self.chunks.len() * self.chunk_size.get()
     }
 
+    /// Drop every value allocated in this arena and reset the bump pointer
+    /// back to the start of its first chunk, so already-grown chunks are
+    /// reused by the next round of allocations instead of being freed.
     pub fn clear(&mut self) {
         self.valid.set(false);
         self.valid = Rc::new(Cell::new(true));
@@ -109,6 +124,8 @@ impl Arena {
         self.current_chunk_index = 0;
     }
 
+    /// Allocate `f()`'s result in this arena, growing a new chunk if the
+    /// current one is full.
     #[inline(always)]
     pub fn alloc<T>(&mut self, f: impl FnOnce() -> T) -> ArenaBox<T> {
         #[inline(always)]
