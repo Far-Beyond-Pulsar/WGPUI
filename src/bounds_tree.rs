@@ -123,8 +123,10 @@ where
 
     /// Inserts `new_bounds` as a leaf at exactly `ordering`, ignoring intersections (the caller
     /// guarantees `ordering` is already greater than any ordering it could collide with). Used by
-    /// [`Self::insert_above_all`], which only needs to find an attachment point in the tree.
-    fn insert_at_order(&mut self, new_bounds: Bounds<U>, ordering: u32) -> u32 {
+    /// [`Self::insert_above_all`], which only needs to find an attachment point in the tree, and
+    /// by `Scene`'s layer scopes to widen a layer's recorded extent to what it actually painted
+    /// once it closes — so later siblings overlapping the overflow still sort above it.
+    pub fn insert_at_order(&mut self, new_bounds: Bounds<U>, ordering: u32) -> u32 {
         let Some(mut index) = self.root else {
             let new_node = self.push_leaf(new_bounds, ordering);
             self.root = Some(new_node);

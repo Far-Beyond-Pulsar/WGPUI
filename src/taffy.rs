@@ -31,9 +31,44 @@ pub struct TaffyLayoutEngine {
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// Every node currently live in `taffy`, whether or not it has been
+    /// touched this frame yet (#93). Maintained alongside every insertion and
+    /// removal so `end_frame`'s sweep never has to ask `taffy` itself for the
+    /// full node set — it doesn't expose one.
+    live_nodes: FxHashSet<LayoutId>,
+    /// Nodes visited this frame, by creation or by [`Self::reuse`] (#93).
+    /// Cleared at the end of every [`Self::end_frame`] call. Every element
+    /// still calls into one of `request_layout`/`request_measured_layout`/
+    /// `reuse` exactly once per frame regardless of reuse (`request_layout`
+    /// itself is never skipped — see `instance.rs`'s module doc), so a node
+    /// absent from this set at `end_frame` is unambiguously gone from this
+    /// frame's tree, not merely unvisited-so-far.
+    touched_this_frame: FxHashSet<LayoutId>,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
+
+/// Whether the Taffy tree persists across frames (#93) — `end_frame`'s
+/// touched-set sweep — rather than being unconditionally wiped and rebuilt
+/// every frame via [`TaffyLayoutEngine::clear`].
+///
+/// `WGPUI_PERSISTENT_LAYOUT=0` reverts to the pre-#93 behaviour: every
+/// element creates a fresh node every frame, `Window::draw` calls `clear()`
+/// instead of `end_frame()`, and `Window::request_layout_or_reuse`/
+/// `request_measured_layout_or_reuse` never take the reuse branch. Following
+/// the `WGPUI_INSTANCES`/`WGPUI_LAYERS` precedent — this phase changes what a
+/// node's identity means across frames, so the old always-rebuild path stays
+/// reachable without a rebuild.
+///
+/// Read once, at first use.
+pub(crate) fn persistent_layout_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("WGPUI_PERSISTENT_LAYOUT")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
 
 impl TaffyLayoutEngine {
     pub fn new() -> Self {
@@ -44,13 +79,20 @@ impl TaffyLayoutEngine {
             absolute_layout_bounds: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            live_nodes: FxHashSet::default(),
+            touched_this_frame: FxHashSet::default(),
         }
     }
 
+    /// Drop every node and start over. `Window::draw`'s only caller now is
+    /// the `WGPUI_PERSISTENT_LAYOUT=0` fallback path — see [`Self::end_frame`],
+    /// which replaces this for the default (persistent) path (#93).
     pub fn clear(&mut self) {
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.computed_layouts.clear();
+        self.live_nodes.clear();
+        self.touched_this_frame.clear();
     }
 
     pub fn request_layout(
@@ -62,7 +104,8 @@ impl TaffyLayoutEngine {
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
 
-        if children.is_empty() {
+        crate::render_stats::count("frame: taffy nodes created");
+        let id: LayoutId = if children.is_empty() {
             self.taffy
                 .new_leaf(taffy_style)
                 .expect(EXPECT_MESSAGE)
@@ -73,7 +116,10 @@ impl TaffyLayoutEngine {
                 .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE)
                 .into()
-        }
+        };
+        self.live_nodes.insert(id);
+        self.touched_this_frame.insert(id);
+        id
     }
 
     pub fn request_measured_layout(
@@ -91,7 +137,9 @@ impl TaffyLayoutEngine {
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
 
-        self.taffy
+        crate::render_stats::count("frame: taffy nodes created");
+        let id: LayoutId = self
+            .taffy
             .new_leaf_with_context(
                 taffy_style,
                 NodeContext {
@@ -99,7 +147,62 @@ impl TaffyLayoutEngine {
                 },
             )
             .expect(EXPECT_MESSAGE)
-            .into()
+            .into();
+        self.live_nodes.insert(id);
+        self.touched_this_frame.insert(id);
+        id
+    }
+
+    /// Mark a retained node as present in this frame's tree without
+    /// recreating it (#93) — the taffy-level counterpart to reconciliation's
+    /// `prepaint`/`paint` skip. Returns `false`, meaning "not safe to reuse,
+    /// create fresh instead," when `id` is not (or is no longer) a live node
+    /// — the same "a miss is a rebuild, never a crash" discipline every other
+    /// reuse path in this crate follows.
+    pub fn reuse(&mut self, id: LayoutId) -> bool {
+        if !self.live_nodes.contains(&id) {
+            return false;
+        }
+        self.touched_this_frame.insert(id);
+        true
+    }
+
+    /// Remove every node that was not touched this frame — replacing the
+    /// unconditional [`Self::clear`] call `Window::draw` used to make (#93).
+    ///
+    /// Safe regardless of removal order among the swept set: `TaffyTree::remove`
+    /// detaches a node from its parent via a checked `.get_mut()` (a no-op if
+    /// the parent was already removed) and clears its own children's parent
+    /// pointers via a checked `.get()` before dropping the node's own slot, so
+    /// a parent and child both present in the same sweep never race each other
+    /// — see the doc comment on this method's call site in `window.rs` for why
+    /// this replaces `clear()` soundly rather than merely usually.
+    pub fn end_frame(&mut self) {
+        let orphaned: Vec<LayoutId> = self
+            .live_nodes
+            .iter()
+            .copied()
+            .filter(|id| !self.touched_this_frame.contains(id))
+            .collect();
+
+        for id in &orphaned {
+            crate::render_stats::count("taffy: nodes swept");
+            // A miss here would mean `live_nodes` disagreed with `taffy`
+            // itself — defensive, not expected; `.ok()` rather than
+            // `.expect(...)` keeps a bookkeeping bug a silent leak-of-one
+            // rather than a panic.
+            self.taffy.remove((*id).into()).ok();
+            self.absolute_layout_bounds.remove(id);
+            self.computed_layouts.remove(id);
+            self.live_nodes.remove(id);
+        }
+        self.touched_this_frame.clear();
+    }
+
+    /// Total live node count, for leak-detection tests and instrumentation
+    /// (#93).
+    pub fn live_node_count(&self) -> usize {
+        self.live_nodes.len()
     }
 
     // Used to understand performance

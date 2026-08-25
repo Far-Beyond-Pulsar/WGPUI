@@ -575,6 +575,50 @@ impl Style {
             .is_some_and(|fill| fill.color().is_some_and(|color| !color.is_transparent()))
     }
 
+    /// Compute the conservative opaque region for this style, or `None` if the
+    /// element does not produce a fully opaque rectangle over its entire bounds.
+    ///
+    /// Accounts for corner radii, border opacity, element opacity, and backdrop
+    /// filters (which read what is behind them and so prevent occlusion).
+    pub fn opaque_region(
+        &self,
+        bounds: Bounds<Pixels>,
+        element_opacity: f32,
+    ) -> Option<Bounds<Pixels>> {
+        use crate::occlusion::compute_opaque_region;
+
+        let has_solid_background = self.background.as_ref().is_some_and(|fill| {
+            fill.color()
+                .is_some_and(|color| !color.is_transparent() && color.tag == crate::BackgroundTag::Solid)
+        });
+        if !has_solid_background {
+            return None;
+        }
+
+        let rem_size = Pixels(16.0);
+        let corner_radii_px = self.corner_radii.to_pixels(rem_size);
+        let max_corner_radius = Pixels(corner_radii_px.max().0.max(0.0));
+
+        let has_opaque_border = self.border_color.is_some_and(|c| c.a >= 1.0);
+        let border_inset = if has_opaque_border {
+            Pixels::ZERO
+        } else {
+            self.border_widths.to_pixels(rem_size).max().0.max(0.0).into()
+        };
+
+        let has_backdrop_filter = !self.backdrop_filter.is_empty();
+
+        compute_opaque_region(
+            bounds,
+            element_opacity,
+            true,
+            max_corner_radius,
+            has_opaque_border,
+            border_inset,
+            has_backdrop_filter,
+        )
+    }
+
     /// Get the text style in this element style.
     pub fn text_style(&self) -> Option<&TextStyleRefinement> {
         if self.text.is_some() {
@@ -695,6 +739,10 @@ impl Style {
                     border_color,
                     self.border_style,
                 ));
+
+                if let Some(opaque) = self.opaque_region(bounds, window.element_opacity()) {
+                    window.mark_current_layer_opaque(opaque);
+                }
             }
 
             continuation(window, cx);
@@ -1421,7 +1469,6 @@ mod tests {
                 thickness: px(4.),
                 color: Some(red()),
             }),
-            // TODO this does not seem right
             fade_out: Some(0.),
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),

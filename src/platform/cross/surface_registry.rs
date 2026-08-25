@@ -103,7 +103,7 @@ impl SurfaceRegistry {
             let current = tb.state.load(Ordering::Acquire);
             let (rendering, ready, display) = TripleBuffer::unpack_state(current);
 
-            log::debug!(
+            log::trace!(
                 "[surface_id={:?}] swap_rendering_ready called - state before: rendering={}, ready={}, display={}",
                 id,
                 rendering,
