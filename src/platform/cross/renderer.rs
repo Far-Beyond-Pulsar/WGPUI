@@ -812,6 +812,8 @@ impl WgpuPipelines {
         context: &WgpuContext,
         surface_configuration: &wgpu::SurfaceConfiguration,
         _path_sample_count: u32,
+        globals_buffer: &wgpu::Buffer,
+        color_adjustments_buffer: &wgpu::Buffer,
     ) -> Self {
         let quads_shader = context
             .device
@@ -1238,7 +1240,7 @@ impl WgpuPipelines {
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &context.globals_buffer,
+                        buffer: globals_buffer,
                         offset: 0,
                         size: None,
                     }),
@@ -1254,7 +1256,7 @@ impl WgpuPipelines {
                     entries: &[wgpu::BindGroupEntry {
                         binding: 0,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &context.color_adjustments_buffer,
+                            buffer: color_adjustments_buffer,
                             offset: 0,
                             size: None,
                         }),
@@ -2278,6 +2280,14 @@ pub struct WgpuRenderer {
     layer_textures: FxHashMap<crate::LayerId, LayerTextureEntry>,
     /// Monotonic frame counter for `layer_textures` idle eviction.
     layer_texture_frame: u64,
+    /// This window's frame-constant uniforms. Per-renderer on purpose: the
+    /// upload dedup below compares against the last value this renderer
+    /// pushed, which is only sound against a buffer no other window writes.
+    /// A shared buffer let one window's viewport overwrite another's while
+    /// the owner's dedup guard skipped the rewrite — content then rendered
+    /// scaled/shifted against the wrong viewport until its own next resize.
+    globals_buffer: wgpu::Buffer,
+    color_adjustments_buffer: wgpu::Buffer,
     // Last values pushed into the frame-constant uniform buffers, so an idle
     // window issues zero `write_buffer` calls at all.
     uploaded_globals: Option<GlobalParams>,
@@ -2410,8 +2420,32 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
-        let pipelines =
-            WgpuPipelines::new(context.as_ref(), &surface_configuration, path_sample_count);
+        let globals_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Globals Buffer"),
+            size: std::mem::size_of::<[f32; 4]>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let color_adjustments_buffer =
+            context
+                .device
+                .create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Color Adjustments Buffer"),
+                    size: 1024 * 16,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::UNIFORM,
+                    mapped_at_creation: false,
+                });
+
+        let pipelines = WgpuPipelines::new(
+            context.as_ref(),
+            &surface_configuration,
+            path_sample_count,
+            &globals_buffer,
+            &color_adjustments_buffer,
+        );
 
         // Create persistent framebuffer for browser-canvas-style blitting
         let persistent_framebuffer = context.device.create_texture(&wgpu::TextureDescriptor {
@@ -2489,6 +2523,8 @@ impl WgpuRenderer {
             transform_scratch: Vec::new(),
             layer_textures: FxHashMap::default(),
             layer_texture_frame: 0,
+            globals_buffer,
+            color_adjustments_buffer,
             uploaded_globals: None,
             uploaded_color_adjustments: None,
             #[cfg(feature = "flamegraph")]
@@ -3049,7 +3085,7 @@ impl WgpuRenderer {
             };
             if self.uploaded_color_adjustments != Some(color_adjustments) {
                 self.context.queue.write_buffer(
-                    &self.context.color_adjustments_buffer,
+                    &self.color_adjustments_buffer,
                     0,
                     bytemuck::bytes_of(&color_adjustments),
                 );
@@ -3070,7 +3106,7 @@ impl WgpuRenderer {
 
             if self.uploaded_globals != Some(globals) {
                 self.context.queue.write_buffer(
-                    &self.context.globals_buffer,
+                    &self.globals_buffer,
                     0,
                     bytemuck::bytes_of(&globals),
                 );

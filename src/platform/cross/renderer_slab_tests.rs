@@ -151,7 +151,30 @@ fn headless_harness() -> Option<PixelHarness> {
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
     };
-    let pipelines = WgpuPipelines::new(context.as_ref(), &surface_configuration, 0);
+    let globals_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("harness globals buffer"),
+        size: std::mem::size_of::<[f32; 4]>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let color_adjustments_buffer =
+        context
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("harness color adjustments buffer"),
+                size: 1024 * 16,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::UNIFORM,
+                mapped_at_creation: false,
+            });
+    let pipelines = WgpuPipelines::new(
+        context.as_ref(),
+        &surface_configuration,
+        0,
+        &globals_buffer,
+        &color_adjustments_buffer,
+    );
     let atlas = Arc::new(crate::platform::cross::atlas::WgpuAtlas::new(context.clone()));
     let atlas_sampler = context.device.create_sampler(&wgpu::SamplerDescriptor {
         mag_filter: wgpu::FilterMode::Linear,
@@ -165,6 +188,7 @@ fn headless_harness() -> Option<PixelHarness> {
     Some(PixelHarness {
         context,
         pipelines,
+        globals_buffer,
         atlas,
         buffers,
         registry: SlabRegistry::new(),
@@ -175,6 +199,7 @@ fn headless_harness() -> Option<PixelHarness> {
 struct PixelHarness {
     context: Arc<WgpuContext>,
     pipelines: WgpuPipelines,
+    globals_buffer: wgpu::Buffer,
     atlas: Arc<crate::platform::cross::atlas::WgpuAtlas>,
     buffers: slab_gpu::SlabGpuBuffers,
     registry: SlabRegistry,
@@ -327,7 +352,7 @@ impl PixelHarness {
         let globals = self.globals();
         self.context
             .queue
-            .write_buffer(&self.context.globals_buffer, 0, bytemuck::bytes_of(&globals));
+            .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
     }
 
     fn buffer_group(

@@ -36,14 +36,21 @@ pub struct WgpuContext {
     pub(crate) queue: wgpu::Queue,
     pub(super) instance: wgpu::Instance,
 
-    pub(super) globals_buffer: wgpu::Buffer,
+    // The globals and color-adjustment uniforms are NOT shared here, on
+    // purpose: every window's renderer dedups their uploads against its own
+    // last-written value (`uploaded_globals`), which is only sound if each
+    // window owns the buffer it compares against. Sharing one buffer across
+    // windows let window B's viewport overwrite window A's while A's dedup
+    // guard still said "already uploaded" — A then rendered every frame
+    // against B's viewport size until something re-wrote it, presenting as
+    // shifted/scaled content with hit testing unaffected. They now live on
+    // `WgpuRenderer`, one pair per window.
     pub(super) quads_buffer: Mutex<wgpu::Buffer>,
     pub(super) shadows_buffer: Mutex<wgpu::Buffer>,
     pub(super) backdrop_filters_buffer: Mutex<wgpu::Buffer>,
     pub(super) underlines_buffer: Mutex<wgpu::Buffer>,
     pub(super) mono_sprites_buffer: Mutex<wgpu::Buffer>,
     pub(super) poly_sprites_buffer: Mutex<wgpu::Buffer>,
-    pub(super) color_adjustments_buffer: wgpu::Buffer,
     pub(super) paths_vertices_buffer: Mutex<wgpu::Buffer>,
 
     pub(crate) surface_registry: Arc<SurfaceRegistry>,
@@ -174,13 +181,6 @@ impl WgpuContext {
                     ..Default::default()
                 }))?;
 
-            let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Globals Buffer"),
-                size: std::mem::size_of::<[f32; 4]>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
             // Phase 4 of the profiling epic (issue #60/#71) reads these seven
             // fixed buffers back via `copy_buffer_to_buffer` during a triggered
             // GPU deep capture (see `DeepCaptureBufferKind`), which requires
@@ -265,30 +265,18 @@ impl WgpuContext {
                 mapped_at_creation: false,
             });
 
-            let color_adjustments_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Color Adjustments Buffer"),
-                // Resized dynamically by ensure_buffer_size() when the initial allocation is exceeded.
-                size: 1024 * 16,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::UNIFORM,
-                mapped_at_creation: false,
-            });
-
             Ok(Self {
                 adapter,
                 device,
                 queue,
                 instance,
 
-                globals_buffer,
                 quads_buffer: Mutex::new(quads_buffer),
                 shadows_buffer: Mutex::new(shadows_buffer),
                 backdrop_filters_buffer: Mutex::new(backdrop_filters_buffer),
                 underlines_buffer: Mutex::new(underlines_buffer),
                 mono_sprites_buffer: Mutex::new(mono_sprites_buffer),
                 poly_sprites_buffer: Mutex::new(poly_sprites_buffer),
-                color_adjustments_buffer,
 
                 paths_vertices_buffer: Mutex::new(paths_vertices_buffer),
                 surface_registry: Arc::new(SurfaceRegistry::new()),
@@ -357,13 +345,6 @@ impl WgpuContext {
         queue: wgpu::Queue,
         desired_maximum_frame_latency: u32,
     ) -> anyhow::Result<Self> {
-        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Globals Buffer"),
-            size: std::mem::size_of::<[f32; 4]>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         #[cfg(feature = "flamegraph")]
         let deep_capture_readback = wgpu::BufferUsages::COPY_SRC;
         #[cfg(not(feature = "flamegraph"))]
@@ -438,28 +419,17 @@ impl WgpuContext {
             mapped_at_creation: false,
         });
 
-        let color_adjustments_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Color Adjustments Buffer"),
-            size: 1024 * 16,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::UNIFORM,
-            mapped_at_creation: false,
-        });
-
         Ok(Self {
             adapter,
             device,
             queue,
             instance,
-            globals_buffer,
             quads_buffer: Mutex::new(quads_buffer),
             shadows_buffer: Mutex::new(shadows_buffer),
             backdrop_filters_buffer: Mutex::new(backdrop_filters_buffer),
             underlines_buffer: Mutex::new(underlines_buffer),
             mono_sprites_buffer: Mutex::new(mono_sprites_buffer),
             poly_sprites_buffer: Mutex::new(poly_sprites_buffer),
-            color_adjustments_buffer,
             paths_vertices_buffer: Mutex::new(paths_vertices_buffer),
             surface_registry: Arc::new(SurfaceRegistry::new()),
             desired_maximum_frame_latency,
@@ -476,9 +446,10 @@ impl WgpuContext {
     /// itself be the thing that brings down an already-degraded process.
     #[cfg(feature = "flamegraph")]
     pub(crate) fn fixed_buffer_memory_usage(&self) -> u64 {
-        self.globals_buffer.size()
-            + self.color_adjustments_buffer.size()
-            + buffer_size_or_zero(&self.quads_buffer)
+        // The globals and color-adjustment uniforms are per-renderer now
+        // (see the struct field comment); they are accounted by
+        // `WgpuRenderer`'s own reporting, not here.
+        buffer_size_or_zero(&self.quads_buffer)
             + buffer_size_or_zero(&self.shadows_buffer)
             + buffer_size_or_zero(&self.backdrop_filters_buffer)
             + buffer_size_or_zero(&self.underlines_buffer)
