@@ -754,7 +754,14 @@ mod tests {
     fn quad_entry(quad: &Quad) -> Entry {
         Entry {
             kind: SlabKind::Quads,
-            marker: quad.corner_radii.top_left.0 as u32,
+            // Opaque occluders carry their marker on the background hue
+            // (their corner radius is zeroed so they qualify as occluders);
+            // every other marked quad rides the corner-radius channel.
+            marker: if quad.background.solid.a >= 1.0 {
+                quad.background.solid.h as u32
+            } else {
+                quad.corner_radii.top_left.0 as u32
+            },
         }
     }
 
@@ -1469,6 +1476,13 @@ mod tests {
     fn opaque_quad_marked(bounds: Bounds<ScaledPixels>, marker: u32) -> Quad {
         let mut quad = quad_marked(bounds, marker);
         quad.background.solid.a = 1.;
+        // `quad_marked` encodes the marker as a corner radius; a radius that
+        // large insets the conservative opaque region to nothing, so the
+        // sweep would never classify this quad as an occluder. Occluders in
+        // these tests are sharp-cornered, with the marker riding the
+        // background hue instead.
+        quad.corner_radii = Corners::default();
+        quad.background.solid.h = marker as f32;
         quad
     }
 
@@ -1539,7 +1553,12 @@ mod tests {
         scene.insert_primitive(poly_sprite_marked(panel, 0, 2, 73));
         scene.insert_primitive(shadow_marked(panel, 74));
         scene.insert_primitive(opaque_quad_marked(rect(0., 0., 100., 100.), 75));
-        scene.insert_primitive(underline_marked(rect(120., 120., 30., 10.), 76));
+        // Painted above the occluder and overlapping it: the sweep keeps it,
+        // and because every kept primitive participates in one overlap chain,
+        // replaying them into the oracle's fresh bounds tree preserves their
+        // recorded draw order (a disjoint item could legally reuse a low
+        // ordering and interleave differently after reinsertion).
+        scene.insert_primitive(underline_marked(rect(20., 20., 30., 10.), 76));
         let items = scene.end_layer().unwrap();
         scene.finish();
 
@@ -1548,7 +1567,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 LayerItem::Primitive(Primitive::Quad(quad)) => {
-                    Some(vec![quad.corner_radii.top_left.0 as u32])
+                    Some(vec![quad.background.solid.h as u32])
                 }
                 LayerItem::Primitive(Primitive::Underline(u)) => Some(vec![u.thickness.0 as u32]),
                 LayerItem::Primitive(Primitive::Shadow(s)) => {
