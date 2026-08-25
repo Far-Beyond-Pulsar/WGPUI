@@ -232,19 +232,63 @@ impl Element for VirtualList {
             state.smooth_scroll.current()
         };
 
-        let mut start = self.find_index(-visual_scroll);
+        // Overscroll buffer (#96): inside a texture-retained layer with a
+        // margin, scroll frames skip per-item layout entirely (the layer
+        // composites its texture, shifted), and refills lay out the full
+        // buffer range so margin content exists offscreen.
+        let buffer_frame = super::scroll_buffer::prepare_scroll_buffer(
+            window,
+            point(px(0.0), visual_scroll),
+        );
 
-        let mut end = self.find_index(-visual_scroll + viewport_height) + 1;
+        let (visible, content_mask) = match buffer_frame {
+            super::scroll_buffer::ScrollBufferFrame::Skip => {
+                // The layer's composite covers the list this frame. The base
+                // div's prepaint below still runs: its hitbox and the
+                // scroll-offset clamp must stay live.
+                return self.base.interactivity().prepaint(
+                    global_id,
+                    inspector_id,
+                    bounds,
+                    Size {
+                        width: bounds.size.width,
+                        height: self.content_height,
+                    },
+                    window,
+                    cx,
+                    |_style, _, hitbox, _, _| hitbox,
+                );
+            }
+            super::scroll_buffer::ScrollBufferFrame::Buffer { margin } => {
+                // Refill: cover the viewport plus the whole margin, under a
+                // mask that lets the margin through to the texture.
+                let content_top = -visual_scroll;
+                let buffer_top = content_top - margin.height;
+                let buffer_bottom = content_top + viewport_height + margin.height;
+                let start = self.find_index(buffer_top.max(px(0.0)));
+                let end = (self.find_index(buffer_bottom.max(px(0.0))) + 1)
+                    .min(self.heights.len());
+                (
+                    start..end,
+                    ContentMask {
+                        bounds: super::scroll_buffer::inflate_for_buffer(bounds, margin),
+                    },
+                )
+            }
+            super::scroll_buffer::ScrollBufferFrame::Viewport => {
+                let mut start = self.find_index(-visual_scroll);
 
-        start = start.saturating_sub(self.overscan);
+                let mut end = self.find_index(-visual_scroll + viewport_height) + 1;
 
-        end = cmp::min(end + self.overscan + 1, self.heights.len());
+                start = start.saturating_sub(self.overscan);
 
-        let visible = start..end;
+                end = cmp::min(end + self.overscan + 1, self.heights.len());
+
+                (start..end, ContentMask { bounds })
+            }
+        };
 
         let items = (self.render)(visible.clone(), window, cx);
-
-        let content_mask = ContentMask { bounds };
 
         window.with_content_mask(Some(content_mask), |window| {
             for (mut item, ix) in items.into_iter().zip(visible.clone()) {

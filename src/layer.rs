@@ -27,8 +27,9 @@
 //! As of #92, a layer that *is* re-rendering can additionally reconcile at
 //! element granularity — see [`Layer::instances`] and [`crate::instance`] —
 //! so one changed child no longer forces every sibling through `prepaint`/
-//! `paint` again. Textures (#96) still live inside a layer later; that one
-//! doesn't exist yet.
+//! `paint` again. As of #96 a layer can additionally be *texture-retained*:
+//! its content lives in a persistent renderer-side texture and a clean frame
+//! composites it with a single surface draw — see [`Layer::texture_retained`].
 //!
 //! Hitboxes, dispatch nodes, tooltips and shaped text still travel through the
 //! old index-range replay path, which stays until #97 — see
@@ -53,11 +54,13 @@
 
 use crate::{
     Bounds, ContentMask, EntityId, GlobalElementId, InstanceKey, Invalidation, Pixels, Point,
-    Primitive, px, size,
+    Primitive, px, point, size,
 };
 use crate::instance::ElementInstance;
+use crate::scene_pack::{FallbackReason, RecordedSlabPack};
 use collections::{FxHashMap, FxHashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// Identifies one retained layer for as long as the window keeps it.
 ///
@@ -124,24 +127,21 @@ impl LayerTransform {
 }
 
 /// Tuning for one layer.
-///
-/// `rasterize_above` and `overdraw_margin` are defined here and read by nothing
-/// yet: they are inputs to texture-backed layers (#96) and overscroll buffers.
-/// Defining them now means those phases add behaviour to a field rather than
-/// reshaping this struct and every construction of it.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct LayerPolicy {
     /// Below this primitive count the layer stays primitive-retained: it keeps
     /// its recorded primitives and re-emits them, with no texture. A layer
     /// holding twelve quads is cheaper to re-emit than to composite through an
-    /// offscreen target.
-    ///
-    /// Unused until #96.
+    /// offscreen target. A layer with a non-zero [`Self::overdraw_margin`]
+    /// rasterizes regardless — the overscroll buffer is the point.
     pub rasterize_above: usize,
     /// How far outside its bounds the layer renders, so that a later scroll can
     /// reveal already-rendered content without re-rendering.
     ///
-    /// Unused until #96.
+    /// Non-zero marks the layer as an *overscroll buffer* (#96): the texture
+    /// covers `bounds + 2 × margin`, scrolling shifts the composite without
+    /// re-recording, and the layer re-renders (refills) once accumulated
+    /// scroll passes half the margin.
     pub overdraw_margin: crate::Size<Pixels>,
     /// How many consecutive frames the layer may go unvisited before its
     /// retained content is dropped.
@@ -168,6 +168,13 @@ impl LayerPolicy {
     /// silently change what `cached` does.
     pub fn compat() -> Self {
         LayerPolicy::default()
+    }
+
+    /// Whether this policy turns the layer into an overscroll buffer (#96):
+    /// non-zero margin means the texture extends past the viewport and
+    /// scrolling shifts the composite instead of re-recording.
+    pub fn buffers_scroll(&self) -> bool {
+        self.overdraw_margin != crate::size(px(0.), px(0.))
     }
 }
 
@@ -286,6 +293,55 @@ pub(crate) struct Layer {
     /// individual entries here are only overwritten for the children that
     /// actually rebuilt; a reconciled child's entry is left untouched.
     pub instances: FxHashMap<InstanceKey, ElementInstance>,
+    /// This layer's own content, packed into slab-ready form once at record
+    /// time (`Some(Ok)`), or why packing fell back to the legacy composite
+    /// path (`Some(Err)`). `None` when slabs are off or nothing was packable.
+    ///
+    /// Derived from `items` at the origin that record used, and cleared with
+    /// them in [`Self::drop_content`]. The pack clones every primitive into
+    /// per-kind arrays, so caching it keeps a second copy of the layer's
+    /// geometry alive between records — the price of taking validate/gather/
+    /// sort out of every composite. That copy is bounded by the same
+    /// mark-and-sweep eviction that bounds `items` (it dies with the layer's
+    /// content, and a re-record replaces it wholesale), exactly like
+    /// `instances`; a layer is only worth compositing if it survives long
+    /// enough to amortise one extra copy.
+    pub packed: Option<Result<Arc<RecordedSlabPack>, FallbackReason>>,
+    /// Whether this layer's content is baked into a persistent renderer-side
+    /// texture (#96): clean frames composite it with a single
+    /// `SurfaceContent::Layer` draw instead of re-emitting slab spans.
+    ///
+    /// Decided at record time — rasterization needs packable, nested-free
+    /// content — and consumed by the composite paths, which emit the surface
+    /// and skip the spans entirely. The texture itself lives in the renderer's
+    /// layer-texture cache; when the renderer drops one (resize, eviction) it
+    /// posts a re-record request and the next frame re-bakes it.
+    pub texture_retained: bool,
+    /// The buffer extent the texture was rendered at, in window coordinates:
+    /// [`LayerCacheKey::bounds`] inflated by [`LayerPolicy::overdraw_margin`].
+    ///
+    /// The composite surface samples the texture across these bounds (shifted
+    /// by [`Self::content_offset`]) while clipping to the layer's visible
+    /// rect, so margin content exists offscreen but never paints outside the
+    /// layer's own extent.
+    pub texture_bounds: Bounds<Pixels>,
+    /// How far the buffered content has scrolled since the texture was
+    /// rendered: the difference between the current scroll position and
+    /// [`Self::buffer_anchor`], maintained by the buffered element (a
+    /// virtualized list) via `Window::set_layer_content_offset`.
+    ///
+    /// The composite shifts by this much instead of re-recording; the element
+    /// requests a refill through `Window::request_layer_buffer_refill` once it
+    /// passes half the margin, so the shift never outruns the texture.
+    pub content_offset: Point<Pixels>,
+    /// The scroll-space position the buffer was rendered at, set by the
+    /// buffered element at refill time. Opaque to the framework: only the
+    /// element that reads it back gives it meaning.
+    pub buffer_anchor: Point<Pixels>,
+    /// Whether [`Self::buffer_anchor`] reflects a record that actually painted
+    /// the buffer range. False until the buffered element's first refill, so
+    /// the element knows the texture still covers the viewport only.
+    pub buffer_anchored: bool,
 }
 
 impl Layer {
@@ -307,6 +363,12 @@ impl Layer {
             deferred_dirty: false,
             poisoned_bounds: Vec::new(),
             instances: FxHashMap::default(),
+            packed: None,
+            texture_retained: false,
+            texture_bounds: Bounds::default(),
+            content_offset: Point::default(),
+            buffer_anchor: Point::default(),
+            buffer_anchored: false,
         }
     }
 
@@ -328,6 +390,30 @@ impl Layer {
         // worst a later InstanceKey collision (extremely unlikely, but the
         // failure mode matters) could reuse one against unrelated content.
         self.instances.clear();
+        // The pack describes exactly the dropped items; keeping it would pin
+        // the cloned geometry with nothing left to splice it against.
+        self.packed = None;
+        // The texture (if any) outlives this record only as stale pixels; the
+        // renderer's cache is invalidated through the re-record path.
+        self.texture_retained = false;
+        self.content_offset = Point::default();
+        self.buffer_anchor = Point::default();
+        self.buffer_anchored = false;
+    }
+}
+
+/// Inflate `bounds` by `margin` on every side.
+///
+/// The buffer rect for an overscroll layer: `bounds + 2 × margin` per axis,
+/// so content up to `margin` beyond the viewport exists in the texture and a
+/// scroll of up to `margin` never outruns it.
+pub(crate) fn inflate_bounds(bounds: Bounds<Pixels>, margin: crate::Size<Pixels>) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(bounds.origin.x - margin.width, bounds.origin.y - margin.height),
+        size: size(
+            bounds.size.width + margin.width + margin.width,
+            bounds.size.height + margin.height + margin.height,
+        ),
     }
 }
 
@@ -343,6 +429,23 @@ impl Layer {
 pub(crate) fn layers_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("WGPUI_LAYERS")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
+/// Whether layers may be rasterized into persistent textures (#96).
+///
+/// `WGPUI_LAYERS_RASTERIZE=0` forces every layer to stay primitive-retained
+/// (slab spans, no offscreen texture), which isolates GPU-side texture
+/// compositing problems from CPU-side ones: the two modes must render
+/// identically, only slower.
+///
+/// Read once, at first use.
+pub(crate) fn rasterization_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("WGPUI_LAYERS_RASTERIZE")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(true)
     });

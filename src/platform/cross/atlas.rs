@@ -22,11 +22,23 @@ impl WgpuAtlas {
             tiles_by_key: FxHashMap::default(),
             
             uploads: Vec::new(),
+            destroyed_pages: Vec::new(),
         }))
     }
 
     pub fn before_frame(&self, encoder: &mut wgpu::CommandEncoder) {
         self.0.lock().flush(encoder);
+    }
+
+    /// Drain every page whose contents changed under existing tile handles:
+    /// fully-destroyed textures and tiles freed out of still-live pages alike.
+    ///
+    /// Layer-slab residency keys off these: any sprite run referencing an
+    /// evicted page must not reach the GPU with stale texel ids, so the
+    /// renderer poisons those layers and requests a re-record (see
+    /// `slab_gpu`). Draining is destructive — each event is reported once.
+    pub(crate) fn drain_destroyed_pages(&self) -> Vec<crate::AtlasTextureId> {
+        std::mem::take(&mut self.0.lock().destroyed_pages)
     }
 
     pub(crate) fn get_texture_info(&self, texture_id: AtlasTextureId) -> WgpuTextureInfo {
@@ -145,6 +157,11 @@ impl PlatformAtlas for WgpuAtlas {
         #[cfg(feature = "flamegraph")]
         crate::record_atlas_tile_evicted();
 
+        // Both eviction shapes invalidate slab residency: a destroyed page
+        // takes every tile with it, and a tile freed from a live page leaves
+        // its region reusable by the next allocation.
+        atlas.destroyed_pages.push(id);
+
         let Some(texture_slot) = atlas.storage[id.kind].textures.get_mut(id.index as usize) else {
             return;
         };
@@ -173,6 +190,9 @@ struct WgpuAtlasState {
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     uploads: Vec<PendingUpload>,
+    /// Evictions not yet reported to the slab registry: destroyed pages and
+    /// tiles freed from live pages, deduplicated at drain time.
+    destroyed_pages: Vec<crate::AtlasTextureId>,
 }
 
 impl WgpuAtlasState {

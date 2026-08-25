@@ -1,6 +1,11 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 use crate::layer::{Layer, LayerCacheKey, LayerItem};
+use crate::platform::cross::slab::SlabKind;
+use crate::scene_pack::{
+    FallbackReason, PackedLayer, RecordedSlabPack, SlabPackPiece, first_unsupported_kind,
+    pack_layer_items,
+};
 use crate::time_ext::Instant;
 use crate::util::post_inc;
 use crate::util::{ResultExt, measure};
@@ -57,6 +62,262 @@ use std::{
 use uuid::Uuid;
 
 mod prompts;
+
+/// One maximal run of a layer's own packable primitives, plus where nested
+/// layers sat between them.
+pub(crate) enum SlabSegment {
+    /// Item-index range (all primitives) with its packed form.
+    Stretch(Range<usize>, Box<PackedLayer>),
+    Nested(LayerKey),
+}
+
+/// The overscroll-buffer state (#96) of the layer a subtree is being
+/// prepainted inside, handed to buffered elements via
+/// [`Window::prepaint_layer_buffer`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrepaintLayerBuffer {
+    pub key: LayerKey,
+    pub margin: Size<Pixels>,
+    /// The scroll-space position the buffer was rendered at; opaque to the
+    /// framework, meaningful to the element that set it.
+    pub anchor: Point<Pixels>,
+    /// How far the content has scrolled since the buffer was rendered.
+    pub content_offset: Point<Pixels>,
+    /// Whether the layer will composite this frame (skip per-item work).
+    pub will_composite: bool,
+    /// Whether this frame's draw will re-record the layer (paint the full
+    /// buffer range and re-anchor).
+    pub refilling: bool,
+    /// Whether the texture covers the full buffer yet; false until the first
+    /// buffered record.
+    pub buffer_ready: bool,
+}
+
+/// Pack one stretch of consecutive primitive items. The result is stored
+/// relative to the layer's composited `origin` (see `make_packed_relative`).
+///
+/// Unsupported kinds were rejected for the whole layer before segmentation
+/// (see `build_slab_segments`), and `pack_layer_items` still guards its own
+/// contract, so this is the gather-and-sort step only — the pre-slab
+/// redundant full validation pass is gone.
+fn pack_stretch(
+    items: &[LayerItem],
+    start: usize,
+    end: usize,
+    origin: [f32; 2],
+) -> Option<Box<PackedLayer>> {
+    match pack_layer_items(&items[start..end]) {
+        crate::scene_pack::PackOutcome::Packed(mut packed) => {
+            crate::platform::cross::slab_gpu::make_packed_relative(&mut packed, origin);
+            Some(packed)
+        }
+        crate::scene_pack::PackOutcome::FellBack(_) => None,
+    }
+}
+
+/// Whether `previous` and `incoming` cache keys describe the same retained
+/// content at two different origins: every non-bounds input matches, and the
+/// bounds differ by position alone.
+///
+/// A resize is deliberately not a transform-only move: the packed instance
+/// bytes were built for the old extent, so only a re-record can produce the
+/// new geometry.
+fn is_transform_only_move(previous: &LayerCacheKey, incoming: &LayerCacheKey) -> bool {
+    previous.bounds.size == incoming.bounds.size
+        && previous.bounds.origin != incoming.bounds.origin
+        && previous.content_mask == incoming.content_mask
+        && previous.opacity == incoming.opacity
+        && previous.scale_factor == incoming.scale_factor
+}
+
+/// Split a layer's items into slab segments: stretches of its own primitives
+/// separated by nested-layer references. `None` when nothing is packable —
+/// including layers holding a primitive with no slab kind, or items that are
+/// all nested references.
+///
+/// Test-only probe today: production packs at record time via
+/// [`pack_layer_at_record`], and the composite path splices cached bytes. It
+/// keeps the unsupported-kind rejection side-effect-free so probes stay
+/// quiet (a `debug_assert` in this position would fire for the supported
+/// backdrop-filter-inside-a-layer configuration, which exists precisely to
+/// exercise the fallback); production reporting happens in
+/// `pack_layer_at_record`.
+#[cfg(test)]
+pub(crate) fn build_slab_segments(
+    items: &[LayerItem],
+    origin: [f32; 2],
+) -> Option<Vec<SlabSegment>> {
+    // `None` from the scan means "no rejection"; `?` would invert that into
+    // rejecting exactly the packable layers.
+    if first_unsupported_kind(items).is_some() {
+        return None;
+    }
+    build_slab_stretches(items, origin)
+}
+
+/// Segmentation proper, after the caller has handled unsupported kinds.
+fn build_slab_stretches(
+    items: &[LayerItem],
+    origin: [f32; 2],
+) -> Option<Vec<SlabSegment>> {
+    let mut segments: Vec<SlabSegment> = Vec::new();
+    let mut stretch_start: Option<usize> = None;
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            LayerItem::Primitive(_) => {
+                stretch_start.get_or_insert(index);
+            }
+            LayerItem::Nested(nested) => {
+                if let Some(start) = stretch_start.take() {
+                    let packed = pack_stretch(items, start, index, origin)?;
+                    segments.push(SlabSegment::Stretch(start..index, packed));
+                }
+                segments.push(SlabSegment::Nested(*nested));
+            }
+        }
+    }
+    if let Some(start) = stretch_start.take() {
+        let packed = pack_stretch(items, start, items.len(), origin)?;
+        segments.push(SlabSegment::Stretch(start..items.len(), packed));
+    }
+
+    let has_stretch = segments
+        .iter()
+        .any(|segment| matches!(segment, SlabSegment::Stretch(..)));
+    if !has_stretch {
+        return None;
+    }
+    Some(segments)
+}
+
+impl RecordedSlabPack {
+    /// Absorb `build_slab_segments`' output: hoist the per-kind totals and
+    /// each stretch's offset runs out of what used to be the per-frame
+    /// emission loop, so a composite only clones them.
+    fn from_segments(segments: Vec<SlabSegment>) -> Self {
+        let mut totals = [0u32; SlabKind::COUNT];
+        for segment in &segments {
+            let SlabSegment::Stretch(_, packed) = segment else {
+                continue;
+            };
+            totals[SlabKind::Quads.index()] += packed.quads.len() as u32;
+            totals[SlabKind::Shadows.index()] += packed.shadows.len() as u32;
+            totals[SlabKind::Paths.index()] += packed.total_path_vertices();
+            totals[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
+            totals[SlabKind::MonoSprites.index()] += packed.mono_sprites.len() as u32;
+            totals[SlabKind::PolySprites.index()] += packed.poly_sprites.len() as u32;
+        }
+        // Running per-kind offsets: every stretch draws out of the same slab
+        // ranges, so a later stretch's runs start where earlier ones' bytes
+        // end.
+        let mut offsets = [0u32; SlabKind::COUNT];
+        // Stretches arrive contiguous and ascending — nested references sit
+        // between them, never inside — which the offset accumulation below
+        // depends on.
+        #[cfg(debug_assertions)]
+        let mut stretch_cursor = 0usize;
+        let pieces = segments
+            .into_iter()
+            .map(|segment| match segment {
+                SlabSegment::Stretch(range, packed) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        debug_assert!(
+                            range.start >= stretch_cursor,
+                            "stretch ranges must ascend"
+                        );
+                        stretch_cursor = range.end;
+                    }
+                    let runs = packed
+                        .runs
+                        .iter()
+                        .map(|run| crate::scene::SlabRun {
+                            kind: run.kind,
+                            start: offsets[run.kind.index()] + run.start,
+                            count: run.count,
+                            texture_id: run.texture_id,
+                        })
+                        .collect();
+                    offsets[SlabKind::Quads.index()] += packed.quads.len() as u32;
+                    offsets[SlabKind::Shadows.index()] += packed.shadows.len() as u32;
+                    offsets[SlabKind::Paths.index()] += packed.total_path_vertices();
+                    offsets[SlabKind::Underlines.index()] += packed.underlines.len() as u32;
+                    offsets[SlabKind::MonoSprites.index()] += packed.mono_sprites.len() as u32;
+                    offsets[SlabKind::PolySprites.index()] += packed.poly_sprites.len() as u32;
+                    SlabPackPiece::Stretch {
+                        runs,
+                        packed: Arc::from(packed),
+                    }
+                }
+                SlabSegment::Nested(nested) => SlabPackPiece::Nested(nested),
+            })
+            .collect();
+        RecordedSlabPack { totals, pieces }
+    }
+}
+
+/// Pack a freshly-recorded layer's own content once, for every composite
+/// until the next record to splice from.
+///
+/// `Some(Err)` caches a fallback verdict after reporting it — warn-once plus
+/// counter, once per record rather than once per frame. The report is
+/// deliberately NOT accompanied by the `debug_assert` that guards
+/// `pack_layer_items` itself: an unsupported kind at record time is a
+/// supported outcome (the layer composites through the legacy path), not a
+/// producer bug. `None` when nothing was packable at all — empty layers and
+/// nested-reference-only layers have always composited legacy-style.
+fn pack_layer_at_record(
+    items: &[LayerItem],
+    origin: [f32; 2],
+) -> Option<Result<Arc<RecordedSlabPack>, FallbackReason>> {
+    profiling::scope!("wgpui: pack layer at record");
+    if let Some(reason) = first_unsupported_kind(items) {
+        crate::scene_pack::report_rejection(reason);
+        return Some(Err(reason));
+    }
+    let segments = build_slab_stretches(items, origin)?;
+    Some(Ok(Arc::new(RecordedSlabPack::from_segments(segments))))
+}
+
+/// The pre-slab composite replay: re-emit every retained primitive through
+/// `push_retained`, recursing into nested layers.
+fn composite_layer_legacy(
+    scene: &mut Scene,
+    layers: &mut FxHashMap<LayerKey, Layer>,
+    key: LayerKey,
+    frame: u64,
+    scale_factor: f32,
+) {
+    let Some(layer) = layers.get_mut(&key) else {
+        // A nested layer evicted out from under its parent. The parent was
+        // judged clean, so this cannot produce wrong pixels on its own — but
+        // it does mean content silently vanished, so make it visible rather
+        // than merely absent.
+        crate::render_stats::count("layer: nested reference missing");
+        return;
+    };
+    layer.last_visited = frame;
+    let bounds = layer.cache_key.bounds.scale(scale_factor);
+    // Taken out so the recursive call can borrow the map; put back below. A
+    // layer never appears twice in one composite tree, so nothing can observe
+    // the gap.
+    let items = mem::take(&mut layer.items);
+
+    scene.begin_layer(key, bounds, false);
+    for item in &items {
+        match item {
+            LayerItem::Primitive(primitive) => scene.push_retained(primitive),
+            LayerItem::Nested(nested) => {
+                composite_layer_legacy(scene, layers, *nested, frame, scale_factor)
+            }
+        }
+    }
+    scene.end_layer();
+
+    if let Some(layer) = layers.get_mut(&key) {
+        layer.items = items;
+    }
+}
 
 use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
@@ -294,6 +555,60 @@ pub(crate) struct WindowInvalidator {
     inner: Rc<RefCell<WindowInvalidatorInner>>,
 }
 
+static NOTIFY_ATTRIBUTION_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("WGPUI_NOTIFY_ATTRIBUTION")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+});
+
+struct NotifyAttributionState {
+    counts: FxHashMap<EntityId, u64>,
+    last_report: Instant,
+}
+
+static NOTIFY_ATTRIBUTION: std::sync::LazyLock<parking_lot::Mutex<NotifyAttributionState>> =
+    std::sync::LazyLock::new(|| {
+        parking_lot::Mutex::new(NotifyAttributionState {
+            counts: FxHashMap::default(),
+            last_report: Instant::now(),
+        })
+    });
+
+/// Attribute entity invalidations to their source ids when
+/// `WGPUI_NOTIFY_ATTRIBUTION` is set, so a notify storm can be traced to the
+/// entities causing it instead of only being visible as frame cost. One warn
+/// line per second names the top offenders; disabled costs a single atomic
+/// load per invalidation.
+fn record_notify_attribution(entity: EntityId) {
+    if !*NOTIFY_ATTRIBUTION_ENABLED {
+        return;
+    }
+    let mut state = NOTIFY_ATTRIBUTION.lock();
+    *state.counts.entry(entity).or_insert(0) += 1;
+    if state.last_report.elapsed() >= Duration::from_secs(1) {
+        let mut top: Vec<(u64, u64)> = state
+            .counts
+            .iter()
+            .map(|(id, count)| (id.as_u64(), *count))
+            .collect();
+        top.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+        top.truncate(10);
+        let total: u64 = state.counts.values().sum();
+        log::warn!(
+            target: "notify_attribution",
+            "{} entity invalidations in the last second across {} entities; top: {}",
+            total,
+            state.counts.len(),
+            top.iter()
+                .map(|(id, count)| format!("entity {id}: {count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        state.counts.clear();
+        state.last_report = Instant::now();
+    }
+}
+
 impl WindowInvalidator {
     pub fn new() -> Self {
         WindowInvalidator {
@@ -398,6 +713,7 @@ impl WindowInvalidator {
 
     fn invalidate_entity(&self, entity: EntityId, cx: &mut App) -> bool {
         crate::render_stats::count("invalidate: entity");
+        record_notify_attribution(entity);
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
         inner.dirty_views.insert(entity);
@@ -1374,7 +1690,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) retained_layer_stack: Vec<LayerKey>,
-    pub(crate) hitbox_layer_stack: Vec<(LayerKey, Point<Pixels>)>,
+    pub(crate) hitbox_layer_stack: Vec<(LayerKey, Point<Pixels>, Bounds<Pixels>)>,
     /// Parallel to `element_id_stack`, but pushed only around a `.layer()`
     /// subtree's children (#92) and never read by anything predating this
     /// phase. Each entry is either a child's own `ElementId` or a synthetic
@@ -1414,6 +1730,11 @@ pub struct Window {
     /// counts draws this window performed, so a window that stops drawing stops
     /// ageing its layers.
     pub(crate) layer_frame: u64,
+    /// Content tokens handed to the renderer's slab registry: bumped every
+    /// time a layer's items are replaced, read at composite time. A token the
+    /// registry has not seen means "upload this layer's slab".
+    slab_tokens: FxHashMap<LayerKey, u64>,
+    next_slab_token: u64,
     next_layer_id: u32,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
@@ -1902,6 +2223,8 @@ impl Window {
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             layers: FxHashMap::default(),
             layer_frame: 0,
+            slab_tokens: FxHashMap::default(),
+            next_slab_token: 0,
             next_layer_id: 0,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
@@ -1968,6 +2291,16 @@ pub struct DispatchEventResult {
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+}
+
+// See the note on the Pod impls for `Point` in geometry.rs.
+unsafe impl<P: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Pod
+    for ContentMask<P>
+{
+}
+unsafe impl<P: Clone + Debug + Default + PartialEq + bytemuck::Pod> bytemuck::Zeroable
+    for ContentMask<P>
+{
 }
 
 impl ContentMask<Pixels> {
@@ -2158,6 +2491,12 @@ impl Window {
     /// GPUI would rebuild is identical to the last one, and cached views replay
     /// their primitives — including the surface quad — so the compositor
     /// promotes the new texture with nothing re-rendered.
+    ///
+    /// The same shape serves texture-retained layers (#96): a DISPLAY-only
+    /// frame leaves every layer's `needs` untouched, so a clean texture-
+    /// retained layer re-emits exactly its composite surface and the renderer
+    /// promotes whatever its texture now holds. `refresh_buffers` is the
+    /// composite trigger for both kinds of retained texture.
     ///
     /// This is [`InvalidationScope::Window`] with [`Invalidation::DISPLAY`] and
     /// nothing else, and that is the whole difference from [`Self::refresh`]:
@@ -2879,8 +3218,8 @@ impl Window {
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
-    #[profiling::function]
     pub fn draw<'app>(&mut self, cx: &'app mut App) -> ArenaClearNeeded<'app> {
+        profiling::scope!("wgpui: draw");
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
@@ -2897,6 +3236,23 @@ impl Window {
         );
 
         self.apply_invalidations();
+
+        // Slab-driven re-records (spec #94): the renderer discovers atlas
+        // evictions under resident layers at frame start and posts them here.
+        // Draining before draw_roots is what makes invalidation-before-draw
+        // hold — the affected layer rebuilds (fresh tiles, fresh token) before
+        // its span is recorded again, so stale tiles can never reach the GPU.
+        if crate::scene_pack::slabs_enabled() {
+            for layer_key in crate::platform::cross::slab_gpu::take_rerecord_requests() {
+                if self.layers.contains_key(&layer_key) {
+                    self.invalidator
+                        .invalidate_layer(layer_key, Invalidation::all());
+                } else {
+                    self.slab_tokens.remove(&layer_key);
+                }
+            }
+        }
+
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
@@ -3079,6 +3435,7 @@ impl Window {
     /// Turn everything recorded since the last draw into the per-draw state the
     /// element walk reads: window-scope axes, and the entity-scope dirty sets.
     fn apply_invalidations(&mut self) {
+        profiling::scope!("wgpui: apply_invalidations");
         self.window_invalidation = self.invalidator.take_window_axes();
 
         // Layer-scope requests mark exactly the layer they name — no ancestor
@@ -3113,8 +3470,8 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
-    #[profiling::function]
     fn present(&self) {
+        profiling::scope!("wgpui: present");
         #[cfg(feature = "flamegraph")]
         let _present_span = crate::enter_span(
             crate::SpanName::Static("Window::present"),
@@ -3134,8 +3491,8 @@ impl Window {
     }
 
     /// Present only the cached framebuffer (fast path - no compositor)
-    #[profiling::function]
     fn present_framebuffer_only(&self) {
+        profiling::scope!("wgpui: present_framebuffer_only");
         #[cfg(feature = "flamegraph")]
         let _present_span = crate::enter_span(
             crate::SpanName::Static("Window::present_framebuffer_only"),
@@ -3189,49 +3546,61 @@ impl Window {
         // `prepaint_as_root` split into its two halves so layout and prepaint can
         // be timed apart; the pair is exactly what that method does.
         {
+            profiling::scope!("wgpui: layout");
             let _t = crate::render_stats::scope("frame: layout");
             root_element.layout_as_root(root_size.into(), self, cx);
         }
 
-        let prepaint_timer = crate::render_stats::scope("frame: prepaint");
-        root_element.prepaint_at(Point::default(), self, cx);
+        let _inspector_element;
+        let mut sorted_deferred_draws;
+        let mut prompt_element;
+        let mut active_drag_element;
+        let mut tooltip_element;
+        {
+            profiling::scope!("wgpui: prepaint");
+            let prepaint_timer = crate::render_stats::scope("frame: prepaint");
+            root_element.prepaint_at(Point::default(), self, cx);
 
-        #[cfg(any(feature = "inspector", debug_assertions))]
-        let inspector_element = self.prepaint_inspector(inspector_width, cx);
+            #[cfg(any(feature = "inspector", debug_assertions))]
+            {
+                _inspector_element = self.prepaint_inspector(inspector_width, cx);
+            }
 
-        let mut sorted_deferred_draws =
-            (0..self.next_frame.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
-        sorted_deferred_draws.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
-        self.prepaint_deferred_draws(&sorted_deferred_draws, cx);
+            sorted_deferred_draws =
+                (0..self.next_frame.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
+            sorted_deferred_draws.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
+            self.prepaint_deferred_draws(&sorted_deferred_draws, cx);
 
-        let mut prompt_element = None;
-        let mut active_drag_element = None;
-        let mut tooltip_element = None;
-        if let Some(prompt) = self.prompt.take() {
-            let mut element = prompt.view.any_view().into_any();
-            element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
-            prompt_element = Some(element);
-            self.prompt = Some(prompt);
-        } else if let Some(active_drag) = cx.active_drag.take() {
-            let mut element = active_drag.view.clone().into_any();
-            let offset = self.mouse_position() - active_drag.cursor_offset;
-            element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
-            active_drag_element = Some(element);
-            cx.active_drag = Some(active_drag);
-        } else {
-            tooltip_element = self.prepaint_tooltip(cx);
+            prompt_element = None;
+            active_drag_element = None;
+            tooltip_element = None;
+            if let Some(prompt) = self.prompt.take() {
+                let mut element = prompt.view.any_view().into_any();
+                element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+                prompt_element = Some(element);
+                self.prompt = Some(prompt);
+            } else if let Some(active_drag) = cx.active_drag.take() {
+                let mut element = active_drag.view.clone().into_any();
+                let offset = self.mouse_position() - active_drag.cursor_offset;
+                element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
+                active_drag_element = Some(element);
+                cx.active_drag = Some(active_drag);
+            } else {
+                tooltip_element = self.prepaint_tooltip(cx);
+            }
+
+            self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position, &self.layers);
+            drop(prepaint_timer);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position, &self.layers);
-        drop(prepaint_timer);
-
         // Now actually paint the elements.
+        profiling::scope!("wgpui: paint");
         let paint_timer = crate::render_stats::scope("frame: paint");
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
-        self.paint_inspector(inspector_element, cx);
+        self.paint_inspector(_inspector_element, cx);
 
         self.paint_deferred_draws(&sorted_deferred_draws, cx);
 
@@ -4212,6 +4581,50 @@ impl Window {
         });
     }
 
+    /// The shared composite predicate for one retained layer: every condition
+    /// both [`Self::with_retained_layer`]'s paint-time decision and a buffered
+    /// element's prepaint-time prediction (#96) must agree on.
+    ///
+    /// Cache-key equality is deliberately NOT here: the paint-time decision
+    /// branches on *how* the key differs (identical → composite, origin-only →
+    /// transform-only move), so the caller adds the comparison it needs. The
+    /// buffer prediction, which only composites, adds full equality.
+    ///
+    /// #96: an overscroll buffer (non-zero margin) exempts the pointer
+    /// conditions. Scrolling happens under the cursor by definition, and
+    /// the shifted composite is precisely the frame a re-render must not
+    /// happen on; hover styling inside the buffer goes stale between
+    /// refills (half a margin of scroll) by design.
+    fn layer_reuse_conditions(
+        &self,
+        layer: &Layer,
+        content_key: Option<u64>,
+        mouse_inside: bool,
+        view_rebuilt: bool,
+    ) -> bool {
+        let pointer_exempt = layer.policy.overdraw_margin != size(px(0.), px(0.));
+        layer.content_key == content_key
+            && layer.has_content()
+            && layer.needs.is_empty()
+            && !layer.deferred_dirty
+            && (pointer_exempt || (!layer.had_mouse && !mouse_inside))
+            && !view_rebuilt
+            && self.view_cache_available()
+            && !self.accessed_entity_invalidated(&layer.accessed_entities)
+            // The paint range is an absolute offset into last frame's
+            // arrays. It is validated for the same reason
+            // `AnyView::cached` validates its own: nothing in the type
+            // system ties a stored range to the array it came from, and a
+            // range that has aged slices out of bounds and takes the
+            // process down. A stale range is a re-render, not a crash.
+            && self
+                .invalid_reuse_range(
+                    &(PrepaintStateIndex::default()..PrepaintStateIndex::default()),
+                    &layer.paint_range,
+                )
+                .is_none()
+    }
+
     /// Paint into the retained layer named by `global_id`, or composite last
     /// frame's primitives for it and skip painting entirely.
     ///
@@ -4281,30 +4694,27 @@ impl Window {
         // reason unrelated to the subtree.
         let view_rebuilt = content_key.is_none() && self.dirty_views.contains(&self.current_view());
 
-        let composite = !view_rebuilt
+        let layer_conditions_hold = self.layers.get(&key).is_some_and(|layer| {
+            self.layer_reuse_conditions(layer, content_key, mouse_inside, view_rebuilt)
+        });
+        let reusable_frame = layer_conditions_hold;
+
+        let composite = reusable_frame
+            && self
+                .layers
+                .get(&key)
+                .is_some_and(|layer| layer.cache_key == cache_key);
+
+        // Spec #94's headline: a TRANSFORM-only change should cost one
+        // uniform write, not a re-record plus a full instance re-upload.
+        // Slabs must be live because the fast path has no legacy fallback —
+        // replaying retained primitives at their recorded positions would
+        // draw the layer where it was, not where it is.
+        let transform_only_move = reusable_frame
+            && crate::scene_pack::slabs_enabled()
             && self.layers.get(&key).is_some_and(|layer| {
-                layer.content_key == content_key
-                && layer.has_content()
-                && layer.needs.is_empty()
-                && !layer.deferred_dirty
-                && layer.cache_key == cache_key
-                && !layer.had_mouse
-                && !mouse_inside
-                && !self.accessed_entity_invalidated(&layer.accessed_entities)
-                // The paint range is an absolute offset into last frame's
-                // arrays. It is validated for the same reason
-                // `AnyView::cached` validates its own: nothing in the type
-                // system ties a stored range to the array it came from, and a
-                // range that has aged slices out of bounds and takes the
-                // process down. A stale range is a re-render, not a crash.
-                && self
-                    .invalid_reuse_range(
-                        &(PrepaintStateIndex::default()..PrepaintStateIndex::default()),
-                        &layer.paint_range,
-                    )
-                    .is_none()
-            })
-            && self.view_cache_available();
+                is_transform_only_move(&layer.cache_key, &cache_key)
+            });
 
         if composite {
             // Primitives come from the layer; everything else the skipped paint
@@ -4312,6 +4722,15 @@ impl Window {
             // handlers, tab stops, shaped text, accessed element state — comes
             // from the recorded range. Without this a composited panel renders
             // correctly and stops responding to the mouse.
+            //
+            // The replacement range is stamped around BOTH halves: a `PaintIndex`
+            // spans every array, so only the full reuse+composite extent stays a
+            // valid source for the next frame's replay. With slabs, compositing
+            // no longer appends the recorded primitives to the frame arrays, and
+            // leaving the recording-era range in place would read as out-of-bounds
+            // against composited frames' shorter scenes and force an eternal
+            // re-render.
+            let composite_start = self.paint_index();
             let range = self.layers[&key].paint_range.clone();
             self.reuse_paint_except_scene(&range);
             if self.is_layer_occluded(key) {
@@ -4319,9 +4738,31 @@ impl Window {
                 if let Some(layer) = self.layers.get_mut(&key) {
                     layer.deferred_dirty = false;
                 }
+                // Occluded frames emit nothing new; the previous range still
+                // describes the last visible extent.
+            } else if self.layers[&key].texture_retained {
+                // The #96 skip condition: the content lives in a persistent
+                // texture, so the whole composite is one surface draw. The
+                // surface's bounds carry the buffer shift, so this same path
+                // covers both the still frame and the scroll frame.
+                self.paint_layer_texture_surface(key);
+                let composite_end = self.paint_index();
+                if let Some(layer) = self.layers.get_mut(&key) {
+                    layer.paint_range = composite_start..composite_end;
+                }
             } else {
                 self.composite_layer(key);
+                let composite_end = self.paint_index();
+                if let Some(layer) = self.layers.get_mut(&key) {
+                    layer.paint_range = composite_start..composite_end;
+                }
             }
+            return None;
+        }
+
+        if transform_only_move
+            && self.try_composite_transform_only_move(key, cache_key.clone(), self.layer_frame)
+        {
             return None;
         }
 
@@ -4353,6 +4794,20 @@ impl Window {
             layer.had_mouse = mouse_inside;
         }
 
+        // #96: the record frame painted inline (correct for this frame), and a
+        // texture-retained layer must also bake its content into the
+        // renderer's persistent texture so the NEXT frame can composite from
+        // it. The spans below carry the texture target, so the renderer
+        // redirects them into the texture instead of drawing them on screen —
+        // the inline primitives above remain this frame's only visible output.
+        if self
+            .layers
+            .get(&key)
+            .is_some_and(|layer| layer.texture_retained)
+        {
+            self.emit_layer_texture_render(key, self.layer_frame);
+        }
+
         Some(result)
     }
 
@@ -4369,11 +4824,31 @@ impl Window {
         policy: LayerPolicy,
         f: impl FnOnce(&mut Window) -> R,
     ) -> R {
+        profiling::scope!("wgpui: record layer");
         crate::render_stats::count("layer: re-rendered");
         let scaled_bounds = cache_key.bounds.scale(cache_key.scale_factor);
         let paint_start = self.paint_index();
         let id = self.next_layer_id;
         let frame = self.layer_frame;
+
+        // Overscroll buffer (#96): the texture covers bounds + 2 × margin, so
+        // content beyond the viewport exists and a scroll within the margin
+        // never needs a re-record. Everything downstream — the ordering
+        // scope's extent, the occlusion protection band, the pack origin —
+        // keys off this rect rather than the visible bounds.
+        let margin = policy.overdraw_margin;
+        let buffered = margin != size(px(0.), px(0.));
+        let texture_bounds = if buffered {
+            crate::layer::inflate_bounds(cache_key.bounds, margin)
+        } else {
+            cache_key.bounds
+        };
+        let scaled_texture_bounds = texture_bounds.scale(cache_key.scale_factor);
+
+        let was_texture_retained = self
+            .layers
+            .get(&key)
+            .is_some_and(|layer| layer.texture_retained && layer.has_content());
 
         {
             let layer = self.layers.entry(key).or_insert_with(|| {
@@ -4384,13 +4859,43 @@ impl Window {
             layer.poisoned_bounds.clear();
         }
 
-        self.next_frame.scene.begin_layer(key, scaled_bounds, true);
+        self.next_frame
+            .scene
+            .begin_layer(key, scaled_texture_bounds, true);
         let result = f(self);
         let items = self
             .next_frame
             .scene
             .end_layer()
             .expect("a recording layer must return its captured items");
+
+        // Instance-tier occlusion (#95): drop this layer's own primitives that
+        // are fully covered by opaque quads painted above them in the same
+        // layer, before anything downstream sees them. One decision upstream
+        // of both consumers — `pack_layer_at_record` below and the legacy
+        // replay in `composite_layer_legacy` — so packed and legacy outputs
+        // agree by construction.
+        //
+        // This runs only while the layer is re-rendering (dirty anyway), and
+        // only against same-layer occluders: any change to those occluders
+        // re-records the layer through this very path, so a baked decision
+        // cannot go stale silently and a clean layer's slab never churns
+        // because an occluder moved. The retained items are rebuilt wholesale
+        // on every record; reconciled children's owned `ElementInstance::items`
+        // were captured during the walk above and stay complete, so a later
+        // record replays them intact once they are no longer covered.
+        //
+        // #96: overdraw regions are exempt — content outside the current clip
+        // exists precisely so a later scroll (a transform-only composite) can
+        // reveal it, so items reaching into the margin band are never culled
+        // and never act as occluders.
+        let items = if buffered {
+            let viewport = cache_key.bounds.scale(cache_key.scale_factor);
+            let buffer = scaled_texture_bounds;
+            crate::occlusion::cull_covered_instances_excluding_overdraw(items, viewport, buffer)
+        } else {
+            crate::occlusion::cull_covered_instances(items)
+        };
 
         let paint_range = paint_start..self.paint_index();
         if let Some(layer) = self.layers.get_mut(&key) {
@@ -4405,6 +4910,48 @@ impl Window {
             layer.transform = LayerTransform {
                 offset: bounds.origin,
             };
+            // Fresh items mean fresh content: the next composite of this
+            // layer must re-upload its slab, which the new token forces.
+            self.slab_tokens.insert(key, self.next_slab_token);
+            self.next_slab_token += 1;
+            // Pack once per content generation: every composite until the
+            // next record splices spans straight from this pack, so the
+            // validate/gather/sort work runs here instead of per frame.
+            // Content is origin-relative to THIS record's origin, which is
+            // exactly what a clean composite re-emits. A buffered layer packs
+            // relative to the TEXTURE origin instead, so its spans draw in
+            // texture space with a zero transform translate.
+            let pack_origin = if buffered {
+                [
+                    scaled_texture_bounds.origin.x.0,
+                    scaled_texture_bounds.origin.y.0,
+                ]
+            } else {
+                [scaled_bounds.origin.x.0, scaled_bounds.origin.y.0]
+            };
+            layer.packed = if crate::scene_pack::slabs_enabled() {
+                pack_layer_at_record(&layer.items, pack_origin)
+            } else {
+                None
+            };
+            // Texture retention (#96): rasterize packable, nested-free content
+            // above the policy threshold — or always, for an overscroll
+            // buffer, whose margin content is the point. `WGPUI_LAYERS_RASTERIZE=0`
+            // keeps everything primitive-retained.
+            let has_nested = layer
+                .items
+                .iter()
+                .any(|item| matches!(item, LayerItem::Nested(_)));
+            let rasterizable = crate::layer::rasterization_enabled()
+                && crate::scene_pack::slabs_enabled()
+                && layer.packed.as_ref().is_some_and(|packed| packed.is_ok())
+                && !has_nested
+                && (buffered || layer.items.len() > policy.rasterize_above);
+            layer.texture_retained = rasterizable;
+            layer.texture_bounds = texture_bounds;
+            if rasterizable && buffered && was_texture_retained {
+                crate::render_stats::count("scroll: buffer refills");
+            }
             layer.needs = Invalidation::empty();
             layer.last_visited = frame;
             layer.had_mouse = false;
@@ -4526,47 +5073,18 @@ impl Window {
         true
     }
 
-    /// Re-emit `key`'s retained primitives, and those of every layer nested
+    /// Re-emit `key`'s retained content, and that of every layer nested
     /// inside it, without re-running any element code.
+    ///
+    /// With slabs enabled and the layer's own items packable, each maximal
+    /// stretch of its own primitives is recorded as a scene slab span — no
+    /// primitives are re-cloned into the frame arrays, and the renderer draws
+    /// them from persistent per-layer buffers. Nested layers split stretches
+    /// so their own ordering scopes sit exactly where they were painted. Any
+    /// packing rejection takes the legacy replay path for the whole layer,
+    /// which is correct rebuild behaviour, not an error.
     fn composite_layer(&mut self, key: LayerKey) {
-        fn composite(
-            scene: &mut Scene,
-            layers: &mut FxHashMap<LayerKey, Layer>,
-            key: LayerKey,
-            frame: u64,
-            scale_factor: f32,
-        ) {
-            let Some(layer) = layers.get_mut(&key) else {
-                // A nested layer evicted out from under its parent. The parent
-                // was judged clean, so this cannot produce wrong pixels on its
-                // own — but it does mean content silently vanished, so make it
-                // visible rather than merely absent.
-                crate::render_stats::count("layer: nested reference missing");
-                return;
-            };
-            layer.last_visited = frame;
-            let bounds = layer.cache_key.bounds.scale(scale_factor);
-            // Taken out so the recursive call can borrow the map; put back
-            // below. A layer never appears twice in one composite tree, so
-            // nothing can observe the gap.
-            let items = mem::take(&mut layer.items);
-
-            scene.begin_layer(key, bounds, false);
-            for item in &items {
-                match item {
-                    LayerItem::Primitive(primitive) => scene.push_retained(primitive),
-                    LayerItem::Nested(nested) => {
-                        composite(scene, layers, *nested, frame, scale_factor)
-                    }
-                }
-            }
-            scene.end_layer();
-
-            if let Some(layer) = layers.get_mut(&key) {
-                layer.items = items;
-            }
-        }
-
+        profiling::scope!("wgpui: layer composite");
         crate::render_stats::count("layer: composited");
         let _t = crate::render_stats::scope("layer: composite");
         let frame = self.layer_frame;
@@ -4576,7 +5094,21 @@ impl Window {
             .get(&key)
             .map(|layer| layer.cache_key.bounds)
             .unwrap_or_default();
-        composite(
+
+        if crate::scene_pack::slabs_enabled()
+            && !self.next_frame.scene.innermost_layer_is_recording()
+        {
+            let composited_as_slab =
+                self.try_composite_layer_into_scene_as_slab(key, frame, scale_factor);
+            if composited_as_slab {
+                if crate::layer::layer_debug_enabled() {
+                    self.paint_layer_debug_tint(key, bounds, false);
+                }
+                return;
+            }
+        }
+
+        composite_layer_legacy(
             &mut self.next_frame.scene,
             &mut self.layers,
             key,
@@ -4589,6 +5121,393 @@ impl Window {
         }
     }
 
+    /// The slab splice half of [`Self::composite_layer`]: emit one span per
+    /// maximal stretch of `key`'s own primitives from the pack cached at
+    /// record time, recursing into nested layers between stretches. Returns
+    /// `false` when the layer must composite through the legacy path instead
+    /// (nothing cached: nothing packable, a packing rejection, or slabs off
+    /// at record time).
+    ///
+    /// No packing happens here — the bytes were built once at record, so a
+    /// clean frame's composite is span emission only and the renderer reads
+    /// the unchanged token as Clean (zero uploads).
+    fn try_composite_layer_into_scene_as_slab(
+        &mut self,
+        key: LayerKey,
+        frame: u64,
+        scale_factor: f32,
+    ) -> bool {
+        profiling::scope!("wgpui: slab splice");
+        // A texture-retained layer's pack is relative to its TEXTURE origin
+        // (#96), so splicing it as a plain span would draw it offset by the
+        // margin. Its composites go through the surface path instead — the
+        // retained-layer decision routes there; this guard covers the direct
+        // `composite_layer` callers (nested recursion, `AnyView::cached`'s
+        // reuse), which fall back to the legacy replay: correct, just slower.
+        if self
+            .layers
+            .get(&key)
+            .is_some_and(|layer| layer.texture_retained)
+        {
+            return false;
+        }
+        let Some((scaled_bounds, scaled_origin, pack)) = self.layers.get(&key).and_then(|layer| {
+            if !layer.has_content() {
+                return None;
+            }
+            let pack = match &layer.packed {
+                Some(Ok(pack)) => Arc::clone(pack),
+                _ => return None,
+            };
+            let scaled_bounds = layer.cache_key.bounds.scale(scale_factor);
+            let scaled_origin = [scaled_bounds.origin.x.0, scaled_bounds.origin.y.0];
+            Some((scaled_bounds, scaled_origin, pack))
+        }) else {
+            return false;
+        };
+        self.emit_layer_slab_spans(
+            key,
+            frame,
+            scale_factor,
+            scaled_bounds,
+            scaled_origin,
+            &pack,
+            None,
+        )
+    }
+
+    /// The #94 headline path: composite a layer whose only change since its
+    /// last render is its origin.
+    ///
+    /// The caller has already established every composite condition except
+    /// full `cache_key` equality, and [`is_transform_only_move`] has
+    /// established that the bounds differ by origin alone. Packed content is
+    /// stored origin-relative, so re-emitting it under the SAME slab token at
+    /// the NEW origin leaves the renderer's sync plan Clean: zero instance
+    /// bytes move, and the whole relocation costs one 64-byte transform slot.
+    /// That slot write happens renderer-side off the span's new origin.
+    ///
+    /// Returns `false` — having touched nothing, so the caller falls back to
+    /// a normal re-record — when the layer turns out unable to take the path:
+    ///
+    /// - a recording layer is active above this one. The legacy fallback
+    ///   inside [`Self::composite_layer`] would replay the retained
+    ///   primitives at their recorded positions, which the move just made
+    ///   stale; only a re-record repaints them correctly.
+    /// - the retained items include nested layer references. Each nested
+    ///   layer carries its own origin, refreshed only by its own paint walk,
+    ///   which a composited parent skips; splicing them here would draw the
+    ///   children at their previous positions inside a moved parent. Whether
+    ///   the children moved by exactly the parent's delta is not something
+    ///   this path can know, so it declines.
+    /// - the retained items do not pack into slabs at the new origin (the
+    ///   same rejection any slab composite hits).
+    fn try_composite_transform_only_move(
+        &mut self,
+        key: LayerKey,
+        cache_key: LayerCacheKey,
+        frame: u64,
+    ) -> bool {
+        if self.next_frame.scene.innermost_layer_is_recording() {
+            return false;
+        }
+        // A texture-retained layer moves even cheaper (#96): the texture is
+        // position-independent, so the move is one surface draw at the new
+        // bounds — no spans, no slot writes, no uploads.
+        if self
+            .layers
+            .get(&key)
+            .is_some_and(|layer| layer.texture_retained)
+        {
+            let new_bounds = cache_key.bounds;
+            if let Some(layer) = self.layers.get_mut(&key) {
+                let delta = new_bounds.origin - layer.cache_key.bounds.origin;
+                layer.cache_key = cache_key;
+                layer.transform = LayerTransform {
+                    offset: new_bounds.origin + layer.content_offset,
+                };
+                if let Some(opaque) = &mut layer.opaque_bounds {
+                    opaque.origin += delta;
+                }
+                for poisoned in &mut layer.poisoned_bounds {
+                    poisoned.origin += delta;
+                }
+                layer.texture_bounds.origin += delta;
+            }
+            let composite_start = self.paint_index();
+            let range = match self.layers.get(&key) {
+                Some(layer) => layer.paint_range.clone(),
+                None => return true,
+            };
+            self.reuse_paint_except_scene(&range);
+            if self.is_layer_occluded(key) {
+                crate::render_stats::count("occlusion: layers culled");
+                if let Some(layer) = self.layers.get_mut(&key) {
+                    layer.deferred_dirty = false;
+                }
+                return true;
+            }
+            crate::render_stats::count("layer: composited (texture)");
+            self.paint_layer_texture_surface(key);
+            let composite_end = self.paint_index();
+            if let Some(layer) = self.layers.get_mut(&key) {
+                layer.paint_range = composite_start..composite_end;
+            }
+            return true;
+        }
+        let scale_factor = self.scale_factor();
+        let scaled_bounds = cache_key.bounds.scale(scale_factor);
+        let scaled_origin = [scaled_bounds.origin.x.0, scaled_bounds.origin.y.0];
+        // Packed bytes are origin-relative, so a pure translation leaves them
+        // byte-identical: the record-time cache is reused as-is under the
+        // SAME token — no repack, no uploads, one transform slot renderer-side.
+        let pack = {
+            let Some(layer) = self.layers.get(&key) else {
+                return false;
+            };
+            if layer
+                .items
+                .iter()
+                .any(|item| matches!(item, LayerItem::Nested(_)))
+            {
+                return false;
+            }
+            let Some(Ok(pack)) = layer.packed.as_ref() else {
+                // Never packed or an unsupported-kind fallback: decline so the
+                // caller falls back to a full re-record, which rebuilds it.
+                return false;
+            };
+            Arc::clone(pack)
+        };
+
+        // Stamp everything a re-record would have stamped, minus the record:
+        // the content is unchanged, so the slab token stays untouched and the
+        // renderer keeps treating its resident bytes as current.
+        let new_bounds = cache_key.bounds;
+        if let Some(layer) = self.layers.get_mut(&key) {
+            let delta = new_bounds.origin - layer.cache_key.bounds.origin;
+            layer.cache_key = cache_key;
+            layer.transform = LayerTransform {
+                offset: new_bounds.origin,
+            };
+            // Occluder coverage is recorded in window coordinates; it moves
+            // with the layer or culling decisions below and next frame judge
+            // the wrong region.
+            if let Some(opaque) = &mut layer.opaque_bounds {
+                opaque.origin += delta;
+            }
+            for poisoned in &mut layer.poisoned_bounds {
+                poisoned.origin += delta;
+            }
+        }
+
+        let composite_start = self.paint_index();
+        let range = match self.layers.get(&key) {
+            Some(layer) => layer.paint_range.clone(),
+            None => return true,
+        };
+        self.reuse_paint_except_scene(&range);
+        if self.is_layer_occluded(key) {
+            crate::render_stats::count("occlusion: layers culled");
+            if let Some(layer) = self.layers.get_mut(&key) {
+                layer.deferred_dirty = false;
+            }
+            // Occluded frames emit nothing new; the previous range still
+            // describes the last visible extent.
+            return true;
+        }
+
+        crate::render_stats::count("layer: composited (transform-only)");
+        self.emit_layer_slab_spans(
+            key,
+            frame,
+            scale_factor,
+            scaled_bounds,
+            scaled_origin,
+            &pack,
+            None,
+        );
+        let composite_end = self.paint_index();
+        if let Some(layer) = self.layers.get_mut(&key) {
+            layer.paint_range = composite_start..composite_end;
+        }
+        if crate::layer::layer_debug_enabled() {
+            self.paint_layer_debug_tint(key, new_bounds, false);
+        }
+        true
+    }
+
+    /// The slab splice half shared by [`Self::try_composite_layer_into_scene_as_slab`]
+    /// and [`Self::try_composite_transform_only_move`]: record one span per
+    /// stretch of the layer's own primitives from `pack`, recursing into
+    /// nested layers between stretches.
+    ///
+    /// The pack was built at `origin` (record time for a clean composite, the
+    /// move for the transform-only path), so spans reference cached bytes
+    /// whose reference origin equals the origin they declare — the renderer
+    /// reads an unchanged token as Clean and uploads nothing. Everything the
+    /// spans carry besides bounds/key/token/origin is precomputed in the
+    /// pack; this loop only clones runs and Arcs.
+    fn emit_layer_slab_spans(
+        &mut self,
+        key: LayerKey,
+        frame: u64,
+        scale_factor: f32,
+        bounds: Bounds<ScaledPixels>,
+        origin: [f32; 2],
+        pack: &RecordedSlabPack,
+        texture: Option<crate::scene::LayerTextureTarget>,
+    ) -> bool {
+        let token = self.slab_tokens.get(&key).copied().unwrap_or(0);
+
+        self.next_frame.scene.begin_layer(key, bounds, false);
+        crate::render_stats::count("layer: composited (slab)");
+        for piece in &pack.pieces {
+            match piece {
+                SlabPackPiece::Stretch { runs, packed } => {
+                    self.next_frame.scene.push_layer_slab_span(
+                        bounds,
+                        key,
+                        token,
+                        origin,
+                        pack.totals,
+                        runs.clone(),
+                        Arc::clone(packed),
+                        texture.clone(),
+                    );
+                }
+                SlabPackPiece::Nested(nested) => {
+                    self.composite_nested_layer_for_slab(*nested, frame, scale_factor);
+                }
+            }
+        }
+        self.next_frame.scene.end_layer();
+        if let Some(layer) = self.layers.get_mut(&key) {
+            layer.last_visited = frame;
+        }
+        true
+    }
+
+    /// Bake a freshly-recorded texture-retained layer's content into the
+    /// renderer's persistent texture (#96).
+    ///
+    /// One span per stretch of the layer's own primitives, each carrying the
+    /// [`crate::scene::LayerTextureTarget`] that redirects the renderer into
+    /// the layer's texture. The pack was built at the texture origin, so the
+    /// spans draw in texture space with a zero transform translate. Called
+    /// only from the record path — the record frame's inline primitives are
+    /// the visible output; these spans are the texture's.
+    fn emit_layer_texture_render(&mut self, key: LayerKey, frame: u64) {
+        profiling::scope!("wgpui: layer texture render");
+        let scale_factor = self.scale_factor();
+        let Some((scaled_texture_bounds, origin, pack, target)) =
+            self.layers.get(&key).and_then(|layer| {
+                if !layer.texture_retained || !layer.has_content() {
+                    return None;
+                }
+                let pack = match &layer.packed {
+                    Some(Ok(pack)) => Arc::clone(pack),
+                    _ => return None,
+                };
+                let scaled_texture_bounds = layer.texture_bounds.scale(scale_factor);
+                let origin = [
+                    scaled_texture_bounds.origin.x.0,
+                    scaled_texture_bounds.origin.y.0,
+                ];
+                let target = crate::scene::LayerTextureTarget {
+                    layer_id: layer.id,
+                    key,
+                    content_token: self.slab_tokens.get(&key).copied().unwrap_or(0),
+                    texture_bounds: scaled_texture_bounds,
+                };
+                Some((scaled_texture_bounds, origin, pack, target))
+            })
+        else {
+            return;
+        };
+        crate::render_stats::count("layer: rasterized");
+        self.emit_layer_slab_spans(
+            key,
+            frame,
+            scale_factor,
+            scaled_texture_bounds,
+            origin,
+            &pack,
+            Some(target),
+        );
+    }
+
+    /// The #96 skip condition: composite a texture-retained layer with a
+    /// single surface draw.
+    ///
+    /// The surface samples the layer's persistent texture across its buffer
+    /// extent, shifted by the buffered element's [`Layer::content_offset`]
+    /// (zero for a still frame), and clips to the layer's visible rect —
+    /// margin content exists in the texture but never paints outside the
+    /// layer's own extent. Also moves [`Layer::transform`] by the same shift
+    /// so hit testing inverts into the coordinate space the recorded hitboxes
+    /// live in.
+    fn paint_layer_texture_surface(&mut self, key: LayerKey) {
+        let scale_factor = self.scale_factor();
+        let Some((layer_id, content_offset, texture_bounds, visible_bounds)) =
+            self.layers.get(&key).map(|layer| {
+                (
+                    layer.id,
+                    layer.content_offset,
+                    {
+                        let mut bounds = layer.texture_bounds;
+                        bounds.origin += layer.content_offset;
+                        bounds
+                    },
+                    layer
+                        .cache_key
+                        .bounds
+                        .intersect(&layer.cache_key.content_mask.bounds),
+                )
+            })
+        else {
+            return;
+        };
+        if let Some(layer) = self.layers.get_mut(&key) {
+            layer.transform = LayerTransform {
+                offset: layer.cache_key.bounds.origin + content_offset,
+            };
+        }
+
+        crate::render_stats::count("layer: composited (texture)");
+        use crate::{PaintSurface, scene::SurfaceContent};
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds: texture_bounds.scale(scale_factor),
+            content_mask: crate::ContentMask {
+                bounds: visible_bounds.scale(scale_factor),
+            },
+            content: SurfaceContent::Layer(layer_id),
+        });
+    }
+
+    /// Recurse into a nested layer from the slab path. The child decides its
+    /// own representation independently — slabbed children splice spans into
+    /// their own scope inside the parent's, legacy children replay inline.
+    fn composite_nested_layer_for_slab(&mut self, nested: LayerKey, frame: u64, scale_factor: f32) {
+        let exists = self
+            .layers
+            .get(&nested)
+            .is_some_and(|layer| layer.has_content());
+        if !exists {
+            crate::render_stats::count("layer: nested reference missing");
+            return;
+        }
+        if crate::scene_pack::slabs_enabled()
+            && !self.next_frame.scene.innermost_layer_is_recording()
+            && self.try_composite_layer_into_scene_as_slab(nested, frame, scale_factor)
+        {
+            return;
+        }
+        let scene = &mut self.next_frame.scene;
+        let layers = &mut self.layers;
+        composite_layer_legacy(scene, layers, nested, frame, scale_factor);
+    }
     /// Tint `bounds` by the layer's id, at full strength on a frame it
     /// re-rendered.
     ///
@@ -4629,14 +5548,17 @@ impl Window {
     /// [`Layer::instances`]): instances are owned by layers and die with them,
     /// via `Layer::drop_content` below.
     fn evict_stale_layers(&mut self) {
+        profiling::scope!("wgpui: evict_stale_layers");
         let frame = self.layer_frame;
         let mut dropped_content = 0usize;
         let mut dropped_records = 0usize;
+        let mut forgotten_keys: Vec<LayerKey> = Vec::new();
         self.layers.retain(|key, layer| {
             let age = frame.saturating_sub(layer.last_visited);
             let evict_after = layer.policy.evict_after_frames as u64;
             if age > evict_after.saturating_mul(2) {
                 dropped_records += 1;
+                forgotten_keys.push(*key);
                 log::trace!(
                     "layer {key:?} ({:?}) forgotten after {age} frames",
                     layer.id
@@ -4653,6 +5575,9 @@ impl Window {
             }
             true
         });
+        for key in &forgotten_keys {
+            self.slab_tokens.remove(key);
+        }
         for _ in 0..dropped_content + dropped_records {
             crate::render_stats::count("layer: evicted");
         }
@@ -5038,7 +5963,7 @@ impl Window {
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
                 pad: 0,
-                grayscale: false,
+                grayscale: 0,
                 bounds,
                 corner_radii: Default::default(),
                 content_mask,
@@ -5154,7 +6079,7 @@ impl Window {
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
-            grayscale,
+            grayscale: u32::from(grayscale),
             bounds: bounds
                 .map_origin(|origin| origin.floor())
                 .map_size(|size| size.ceil()),
@@ -5406,7 +6331,7 @@ impl Window {
         let mut bounds = bounds;
         let mut content_mask = self.content_mask();
         let layer = self.hitbox_layer_stack.last().copied();
-        if let Some((_, origin)) = layer {
+        if let Some((_, origin, _)) = layer {
             bounds.origin -= origin;
             content_mask.bounds.origin -= origin;
         }
@@ -5417,7 +6342,7 @@ impl Window {
             bounds,
             content_mask,
             behavior,
-            layer: layer.map(|(key, _)| key),
+            layer: layer.map(|(key, _, _)| key),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -5429,14 +6354,20 @@ impl Window {
     /// geometry must not: a later transform-only composite moves the pixels
     /// without re-running prepaint. Hit testing therefore maps the query point
     /// back into this coordinate space once per layer.
+    ///
+    /// `bounds` travels with the key so a buffered element prepainting inside
+    /// the layer (#96) can evaluate the same composite decision
+    /// [`Self::with_retained_layer`] will make at paint time — the prediction
+    /// and the decision must read the same fresh inputs or a skipped list
+    /// gets recorded empty.
     pub(crate) fn with_layer_hitbox_scope<R>(
         &mut self,
         key: LayerKey,
-        origin: Point<Pixels>,
+        bounds: Bounds<Pixels>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_prepaint();
-        self.hitbox_layer_stack.push((key, origin));
+        self.hitbox_layer_stack.push((key, bounds.origin, bounds));
         let result = f(self);
         self.hitbox_layer_stack.pop();
         result
@@ -5447,7 +6378,90 @@ impl Window {
     /// `with_layer_hitbox_scope` already keeps correctly scoped to exactly
     /// this — see that method's own doc comment.
     pub(crate) fn current_prepaint_layer(&self) -> Option<LayerKey> {
-        self.hitbox_layer_stack.last().map(|(key, _)| *key)
+        self.hitbox_layer_stack.last().map(|(key, _, _)| *key)
+    }
+
+    /// The overscroll buffer (#96) of the layer the subtree is currently being
+    /// prepainted inside, if that layer is texture-retained with a non-zero
+    /// margin and its texture actually covers the buffer.
+    ///
+    /// `will_composite` mirrors the composite decision
+    /// [`Self::with_retained_layer`] will make later this frame — both call
+    /// [`Self::layer_reuse_conditions`] with the same fresh inputs, so a
+    /// virtualized list can skip its per-item layout on frames the layer is
+    /// going to composite anyway without the prediction ever disagreeing with
+    /// the decision.
+    ///
+    /// `refilling` is true on the frame a `DISPLAY` invalidation will
+    /// re-record the layer: the element must paint its full buffer range and
+    /// re-anchor. `buffer_ready` is false until the first buffered record —
+    /// the texture then covers the viewport only, and the element should
+    /// request a refill rather than trust the margin.
+    pub(crate) fn prepaint_layer_buffer(&self) -> Option<PrepaintLayerBuffer> {
+        let (key, _, bounds) = self.hitbox_layer_stack.last().copied()?;
+        let layer = self.layers.get(&key)?;
+        let margin = layer.policy.overdraw_margin;
+        if margin == size(px(0.), px(0.)) || !layer.texture_retained {
+            return None;
+        }
+        let fresh_cache_key = LayerCacheKey {
+            bounds,
+            content_mask: self.content_mask(),
+            opacity: self.element_opacity,
+            scale_factor: self.scale_factor(),
+        };
+        let view_rebuilt =
+            layer.content_key.is_none() && self.dirty_views.contains(&self.current_view());
+        Some(PrepaintLayerBuffer {
+            key,
+            margin,
+            anchor: layer.buffer_anchor,
+            content_offset: layer.content_offset,
+            will_composite: self.layer_reuse_conditions(
+                layer,
+                layer.content_key,
+                /* mouse_inside */ false,
+                view_rebuilt,
+            ) && layer.cache_key == fresh_cache_key,
+            refilling: !layer.needs.is_empty(),
+            buffer_ready: layer.buffer_anchored,
+        })
+    }
+
+    /// Whether the named layer's `DISPLAY` invalidation will re-record it this
+    /// frame — the refill signal for a buffered element's prepaint.
+    pub(crate) fn layer_is_refilling(&self, key: LayerKey) -> bool {
+        self.layers
+            .get(&key)
+            .is_some_and(|layer| !layer.needs.is_empty())
+    }
+
+    /// Re-anchor a buffered layer's overscroll texture at `anchor` (the
+    /// element's scroll-space position the buffer was rendered at). Also marks
+    /// the buffer as anchored, the element's signal that the texture covers
+    /// the full margin.
+    pub(crate) fn set_layer_buffer_anchor(&mut self, key: LayerKey, anchor: Point<Pixels>) {
+        if let Some(layer) = self.layers.get_mut(&key) {
+            layer.buffer_anchor = anchor;
+            layer.buffer_anchored = true;
+        }
+    }
+
+    /// Record how far a buffered layer's content has scrolled since its
+    /// texture was rendered. The composite shifts by this much instead of
+    /// re-recording.
+    pub(crate) fn set_layer_content_offset(&mut self, key: LayerKey, offset: Point<Pixels>) {
+        if let Some(layer) = self.layers.get_mut(&key) {
+            layer.content_offset = offset;
+        }
+    }
+
+    /// Ask for a buffered layer to re-render its texture, re-centred on the
+    /// current scroll position. Applied like any layer invalidation: the next
+    /// draw answers it, which is why refills are requested at half margin —
+    /// the shift never outruns the texture while the refill is in flight.
+    pub(crate) fn request_layer_buffer_refill(&self, key: LayerKey) {
+        self.invalidator.invalidate_layer(key, Invalidation::DISPLAY);
     }
 
     // A paint-time counterpart (`current_paint_layer`, reading
@@ -9151,6 +10165,1490 @@ mod test {
     }
 
     // -------------------------------------------------------------------
+    // Transform-only composites (#94)
+    // -------------------------------------------------------------------
+
+    /// Serializes the stats-based test below against its own siblings. The
+    /// counter registry is process-global; only tests that trigger the
+    /// transform-only path bump its counter, and these tests are the only
+    /// ones that do.
+    static TRANSFORM_STATS_ORDERING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// A `.layer_keyed(..)` panel whose position and size are driven through
+    /// shared state, so a frame can move it through real layout while its
+    /// content key holds. This is the exact shape the transform-only
+    /// composite path exists for: a panel translated by its surroundings,
+    /// whose own subtree did not change.
+    ///
+    /// The interactive children exist so the layer carries real hitboxes —
+    /// a move must carry them along via [`LayerTransform`] — and so the
+    /// mouse-inside gate has something to be inside of.
+    struct MovableLayerView {
+        origin: std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+        extent: std::rc::Rc<std::cell::Cell<crate::Size<crate::Pixels>>>,
+        version: u64,
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for MovableLayerView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let origin = self.origin.get();
+            let extent = self.extent.get();
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer_keyed(self.version)
+                    // Away from the test platform's (0,0) mouse position: a
+                    // layer under the pointer always re-renders.
+                    .absolute()
+                    .left(origin.x)
+                    .top(origin.y)
+                    .w(extent.width)
+                    .h(extent.height)
+                    .bg(crate::red())
+                    .cursor_pointer()
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                paints.set(paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .w(px(50.))
+                        .h(px(50.)),
+                    )
+                    .child(
+                        crate::div()
+                            .w(px(10.))
+                            .h(px(10.))
+                            .on_mouse_down(crate::MouseButton::Left, |_, _, _| {}),
+                    ),
+            )
+        }
+    }
+
+    fn movable_layer_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        crate::WindowHandle<MovableLayerView>,
+        std::rc::Rc<std::cell::Cell<usize>>,
+        std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+        std::rc::Rc<std::cell::Cell<crate::Size<crate::Pixels>>>,
+    ) {
+        let origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(200.), px(200.))));
+        let extent = std::rc::Rc::new(std::cell::Cell::new(size(px(100.), px(100.))));
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let origin_for_view = origin.clone();
+        let extent_for_view = extent.clone();
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| MovableLayerView {
+                origin: origin_for_view,
+                extent: extent_for_view,
+                version: 0,
+                paints: paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        (window, paints, origin, extent)
+    }
+
+    /// Translate the panel through shared state and notify, the way an
+    /// ancestor-layout change would.
+    fn move_movable_layer(
+        window: &crate::WindowHandle<MovableLayerView>,
+        origin: &std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+        cx: &mut TestAppContext,
+        dx: f32,
+        dy: f32,
+    ) {
+        let old = origin.get();
+        origin.set(crate::Point::new(old.x + px(dx), old.y + px(dy)));
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+    }
+
+    /// `(content_token, totals, origin)` for every slab span of `key` in the
+    /// rendered frame. With slabs live, the token staying put while the
+    /// origin moves is precisely the contract the renderer side pins (see
+    /// slab_gpu's write-log tests and the GPU-tier transform readback):
+    /// Clean plan, zero instance bytes, one transform slot written.
+    fn slab_spans_for(
+        window: &Window,
+        key: crate::LayerKey,
+    ) -> Vec<(u64, [u32; crate::platform::cross::slab::SlabKind::COUNT], [f32; 2])> {
+        window
+            .rendered_frame
+            .scene
+            .layer_slab_spans
+            .iter()
+            .filter(|span| span.key == key)
+            .map(|span| (span.content_token, span.totals, span.origin))
+            .collect()
+    }
+
+    /// The #94 headline acceptance: translating a keyed layer whose content
+    /// did not change skips the re-record entirely. The retained packed bytes
+    /// are re-emitted under the SAME slab token at the NEW origin, which the
+    /// renderer resolves as Clean — zero instance bytes, one uniform slot —
+    /// and the following idle frame goes silent again.
+    #[gpui::test]
+    fn a_transform_only_move_skips_the_record_and_reemits_the_same_token(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() {
+            return;
+        }
+        let slabs = crate::scene_pack::slabs_enabled();
+        let (window, paints, origin, _) = movable_layer_window(cx);
+        let painted_once = paints.get();
+        assert_eq!(painted_once, 1, "the first frame renders the layer");
+
+        // Spans exist only from a layer's second frame on: the first one
+        // records, it does not composite yet.
+        clean_frame(cx, window.into());
+
+        let (key, scale_factor, first_span, first_token) = window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().expect("the layer was recorded");
+                (
+                    key,
+                    this.scale_factor(),
+                    slab_spans_for(this, key),
+                    this.slab_tokens.get(&key).copied(),
+                )
+            })
+            .unwrap();
+        if slabs {
+            assert!(
+                !first_span.is_empty(),
+                "the layer must composite as slab spans"
+            );
+        }
+        let expected_origin = |x: f32, y: f32| [x * scale_factor, y * scale_factor];
+
+        move_movable_layer(&window, &origin, cx, 40., 30.);
+
+        window
+            .update(cx, |_, this, _| {
+                let layer = &this.layers[&key];
+                assert_eq!(
+                    layer.cache_key.bounds.origin,
+                    crate::point(px(240.), px(230.)),
+                    "the layer's cache key must be re-stamped to the new position"
+                );
+                assert_eq!(
+                    layer.transform.offset,
+                    crate::point(px(240.), px(230.)),
+                    "hit-test inversion depends on the transform following the move"
+                );
+                if slabs {
+                    assert_eq!(
+                        slab_spans_for(this, key),
+                        vec![(
+                            first_span[0].0,
+                            first_span[0].1,
+                            expected_origin(240., 230.)
+                        )],
+                        "the moved frame must re-emit the SAME token and totals at \
+                         the NEW origin"
+                    );
+                    assert_eq!(
+                        this.slab_tokens.get(&key).copied(),
+                        first_token,
+                        "a transform-only move must not bump the slab token"
+                    );
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            paints.get(),
+            if slabs { painted_once } else { painted_once + 1 },
+            "with slabs live the move must not re-record; without them the old \
+             full-re-render behaviour stands"
+        );
+
+        // The frame after the move is an ordinary clean frame: nothing may
+        // regress back into re-recording, and nothing may move again.
+        clean_frame(cx, window.into());
+        window
+            .update(cx, |_, this, _| {
+                let layer = &this.layers[&key];
+                assert_eq!(layer.transform.offset, crate::point(px(240.), px(230.)));
+                if slabs {
+                    assert_eq!(
+                        slab_spans_for(this, key),
+                        vec![(
+                            first_span[0].0,
+                            first_span[0].1,
+                            expected_origin(240., 230.)
+                        )],
+                        "the idle frame must be byte-identical to the moved frame"
+                    );
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            paints.get(),
+            if slabs { painted_once } else { painted_once + 1 },
+            "the idle frame re-rendered the layer"
+        );
+    }
+
+    /// A transform-only move must take the layer's input geometry with it:
+    /// the hitboxes were registered relative to the layer's origin, and the
+    /// updated [`LayerTransform`] is what maps a world-space query back in.
+    /// A stale offset would leave clicks landing one move behind the pixels.
+    #[gpui::test]
+    fn a_transform_moved_layer_hit_tests_at_its_new_position(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let (window, paints, origin, _) = movable_layer_window(cx);
+        let painted_once = paints.get();
+
+        move_movable_layer(&window, &origin, cx, 40., 30.);
+        assert_eq!(
+            paints.get(),
+            if crate::scene_pack::slabs_enabled() {
+                painted_once
+            } else {
+                painted_once + 1
+            },
+            "setup: the move behaved unexpectedly"
+        );
+
+        window
+            .update(cx, |_, this, _| {
+                // The layer used to span (200..300); it now spans
+                // (240..340). Probe points that belong to exactly one of the
+                // two regions, since the move is smaller than the layer.
+                let at_new_only = this
+                    .rendered_frame
+                    .hit_test(crate::Point::new(px(330.), px(320.)), &this.layers);
+                assert!(
+                    !at_new_only.ids.is_empty(),
+                    "the layer's hitboxes must follow its transform-only move"
+                );
+                let at_old_only = this
+                    .rendered_frame
+                    .hit_test(crate::Point::new(px(205.), px(205.)), &this.layers);
+                assert!(
+                    at_old_only.ids.is_empty(),
+                    "the hitboxes must not remain at the layer's previous position"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Resizing is NOT a transform-only move: the packed instance bytes
+    /// describe the old extent, so the layer must go through a full
+    /// re-record — which also bumps its slab token, forcing the renderer to
+    /// upload the new geometry.
+    #[gpui::test]
+    fn a_resize_re_records_instead_of_taking_the_transform_path(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let slabs = crate::scene_pack::slabs_enabled();
+        let (window, paints, origin, extent) = movable_layer_window(cx);
+        let painted_once = paints.get();
+
+        move_movable_layer(&window, &origin, cx, 40., 30.);
+        let paints_after_move = paints.get();
+        assert_eq!(
+            paints_after_move,
+            if slabs { painted_once } else { painted_once + 1 },
+            "setup: the pure move behaved unexpectedly"
+        );
+
+        let (key, token_after_move) = window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().expect("the layer was recorded");
+                (key, this.slab_tokens.get(&key).copied())
+            })
+            .unwrap();
+
+        extent.set(size(px(140.), px(100.)));
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, this, _| {
+                let layer = &this.layers[&key];
+                assert_eq!(layer.cache_key.bounds.size.width, px(140.));
+                if slabs {
+                    assert_ne!(
+                        this.slab_tokens.get(&key).copied(),
+                        token_after_move,
+                        "a re-record must hand the renderer a fresh token"
+                    );
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            paints.get(),
+            paints_after_move + 1,
+            "the resize must re-record regardless of the kill-switch state"
+        );
+    }
+
+    /// Changing the layer's content key while it moves is the caller
+    /// withdrawing the claim the fast path rests on: full re-record.
+    #[gpui::test]
+    fn a_content_key_change_re_records_even_while_the_layer_moves(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let (window, paints, origin, _) = movable_layer_window(cx);
+        let painted_once = paints.get();
+
+        // Move AND change the key in the same frame: whatever the geometry
+        // did, the key change alone forbids reuse.
+        let old = origin.get();
+        origin.set(crate::Point::new(old.x + px(40.), old.y + px(30.)));
+        window
+            .update(cx, |view, _, cx| {
+                view.version += 1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            paints.get(),
+            painted_once + 1,
+            "a changed content key must force a re-record"
+        );
+    }
+
+    /// The documented conservatism carries over verbatim: a layer under the
+    /// pointer re-renders, because hover state is read during paint and
+    /// nothing invalidates for it.
+    #[gpui::test]
+    fn a_moved_layer_under_the_pointer_still_re_records(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let (window, paints, origin, _) = movable_layer_window(cx);
+        let painted_once = paints.get();
+
+        let old = origin.get();
+        origin.set(crate::Point::new(old.x + px(40.), old.y + px(30.)));
+        window
+            .update(cx, |_, this, cx| {
+                // The panel now sits at (240, 230)..(340, 330).
+                this.mouse_position = crate::Point::new(px(250.), px(240.));
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            paints.get(),
+            painted_once + 1,
+            "mouse-inside must fall back to the normal record path"
+        );
+        window
+            .update(cx, |_, this, _| {
+                let key = *this.layers.keys().next().expect("the layer was recorded");
+                assert!(
+                    this.layers[&key].had_mouse,
+                    "the re-record must stamp had_mouse like any other"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A layer carrying a backdrop filter poisons the pixels behind it and
+    /// cannot express its content as slab instances at all. It must never
+    /// take the fast path — the fallback is the ordinary re-record.
+    #[gpui::test]
+    fn a_backdrop_poisoned_layer_re_records_when_moved(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        struct PoisonedMovableLayer {
+            origin: std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+            paints: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl crate::Render for PoisonedMovableLayer {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let origin = self.origin.get();
+                let paints = self.paints.clone();
+                crate::div().size_full().child(
+                    crate::div()
+                        .id("frosted")
+                        .layer_keyed(0u64)
+                        .absolute()
+                        .left(origin.x)
+                        .top(origin.y)
+                        .w(px(100.))
+                        .h(px(100.))
+                        .bg(crate::red())
+                        .child(
+                            crate::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    paints.set(paints.get() + 1);
+                                    window.paint_quad(crate::fill(bounds, crate::blue()));
+                                },
+                            )
+                            .w(px(50.))
+                            .h(px(50.)),
+                        )
+                        .child(crate::div().w(px(60.)).h(px(60.)).backdrop_blur(px(4.))),
+                )
+            }
+        }
+
+        let origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(200.), px(200.))));
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let origin_for_view = origin.clone();
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| PoisonedMovableLayer {
+                origin: origin_for_view,
+                paints: paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let painted_once = paints.get();
+
+        // Note: the operative gate here is pack rejection — a BackdropFilter
+        // primitive has no slab kind, so `build_slab_segments` refuses the
+        // layer and the fast path declines. (The window-side poisoned_bounds
+        // bookkeeping is cleared at the end of every record, so it is not an
+        // observable here.)
+        let old = origin.get();
+        origin.set(crate::Point::new(old.x + px(40.), old.y + px(30.)));
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            paints.get(),
+            painted_once + 1,
+            "the poisoned layer must re-record instead of transforming"
+        );
+    }
+
+    /// A layer whose retained content includes nested layer references
+    /// declines the fast path: each nested layer's origin is refreshed only
+    /// by its own paint walk, which a composited parent skips, so splicing
+    /// them under a moved parent could draw them at their previous
+    /// positions. Ambiguity falls back to the record path.
+    #[gpui::test]
+    fn a_layer_with_nested_layers_re_records_when_moved(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        struct OuterWithNestedLayer {
+            origin: std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+            outer_paints: std::rc::Rc<std::cell::Cell<usize>>,
+            inner_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl crate::Render for OuterWithNestedLayer {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let origin = self.origin.get();
+                let outer_paints = self.outer_paints.clone();
+                let inner_paints = self.inner_paints.clone();
+                crate::div().size_full().child(
+                    crate::div()
+                        .id("outer")
+                        .layer_keyed(0u64)
+                        .absolute()
+                        .left(origin.x)
+                        .top(origin.y)
+                        .w(px(100.))
+                        .h(px(100.))
+                        .bg(crate::red())
+                        .child(
+                            crate::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    outer_paints.set(outer_paints.get() + 1);
+                                    window.paint_quad(crate::fill(bounds, crate::blue()));
+                                },
+                            )
+                            .w(px(20.))
+                            .h(px(20.)),
+                        )
+                        .child(
+                            crate::div()
+                                .id("inner")
+                                .layer()
+                                .absolute()
+                                .left(px(30.))
+                                .top(px(30.))
+                                .w(px(40.))
+                                .h(px(40.))
+                                .child(
+                                    crate::canvas(
+                                        |_, _, _| (),
+                                        move |bounds, _, window, _| {
+                                            inner_paints.set(inner_paints.get() + 1);
+                                            window.paint_quad(crate::fill(bounds, crate::green()));
+                                        },
+                                    )
+                                    .size_full(),
+                                ),
+                        ),
+                )
+            }
+        }
+
+        let origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(150.), px(150.))));
+        let outer_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let inner_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let origin_for_view = origin.clone();
+        let outer_paints_for_view = outer_paints.clone();
+        let inner_paints_for_view = inner_paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| OuterWithNestedLayer {
+                origin: origin_for_view,
+                outer_paints: outer_paints_for_view,
+                inner_paints: inner_paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let outer_once = outer_paints.get();
+        let inner_once = inner_paints.get();
+
+        let old = origin.get();
+        origin.set(crate::Point::new(old.x + px(40.), old.y + px(30.)));
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            outer_paints.get(),
+            outer_once + 1,
+            "the outer layer must decline the fast path and re-record"
+        );
+        assert_eq!(
+            inner_paints.get(),
+            inner_once + 1,
+            "re-recording the parent repaints the nested layer's subtree"
+        );
+    }
+
+    /// Occluder bookkeeping must follow a transform-only move. The moved
+    /// foreground's opaque coverage is recorded in window coordinates; if it
+    /// did not shift with the layer, the background would stay culled (or
+    /// deferred-dirty) against coverage at the foreground's OLD position.
+    #[gpui::test]
+    fn moving_a_transform_only_occluder_updates_what_it_covers(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let slabs = crate::scene_pack::slabs_enabled();
+        struct MovableOccluderView {
+            fg_origin: std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+            bg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+            fg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl crate::Render for MovableOccluderView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let fg_origin = self.fg_origin.get();
+                let bg_paints = self.bg_paints.clone();
+                let fg_paints = self.fg_paints.clone();
+                crate::div()
+                    .size_full()
+                    .child(
+                        crate::div()
+                            .id("bg")
+                            .layer_keyed(0u64)
+                            .absolute()
+                            .left(px(200.))
+                            .top(px(200.))
+                            .w(px(200.))
+                            .h(px(200.))
+                            .bg(crate::green())
+                            .child(crate::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    bg_paints.set(bg_paints.get() + 1);
+                                    window.paint_quad(crate::fill(bounds, crate::blue()));
+                                },
+                            )),
+                    )
+                    .child(
+                        crate::div()
+                            .id("fg")
+                            .layer_keyed(0u64)
+                            .absolute()
+                            .left(fg_origin.x)
+                            .top(fg_origin.y)
+                            .w(px(200.))
+                            .h(px(200.))
+                            .bg(crate::red())
+                            .child(crate::canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    fg_paints.set(fg_paints.get() + 1);
+                                    window.paint_quad(crate::fill(bounds, crate::blue()));
+                                },
+                            )),
+                    )
+            }
+        }
+
+        let fg_origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(200.), px(200.))));
+        let bg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fg_origin_for_view = fg_origin.clone();
+        let bg_paints_for_view = bg_paints.clone();
+        let fg_paints_for_view = fg_paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| MovableOccluderView {
+                fg_origin: fg_origin_for_view,
+                bg_paints: bg_paints_for_view,
+                fg_paints: fg_paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let bg_once = bg_paints.get();
+        let fg_once = fg_paints.get();
+
+        // Both layers fully overlap, so the foreground covers the
+        // background. Both are keyed, so view notifies never rebuild them:
+        // every transition below is driven by exactly one mechanism.
+        let move_fg = |window: &crate::WindowHandle<MovableOccluderView>,
+                       cx: &mut TestAppContext,
+                       dx: f32,
+                       dy: f32| {
+            let old = fg_origin.get();
+            fg_origin.set(crate::Point::new(old.x + px(dx), old.y + px(dy)));
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.run_until_parked();
+        };
+
+        // A first clean frame settles occlusion: the background is culled
+        // under the foreground's opaque region.
+        clean_frame(cx, window.into());
+
+        // Reveal: move the foreground off the background. The frame that
+        // moves the occluder still judges the background against its
+        // previous-frame coverage (paint order) — the documented cross-frame
+        // cost the record-path occluder tests also pin — so the reveal lands
+        // on the following clean frame, where the background must COMPOSITE
+        // (visited). Culling is what stale coverage would keep producing; it
+        // only stops if the foreground's opaque region moved away with it.
+        move_fg(&window, cx, 300., 300.);
+        assert_eq!(
+            fg_paints.get(),
+            if slabs { fg_once } else { fg_once + 1 },
+            "the foreground itself must not re-record when slabs are live"
+        );
+
+        clean_frame(cx, window.into());
+        let revealed = window
+            .update(cx, |_, this, _| {
+                let bg_key = this
+                    .layers
+                    .iter()
+                    .min_by_key(|(_, layer)| layer.id)
+                    .expect("both layers exist")
+                    .0;
+                (
+                    this.layers[&bg_key].last_visited == this.layer_frame,
+                    bg_paints.get(),
+                )
+            })
+            .unwrap();
+        assert!(
+            revealed.0,
+            "the background must stop being culled once the occluder's \
+             coverage has moved away with it"
+        );
+        assert_eq!(
+            revealed.1, bg_once,
+            "a revealed-and-clean background composites; it does not re-render"
+        );
+
+        // Cover again and invalidate ONLY the background: covered and dirty,
+        // it must go deferred-dirty rather than rebuild unseen.
+        move_fg(&window, cx, -300., -300.);
+        window
+            .update(cx, |_, this, _| {
+                let bg_key = this
+                    .layers
+                    .iter()
+                    .min_by_key(|(_, layer)| layer.id)
+                    .expect("both layers exist")
+                    .0;
+                this.invalidator
+                    .invalidate_layer(*bg_key, Invalidation::all());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |_, this, _| {
+                let bg_key = this
+                    .layers
+                    .iter()
+                    .min_by_key(|(_, layer)| layer.id)
+                    .expect("both layers exist")
+                    .0;
+                assert!(
+                    this.layers[&bg_key].deferred_dirty,
+                    "setup: the invalidated background must be deferred-dirty under \
+                     the covering foreground"
+                );
+            })
+            .unwrap();
+
+        // Reveal again. The deferred-dirty background may only rebuild once
+        // the moved coverage no longer hides it — the same shift-dependent
+        // decision, now through the deferred-dirty gate.
+        let bg_before_release = bg_paints.get();
+        move_fg(&window, cx, 300., 300.);
+        clean_frame(cx, window.into());
+
+        assert!(
+            bg_paints.get() > bg_before_release,
+            "the deferred-dirty background must rebuild once the moved \
+             coverage no longer hides it"
+        );
+        window
+            .update(cx, |_, this, _| {
+                let bg_key = this
+                    .layers
+                    .iter()
+                    .min_by_key(|(_, layer)| layer.id)
+                    .expect("both layers exist")
+                    .0;
+                assert!(
+                    !this.layers[&bg_key].deferred_dirty,
+                    "deferred_dirty must clear after the revealed rebuild"
+                );
+            })
+            .unwrap();
+    }
+    // -------------------------------------------------------------------
+    // Instance-tier occlusion culling (#95)
+    // -------------------------------------------------------------------
+
+    /// Quads of a layer's retained items whose background matches `color`.
+    fn quads_with_background(items: &[crate::layer::LayerItem], color: crate::Hsla) -> usize {
+        items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    crate::layer::LayerItem::Primitive(crate::scene::Primitive::Quad(quad))
+                        if quad.background.solid == color
+                )
+            })
+            .count()
+    }
+
+    /// A layer holding two canvases; an opaque sibling painted between them
+    /// fully covers the first and leaves the second alone.
+    struct CoveredInstanceView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for CoveredInstanceView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(200.))
+                    .h(px(200.))
+                    // The covered cullee.
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                paints.set(paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(0.))
+                        .w(px(40.))
+                        .h(px(40.)),
+                    )
+                    // Opaque sibling painted after it.
+                    .child(
+                        crate::div()
+                            .absolute()
+                            .left(px(0.))
+                            .top(px(0.))
+                            .w(px(60.))
+                            .h(px(60.))
+                            .bg(crate::red()),
+                    )
+                    // Control: same kind of content, outside the cover.
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                window.paint_quad(crate::fill(bounds, crate::green()));
+                            },
+                        )
+                        .absolute()
+                        .left(px(100.))
+                        .top(px(100.))
+                        .w(px(40.))
+                        .h(px(40.)),
+                    ),
+            )
+        }
+    }
+
+    /// Occluded instances inside a dirty layer emit no primitives on the next
+    /// record, and the reserved counter demonstrates it.
+    #[gpui::test]
+    fn occluded_instances_inside_a_dirty_layer_emit_no_primitives(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| CoveredInstanceView {
+                paints: paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let painted_once = paints.get();
+        assert_eq!(painted_once, 1, "setup: the canvas painted once");
+
+        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let counter = "occlusion: instances culled";
+        crate::render_stats::set_force_enabled(true);
+        let before = crate::render_stats::snapshot();
+        let before_culled = before.counters.get(counter).copied().unwrap_or(0);
+
+        // Dirty the layer without touching its content: the record runs again,
+        // and the sweep drops the covered canvas's quad.
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        let after = crate::render_stats::snapshot();
+        crate::render_stats::set_force_enabled(false);
+        let culled = after
+            .counters
+            .get(counter)
+            .copied()
+            .unwrap_or(0)
+            - before_culled;
+
+        assert_eq!(
+            paints.get(),
+            painted_once + 1,
+            "setup: the dirty layer re-rendered"
+        );
+        assert!(culled >= 1, "the sweep must report the covered instance");
+
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(window.layers.len(), 1, "setup: exactly one layer");
+                let layer = window.layers.values().next().expect("the layer exists");
+                assert_eq!(
+                    quads_with_background(&layer.items, crate::blue()),
+                    0,
+                    "the fully covered canvas must not emit"
+                );
+                assert!(
+                    quads_with_background(&layer.items, crate::red()) >= 1,
+                    "the occluder itself still emits"
+                );
+                assert!(
+                    quads_with_background(&layer.items, crate::green()) >= 1,
+                    "the uncovered control still emits"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A static bottom layer under an animating opaque top layer: the trap
+    /// this phase exists to avoid. The animation churns the TOP layer's slab
+    /// every frame while the bottom layer's bytes never move — it neither
+    /// re-renders nor repacks, so the renderer keeps judging its slab Clean
+    /// and uploads zero bytes for it (the CPU-decision half of `slab: bytes
+    /// uploaded`; the renderer-side half is pinned by slab_gpu's own tests).
+    ///
+    /// The two layers live under separate views: a notified view re-renders
+    /// every non-deferred layer beneath it, so sharing one view would make
+    /// the bottom layer re-record for reasons unrelated to occlusion.
+    struct TrapStaticBottomView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for TrapStaticBottomView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div()
+                .id("bottom")
+                .layer()
+                .absolute()
+                .left(px(150.))
+                .top(px(150.))
+                .w(px(300.))
+                .h(px(300.))
+                .bg(crate::green())
+                .child(crate::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        paints.set(paints.get() + 1);
+                        window.paint_quad(crate::fill(bounds, crate::blue()));
+                    },
+                ))
+        }
+    }
+
+    struct TrapAnimatedOccluderView {
+        origin: std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for TrapAnimatedOccluderView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let origin = self.origin.get();
+            let paints = self.paints.clone();
+            crate::div()
+                .id("top")
+                .layer()
+                .absolute()
+                .left(origin.x)
+                .top(origin.y)
+                .w(px(120.))
+                .h(px(120.))
+                .bg(crate::red())
+                .child(crate::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        paints.set(paints.get() + 1);
+                        window.paint_quad(crate::fill(bounds, crate::blue()));
+                    },
+                ))
+        }
+    }
+
+    struct TrapRootView {
+        bottom: crate::Entity<TrapStaticBottomView>,
+        occluder: crate::Entity<TrapAnimatedOccluderView>,
+    }
+
+    impl crate::Render for TrapRootView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div()
+                .size_full()
+                .child(self.bottom.clone())
+                .child(self.occluder.clone())
+        }
+    }
+
+    /// THE trap test: an occluder animating over a clean layer never forces
+    /// that layer's repack or upload, even though the covered regions shift
+    /// every frame.
+    #[gpui::test]
+    fn an_animated_occluder_never_churns_the_clean_layer_it_moves_over(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let bottom_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let top_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(160.), px(160.))));
+        let origin_for_view = origin.clone();
+        let bottom_paints_for_view = bottom_paints.clone();
+        let top_paints_for_view = top_paints.clone();
+
+        let occluder = cx.update(|cx| {
+            cx.new(|_| TrapAnimatedOccluderView {
+                origin: origin_for_view,
+                paints: top_paints_for_view,
+            })
+        });
+        let occluder_handle = occluder.clone();
+        let bottom = cx.update(|cx| {
+            cx.new(|_| TrapStaticBottomView {
+                paints: bottom_paints_for_view,
+            })
+        });
+        let window =
+            cx.open_window(size(px(800.), px(600.)), move |_, _| TrapRootView { bottom, occluder });
+        cx.run_until_parked();
+
+        // The bottom layer is the wider one (300px vs the 120px occluder).
+        fn read_bottom(
+            window: &crate::WindowHandle<TrapRootView>,
+            cx: &mut TestAppContext,
+        ) -> (u64, Option<u64>, usize, usize) {
+            window
+                .update(cx, |_, window, _| {
+                    let key = *window
+                        .layers
+                        .iter()
+                        .find(|(_, layer)| layer.cache_key.bounds.size.width == px(300.))
+                        .map(|(key, _)| key)
+                        .expect("the static bottom layer was recorded");
+                    let layer = &window.layers[&key];
+                    let pack_ptr = match &layer.packed {
+                        Some(Ok(pack)) => std::sync::Arc::as_ptr(pack) as *const () as usize,
+                        _ => 0,
+                    };
+                    (
+                        layer.last_visited,
+                        window.slab_tokens.get(&key).copied(),
+                        pack_ptr,
+                        layer.cache_key.bounds.size.width.0 as usize,
+                    )
+                })
+                .unwrap()
+        }
+
+        let bottom_painted_once = bottom_paints.get();
+        let top_painted_once = top_paints.get();
+        let (_, token_before, pack_before, _) = read_bottom(&window, cx);
+
+        for _round in 0..4 {
+            let old = origin.get();
+            origin.set(crate::Point::new(old.x + px(30.), old.y + px(20.)));
+            // Notify only the animating view: the bottom layer's owner stays
+            // clean, exactly like a real animation driving one subtree.
+            occluder_handle.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            assert_eq!(
+                bottom_paints.get(),
+                bottom_painted_once,
+                "the animated occluder must never force the clean layer to re-render"
+            );
+        }
+
+        let (_, token_after, pack_after, _) = read_bottom(&window, cx);
+        window
+            .update(cx, |_, window, _| {
+                let key = *window
+                    .layers
+                    .iter()
+                    .find(|(_, layer)| layer.cache_key.bounds.size.width == px(300.))
+                    .map(|(key, _)| key)
+                    .expect("the static bottom layer was recorded");
+                let layer = &window.layers[&key];
+                assert!(
+                    layer.needs.is_empty(),
+                    "the clean bottom layer must stay fully valid"
+                );
+                assert!(
+                    !layer.deferred_dirty,
+                    "partial coverage must not trigger the deferred-dirty path"
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            token_before, token_after,
+            "a stable token is what makes the renderer treat the bottom \
+             slab as Clean (zero uploads)"
+        );
+        if crate::scene_pack::slabs_enabled() {
+            assert_ne!(pack_before, 0, "the bottom layer must have packed");
+            assert_eq!(
+                pack_before, pack_after,
+                "the bottom layer's packed bytes were replaced: its slab would \
+                 have to re-upload"
+            );
+        }
+        assert_eq!(
+            top_paints.get(),
+            top_painted_once + 4,
+            "setup: the animating layer re-recorded every frame"
+        );
+    }
+
+    /// An instance culled while covered comes back exactly once when the
+    /// occluder moves away inside the same layer: the move dirties the layer
+    /// through ordinary element invalidation, one re-record recomputes the
+    /// sweep with fresh geometry, and the cullee's primitives are emitted
+    /// again — identical to what a full rebuild would have painted.
+    struct InstanceRevealView {
+        occluder_origin: std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for InstanceRevealView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let occluder_origin = self.occluder_origin.get();
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    .absolute()
+                    .left(px(150.))
+                    .top(px(150.))
+                    .w(px(300.))
+                    .h(px(300.))
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                paints.set(paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .absolute()
+                        .left(px(20.))
+                        .top(px(20.))
+                        .w(px(40.))
+                        .h(px(40.)),
+                    )
+                    .child(
+                        crate::div()
+                            .absolute()
+                            .left(occluder_origin.x)
+                            .top(occluder_origin.y)
+                            .w(px(80.))
+                            .h(px(80.))
+                            .bg(crate::red()),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn an_instance_culled_under_a_moving_occluder_comes_back_when_revealed(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(10.), px(10.))));
+        let origin_for_view = origin.clone();
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| InstanceRevealView {
+                occluder_origin: origin_for_view,
+                paints: paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+        let painted_once = paints.get();
+
+        fn blue_quads(window: &Window) -> usize {
+            window
+                .layers
+                .values()
+                .map(|layer| quads_with_background(&layer.items, crate::blue()))
+                .sum()
+        }
+
+        // Covered: the canvas quad is baked out of the retained record.
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(
+                    blue_quads(window),
+                    0,
+                    "setup: the covered cullee must be culled on record"
+                );
+            })
+            .unwrap();
+
+        // Move the occluder away inside the layer; ordinary invalidation
+        // re-records it once.
+        origin.set(crate::point(px(220.), px(220.)));
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            paints.get(),
+            painted_once + 1,
+            "the reveal must cost exactly one re-record"
+        );
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(
+                    blue_quads(window),
+                    1,
+                    "revealed: the previously culled instance emits again"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Visual occlusion is not hit occlusion (#95 §"Must not skip hit
+    /// registration"). Two identical buttons in one layer; an opaque sibling
+    /// fully covers the first (its primitives are culled) and leaves the
+    /// second alone. Hitboxes, listeners and dispatch nodes must behave
+    /// identically for both — the internal differential for the Phase 5
+    /// hit-test pattern, run with culling enabled.
+    ///
+    /// This is also the spec's explicit tab-panel case: a nested panel whose
+    /// sibling covers it emits nothing yet stays fully clickable while its
+    /// covering overlay carries no `BlockMouse`.
+    struct ClickableUnderOverlayView {
+        clicks_a: std::rc::Rc<std::cell::Cell<usize>>,
+        clicks_b: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for ClickableUnderOverlayView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let clicks_a = self.clicks_a.clone();
+            let clicks_b = self.clicks_b.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("panel")
+                    .layer()
+                    .absolute()
+                    .left(px(150.))
+                    .top(px(150.))
+                    .w(px(400.))
+                    .h(px(300.))
+                    // Button A sits under a deeply nested "tab panel".
+                    .child(
+                        crate::div()
+                            .absolute()
+                            .left(px(0.))
+                            .top(px(0.))
+                            .w(px(200.))
+                            .h(px(200.))
+                            .child(
+                                crate::div().child(
+                                    crate::div()
+                                        .id("button-a")
+                                        .absolute()
+                                        .left(px(20.))
+                                        .top(px(20.))
+                                        .w(px(60.))
+                                        .h(px(60.))
+                                        .bg(crate::red())
+                                        .on_mouse_down(crate::MouseButton::Left,
+                                            move |_, _, _| clicks_a.set(clicks_a.get() + 1)),
+                                ),
+                            ),
+                    )
+                    // Opaque overlay painted after A: covers it completely.
+                    .child(
+                        crate::div()
+                            .absolute()
+                            .left(px(0.))
+                            .top(px(0.))
+                            .w(px(200.))
+                            .h(px(200.))
+                            .bg(crate::blue()),
+                    )
+                    // Button B is never covered.
+                    .child(
+                        crate::div()
+                            .id("button-b")
+                            .absolute()
+                            .left(px(240.))
+                            .top(px(20.))
+                            .w(px(60.))
+                            .h(px(60.))
+                            .bg(crate::red())
+                            .on_mouse_down(crate::MouseButton::Left,
+                                move |_, _, _| clicks_b.set(clicks_b.get() + 1)),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn culling_leaves_hit_testing_and_clicks_identical(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let clicks_a = std::rc::Rc::new(std::cell::Cell::new(0));
+        let clicks_b = std::rc::Rc::new(std::cell::Cell::new(0));
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            {
+                let clicks_a = clicks_a.clone();
+                let clicks_b = clicks_b.clone();
+                move |_, _| ClickableUnderOverlayView { clicks_a, clicks_b }
+            },
+        );
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, _| {
+                // Both buttons are red; the covered one's quad must be gone,
+                // the uncovered one's must remain.
+                // Quads are recorded in scaled pixels; buttons sit at
+                // panel-local x 20 (covered) and 240 (control).
+                fn quads_at(window: &Window, window_x: f32) -> usize {
+                    let scale = window.scale_factor();
+                    let target = window_x * scale;
+                    window
+                        .layers
+                        .values()
+                        .map(|layer| {
+                            layer
+                                .items
+                                .iter()
+                                .filter(|item| {
+                                    matches!(
+                                        item,
+                                        crate::layer::LayerItem::Primitive(
+                                            crate::scene::Primitive::Quad(quad),
+                                        ) if quad.bounds.origin.x.0 == target
+                                    )
+                                })
+                                .count()
+                        })
+                        .sum::<usize>()
+                }
+                assert_eq!(
+                    quads_at(window, 170.),
+                    0,
+                    "setup: the covered button's quad is culled"
+                );
+                assert!(
+                    quads_at(window, 390.) >= 1,
+                    "setup: the uncovered control still emits"
+                );
+            })
+            .unwrap();
+
+        // Click the centers of both buttons: covered A at window (200, 200),
+        // uncovered B at (420, 200).
+        for position in [
+            crate::point(px(200.), px(200.)),
+            crate::point(px(420.), px(200.)),
+        ] {
+            window
+                .update(cx, |_, window, cx| {
+                    window.dispatch_event(
+                        crate::PlatformInput::MouseDown(crate::MouseDownEvent {
+                            button: crate::MouseButton::Left,
+                            position,
+                            modifiers: Default::default(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+        }
+        cx.run_until_parked();
+
+        assert_eq!(
+            clicks_a.get(),
+            1,
+            "the culled-but-not-blocked button must still receive the click"
+        );
+        assert_eq!(
+            clicks_b.get(),
+            1,
+            "the uncovered control must behave as always"
+        );
+
+        // The Phase 5 differential half: hitboxes stay registered for culled
+        // content at the same positions.
+        window
+            .update(cx, |_, window, _| {
+                let hit_over_culled = window.rendered_frame.hit_test(
+                    crate::point(px(200.), px(200.)),
+                    &window.layers,
+                );
+                let hit_over_control = window.rendered_frame.hit_test(
+                    crate::point(px(420.), px(200.)),
+                    &window.layers,
+                );
+                assert!(
+                    !hit_over_culled.ids.is_empty(),
+                    "culled content keeps its hitboxes"
+                );
+                assert!(
+                    !hit_over_control.ids.is_empty(),
+                    "setup: the control registers hitboxes"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The window-side half of the headline metric, counted: one move costs
+    /// exactly one fast-path composite, and the following idle frame costs
+    /// zero. The renderer-side half — zero instance bytes and exactly one
+    /// transform slot for that composite — is unreachable from window tests
+    /// (the test platform has no renderer) and is pinned by slab_gpu's
+    /// write-log tests plus the GPU-tier transform readback.
+    ///
+    /// `FORCE_ENABLED` is process-global and render_stats' own tests flip it
+    /// concurrently; an interleaving can silence our counters mid-frame
+    /// without anything being wrong. The structural half (the paint counter
+    /// above) proves the fast path ran, so only the counter read is retried.
+    #[gpui::test]
+    fn a_transform_only_move_counts_exactly_one_fast_path_hit(cx: &mut TestAppContext) {
+        if layers_off() || !crate::scene_pack::slabs_enabled() {
+            return;
+        }
+        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let hit_counter = "layer: composited (transform-only)";
+
+        for _attempt in 0..25 {
+            let (window, paints, origin, _) = movable_layer_window(cx);
+            let painted_once = paints.get();
+
+            crate::render_stats::set_force_enabled(true);
+            let before = crate::render_stats::snapshot();
+            let before_hits = before.counters.get(hit_counter).copied().unwrap_or(0);
+
+            move_movable_layer(&window, &origin, cx, 40., 30.);
+            clean_frame(cx, window.into());
+
+            let after = crate::render_stats::snapshot();
+            crate::render_stats::set_force_enabled(false);
+            let hits = after
+                .counters
+                .get(hit_counter)
+                .copied()
+                .unwrap_or(0)
+                - before_hits;
+
+            match paints.get() {
+                value if value == painted_once => {}
+                other => panic!(
+                    "the transform-only move fell back to re-recording \
+                     (paints {painted_once} -> {other})"
+                ),
+            }
+            if hits == 1 {
+                return;
+            }
+        }
+        panic!("the transform-only counter never recorded its single hit");
+    }
+
+    // -------------------------------------------------------------------
     // Element instances + reconciliation (#92)
     // -------------------------------------------------------------------
 
@@ -10058,8 +12556,25 @@ mod test {
         if layers_off() || occlusion_off() {
             return;
         }
-        let (window, bg_paints, fg_paints) =
-            two_layer_occlusion_window(cx, false, false, false);
+        // The foreground's position is driven through shared state so the move
+        // below goes through real layout. Editing the retained record directly
+        // (`layers[key].cache_key.bounds`) would change no painted geometry —
+        // that field is derived from layout on every re-render.
+        let fg_origin = std::rc::Rc::new(std::cell::Cell::new(crate::point(px(200.), px(200.))));
+        let bg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fg_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fg_origin_for_view = fg_origin.clone();
+        let bg_paints_for_view = bg_paints.clone();
+        let fg_paints_for_view = fg_paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| RevealedOcclusionView {
+                fg_origin: fg_origin_for_view,
+                bg_paints: bg_paints_for_view,
+                fg_paints: fg_paints_for_view,
+            },
+        );
+        cx.run_until_parked();
         let bg_painted_once = bg_paints.get();
         let fg_painted_once = fg_paints.get();
 
@@ -10071,10 +12586,13 @@ mod test {
         // The foreground is dirty and visible, so it re-renders.
         window
             .update(cx, |_, this, _| {
-                let mut keys: Vec<_> = this.layers.keys().copied().collect();
-                keys.sort();
-                let bg_key = keys[0];
-                let bg = this.layers.get(&bg_key).unwrap();
+                let bg_key = this
+                    .layers
+                    .iter()
+                    .min_by_key(|(_, layer)| layer.id)
+                    .expect("both layers exist")
+                    .0;
+                let bg = &this.layers[&bg_key];
                 assert!(
                     bg.deferred_dirty,
                     "the occluded layer must be marked deferred_dirty; has_content={}, opaque_bounds={:?}",
@@ -10095,42 +12613,103 @@ mod test {
             "the visible fg must re-render when notified"
         );
 
-        // Move the foreground layer to (400, 400) so it no longer covers the
-        // background at (200, 200). Notify the view — the bg should now be
-        // visible, so it re-renders and clears deferred_dirty.
-        window
-            .update(cx, |_, this, _| {
-                let mut keys: Vec<_> = this.layers.keys().copied().collect();
-                keys.sort();
-                let fg_key = keys[1];
-                let fg = this.layers.get_mut(&fg_key).unwrap();
-                fg.cache_key.bounds = crate::Bounds {
-                    origin: crate::point(px(400.), px(400.)),
-                    size: crate::size(px(100.), px(100.)),
-                };
-            })
-            .unwrap();
-        let new_bg_paints = bg_paints.get();
+        // Move the foreground to (400, 400) so it no longer covers the
+        // background at (200, 200), and notify.
+        fg_origin.set(crate::point(px(400.), px(400.)));
         window.update(cx, |_, _, cx| cx.notify()).unwrap();
         cx.run_until_parked();
 
-        // The background is no longer occluded and should re-render.
+        // The frame that moves the occluder still judges the background
+        // against the foreground's previous-frame opaque region: layers are
+        // visited in paint order, so the background decides before the
+        // foreground has re-recorded its new geometry. Staying culled for
+        // exactly that frame is the documented cost of cross-frame occluder
+        // data; the invariant is that the layer comes back (next frame).
+        assert_eq!(
+            bg_paints.get(),
+            bg_painted_once,
+            "the frame that moves the occluder still sees last frame's coverage"
+        );
+
+        clean_frame(cx, window.into());
+
         assert!(
-            bg_paints.get() > new_bg_paints,
-            "the bg must re-render when it becomes visible again"
+            bg_paints.get() > bg_painted_once,
+            "the bg must re-render once fresh occluder data shows it visible"
         );
         window
             .update(cx, |_, this, _| {
-                let mut keys: Vec<_> = this.layers.keys().copied().collect();
-                keys.sort();
-                let bg_key = keys[0];
-                let bg = this.layers.get(&bg_key).unwrap();
+                let bg_key = this
+                    .layers
+                    .iter()
+                    .min_by_key(|(_, layer)| layer.id)
+                    .expect("both layers exist")
+                    .0;
+                let bg = &this.layers[&bg_key];
                 assert!(
                     !bg.deferred_dirty,
                     "deferred_dirty must be cleared after re-rendering"
                 );
             })
             .unwrap();
+    }
+
+    /// A two-layer view whose foreground can be moved at runtime: a background
+    /// layer behind a fully-covering foreground layer, both with solid opaque
+    /// backgrounds.
+    struct RevealedOcclusionView {
+        fg_origin: std::rc::Rc<std::cell::Cell<crate::Point<crate::Pixels>>>,
+        bg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+        fg_paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for RevealedOcclusionView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let fg_origin = self.fg_origin.get();
+            let bg_paints = self.bg_paints.clone();
+            let fg_paints = self.fg_paints.clone();
+
+            crate::div().size_full().child(
+                crate::div()
+                    .id("bg")
+                    .layer()
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(200.))
+                    .h(px(200.))
+                    .bg(crate::green())
+                    .child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                bg_paints.set(bg_paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .w(px(10.))
+                        .h(px(10.)),
+                    ),
+            )
+            .child(
+                crate::div()
+                    .id("fg")
+                    .layer()
+                    .absolute()
+                    .left(fg_origin.x)
+                    .top(fg_origin.y)
+                    .w(px(200.))
+                    .h(px(200.))
+                    .bg(crate::red())
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            fg_paints.set(fg_paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )),
+            )
+        }
     }
 
     /// A backdrop filter poisons layers behind it — they must not be occluded.
@@ -10466,7 +13045,13 @@ mod test {
         }
     }
 
-    /// A zero-sized layer is always considered "covered" and culled.
+    /// A zero-sized layer is trivially "covered" (see `occlusion.rs`'s
+    /// zero-size rule) and emits nothing: every primitive it paints has empty
+    /// clipped bounds and is dropped by the scene, so the layer retains no
+    /// items and there is nothing to composite or cull. Its paint closures do
+    /// re-run on clean frames — the reuse paths are gated on `has_content`,
+    /// which stays false — but that re-recording is invisible work, not a
+    /// correctness hazard. What must hold is no crash and no scene output.
     #[gpui::test]
     fn occlusion_zero_sized_layer_is_always_covered(cx: &mut TestAppContext) {
         if layers_off() || occlusion_off() {
@@ -10482,11 +13067,43 @@ mod test {
         );
         cx.run_until_parked();
         let painted_once = paints.get();
+        assert_eq!(painted_once, 1, "the first frame runs the layer's paint");
 
-        clean_frame(cx, window.into());
+        window
+            .update(cx, |_, this, _| {
+                let key = *this
+                    .layers
+                    .keys()
+                    .next()
+                    .expect("the `.layer()` div created a layer");
+                assert!(
+                    !this.layers[&key].has_content(),
+                    "a zero-sized layer retains no items — the scene drops \
+                     primitives whose clipped bounds are empty"
+                );
+            })
+            .unwrap();
 
-        // Zero-sized layer content is culled but should not crash.
-        assert_eq!(paints.get(), painted_once);
+        let quads_after_first = quad_count(window.into(), cx);
+        for _ in 0..3 {
+            clean_frame(cx, window.into());
+        }
+        assert!(
+            paints.get() > painted_once,
+            "with nothing retained there is nothing to cull, so the layer's \
+             paint re-runs each clean frame"
+        );
+        assert_eq!(
+            quad_count(window.into(), cx),
+            quads_after_first,
+            "the zero-sized layer contributes no primitives to any frame"
+        );
+    }
+
+    fn quad_count(window: crate::AnyWindowHandle, cx: &mut TestAppContext) -> usize {
+        window
+            .update(cx, |_, this, _| this.rendered_frame.scene.quads.len())
+            .unwrap()
     }
 
     struct ZeroSizedLayerView {
@@ -10654,5 +13271,492 @@ mod test {
                     )),
             )
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Texture-retained layers and overscroll buffers (#96)
+    // -------------------------------------------------------------------
+
+    fn rasterization_off() -> bool {
+        !crate::layer::rasterization_enabled()
+    }
+
+    /// A layer holding three canvases; the rasterize threshold is shared so a
+    /// test can move it through the real render path.
+    struct RasterizedView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+        threshold: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for RasterizedView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("rasterized")
+                    .layer_with_policy(crate::LayerPolicy {
+                        rasterize_above: self.threshold.get(),
+                        ..Default::default()
+                    })
+                    // Away from the origin: the test platform's mouse sits at
+                    // (0,0), and a layer under the pointer always re-renders.
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(200.))
+                    .h(px(200.))
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            paints.set(paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .size(px(40.))
+                    .h(px(40.)))
+                    .child(
+                        crate::div()
+                            .size(px(20.))
+                            .h(px(20.))
+                            .absolute()
+                            .left(px(10.))
+                            .top(px(10.))
+                            .bg(crate::red()),
+                    )
+                    .child(
+                        crate::div()
+                            .size(px(20.))
+                            .h(px(20.))
+                            .absolute()
+                            .left(px(40.))
+                            .top(px(40.))
+                            .bg(crate::green()),
+                    ),
+            )
+        }
+    }
+
+    /// The #96 skip condition: a layer above `rasterize_above` bakes its
+    /// content into a texture at record time, and a clean frame composites it
+    /// with one `SurfaceContent::Layer` surface instead of slab spans.
+    #[gpui::test]
+    fn a_texture_retained_layer_composites_from_a_surface(cx: &mut TestAppContext) {
+        if layers_off() || rasterization_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let paints_for_view = paints.clone();
+        let threshold = std::rc::Rc::new(std::cell::Cell::new(2usize));
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| RasterizedView {
+                paints: paints_for_view,
+                threshold: threshold.clone(),
+            },
+        );
+        cx.run_until_parked();
+        assert_eq!(paints.get(), 1, "setup: the record frame painted inline");
+
+        window
+            .update(cx, |_, this, _| {
+                let layer = this.layers.values().next().expect("the layer exists");
+                let kinds: Vec<&'static str> = layer
+                    .items
+                    .iter()
+                    .map(|item| match item {
+                        crate::layer::LayerItem::Primitive(crate::scene::Primitive::Quad(_)) => {
+                            "quad"
+                        }
+                        crate::layer::LayerItem::Primitive(_) => "other",
+                        crate::layer::LayerItem::Nested(_) => "nested",
+                    })
+                    .collect();
+                assert!(
+                    layer.texture_retained,
+                    "three packable primitives exceed rasterize_above: 2 \
+                     (packed_ok={:?}, items={} {kinds:?}, nested={}, slabs={}, raster_env={})",
+                    layer.packed.as_ref().map(|packed| packed.is_ok()),
+                    layer.items.len(),
+                    layer
+                        .items
+                        .iter()
+                        .any(|item| matches!(item, crate::layer::LayerItem::Nested(_))),
+                    crate::scene_pack::slabs_enabled(),
+                    crate::layer::rasterization_enabled(),
+                );
+                assert_eq!(
+                    layer.texture_bounds, layer.cache_key.bounds,
+                    "no margin: the texture covers exactly the layer bounds"
+                );
+            })
+            .unwrap();
+
+        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let counter = "layer: rasterized";
+        crate::render_stats::set_force_enabled(true);
+        let before = crate::render_stats::snapshot();
+        let before_rasterized = before.counters.get(counter).copied().unwrap_or(0);
+
+        clean_frame(cx, window.into());
+
+        let after = crate::render_stats::snapshot();
+        crate::render_stats::set_force_enabled(false);
+
+        assert_eq!(
+            paints.get(),
+            1,
+            "the clean frame must composite instead of re-rendering"
+        );
+        assert_eq!(
+            after.counters.get(counter).copied().unwrap_or(0),
+            before_rasterized,
+            "a clean frame must not re-bake the texture"
+        );
+
+        window
+            .update(cx, |_, this, _| {
+                let scene = &this.rendered_frame.scene;
+                assert!(
+                    !scene.layer_slab_spans.is_empty()
+                        || scene
+                            .surfaces
+                            .iter()
+                            .any(|surface| matches!(surface.content, crate::scene::SurfaceContent::Layer(_))),
+                    "the composite frame must carry the layer surface"
+                );
+                let layer_surfaces = scene
+                    .surfaces
+                    .iter()
+                    .filter(|surface| {
+                        matches!(surface.content, crate::scene::SurfaceContent::Layer(_))
+                    })
+                    .count();
+                assert_eq!(
+                    layer_surfaces, 1,
+                    "the skip condition emits exactly one surface for the layer"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Below `rasterize_above` a layer stays primitive-retained: no texture
+    /// decision, composites as slab spans, no surfaces in the scene.
+    #[gpui::test]
+    fn a_small_layer_stays_primitive_retained(cx: &mut TestAppContext) {
+        if layers_off() || rasterization_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let paints_for_view = paints.clone();
+        let threshold = std::rc::Rc::new(std::cell::Cell::new(1000usize));
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| RasterizedView {
+                paints: paints_for_view,
+                threshold: threshold.clone(),
+            },
+        );
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, this, _| {
+                let layer = this.layers.values().next().expect("the layer exists");
+                assert!(
+                    !layer.texture_retained,
+                    "three primitives against rasterize_above: 1000 must stay \
+                     primitive-retained"
+                );
+            })
+            .unwrap();
+
+        clean_frame(cx, window.into());
+
+        window
+            .update(cx, |_, this, _| {
+                let layer_surfaces = this
+                    .rendered_frame
+                    .scene
+                    .surfaces
+                    .iter()
+                    .filter(|surface| {
+                        matches!(surface.content, crate::scene::SurfaceContent::Layer(_))
+                    })
+                    .count();
+                assert_eq!(
+                    layer_surfaces, 0,
+                    "a primitive-retained layer never composites through a surface"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A virtualized list inside an overscroll-buffer layer: scrolling within
+    /// half the margin shifts the composite without re-recording or laying
+    /// out items; scrolling past it refills exactly once.
+    struct BufferedListView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+        handle: crate::ScrollHandle,
+        controller: crate::VirtualListScrollController,
+    }
+
+    impl crate::Render for BufferedListView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            let heights: std::rc::Rc<Vec<crate::Pixels>> =
+                std::rc::Rc::new((0..100).map(|_| px(28.)).collect());
+            crate::div().size_full().child(
+                crate::div()
+                    .id("buffered-list")
+                    .layer_keyed("buffered-list-content")
+                    .layer_with_policy(crate::LayerPolicy {
+                        overdraw_margin: crate::size(px(0.), px(50.)),
+                        ..Default::default()
+                    })
+                    .size_full()
+                    .child(crate::vlist(
+                        cx.entity(),
+                        "buffered-vlist",
+                        heights,
+                        self.handle.clone(),
+                        self.controller.clone(),
+                        move |this: &mut Self, range: std::ops::Range<usize>, _, _| {
+                            this.paints.set(this.paints.get() + range.len());
+                            range
+                                .map(|ix| {
+                                    crate::div()
+                                        .w_full()
+                                        .h(px(28.))
+                                        .bg(crate::blue())
+                                        .child(format!("item {ix}"))
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    )),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn an_overscroll_buffer_shifts_without_rerecording_then_refills(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() || rasterization_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let handle = crate::ScrollHandle::new();
+        let controller = crate::VirtualListScrollController::new();
+        // Deterministic scroll positions: no smooth-scroll lag.
+        controller
+            .state
+            .borrow_mut()
+            .smooth_scroll
+            .set_mode(crate::SmoothScrollMode::Disabled);
+        let view = BufferedListView {
+            paints: paints.clone(),
+            handle: handle.clone(),
+            controller: controller.clone(),
+        };
+        let window = cx.open_window(size(px(400.), px(300.)), move |_, _| view);
+        cx.run_until_parked();
+
+        // Settle the buffer: frame 1 records (viewport range), the next frame
+        // notices the un-anchored buffer and requests a refill, and the refill
+        // frame re-renders covering viewport + margin.
+        clean_frame(cx, window.into());
+        clean_frame(cx, window.into());
+        clean_frame(cx, window.into());
+
+        let key = window
+            .update(cx, |_, this, _| {
+                let (key, layer) = this.layers.iter().next().expect("the layer exists");
+                assert!(layer.texture_retained, "a buffered layer rasterizes");
+                assert!(layer.buffer_anchored, "the refill anchored the buffer");
+                assert_eq!(
+                    layer.texture_bounds.size.height,
+                    px(300.) + px(50.) + px(50.),
+                    "the texture covers viewport + 2 × margin"
+                );
+                *key
+            })
+            .unwrap();
+
+        let paints_before_scroll = paints.get();
+        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let refill_counter = "scroll: buffer refills";
+        crate::render_stats::set_force_enabled(true);
+        let before = crate::render_stats::snapshot();
+        let before_refills = before.counters.get(refill_counter).copied().unwrap_or(0);
+
+        // A small scroll: within half the margin (25px), so the frame shifts
+        // the composite instead of re-recording, and no items are laid out.
+        window
+            .update(cx, |_, this, _| {
+                handle.set_offset(crate::Point::new(px(0.), px(-20.)));
+                this.refresh_buffers();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let after_shift = crate::render_stats::snapshot();
+        assert_eq!(
+            paints.get(),
+            paints_before_scroll,
+            "a buffered scroll frame must not lay out items"
+        );
+
+        window
+            .update(cx, |_, this, _| {
+                let layer = &this.layers[&key];
+                assert_eq!(
+                    layer.content_offset,
+                    crate::Point::new(px(0.), px(-20.)),
+                    "the shift is recorded as the content offset"
+                );
+                assert_eq!(
+                    layer.transform.offset,
+                    crate::Point::new(px(0.), px(0.) + px(-20.)),
+                    "the layer transform shifts with the content for hit testing"
+                );
+            })
+            .unwrap();
+
+        // Scrolling past half the margin requests a refill; the next frame
+        // re-renders the buffer and re-anchors at the new position. (The
+        // harness needs an explicit frame for it: in production the wheel
+        // listener's notify supplies the next frame.)
+        window
+            .update(cx, |_, this, _| {
+                handle.set_offset(crate::Point::new(px(0.), px(-60.)));
+                this.refresh_buffers();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        clean_frame(cx, window.into());
+
+        let after = crate::render_stats::snapshot();
+        crate::render_stats::set_force_enabled(false);
+
+        assert!(
+            paints.get() > paints_before_scroll,
+            "the refill frame lays out the buffer range"
+        );
+        assert_eq!(
+            after
+                .counters
+                .get(refill_counter)
+                .copied()
+                .unwrap_or(0)
+                - before_refills,
+            1,
+            "exactly one refill for one margin-crossing scroll"
+        );
+        window
+            .update(cx, |_, this, _| {
+                let layer = &this.layers[&key];
+                assert_eq!(
+                    layer.content_offset,
+                    crate::Point::default(),
+                    "the refill re-centres the buffer: no residual shift"
+                );
+                assert_eq!(layer.buffer_anchor.y, px(-60.));
+            })
+            .unwrap();
+    }
+
+    /// Overdraw regions are exempt from instance-tier occlusion culling
+    /// (#96): content in the margin band exists so a later scroll can reveal
+    /// it, so an occluder covering it must not suppress emission.
+    struct OverdrawOccludedView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for OverdrawOccludedView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("overdraw-occluded")
+                    .layer_with_policy(crate::LayerPolicy {
+                        overdraw_margin: crate::size(px(0.), px(50.)),
+                        rasterize_above: 2,
+                        ..Default::default()
+                    })
+                    .absolute()
+                    .left(px(100.))
+                    .top(px(100.))
+                    .w(px(200.))
+                    .h(px(200.))
+                    // The cullee: sits in the margin band above the layer.
+                    .child(crate::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            paints.set(paints.get() + 1);
+                            window.paint_quad(crate::fill(bounds, crate::blue()));
+                        },
+                    )
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(-30.))
+                    .w(px(40.))
+                    .h(px(40.)))
+                    // An opaque sibling covering the margin item's window
+                    // position exactly.
+                    .child(
+                        crate::div()
+                            .absolute()
+                            .left(px(0.))
+                            .top(px(-30.))
+                            .size(px(60.))
+                            .bg(crate::red()),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn overdraw_content_survives_instance_culling(cx: &mut TestAppContext) {
+        if layers_off() || rasterization_off() || occlusion_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let paints_for_view = paints.clone();
+        let window = cx.open_window(
+            size(px(800.), px(600.)),
+            move |_, _| OverdrawOccludedView {
+                paints: paints_for_view,
+            },
+        );
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, this, _| {
+                let layer = this.layers.values().next().expect("the layer exists");
+                let blue_quads = layer
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item,
+                            crate::layer::LayerItem::Primitive(
+                                crate::scene::Primitive::Quad(quad)
+                            ) if quad.background.solid == crate::blue()
+                        )
+                    })
+                    .count();
+                assert_eq!(
+                    blue_quads, 1,
+                    "the margin-band item must survive culling even under an \
+                     opaque sibling: a scroll can reveal it"
+                );
+                assert!(
+                    layer.texture_retained,
+                    "the buffered layer rasterizes regardless of the threshold"
+                );
+            })
+            .unwrap();
     }
 }

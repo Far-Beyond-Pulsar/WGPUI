@@ -39,11 +39,14 @@ mod key_dispatch;
 mod keymap;
 mod layer;
 mod path_builder;
+#[cfg(test)]
+mod perf_ab_tests;
 mod platform;
 pub mod prelude;
 mod queue;
 pub mod render_stats;
 mod scene;
+mod scene_pack;
 mod shared_string;
 mod shared_uri;
 mod style;

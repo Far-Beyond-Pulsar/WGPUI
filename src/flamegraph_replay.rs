@@ -1892,14 +1892,12 @@ mod tests {
 
     /// Builds the raw bytes for one `Quad` the exact same way
     /// `WgpuRenderer::draw` does when uploading `scene.quads` to the GPU
-    /// (`unsafe { as_bytes(&scene.quads) }`, `platform/cross/renderer.rs`) --
-    /// a raw `#[repr(C)]` reinterpret, not a `bytemuck` cast, mirroring the
-    /// production write path exactly so this test's captured bytes are
-    /// genuinely representative of what Phase 4 would have read back from a
-    /// live frame.
+    /// (`bytemuck::cast_slice(&scene.quads)`, `platform/cross/renderer.rs`),
+    /// mirroring the production write path exactly so this test's captured
+    /// bytes are genuinely representative of what Phase 4 would have read
+    /// back from a live frame.
     fn quad_bytes(quad: &crate::scene::Quad) -> Vec<u8> {
-        unsafe { std::slice::from_raw_parts(quad as *const crate::scene::Quad as *const u8, core::mem::size_of::<crate::scene::Quad>()) }
-            .to_vec()
+        bytemuck::cast_slice(std::slice::from_ref(quad)).to_vec()
     }
 
     /// End-to-end GPU replay test: builds one opaque red `Quad` covering the
@@ -2059,13 +2057,7 @@ mod tests {
             },
             transformation: crate::scene::TransformationMatrix::unit(),
         };
-        let sprite_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &sprite as *const crate::scene::MonochromeSprite as *const u8,
-                core::mem::size_of::<crate::scene::MonochromeSprite>(),
-            )
-        }
-        .to_vec();
+        let sprite_bytes = bytemuck::cast_slice(std::slice::from_ref(&sprite)).to_vec();
 
         let encoded_atlas_id = 0u64; // (Monochrome as u64) << 32 | index 0
         let capture = DeepCapture {
@@ -2143,7 +2135,7 @@ mod tests {
         let sprite = crate::scene::PolychromeSprite {
             order: 0,
             pad: 0,
-            grayscale: false,
+            grayscale: 0,
             opacity: 1.0,
             bounds,
             content_mask: crate::ContentMask { bounds },
@@ -2167,13 +2159,7 @@ mod tests {
                 },
             },
         };
-        let sprite_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &sprite as *const crate::scene::PolychromeSprite as *const u8,
-                core::mem::size_of::<crate::scene::PolychromeSprite>(),
-            )
-        }
-        .to_vec();
+        let sprite_bytes = bytemuck::cast_slice(std::slice::from_ref(&sprite)).to_vec();
 
         let encoded_atlas_id = 1u64 << 32; // (Polychrome as u64) << 32 | index 0
         let capture = DeepCapture {
@@ -2295,16 +2281,13 @@ mod tests {
     }
 
     /// Builds the raw bytes for one `Shadow` the exact same way
-    /// `WgpuRenderer::draw` uploads `scene.shadows` to the GPU -- a raw
-    /// `#[repr(C)]` reinterpret, mirroring [`quad_bytes`] above but for
-    /// `crate::scene::Shadow`, proving `render_shadows_step`'s "same recipe"
-    /// claim generalizes to a shader with a different (if structurally
+    /// `WgpuRenderer::draw` uploads `scene.shadows` to the GPU -- a
+    /// `bytemuck::cast_slice` reinterpret, mirroring [`quad_bytes`] above but
+    /// for `crate::scene::Shadow`, proving `render_shadows_step`'s "same
+    /// recipe" claim generalizes to a shader with a different (if structurally
     /// similar) storage-buffer struct.
     fn shadow_bytes(shadow: &crate::scene::Shadow) -> Vec<u8> {
-        unsafe {
-            std::slice::from_raw_parts(shadow as *const crate::scene::Shadow as *const u8, core::mem::size_of::<crate::scene::Shadow>())
-        }
-        .to_vec()
+        bytemuck::cast_slice(std::slice::from_ref(shadow)).to_vec()
     }
 
     /// End-to-end GPU replay test for `Shadows`, mirroring
