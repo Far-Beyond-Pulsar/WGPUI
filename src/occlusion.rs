@@ -27,7 +27,7 @@
 
 use crate::layer::LayerItem;
 use crate::scene::{Primitive, Quad};
-use crate::{BackgroundTag, BorderStyle, Bounds, Point, ScaledPixels};
+use crate::{BackgroundTag, BorderStyle, Bounds, Point, ScaledPixels, point};
 
 /// Whether layer-tier occlusion is enabled.
 pub(crate) fn enabled() -> bool {
@@ -306,14 +306,33 @@ fn intersects_any(bounds: &Bounds<ScaledPixels>, regions: &[Bounds<ScaledPixels>
 /// parent layer, so relying on them could bake a hole that no later record
 /// repairs.
 pub(crate) fn cull_covered_instances(items: Vec<LayerItem>) -> Vec<LayerItem> {
+    cull_covered_instances_with_overdraw(items, None)
+}
+
+/// [`cull_covered_instances`] for an overscroll-buffer layer (#96): content
+/// reaching into the margin band (`buffer` beyond `viewport`) is exempt from
+/// culling — it exists precisely so a later transform-only scroll can reveal
+/// it, and it never acts as an occluder either, keeping the pass conservative.
+pub(crate) fn cull_covered_instances_excluding_overdraw(
+    items: Vec<LayerItem>,
+    viewport: Bounds<ScaledPixels>,
+    buffer: Bounds<ScaledPixels>,
+) -> Vec<LayerItem> {
+    cull_covered_instances_with_overdraw(items, Some((viewport, buffer)))
+}
+
+fn cull_covered_instances_with_overdraw(
+    items: Vec<LayerItem>,
+    overdraw: Option<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
+) -> Vec<LayerItem> {
     if !enabled() {
         return items;
     }
 
-    let keep = compute_keep_mask(&items);
+    let keep = compute_keep_mask(&items, overdraw);
 
     if validate_enabled() {
-        let independent = compute_keep_mask_independently(&items);
+        let independent = compute_keep_mask_independently(&items, overdraw);
         for (index, (kept, independently_kept)) in
             keep.iter().zip(independent.iter()).enumerate()
         {
@@ -344,10 +363,34 @@ pub(crate) fn cull_covered_instances(items: Vec<LayerItem>) -> Vec<LayerItem> {
     kept_items
 }
 
+/// Whether one primitive's visible bounds reach into an overscroll buffer's
+/// margin band: outside the viewport, inside the buffer. Such content must be
+/// emitted whatever covers it today, because a scroll can reveal it tomorrow.
+fn in_overdraw_band(
+    visible: &Bounds<ScaledPixels>,
+    overdraw: &Option<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
+) -> bool {
+    let Some((viewport, buffer)) = overdraw else {
+        return false;
+    };
+    let clipped = visible.intersect(buffer);
+    let zero = ScaledPixels(0.0);
+    let intersects_buffer = clipped.size.width > zero && clipped.size.height > zero;
+    let inside_viewport = viewport.contains(&visible.origin)
+        && viewport.contains(&point(
+            visible.origin.x + visible.size.width,
+            visible.origin.y + visible.size.height,
+        ));
+    intersects_buffer && !inside_viewport
+}
+
 /// One backward sweep over the layer's own primitives, from topmost paint
 /// order down: every opaque quad met joins the running occluder set before
 /// anything beneath it is tested against it.
-fn compute_keep_mask(items: &[LayerItem]) -> Vec<bool> {
+fn compute_keep_mask(
+    items: &[LayerItem],
+    overdraw: Option<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
+) -> Vec<bool> {
     let mut keep = vec![true; items.len()];
     let mut occluders: Vec<Bounds<ScaledPixels>> = Vec::new();
     // Dilated bounds of backdrop filters and filter groups seen so far.
@@ -381,7 +424,9 @@ fn compute_keep_mask(items: &[LayerItem]) -> Vec<bool> {
         let Some(visible) = cullee_visible_bounds(primitive) else {
             continue;
         };
-        let protected = group_depth > 0 || intersects_any(&visible, &poisoned);
+        let protected = group_depth > 0
+            || intersects_any(&visible, &poisoned)
+            || in_overdraw_band(&visible, &overdraw);
         if !protected && fully_covered(visible, &occluders) {
             keep[index] = false;
         }
@@ -407,7 +452,10 @@ fn compute_keep_mask(items: &[LayerItem]) -> Vec<bool> {
 /// incremental sweep. Slow by design; validate mode only. Any disagreement
 /// between the two passes means the sweep's bookkeeping drifted, and is
 /// counted under `occlusion: validate divergences`.
-fn compute_keep_mask_independently(items: &[LayerItem]) -> Vec<bool> {
+fn compute_keep_mask_independently(
+    items: &[LayerItem],
+    overdraw: Option<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
+) -> Vec<bool> {
     /// Filter-group nesting depth at `through`, counting boundaries up to and
     /// including that position. A non-boundary primitive sits inside a group
     /// exactly when this is greater than zero.
@@ -455,8 +503,11 @@ fn compute_keep_mask_independently(items: &[LayerItem]) -> Vec<bool> {
         let Some(visible) = cullee_visible_bounds(primitive) else {
             continue;
         };
-        if protected_from_above(items, index, &visible) {
-            // Poisoned content always emits; no occluder set can change that.
+        if protected_from_above(items, index, &visible)
+            || in_overdraw_band(&visible, &overdraw)
+        {
+            // Poisoned and overdraw content always emits; no occluder set can
+            // change that.
             continue;
         }
 
@@ -469,11 +520,14 @@ fn compute_keep_mask_independently(items: &[LayerItem]) -> Vec<bool> {
                 continue;
             };
             // The probed quad joins the set on exactly the sweep's terms:
-            // a quad inside a group or beneath a poison zone never collects.
+            // a quad inside a group, beneath a poison zone, or reaching into
+            // an overdraw band never collects.
             let Some(probe_bounds) = cullee_visible_bounds(&Primitive::Quad(*quad)) else {
                 continue;
             };
-            if protected_from_above(items, probe_index, &probe_bounds) {
+            if protected_from_above(items, probe_index, &probe_bounds)
+                || in_overdraw_band(&probe_bounds, &overdraw)
+            {
                 continue;
             }
             occluders.push(region);
@@ -1066,8 +1120,8 @@ mod tests {
         ];
         for stream in &streams {
             assert_eq!(
-                compute_keep_mask(stream),
-                compute_keep_mask_independently(stream),
+                compute_keep_mask(stream, None),
+                compute_keep_mask_independently(stream, None),
                 "sweep and independent passes disagree on {} items",
                 stream.len()
             );
@@ -1150,3 +1204,4 @@ mod tests {
         assert_eq!(quad_opaque_region(&quad), None);
     }
 }
+

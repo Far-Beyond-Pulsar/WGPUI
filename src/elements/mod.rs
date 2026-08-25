@@ -7,6 +7,7 @@ mod h_list;
 mod image_cache;
 mod img;
 mod list;
+mod scroll_buffer;
 mod smooth_scroll;
 mod surface;
 mod svg;

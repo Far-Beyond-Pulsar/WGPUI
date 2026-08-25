@@ -1759,7 +1759,7 @@ impl Element for Div {
         };
 
         let hitbox = match layer_key {
-            Some(key) => window.with_layer_hitbox_scope(key, bounds.origin, prepaint),
+            Some(key) => window.with_layer_hitbox_scope(key, bounds, prepaint),
             None => prepaint(window),
         };
 
@@ -2537,21 +2537,37 @@ impl Interactivity {
                 }
 
                 window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
-                        style.overflow_mask(bounds, window.rem_size()),
-                        |window| {
-                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
-                            } else {
-                                None
-                            };
+                    // An overscroll-buffer layer (#96) widens its own overflow
+                    // clip by the policy margin, so content painted into the
+                    // buffer — a list's offscreen rows — survives to the
+                    // texture instead of being clipped at the viewport edge.
+                    // The composite clips back to the visible rect, so the
+                    // margin never paints outside the layer.
+                    let overflow_mask = style
+                        .overflow_mask(bounds, window.rem_size())
+                        .map(|mut mask| {
+                            if let Some(policy) = self.layer
+                                && policy.buffers_scroll()
+                            {
+                                mask.bounds = crate::layer::inflate_bounds(
+                                    mask.bounds,
+                                    policy.overdraw_margin,
+                                );
+                            }
+                            mask
+                        });
+                    window.with_content_mask(overflow_mask, |window| {
+                        let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                            Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                        } else {
+                            None
+                        };
 
-                            let scroll_offset =
-                                self.clamp_scroll_position(bounds, &style, window, cx);
-                            let result = f(&style, scroll_offset, hitbox, window, cx);
-                            (result, element_state)
-                        },
-                    )
+                        let scroll_offset =
+                            self.clamp_scroll_position(bounds, &style, window, cx);
+                        let result = f(&style, scroll_offset, hitbox, window, cx);
+                        (result, element_state)
+                    })
                 })
             },
         )

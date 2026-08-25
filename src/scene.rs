@@ -2,8 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, LayerKey,
-    Pixels, Point, Radians, ScaledPixels, Size, TextColor, bounds_tree::BoundsTree,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, LayerId,
+    LayerKey, Pixels, Point, Radians, ScaledPixels, Size, TextColor, bounds_tree::BoundsTree,
     layer::LayerItem, platform::cross::surface_registry::SurfaceId, point,
 };
 use std::{
@@ -465,6 +465,7 @@ impl Scene {
         totals: [u32; SlabKind::COUNT],
         runs: Vec<SlabRun>,
         packed: Arc<PackedLayer>,
+        texture: Option<LayerTextureTarget>,
     ) {
         let scope = self.active_scope();
         let local_order = self.scopes[scope].tree.insert_above_all(bounds);
@@ -476,6 +477,7 @@ impl Scene {
             totals,
             runs,
             packed,
+            texture,
             reservation_bounds: bounds,
             order_scope: scope,
             local_order,
@@ -1070,6 +1072,12 @@ pub(crate) struct LayerSlabSpan {
     pub runs: Vec<SlabRun>,
     /// This stretch's packed arrays — the upload source of truth.
     pub packed: Arc<PackedLayer>,
+    /// Set when this span renders into a texture-retained layer's persistent
+    /// texture (#96) instead of the framebuffer. The packed coordinates are
+    /// texture-relative (the pack was built at the texture origin), so the
+    /// renderer draws them with a zero transform translate through a viewport
+    /// remapped onto the texture.
+    pub texture: Option<LayerTextureTarget>,
     reservation_bounds: Bounds<ScaledPixels>,
     order_scope: usize,
     local_order: DrawOrder,
@@ -1727,6 +1735,29 @@ impl From<PolychromeSprite> for Primitive {
 pub(crate) enum SurfaceContent {
     /// A WGPU surface managed by the SurfaceRegistry.
     Wgpu(SurfaceId),
+    /// A texture-retained layer's persistent texture (#96). The renderer
+    /// samples it from its layer-texture cache; the surface's bounds select
+    /// the sub-rect (the texture covers the layer's buffer extent) and the
+    /// content mask clips to the layer's visible rect.
+    Layer(LayerId),
+}
+
+/// Renderer-side target carried by a texture-retained layer's slab spans
+/// (#96): the spans redirect into this layer's persistent texture instead of
+/// the framebuffer, and the following `PaintSurface` composites the result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LayerTextureTarget {
+    pub layer_id: LayerId,
+    /// The owning layer, so the renderer can request a re-record if it has to
+    /// drop the texture (resize, eviction).
+    pub key: LayerKey,
+    /// The content generation baked into the texture; matches the span's own
+    /// token, carried again here so the cache entry is self-describing.
+    pub content_token: u64,
+    /// The buffer extent in scaled window pixels. The texture is created at
+    /// exactly this size and the composite surface samples it across these
+    /// bounds.
+    pub texture_bounds: Bounds<ScaledPixels>,
 }
 
 #[derive(Clone, Debug)]
@@ -2675,7 +2706,7 @@ mod slab_splice_tests {
                 totals,
                 runs,
                 Arc::from(packed),
-            );
+            None,);
         }
         spliced.end_layer();
         spliced.insert_primitive(quad_marked(rect(300., 300., 200., 200.), 907));
@@ -2778,7 +2809,7 @@ mod slab_splice_tests {
                         totals,
                         runs,
                         Arc::from(packed),
-                    );
+                    None,);
                 }
                 crate::window::SlabSegment::Nested(key) => {
                     cursor += 1;
@@ -2858,7 +2889,7 @@ mod slab_splice_tests {
                 ],
                 runs,
                 Arc::from(packed),
-            );
+            None,);
         }
         recorded.end_layer();
         let end = recorded.len();
@@ -2907,3 +2938,4 @@ mod slab_splice_tests {
         assert!(build_slab_segments(&boundary_items, [0.; 2]).is_none());
     }
 }
+

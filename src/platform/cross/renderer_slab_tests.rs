@@ -812,7 +812,7 @@ fn build_frames(origin: (f32, f32), tile: AtlasTile) -> anyhow::Result<(Scene, S
         totals,
         runs,
         Arc::from(packed),
-    );
+    None,);
     spliced.end_layer();
     spliced.finish();
 
@@ -1050,7 +1050,7 @@ fn build_multi_span_frames(origin: (f32, f32)) -> anyhow::Result<(Scene, Scene)>
         totals_a,
         vec![crate::scene::SlabRun { kind: SlabKind::Quads, start: 0, count: mid, texture_id: None }],
         std::sync::Arc::from(head),
-    );
+    None,);
     spliced.push_layer_slab_span(
         panel_a,
         KEY_A,
@@ -1062,7 +1062,7 @@ fn build_multi_span_frames(origin: (f32, f32)) -> anyhow::Result<(Scene, Scene)>
             crate::scene::SlabRun { kind: SlabKind::Quads, start: mid + 2, count: 2, texture_id: None },
         ],
         std::sync::Arc::from(tail),
-    );
+    None,);
     spliced.end_layer();
     spliced.begin_layer(KEY_B, panel_b, false);
     spliced.push_layer_slab_span(
@@ -1078,7 +1078,7 @@ fn build_multi_span_frames(origin: (f32, f32)) -> anyhow::Result<(Scene, Scene)>
             texture_id: None,
         }],
         std::sync::Arc::from(packed_b),
-    );
+    None,);
     spliced.end_layer();
     spliced.finish();
 
@@ -1567,3 +1567,4 @@ fn cached_slab_groups_survive_clean_only_frames_and_invalidate_per_buffer() -> a
 
     Ok(())
 }
+
