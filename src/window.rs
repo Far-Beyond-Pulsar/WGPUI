@@ -617,13 +617,20 @@ pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
 
 /// RAII guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw operation.
 /// When dropped, restores the previous arena (supporting nested draws).
-pub(crate) struct ElementArenaScope {
+///
+/// `pub` (not `pub(crate)`) so that DLL-loaded plugin code — which links its
+/// own separate copy of this crate, and therefore has its own separate copy
+/// of the `CURRENT_ELEMENT_ARENA`/`ELEMENT_ARENA` thread-locals — can enter
+/// the *host's* already-correct scope using the `App` reference it's handed
+/// across the FFI boundary: `ElementArenaScope::enter(cx.element_arena())`.
+/// See `App::element_arena`'s doc comment for the full leak this closes.
+pub struct ElementArenaScope {
     previous: Option<*const RefCell<Arena>>,
 }
 
 impl ElementArenaScope {
     /// Enter a scope where element allocations use the given arena.
-    pub(crate) fn enter(arena: &RefCell<Arena>) -> Self {
+    pub fn enter(arena: &RefCell<Arena>) -> Self {
         let previous = CURRENT_ELEMENT_ARENA.with(|current| {
             let prev = current.get();
             current.set(Some(arena as *const RefCell<Arena>));
