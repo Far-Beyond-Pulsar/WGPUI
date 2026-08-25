@@ -1464,6 +1464,129 @@ mod tests {
         assert_eq!(packed.paths.len(), 2);
     }
 
+    /// Like `quad_marked`, but with an alpha-one solid background so the #95
+    /// instance sweep classifies it as an occluder.
+    fn opaque_quad_marked(bounds: Bounds<ScaledPixels>, marker: u32) -> Quad {
+        let mut quad = quad_marked(bounds, marker);
+        quad.background.solid.a = 1.;
+        quad
+    }
+
+    /// The #95 instance-tier sweep must leave packed arrays self-consistent:
+    /// dropping a covered path shifts every later path's dense id down, and
+    /// the vertex-stream runs must still address exactly what survives.
+    #[test]
+    fn instance_culling_keeps_path_ids_and_runs_consistent() {
+        let mut scene = Scene::default();
+        let cover = rect(0., 0., 100., 60.);
+        scene.begin_layer(LayerKey(1), rect(0., 0., 150., 150.), true);
+        scene.insert_primitive(path_marked(61, (0., 0.), 1)); // beneath the quad
+        scene.insert_primitive(opaque_quad_marked(cover, 62));
+        scene.insert_primitive(path_marked(63, (10., 10.), 2)); // above the quad
+        let items = scene.end_layer().unwrap();
+        scene.finish();
+
+        let kept = crate::occlusion::cull_covered_instances(items);
+        assert_eq!(kept.len(), 2, "the covered path must not survive the sweep");
+
+        let packed = unpack(pack_layer_items(&kept));
+        assert_eq!(packed.paths.len(), 1);
+        assert_eq!(
+            packed.paths[0].id,
+            PathId(0),
+            "the surviving path renumbers densely despite its recorded id"
+        );
+        assert_eq!(packed.paths[0].color.solid.h as u32, 63);
+        assert_eq!(
+            packed.total_path_vertices(),
+            6,
+            "only the surviving path's vertices remain"
+        );
+        assert_eq!(
+            packed.runs,
+            vec![
+                KindRun {
+                    kind: SlabKind::Quads,
+                    start: 0,
+                    count: 1,
+                    texture_id: None,
+                },
+                KindRun {
+                    kind: SlabKind::Paths,
+                    start: 0,
+                    count: 6,
+                    texture_id: None,
+                },
+            ],
+            "draw order (quad below, path above) survives the culling"
+        );
+    }
+
+    /// Packing the post-cull stream must equal the finished scene built from
+    /// exactly the kept primitives: the legacy oracle applied to the filtered
+    /// stream, entry for entry — the golden-model guarantee extended over the
+    /// cull (#95).
+    #[test]
+    fn packing_a_culled_stream_matches_the_oracle_for_its_kept_items() {
+        let mut scene = Scene::default();
+        let panel = rect(5., 5., 40., 40.);
+        scene.begin_layer(LayerKey(1), rect(0., 0., 200., 200.), true);
+        // Everything painted before the big opaque quad and fully inside it
+        // gets culled; everything after stays.
+        scene.insert_primitive(quad_marked(panel, 70));
+        scene.insert_primitive(underline_marked(panel, 71));
+        scene.insert_primitive(mono_sprite_marked(panel, 0, 1, 72));
+        scene.insert_primitive(poly_sprite_marked(panel, 0, 2, 73));
+        scene.insert_primitive(shadow_marked(panel, 74));
+        scene.insert_primitive(opaque_quad_marked(rect(0., 0., 100., 100.), 75));
+        scene.insert_primitive(underline_marked(rect(120., 120., 30., 10.), 76));
+        let items = scene.end_layer().unwrap();
+        scene.finish();
+
+        let kept = crate::occlusion::cull_covered_instances(items);
+        let kept_markers: Vec<u32> = kept
+            .iter()
+            .filter_map(|item| match item {
+                LayerItem::Primitive(Primitive::Quad(quad)) => {
+                    Some(vec![quad.corner_radii.top_left.0 as u32])
+                }
+                LayerItem::Primitive(Primitive::Underline(u)) => Some(vec![u.thickness.0 as u32]),
+                LayerItem::Primitive(Primitive::Shadow(s)) => {
+                    Some(vec![s.corner_radii.top_left.0 as u32])
+                }
+                LayerItem::Primitive(Primitive::MonochromeSprite(s)) => {
+                    Some(vec![s.text_color.solid.h as u32])
+                }
+                LayerItem::Primitive(Primitive::PolychromeSprite(s)) => {
+                    Some(vec![s.opacity as u32])
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            kept_markers,
+            vec![74, 75, 76],
+            "shadow survives (never culled), covered quad/underline/sprites go"
+        );
+
+        // Replay exactly the kept primitives into a fresh scene and use its
+        // finished batch stream as the oracle.
+        let mut reference = Scene::default();
+        reference.begin_layer(LayerKey(9), rect(0., 0., 200., 200.), true);
+        for item in &kept {
+            if let LayerItem::Primitive(primitive) = item {
+                reference.insert_primitive(primitive.clone());
+            }
+        }
+        reference.end_layer().unwrap();
+        reference.finish();
+
+        let oracle = oracle_stream(&reference, 70..80);
+        assert_eq!(oracle.len(), 3, "oracle sees exactly the kept primitives");
+        assert_packing_matches_oracle(&kept, &oracle);
+    }
+
     #[test]
     fn underline_runs_merge_adjacent_and_split_across_kinds() {
         let mut scene = Scene::default();

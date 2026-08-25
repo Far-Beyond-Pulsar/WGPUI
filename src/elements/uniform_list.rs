@@ -488,15 +488,48 @@ impl Element for UniformList {
 
                         visual_scroll_offset.y = scroll_state.smooth_scroll.current();
                     }
-                    let first_visible_element_ix =
-                        (-(visual_scroll_offset.y + padding.top) / item_height).floor() as usize;
-                    let last_visible_element_ix = ((-visual_scroll_offset.y
-                        + padded_bounds.size.height)
-                        / item_height)
-                        .ceil() as usize;
-
-                    let visible_range = first_visible_element_ix
-                        ..cmp::min(last_visible_element_ix, self.item_count);
+                    // Overscroll buffer (#96): same protocol as virtual_list —
+                    // skip per-item work when the enclosing texture-retained
+                    // layer composites shifted, and lay out the full buffer
+                    // range on a refill.
+                    let buffer_frame = super::scroll_buffer::prepare_scroll_buffer(
+                        window,
+                        point(Pixels::ZERO, visual_scroll_offset.y),
+                    );
+                    let (visible_range, buffer_mask) = match buffer_frame {
+                        super::scroll_buffer::ScrollBufferFrame::Skip => {
+                            return hitbox;
+                        }
+                        super::scroll_buffer::ScrollBufferFrame::Buffer { margin } => {
+                            let content_top = -visual_scroll_offset.y - padding.top;
+                            let first = ((content_top - margin.height) / item_height)
+                                .floor()
+                                .max(0.0) as usize;
+                            let last = (((content_top + padded_bounds.size.height
+                                + margin.height)
+                                / item_height)
+                                .ceil() as usize)
+                                .min(self.item_count);
+                            (
+                                first..last,
+                                Some(super::scroll_buffer::inflate_for_buffer(bounds, margin)),
+                            )
+                        }
+                        super::scroll_buffer::ScrollBufferFrame::Viewport => {
+                            let first_visible_element_ix =
+                                (-(visual_scroll_offset.y + padding.top) / item_height).floor()
+                                    as usize;
+                            let last_visible_element_ix = ((-visual_scroll_offset.y
+                                + padded_bounds.size.height)
+                                / item_height)
+                                .ceil() as usize;
+                            (
+                                first_visible_element_ix
+                                    ..cmp::min(last_visible_element_ix, self.item_count),
+                                None,
+                            )
+                        }
+                    };
 
                     let items = if y_flipped {
                         let flipped_range = self.item_count.saturating_sub(visible_range.end)
@@ -508,7 +541,11 @@ impl Element for UniformList {
                         (self.render_items)(visible_range.clone(), window, cx)
                     };
 
-                    let content_mask = ContentMask { bounds };
+                    let content_mask = buffer_mask
+                        .map(|mask_bounds| ContentMask {
+                            bounds: mask_bounds,
+                        })
+                        .unwrap_or(ContentMask { bounds });
                     window.with_content_mask(Some(content_mask), |window| {
                         for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
                             let item_origin = padded_bounds.origin

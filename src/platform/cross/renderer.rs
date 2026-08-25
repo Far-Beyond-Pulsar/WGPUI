@@ -2173,6 +2173,25 @@ struct SurfaceBoundsEntry {
 /// unisolated and unblurred, rather than allocating unbounded offscreen textures.
 const MAX_FILTER_DEPTH: usize = 4;
 
+/// How many frames a layer texture may go unreferenced before the cache
+/// drops it and posts a re-record request for its layer (#96). Generous, so
+/// a briefly-scrolled-away buffer never thrashes.
+const LAYER_TEXTURE_IDLE_FRAMES: u64 = 240;
+
+/// One texture-retained layer's persistent offscreen texture (#96).
+struct LayerTextureEntry {
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    /// The owning layer, for re-record requests when the entry dies.
+    key: crate::LayerKey,
+    /// The content generation baked in; compared against span tokens.
+    content_token: u64,
+    /// The buffer extent the texture was created at, in scaled window pixels.
+    texture_bounds: crate::Bounds<crate::ScaledPixels>,
+    last_used_frame: u64,
+}
+
 /// Allocates the pool of full-surface-sized offscreen textures that
 /// content-filter groups render into, one per supported nesting depth.
 fn create_filter_group_textures(
@@ -2252,6 +2271,13 @@ pub struct WgpuRenderer {
     slab_upload_scratch: Vec<u8>,
     /// Reusable storage for per-frame dirty transform drains.
     transform_scratch: Vec<(u32, GpuLayerTransform)>,
+    /// Persistent per-layer textures for texture-retained layers (#96),
+    /// keyed by dense [`crate::LayerId`]. Created on first use, sampled by the
+    /// surfaces pipeline on every clean composite frame, and dropped (with a
+    /// re-record request) on resize or idleness.
+    layer_textures: FxHashMap<crate::LayerId, LayerTextureEntry>,
+    /// Monotonic frame counter for `layer_textures` idle eviction.
+    layer_texture_frame: u64,
     // Last values pushed into the frame-constant uniform buffers, so an idle
     // window issues zero `write_buffer` calls at all.
     uploaded_globals: Option<GlobalParams>,
@@ -2461,6 +2487,8 @@ impl WgpuRenderer {
             slab_group_cache: SlabGroupCache::default(),
             slab_upload_scratch: Vec::new(),
             transform_scratch: Vec::new(),
+            layer_textures: FxHashMap::default(),
+            layer_texture_frame: 0,
             uploaded_globals: None,
             uploaded_color_adjustments: None,
             #[cfg(feature = "flamegraph")]
@@ -2537,6 +2565,88 @@ impl WgpuRenderer {
         }
     }
 
+    // -------------------------------------------------------------------
+    // Layer textures (#96).
+    // -------------------------------------------------------------------
+
+    /// Make sure a persistent texture exists for `target` at the right size,
+    /// creating (or recreating) it on first use and on resize. Returns the
+    /// pixel size, or `None` for a degenerate extent.
+    fn ensure_layer_texture(
+        &mut self,
+        target: &crate::scene::LayerTextureTarget,
+    ) -> Option<(u32, u32)> {
+        let width = target.texture_bounds.size.width.0.max(0.0).ceil() as u32;
+        let height = target.texture_bounds.size.height.0.max(0.0).ceil() as u32;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        if let Some(entry) = self.layer_textures.get(&target.layer_id) {
+            if entry.width == width && entry.height == height {
+                return Some((width, height));
+            }
+        }
+
+        let format = self.surface_configuration.format;
+        let texture = self.context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("layer_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        crate::render_stats::count("layer: texture allocated");
+        log::trace!(
+            "layer texture for {:?} (key {:?}) allocated at {width}x{height}",
+            target.layer_id,
+            target.key
+        );
+        // The view holds the texture alive; the texture handle itself is not
+        // needed again until a size change recreates both.
+        drop(texture);
+        self.layer_textures.insert(
+            target.layer_id,
+            LayerTextureEntry {
+                view,
+                width,
+                height,
+                key: target.key,
+                content_token: target.content_token,
+                texture_bounds: target.texture_bounds,
+                last_used_frame: self.layer_texture_frame,
+            },
+        );
+        Some((width, height))
+    }
+
+    /// Drop layer textures that went unreferenced for
+    /// [`LAYER_TEXTURE_IDLE_FRAMES`] frames, posting re-record requests so the
+    /// layers re-bake on their next composite instead of sampling a missing
+    /// texture.
+    fn gc_layer_textures(&mut self) {
+        let frame = self.layer_texture_frame;
+        let stale: Vec<crate::LayerId> = self
+            .layer_textures
+            .iter()
+            .filter(|(_, entry)| frame.saturating_sub(entry.last_used_frame) > LAYER_TEXTURE_IDLE_FRAMES)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some(entry) = self.layer_textures.remove(&id) {
+                log::trace!("layer texture for {id:?} (key {:?}) evicted idle", entry.key);
+                slab_gpu::request_rerecord([entry.key]);
+            }
+        }
+    }
+
     /// One sync decision per layer per frame. Clean layers cost zero
     /// `write_buffer`s; a dirty layer uploads exactly its own slab ranges.
     /// Runs before the render pass so the pass below only draws.
@@ -2565,7 +2675,18 @@ impl WgpuRenderer {
                     self.upload_layer_slab_bytes(scene, span.key);
                 }
             }
-            self.slab_registry.set_layer_translate(span.key, span.origin);
+            // A texture-retained layer's pack was built at the texture origin,
+            // so its spans draw in texture space with an identity translate
+            // (#96); everything else translates from layer-local to window.
+            if let Some(target) = &span.texture {
+                if self.ensure_layer_texture(target).is_none() {
+                    slab_gpu::request_rerecord([span.key]);
+                    continue;
+                }
+                self.slab_registry.set_layer_translate(span.key, [0.0, 0.0]);
+            } else {
+                self.slab_registry.set_layer_translate(span.key, span.origin);
+            }
 
             if let Some(pages) = pages_by_layer.get(&span.key) {
                 self.slab_registry.note_referenced_pages(span.key, pages.iter().copied());
@@ -2723,6 +2844,61 @@ impl WgpuRenderer {
         }
     }
 
+    /// Draw one texture-retained layer's span runs into the CURRENT pass —
+    /// the layer-texture pass the caller set up (#96). No cross-run merging:
+    /// a texture bake is a refill-frame path, and the pass is torn down right
+    /// after.
+    fn draw_texture_span_runs(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        span: &crate::scene::LayerSlabSpan,
+        groups: &SlabDrawGroups,
+        transform_slot_stride: u64,
+        state: &mut PassBindState,
+    ) {
+        if self.slab_registry.is_awaiting_rerecord(span.key) {
+            self.slab_registry.note_span_skipped_awaiting_rerecord();
+            return;
+        }
+        let Some(slabs) = self.slab_registry.entry_slabs(span.key) else {
+            slab_gpu::report_missing_slab_state(span.key);
+            return;
+        };
+        let Some(transform_slot) = self.slab_registry.transform_slot(span.key) else {
+            slab_gpu::report_missing_slab_state(span.key);
+            return;
+        };
+        for run in &span.runs {
+            if let Some(texture_id) = run.texture_id {
+                let key = (texture_id.index, texture_id.kind);
+                if !groups.sprite_textures.contains_key(&key) {
+                    // The atlas page died between resolution and draw; treat
+                    // it exactly like eviction poisoning.
+                    slab_gpu::request_rerecord([span.key]);
+                    self.slab_registry.note_span_skipped_awaiting_rerecord();
+                    return;
+                }
+            }
+            let mut one = Some(OpenSlabRun {
+                key: span.key,
+                slabs,
+                transform_slot,
+                kind: run.kind,
+                texture_id: run.texture_id,
+                start: run.start,
+                count: run.count,
+            });
+            flush_open_slab_run(
+                &self.pipelines,
+                transform_slot_stride,
+                pass,
+                groups,
+                state,
+                &mut one,
+            );
+        }
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
         profiling::scope!("wgpui: renderer draw");
         log::trace!("Renderer::draw: starting frame");
@@ -2804,6 +2980,11 @@ impl WgpuRenderer {
         }
         self.slab_registry.begin_frame();
         self.ensure_slab_buffer_capacities();
+        // Layer-texture upkeep (#96): age the frame counter, drop entries that
+        // have gone unreferenced too long (posting re-record requests), so an
+        // evicted buffer's texture does not hold VRAM forever.
+        self.layer_texture_frame += 1;
+        self.gc_layer_textures();
         // Advisory compaction, gated three ways (all scheduling, never
         // correctness): kill switch, utilization heuristic, and — since the
         // arenas never shrink and GC keeps utilization low regardless — a
@@ -3280,6 +3461,10 @@ impl WgpuRenderer {
             let mut pass_state = PassBindState::default();
             let mut open_slab_run: Option<OpenSlabRun> = None;
 
+            // Layer textures (#96) already cleared this frame: the first span
+            // of a layer clears its texture, later spans load and accumulate.
+            let mut layer_textures_cleared: FxHashSet<crate::LayerId> = FxHashSet::default();
+
             for frame_batch in scene.frame_batches() {
                 let batch = match frame_batch {
                     crate::scene::SceneBatch::Primitives(batch) => {
@@ -3303,6 +3488,183 @@ impl WgpuRenderer {
                         batch
                     }
                     crate::scene::SceneBatch::LayerSlab(span_index) => {
+                        let texture_target = scene
+                            .layer_slab_spans
+                            .get(span_index)
+                            .and_then(|span| span.texture.clone());
+                        if let Some(target) = texture_target {
+                            // #96: this span bakes a texture-retained layer's
+                            // content into its persistent texture. Flush the
+                            // main pass's open run, redirect into the layer
+                            // texture, then resume the main pass untouched.
+                            if let Some(groups) = slab_groups.as_ref() {
+                                flush_open_slab_run(
+                                    &self.pipelines,
+                                    transform_slot_stride,
+                                    &mut pass,
+                                    groups,
+                                    &mut pass_state,
+                                    &mut open_slab_run,
+                                );
+                            }
+                            drop(pass);
+
+                            // `resolve_slab_spans` already created the texture
+                            // (and posted a re-record if it could not); this
+                            // loop holds immutable buffer locks, so it only
+                            // reads the cache here.
+                            let texture_ready = {
+                                let width = target.texture_bounds.size.width.0.max(0.0).ceil() as u32;
+                                let height =
+                                    target.texture_bounds.size.height.0.max(0.0).ceil() as u32;
+                                self.layer_textures.get(&target.layer_id).is_some_and(|entry| {
+                                    entry.width == width && entry.height == height
+                                })
+                            };
+                            if !texture_ready {
+                                pass = command_encoder.begin_render_pass(
+                                    &wgpu::RenderPassDescriptor {
+                                        label: Some("main"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: self
+                                                    .persistent_framebuffer_view
+                                                    .as_ref()
+                                                    .expect("framebuffer exists during draw"),
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Load,
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                                resolve_target: None,
+                                                depth_slice: None,
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        #[cfg(feature = "flamegraph")]
+                                        timestamp_writes: None,
+                                        #[cfg(not(feature = "flamegraph"))]
+                                        timestamp_writes: None,
+                                        occlusion_query_set: None,
+                                        multiview_mask: None,
+                                    },
+                                );
+                                #[cfg(feature = "flamegraph")]
+                                {
+                                    current_pass_label = "main";
+                                }
+                                pass_state.reset();
+                                continue;
+                            }
+                            let texture_view = self.layer_textures[&target.layer_id].view.clone();
+                            if let Some(entry) = self.layer_textures.get_mut(&target.layer_id) {
+                                entry.last_used_frame = self.layer_texture_frame;
+                                entry.content_token = target.content_token;
+                            }
+                            let clear = layer_textures_cleared.insert(target.layer_id);
+
+                            #[cfg(feature = "flamegraph")]
+                            let flamegraph_layer_texture_pass = self.reserve_gpu_timestamps(
+                                crate::SpanName::Static("layer_texture"),
+                                crate::GpuPassKind::FilterGroup,
+                            );
+                            pass = command_encoder.begin_render_pass(
+                                &wgpu::RenderPassDescriptor {
+                                    label: Some("layer_texture"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: &texture_view,
+                                        ops: wgpu::Operations {
+                                            load: if clear {
+                                                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                                            } else {
+                                                wgpu::LoadOp::Load
+                                            },
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        resolve_target: None,
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    #[cfg(feature = "flamegraph")]
+                                    timestamp_writes: flamegraph_layer_texture_pass
+                                        .as_ref()
+                                        .map(|reserved| reserved.writes()),
+                                    #[cfg(not(feature = "flamegraph"))]
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                },
+                            );
+                            #[cfg(feature = "flamegraph")]
+                            {
+                                current_pass_label = "layer_texture";
+                            }
+                            pass_state.reset();
+
+                            // The packed coordinates are texture-relative, but
+                            // every slab vertex shader maps window pixels
+                            // through NDC using the window size. A viewport
+                            // whose affine maps window space onto the texture
+                            // (origin at -texture_origin, size = window) makes
+                            // the existing pipelines draw texture-space
+                            // geometry exactly where the texture lives — no
+                            // shader variants needed.
+                            let viewport_size = self.surface_configuration.width as f32;
+                            let viewport_height = self.surface_configuration.height as f32;
+                            pass.set_viewport(
+                                -target.texture_bounds.origin.x.0,
+                                -target.texture_bounds.origin.y.0,
+                                viewport_size,
+                                viewport_height,
+                                0.0,
+                                1.0,
+                            );
+                            pass.set_scissor_rect(0, 0, target.texture_bounds.size.width.0.ceil() as u32, target.texture_bounds.size.height.0.ceil() as u32);
+
+                            if let Some(groups) = slab_groups.as_ref() {
+                                if let Some(span) = scene.layer_slab_spans.get(span_index) {
+                                    self.draw_texture_span_runs(
+                                        &mut pass,
+                                        span,
+                                        groups,
+                                        transform_slot_stride,
+                                        &mut pass_state,
+                                    );
+                                }
+                            }
+
+                            // Resume the main pass where the redirect left it.
+                            drop(pass);
+                            pass = command_encoder.begin_render_pass(
+                                &wgpu::RenderPassDescriptor {
+                                    label: Some("main"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: self
+                                            .persistent_framebuffer_view
+                                            .as_ref()
+                                            .expect("framebuffer exists during draw"),
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        resolve_target: None,
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    #[cfg(feature = "flamegraph")]
+                                    timestamp_writes: None,
+                                    #[cfg(not(feature = "flamegraph"))]
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                },
+                            );
+                            #[cfg(feature = "flamegraph")]
+                            {
+                                current_pass_label = "main";
+                            }
+                            pass_state.reset();
+                            continue;
+                        }
                         if let Some(groups) = slab_groups.as_ref() {
                             self.draw_layer_slab_span(
                                 &mut pass,
@@ -3933,6 +4295,97 @@ impl WgpuRenderer {
 
                                     seen_surfaces.push(*surface_id);
                                 }
+                            } else if let crate::SurfaceContent::Layer(layer_id) = &surface.content
+                            {
+                                // #96: composite a texture-retained layer's
+                                // persistent texture. The surface's bounds are
+                                // the buffer extent (shifted by the buffered
+                                // element's scroll); the content mask clips to
+                                // the layer's visible rect, so margin content
+                                // never paints outside the layer.
+                                let Some(entry) = self.layer_textures.get_mut(layer_id) else {
+                                    log::trace!(
+                                        "layer texture for {layer_id:?} missing at composite; \
+                                         waiting for the posted re-record"
+                                    );
+                                    continue;
+                                };
+                                entry.last_used_frame = self.layer_texture_frame;
+                                let view = entry.view.clone();
+
+                                let params = SurfaceParams {
+                                    bounds: Bounds {
+                                        origin: [
+                                            surface.bounds.origin.x.0,
+                                            surface.bounds.origin.y.0,
+                                        ],
+                                        size: [
+                                            surface.bounds.size.width.0,
+                                            surface.bounds.size.height.0,
+                                        ],
+                                    },
+                                    content_mask: Bounds {
+                                        origin: [
+                                            surface.content_mask.bounds.origin.x.0,
+                                            surface.content_mask.bounds.origin.y.0,
+                                        ],
+                                        size: [
+                                            surface.content_mask.bounds.size.width.0,
+                                            surface.content_mask.bounds.size.height.0,
+                                        ],
+                                    },
+                                };
+
+                                let params_buffer = self.context.device.create_buffer_init(
+                                    &wgpu::util::BufferInitDescriptor {
+                                        label: Some("layer_surface_params_buffer"),
+                                        contents: bytemuck::bytes_of(&params),
+                                        usage: wgpu::BufferUsages::UNIFORM,
+                                    },
+                                );
+
+                                let surface_bind_group = self.context.device.create_bind_group(
+                                    &wgpu::BindGroupDescriptor {
+                                        label: Some("layer_surface_bind_group"),
+                                        layout: &self.pipelines.surfaces_bind_group_layout,
+                                        entries: &[
+                                            wgpu::BindGroupEntry {
+                                                binding: 0,
+                                                resource: wgpu::BindingResource::Buffer(
+                                                    wgpu::BufferBinding {
+                                                        buffer: &params_buffer,
+                                                        offset: 0,
+                                                        size: None,
+                                                    },
+                                                ),
+                                            },
+                                            wgpu::BindGroupEntry {
+                                                binding: 1,
+                                                resource: wgpu::BindingResource::TextureView(
+                                                    &view,
+                                                ),
+                                            },
+                                            wgpu::BindGroupEntry {
+                                                binding: 2,
+                                                resource: wgpu::BindingResource::Sampler(
+                                                    &self.surface_sampler,
+                                                ),
+                                            },
+                                        ],
+                                    },
+                                );
+
+                                pass.set_pipeline(&self.pipelines.surfaces_pipeline);
+                                pass.set_bind_group(0, &self.pipelines.globals_bind_group, &[]);
+                                pass.set_bind_group(1, &surface_bind_group, &[]);
+                                pass.draw(0..4, 0..1);
+                                pass_state.reset();
+                                #[cfg(feature = "flamegraph")]
+                                crate::record_draw_call(crate::DrawCallKind::Surfaces, 1);
+
+                                // Keep the view alive until after the render pass ends.
+                                surface_views.push(view);
+                                surface_param_buffers.push(params_buffer);
                             }
                         }
                     }
@@ -4371,6 +4824,24 @@ impl WgpuRenderer {
         );
         self.group_textures = group_textures;
         self.group_views = group_views;
+
+        // Layer textures (#96) are sized to their layer's buffer extent, not
+        // the surface, so they survive a resize — but their content was
+        // rasterized against the old scale/viewport, and the composite's NDC
+        // mapping changed. Drop them all; the re-record requests make each
+        // texture-retained layer re-bake on its next composite.
+        let dropped_keys: Vec<crate::LayerKey> = self
+            .layer_textures
+            .drain()
+            .map(|(_, entry)| entry.key)
+            .collect();
+        if !dropped_keys.is_empty() {
+            log::trace!(
+                "dropped {} layer textures for resize; requesting re-records",
+                dropped_keys.len()
+            );
+            slab_gpu::request_rerecord(dropped_keys);
+        }
 
         // Invalidate bounds cache - all surface bounds are now stale
         self.layout_version.fetch_add(1, Ordering::Release);
