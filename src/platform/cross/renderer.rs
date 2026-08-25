@@ -2541,6 +2541,7 @@ impl WgpuRenderer {
     /// `write_buffer`s; a dirty layer uploads exactly its own slab ranges.
     /// Runs before the render pass so the pass below only draws.
     fn resolve_slab_spans(&mut self, scene: &Scene) {
+        profiling::scope!("wgpui: slab sync");
         let pages_by_layer = collect_referenced_pages_by_layer(scene);
         let mut synced_layers: FxHashSet<LayerKey> = FxHashSet::default();
         for span in &scene.layer_slab_spans {
@@ -4499,7 +4500,7 @@ fn flush_slab_run_with_state(
     run: &SlabPendingRun,
     state: &mut PassBindState,
 ) {
-    profiling::scope!("wgpui: flush slab run");
+    profiling::scope!("wgpui: flush slab runs");
     let dynamic_offsets = [(transform_slot as u64 * transform_slot_stride) as u32];
     let transform_id = BoundGroupId::LayerTransform(dynamic_offsets[0]);
     let range_base = slabs.slab(run.kind).base + run.start;
