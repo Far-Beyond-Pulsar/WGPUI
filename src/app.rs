@@ -1717,6 +1717,29 @@ impl App {
         self.element_arena.borrow().capacity() as u64
     }
 
+    /// The per-App element arena that [`crate::window::ElementArenaScope`]
+    /// points [`crate::window::with_element_arena`] at for the duration of
+    /// a draw.
+    ///
+    /// Exposed so a DLL-loaded plugin can enter the *same* scope the host
+    /// already established for this draw, using the `&mut App` it's handed
+    /// across the FFI boundary: `ElementArenaScope::enter(cx.element_arena())`.
+    /// Without this, plugin-compiled code calling `div()`/`AnyElement::new`
+    /// checks its own, separately-linked copy of the
+    /// `CURRENT_ELEMENT_ARENA` thread-local — which the host's
+    /// `ElementArenaScope::enter` call (itself host-compiled) can only ever
+    /// set on the host's own copy — so plugin element construction silently
+    /// falls back to the private per-DLL `ELEMENT_ARENA` thread-local, which
+    /// nothing outside that DLL ever resets. Every element built by plugin
+    /// code then permanently occupies a freshly grown 1 MiB arena chunk for
+    /// the rest of the process's life: a real, unbounded memory leak that
+    /// scales with elements-constructed-per-frame, confirmed via per-callsite
+    /// allocation tracking (see the `plugin-leak-demo` repro, and
+    /// Pulsar-Native issue #261).
+    pub fn element_arena(&self) -> &RefCell<Arena> {
+        &self.element_arena
+    }
+
     /// Check whether a global of the given type has been assigned.
     pub fn has_global<G: Global>(&self) -> bool {
         self.globals_by_type.contains_key(&TypeId::of::<G>())
