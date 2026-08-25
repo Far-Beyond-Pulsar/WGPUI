@@ -2642,7 +2642,7 @@ impl WgpuRenderer {
         for id in stale {
             if let Some(entry) = self.layer_textures.remove(&id) {
                 log::trace!("layer texture for {id:?} (key {:?}) evicted idle", entry.key);
-                slab_gpu::request_rerecord([entry.key]);
+                self.slab_registry.request_rerecord([entry.key]);
             }
         }
     }
@@ -2667,7 +2667,7 @@ impl WgpuRenderer {
             {
                 Err(error) => {
                     slab_gpu::report_sync_overflow(error);
-                    slab_gpu::request_rerecord([span.key]);
+                    self.slab_registry.request_rerecord([span.key]);
                     continue;
                 }
                 Ok(SyncPlan::Clean) => self.slab_registry.note_span_drawn_clean(),
@@ -2680,7 +2680,7 @@ impl WgpuRenderer {
             // (#96); everything else translates from layer-local to window.
             if let Some(target) = &span.texture {
                 if self.ensure_layer_texture(target).is_none() {
-                    slab_gpu::request_rerecord([span.key]);
+                    self.slab_registry.request_rerecord([span.key]);
                     continue;
                 }
                 self.slab_registry.set_layer_translate(span.key, [0.0, 0.0]);
@@ -2793,11 +2793,11 @@ impl WgpuRenderer {
             return;
         }
         let Some(slabs) = self.slab_registry.entry_slabs(span.key) else {
-            slab_gpu::report_missing_slab_state(span.key);
+            slab_gpu::report_missing_slab_state(&self.slab_registry, span.key);
             return;
         };
         let Some(transform_slot) = self.slab_registry.transform_slot(span.key) else {
-            slab_gpu::report_missing_slab_state(span.key);
+            slab_gpu::report_missing_slab_state(&self.slab_registry, span.key);
             return;
         };
         for run in &span.runs {
@@ -2806,7 +2806,7 @@ impl WgpuRenderer {
                 if !groups.sprite_textures.contains_key(&key) {
                     // The atlas page died between resolution and draw; treat
                     // it exactly like eviction poisoning.
-                    slab_gpu::request_rerecord([span.key]);
+                    self.slab_registry.request_rerecord([span.key]);
                     self.slab_registry.note_span_skipped_awaiting_rerecord();
                     return;
                 }
@@ -2861,11 +2861,11 @@ impl WgpuRenderer {
             return;
         }
         let Some(slabs) = self.slab_registry.entry_slabs(span.key) else {
-            slab_gpu::report_missing_slab_state(span.key);
+            slab_gpu::report_missing_slab_state(&self.slab_registry, span.key);
             return;
         };
         let Some(transform_slot) = self.slab_registry.transform_slot(span.key) else {
-            slab_gpu::report_missing_slab_state(span.key);
+            slab_gpu::report_missing_slab_state(&self.slab_registry, span.key);
             return;
         };
         for run in &span.runs {
@@ -2874,7 +2874,7 @@ impl WgpuRenderer {
                 if !groups.sprite_textures.contains_key(&key) {
                     // The atlas page died between resolution and draw; treat
                     // it exactly like eviction poisoning.
-                    slab_gpu::request_rerecord([span.key]);
+                    self.slab_registry.request_rerecord([span.key]);
                     self.slab_registry.note_span_skipped_awaiting_rerecord();
                     return;
                 }
@@ -2897,6 +2897,16 @@ impl WgpuRenderer {
                 &mut one,
             );
         }
+    }
+
+    /// Drain this renderer's pending slab re-record requests.
+    ///
+    /// Called by the owning window at the start of its draw. Requests are
+    /// per-renderer on purpose: a process-global queue would let another
+    /// window's draw consume them, and a request that never reaches its owner
+    /// leaves that owner's poisoned layers skipping draws indefinitely.
+    pub fn take_rerecord_requests(&mut self) -> Vec<crate::LayerKey> {
+        self.slab_registry.take_rerecord_requests()
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -2975,7 +2985,7 @@ impl WgpuRenderer {
         if !evicted_pages.is_empty() {
             let poisoned = self.slab_registry.poison_on_evicted_pages(&evicted_pages);
             if !poisoned.is_empty() {
-                slab_gpu::request_rerecord(poisoned);
+                self.slab_registry.request_rerecord(poisoned);
             }
         }
         self.slab_registry.begin_frame();
@@ -4840,7 +4850,7 @@ impl WgpuRenderer {
                 "dropped {} layer textures for resize; requesting re-records",
                 dropped_keys.len()
             );
-            slab_gpu::request_rerecord(dropped_keys);
+            self.slab_registry.request_rerecord(dropped_keys);
         }
 
         // Invalidate bounds cache - all surface bounds are now stale

@@ -3243,8 +3243,14 @@ impl Window {
         // Draining before draw_roots is what makes invalidation-before-draw
         // hold — the affected layer rebuilds (fresh tiles, fresh token) before
         // its span is recorded again, so stale tiles can never reach the GPU.
+        //
+        // The requests come from this window's own renderer. They must never
+        // travel through a process-global queue: `LayerKey` is unique per
+        // window, so another window's draw would consume them without being
+        // able to act on them, and this window's poisoned layers would then
+        // skip draws until something unrelated invalidated them.
         if crate::scene_pack::slabs_enabled() {
-            for layer_key in crate::platform::cross::slab_gpu::take_rerecord_requests() {
+            for layer_key in self.platform_window.take_slab_rerecord_requests() {
                 if self.layers.contains_key(&layer_key) {
                     self.invalidator
                         .invalidate_layer(layer_key, Invalidation::all());

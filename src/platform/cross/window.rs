@@ -478,6 +478,13 @@ impl PlatformWindow for CrossWindow {
         }
     }
 
+    fn take_slab_rerecord_requests(&mut self) -> Vec<crate::LayerKey> {
+        match self.0.renderer.get() {
+            Some(renderer) => renderer.borrow_mut().take_rerecord_requests(),
+            None => Vec::new(),
+        }
+    }
+
     fn present_framebuffer_only(&self) {
         if let Some(renderer) = self.0.renderer.get() {
             renderer.borrow().present_framebuffer_only();

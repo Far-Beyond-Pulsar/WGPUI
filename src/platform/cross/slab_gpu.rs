@@ -72,26 +72,20 @@ const COUNTER_EVICTION_POISONED: &str = "slab: layers poisoned by atlas eviction
 //
 // Atlas eviction happens deep inside texture cache code holding no handle to
 // the owning window; the renderer discovers it at frame start. Neither can
-// reach `WindowInvalidator` directly, so poison flows through this
-// process-global queue that `Window::draw` drains before recording the next
-// frame, which is what makes invalidation-before-draw ordering hold: the
-// affected layer rebuilds (fresh tiles, fresh token) before its slab is
-// drawn again.
+// reach `WindowInvalidator` directly, so poison flows through a queue that
+// `Window::draw` drains before recording the next frame, which is what makes
+// invalidation-before-draw ordering hold: the affected layer rebuilds (fresh
+// tiles, fresh token) before its slab is drawn again.
+//
+// The queue lives on the [`SlabRegistry`] — one per renderer, one renderer
+// per window — rather than in a process global. A shared queue would hand
+// every window's draw the whole process's pending requests, and `LayerKey`
+// is only unique *within* a window (it hashes an element path), so window B
+// draining window A's requests would drop them on the floor while its own
+// identically-keyed layers rebuilt for nothing. The poisoned layers in A
+// would then never re-record: `awaiting_rerecord` clears only when their
+// content token changes, and nothing else posts that invalidation.
 // ---------------------------------------------------------------------
-
-static LAYERS_NEEDING_RERECORD: LazyLock<Mutex<Vec<LayerKey>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
-
-/// Post a request to rebuild `keys` through the legacy paint path next frame.
-pub(crate) fn request_rerecord(keys: impl IntoIterator<Item = LayerKey>) {
-    let mut queue = LAYERS_NEEDING_RERECORD.lock();
-    queue.extend(keys);
-}
-
-/// Drain every pending re-record request. Called once per window draw.
-pub(crate) fn take_rerecord_requests() -> Vec<LayerKey> {
-    std::mem::take(&mut LAYERS_NEEDING_RERECORD.lock())
-}
 
 // ---------------------------------------------------------------------
 // Transform uniforms.
@@ -286,6 +280,12 @@ pub(crate) struct SlabRegistry {
     /// allocations make any plan instantly stale and the CPU work competes
     /// with the upload path.
     uploads_since_last_plan: u32,
+    /// Re-record requests posted by this renderer's fail-loud paths, drained
+    /// by the owning window's `Window::draw` before it records the next
+    /// frame. Mutex rather than plain `Vec` because posters include `&self`
+    /// draw paths; all of them run on the UI thread, so contention never
+    /// happens — the lock exists for the borrow checker, not for threads.
+    pending_rerecord: Mutex<Vec<LayerKey>>,
 }
 
 impl Default for SlabRegistry {
@@ -298,6 +298,7 @@ impl Default for SlabRegistry {
             compaction_cooldown_frames: 0,
             zero_move_streak: 0,
             uploads_since_last_plan: 0,
+            pending_rerecord: Mutex::new(Vec::new()),
         }
     }
 }
@@ -325,6 +326,18 @@ impl SlabRegistry {
         if freed > 0 {
             crate::render_stats::add(COUNTER_REGISTRY_GC_FREED, freed as u64);
         }
+    }
+
+    /// Post a request to rebuild `keys` through the legacy paint path on the
+    /// owning window's next draw.
+    pub fn request_rerecord(&self, keys: impl IntoIterator<Item = LayerKey>) {
+        self.pending_rerecord.lock().extend(keys);
+    }
+
+    /// Drain every pending re-record request for this renderer. Called once
+    /// per window draw.
+    pub fn take_rerecord_requests(&self) -> Vec<LayerKey> {
+        std::mem::take(&mut self.pending_rerecord.lock())
     }
 
     /// Decide whether drawing a span for (`key`, `content_token`) needs work.
@@ -658,7 +671,7 @@ static MISSING_RUNS_WARNED: LazyLock<std::sync::atomic::AtomicBool> =
 
 /// Fail-loud stand-in for "missing runs / missing registry state" on a span:
 /// warn once + counter + poison so the next frame re-renders legacy.
-pub(crate) fn report_missing_slab_state(key: LayerKey) {
+pub(crate) fn report_missing_slab_state(registry: &SlabRegistry, key: LayerKey) {
     if !MISSING_RUNS_WARNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         log::warn!(
             "slab span for {key:?} resolved against missing registry state; \
@@ -666,7 +679,7 @@ pub(crate) fn report_missing_slab_state(key: LayerKey) {
         );
     }
     crate::render_stats::count(COUNTER_SPANS_SKIPPED_EVICTED);
-    request_rerecord([key]);
+    registry.request_rerecord([key]);
 }
 
 // ---------------------------------------------------------------------
@@ -1282,11 +1295,25 @@ mod tests {
     }
 
     #[test]
-    fn re_record_requests_round_trip_through_the_global_queue() {
-        request_rerecord([KEY, OTHER]);
-        let drained = take_rerecord_requests();
+    fn re_record_requests_round_trip_through_the_registry_queue() {
+        let registry = SlabRegistry::new();
+        registry.request_rerecord([KEY, OTHER]);
+        let drained = registry.take_rerecord_requests();
         assert!(drained.contains(&KEY) && drained.contains(&OTHER));
-        assert!(take_rerecord_requests().is_empty(), "drain must be total");
+        assert!(registry.take_rerecord_requests().is_empty(), "drain must be total");
+    }
+
+    #[test]
+    fn re_record_queues_are_per_registry() {
+        // One renderer per window; a request posted by one must never be
+        // drained by another — a stolen request is never honored by its
+        // owner, whose poisoned layers would then stop drawing for good.
+        let first = SlabRegistry::new();
+        let second = SlabRegistry::new();
+        first.request_rerecord([KEY]);
+        second.request_rerecord([OTHER]);
+        assert_eq!(first.take_rerecord_requests(), vec![KEY]);
+        assert_eq!(second.take_rerecord_requests(), vec![OTHER]);
     }
 
     #[test]

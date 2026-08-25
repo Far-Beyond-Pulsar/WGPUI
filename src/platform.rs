@@ -393,6 +393,20 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draw(&self, scene: &Scene);
     fn present_framebuffer_only(&self);
     fn completed_frame(&self) {}
+
+    /// Drain this window's own pending slab re-record requests (retained
+    /// rendering, spec #94): keys whose GPU residency was poisoned or evicted
+    /// renderer-side, so the layer rebuilds before its slab is drawn again.
+    ///
+    /// Must return only this window's requests. A shared queue would let one
+    /// window's draw consume another window's keys — `LayerKey` is unique per
+    /// window, not per process — and the stolen request would never be
+    /// honored, leaving the owner's layers skipping draws indefinitely.
+    /// Default empty for platforms without a slab-backed renderer.
+    fn take_slab_rerecord_requests(&mut self) -> Vec<crate::LayerKey> {
+        Vec::new()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
 
     /// Programmatically close the OS window. Called by GPUI when a window is
