@@ -32,15 +32,21 @@ mod geometry;
 mod global;
 mod input;
 mod inspector;
+mod instance;
 mod interactive;
+mod occlusion;
 mod key_dispatch;
 mod keymap;
+mod layer;
 mod path_builder;
+#[cfg(test)]
+mod perf_ab_tests;
 mod platform;
 pub mod prelude;
 mod queue;
 pub mod render_stats;
 mod scene;
+mod scene_pack;
 mod shared_string;
 mod shared_uri;
 mod style;
@@ -81,6 +87,11 @@ pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
 pub(crate) use arena::*;
+// `Arena` itself (only `Arena` — `ArenaBox` etc. stay crate-internal) needs
+// to be nameable from outside this crate so DLL-loaded plugin code can call
+// `ElementArenaScope::enter(cx.element_arena())`, which takes `&RefCell<Arena>`.
+// See `App::element_arena`'s doc comment.
+pub use arena::Arena;
 pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
@@ -99,6 +110,8 @@ pub use inspector::*;
 pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
+pub use instance::{InstanceKey, ReconcileKey};
+pub use layer::{LayerId, LayerKey, LayerPolicy, LayerTransform};
 pub use path_builder::*;
 pub use platform::*;
 pub use platform::cross::render_context::WgpuOptions;

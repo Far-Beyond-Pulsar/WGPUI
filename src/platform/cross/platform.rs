@@ -101,6 +101,8 @@ struct AppState {
     active_window_id: Cell<Option<winit::window::WindowId>>,
     hovered_window_id: Cell<Option<winit::window::WindowId>>,
     hovered_external_paths: Vec<PathBuf>,
+    pending_releases:
+        FxHashMap<winit::window::WindowId, HashSet<MouseButton>>,
     #[cfg(target_family = "wasm")]
     wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>>,
     #[cfg(target_family = "wasm")]
@@ -125,11 +127,18 @@ struct ClickState {
 
 impl CrossPlatform {
     pub fn new(wgpu_options: WgpuOptions) -> Result<Self> {
-        Self::new_impl(wgpu_options)
+        Self::new_impl(false, wgpu_options)
     }
 
-    fn new_impl(wgpu_options: WgpuOptions) -> Result<Self> {
-        let wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>> = match WgpuContext::new(&wgpu_options) {
+    pub fn new_headless(wgpu_options: WgpuOptions) -> Result<Self> {
+        Self::new_impl(true, wgpu_options)
+    }
+
+    fn new_impl(headless: bool, wgpu_options: WgpuOptions) -> Result<Self> {
+        let wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>> = if headless {
+            Arc::new(std::sync::OnceLock::new())
+        } else {
+            match WgpuContext::new(&wgpu_options) {
             Ok(ctx) => {
                 let lock = Arc::new(std::sync::OnceLock::new());
                 lock.set(Arc::new(ctx)).ok();
@@ -138,6 +147,7 @@ impl CrossPlatform {
             // On WASM, WgpuContext::new returns an error (needs async init).
             // The OnceLock stays empty; run() will fill it via spawn_local.
             Err(_) => Arc::new(std::sync::OnceLock::new()),
+        }
         };
 
         let (main_tx, main_rx) = PriorityQueueReceiver::new();
@@ -340,6 +350,7 @@ impl Platform for CrossPlatform {
             active_window_id: Cell::new(None),
             hovered_window_id: Cell::new(None),
             hovered_external_paths: Vec::new(),
+            pending_releases: FxHashMap::default(),
             wgpu_context: self.wgpu_context.clone(),
             wgpu_options: WgpuOptions {
                 additional_features: self.wgpu_options.additional_features,
@@ -365,6 +376,7 @@ impl Platform for CrossPlatform {
             active_window_id: Cell::new(None),
             hovered_window_id: Cell::new(None),
             hovered_external_paths: Vec::new(),
+            pending_releases: FxHashMap::default(),
         };
 
         #[cfg(target_family = "wasm")]
@@ -856,7 +868,11 @@ impl Platform for CrossPlatform {
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
-        // TODO(mdeand): How do we want to implement this? For now, just return false.
+        #[cfg(target_os = "macos")]
+        {
+            return true;
+        }
+        #[cfg(not(target_os = "macos"))]
         false
     }
 
@@ -936,6 +952,33 @@ impl AppState {
 
     fn clear_active_context(&self) {
         ACTIVE_CONTEXT.with(|s| s.set(None));
+    }
+
+    fn synthesize_device_mouse_up(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        mouse_button: MouseButton,
+    ) {
+        self.pressed_button = None;
+        self.set_active_context(event_loop);
+        if let Some(window) = self.windows.get(&window_id) {
+            let position = window.0.state.mouse_position.get();
+            let modifiers = self.current_modifiers;
+            let platform_event = PlatformInput::MouseUp(MouseUpEvent {
+                button: mouse_button,
+                position,
+                modifiers,
+                click_count: self.click_state.current_count,
+            });
+            window.0.state.callbacks.invoke_mut(
+                &window.0.state.callbacks.on_input,
+                |cb| {
+                    cb(platform_event.clone());
+                },
+            );
+        }
+        self.clear_active_context();
     }
 
     fn drain_main_queue(&mut self) {
@@ -1020,7 +1063,31 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
                 match state {
                     winit::event::ElementState::Pressed => {
+                        // Synthesize release if a prior press is still pending
+                        // (WindowEvent::MouseInput release was not delivered).
+                        let mouse_up_to_synthesize = self
+                            .hovered_window_id
+                            .get()
+                            .and_then(|window_id| {
+                                let pending = self.pending_releases.get_mut(&window_id)?;
+                                let removed = pending.remove(&mouse_button);
+                                if pending.is_empty() {
+                                    self.pending_releases.remove(&window_id);
+                                }
+                                removed.then_some(window_id)
+                            });
+
+                        if let Some(window_id) = mouse_up_to_synthesize {
+                            self.synthesize_device_mouse_up(event_loop, window_id, mouse_button);
+                        }
+
                         self.pressed_button = Some(mouse_button);
+                        if let Some(window_id) = self.hovered_window_id.get() {
+                            self.pending_releases
+                                .entry(window_id)
+                                .or_default()
+                                .insert(mouse_button);
+                        }
                         if matches!(mouse_button, MouseButton::Navigate(_)) {
                             self.set_active_context(event_loop);
                             if let Some(window_id) = self.hovered_window_id.get() {
@@ -1047,14 +1114,17 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                         }
                     }
                     winit::event::ElementState::Released => {
+                        if let Some(window_id) = self.hovered_window_id.get() {
+                            if let Some(pending) = self.pending_releases.get_mut(&window_id) {
+                                pending.remove(&mouse_button);
+                                if pending.is_empty() {
+                                    self.pending_releases.remove(&window_id);
+                                }
+                            }
+                        }
                         if self.pressed_button == Some(mouse_button) {
                             self.pressed_button = None;
 
-                            // TODO: This is a fallback for macOS when WindowEvent::MouseInput
-                            // release notifications are not delivered reliably. In an ideal fix,
-                            // we would avoid synthesizing MouseUp from raw device events and instead
-                            // make the normal winit event path complete correctly.
-                            //
                             // IMPORTANT: set_active_context must be called here so that any
                             // cx.open_window() calls triggered by the click handler have a valid
                             // event loop reference (without it they silently fail).
@@ -1589,6 +1659,12 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     }
                     winit::event::ElementState::Released => {
                         self.pressed_button = None;
+                        if let Some(pending) = self.pending_releases.get_mut(&window_id) {
+                            pending.remove(&mouse_button);
+                            if pending.is_empty() {
+                                self.pending_releases.remove(&window_id);
+                            }
+                        }
                         if mouse_button == MouseButton::Left {
                             window.window().request_redraw();
                         }
@@ -1768,11 +1844,40 @@ fn handle_ime_event(window: &CrossWindow, ime: &winit::event::Ime) {
 }
 
 #[derive(Debug)]
-struct CrossDisplay {
+pub(crate) struct CrossDisplay {
     id: crate::DisplayId,
     uuid: uuid::Uuid,
     bounds: crate::Bounds<Pixels>,
     refresh_rate_millihertz: Option<u32>,
+}
+
+impl CrossDisplay {
+    pub(crate) fn from_monitor(monitor: &winit::monitor::MonitorHandle) -> Self {
+        let fingerprint = monitor_fingerprint(monitor);
+
+        Self {
+            id: stable_display_id(&fingerprint, &mut HashSet::new()),
+            uuid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &fingerprint),
+            bounds: Self::display_bounds(monitor),
+            refresh_rate_millihertz: monitor.refresh_rate_millihertz(),
+        }
+    }
+
+    fn display_bounds(monitor: &winit::monitor::MonitorHandle) -> crate::Bounds<Pixels> {
+        let scale_factor = monitor.scale_factor() as f32;
+        let position = monitor.position();
+        let size = monitor.size();
+        crate::Bounds::new(
+            point(
+                Pixels(position.x as f32 / scale_factor),
+                Pixels(position.y as f32 / scale_factor),
+            ),
+            crate::Size {
+                width: Pixels(size.width as f32 / scale_factor),
+                height: Pixels(size.height as f32 / scale_factor),
+            },
+        )
+    }
 }
 
 impl crate::PlatformDisplay for CrossDisplay {
@@ -1815,25 +1920,10 @@ fn collect_displays(
                 primary_display_id = Some(display_id);
             }
 
-            let scale_factor = monitor.scale_factor() as f32;
-            let position = monitor.position();
-            let size = monitor.size();
-            let bounds = crate::Bounds::new(
-                point(
-                    Pixels(position.x as f32 / scale_factor),
-                    Pixels(position.y as f32 / scale_factor),
-                ),
-                crate::Size {
-                    width: Pixels(size.width as f32 / scale_factor),
-                    height: Pixels(size.height as f32 / scale_factor),
-                },
-            );
-            let uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &fingerprint);
-
             Rc::new(CrossDisplay {
                 id: display_id,
-                uuid,
-                bounds,
+                uuid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &fingerprint),
+                bounds: CrossDisplay::display_bounds(&monitor),
                 refresh_rate_millihertz: monitor.refresh_rate_millihertz(),
             }) as Rc<dyn crate::PlatformDisplay>
         })

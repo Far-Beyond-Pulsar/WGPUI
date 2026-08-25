@@ -373,7 +373,9 @@ impl Element for HList {
                             scroll_state.smooth_scroll.target_offset = logical_scroll_offset.x;
                             scroll_state.smooth_scroll.animating = false;
                         } else if scroll_state.smooth_scroll.update() {
-                            window.refresh();
+                            // `refresh` would be a no-op here: it is guarded on
+                            // not being mid-draw, and this runs during prepaint.
+                            window.request_animation_frame();
                         }
                         visual_scroll_offset.x = scroll_state.smooth_scroll.current();
                     }
@@ -402,6 +404,23 @@ impl Element for HList {
                     let scroll_left = -visual_scroll_offset.x;
                     let view_right = scroll_left + padded_bounds.size.width;
 
+                    // Overscroll buffer (#96), horizontal axis: skip per-item
+                    // work when the enclosing texture-retained layer
+                    // composites shifted; lay out the buffer range on refill.
+                    let buffer_frame = super::scroll_buffer::prepare_scroll_buffer(
+                        window,
+                        point(visual_scroll_offset.x, Pixels::ZERO),
+                    );
+                    let buffer_margin = match buffer_frame {
+                        super::scroll_buffer::ScrollBufferFrame::Skip => {
+                            return hitbox;
+                        }
+                        super::scroll_buffer::ScrollBufferFrame::Buffer { margin } => {
+                            Some(margin.width)
+                        }
+                        super::scroll_buffer::ScrollBufferFrame::Viewport => None,
+                    };
+
                     let mut cum = Pixels::ZERO;
                     let first_visible = self
                         .item_widths
@@ -418,7 +437,9 @@ impl Element for HList {
                         .iter()
                         .fold(Pixels::ZERO, |a, &w| a + w);
                     let mut last_visible = first_visible;
-                    let overscan_target = view_right + padded_bounds.size.width;
+                    let overscan_target = view_right
+                        + padded_bounds.size.width
+                        + buffer_margin.unwrap_or(Pixels::ZERO);
                     for w in &self.item_widths[first_visible..] {
                         cum += *w;
                         last_visible += 1;
@@ -433,7 +454,15 @@ impl Element for HList {
                     if visible_count > 0 {
                         let items = (self.render_items)(first_visible..visible_range, window, cx);
 
-                        let content_mask = ContentMask { bounds };
+                        let content_mask = match buffer_margin {
+                            Some(margin) => ContentMask {
+                                bounds: super::scroll_buffer::inflate_for_buffer(
+                                    bounds,
+                                    size(margin, Pixels::ZERO),
+                                ),
+                            },
+                            None => ContentMask { bounds },
+                        };
                         let base_x = padded_bounds.origin.x + visual_scroll_offset.x;
                         let base_y = padded_bounds.origin.y + visual_scroll_offset.y;
 

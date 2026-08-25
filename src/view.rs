@@ -1,7 +1,8 @@
 use crate::{
-    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
-    Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, Style, StyleRefinement, TextStyle, WeakEntity,
+    AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element,
+    ElementGeometry, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
+    LayerPolicy, LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, Style, StyleRefinement,
+    TextStyle, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -239,7 +240,10 @@ impl Element for AnyView {
                     (layout_id, None)
                 }
                 _ => {
-                    let mut element = (self.render)(self, window, cx);
+                    let mut element = {
+                        let _t = crate::render_stats::scope("frame: render");
+                        (self.render)(self, window, cx)
+                    };
                     let layout_id = element.request_layout(window, cx);
                     (layout_id, Some(element))
                 }
@@ -308,7 +312,7 @@ impl Element for AnyView {
                         && element_state.cache_key.text_style == text_style
                         && !window.dirty_views.contains(&self.entity_id())
                         && !dependency_invalidated
-                        && !window.refreshing
+                        && window.view_cache_available()
                     {
                         crate::render_stats::count("view cache: reused");
                         let _t = crate::render_stats::scope("view cache: reuse_prepaint");
@@ -316,6 +320,17 @@ impl Element for AnyView {
                         window.reuse_prepaint(element_state.prepaint_range.clone());
                         cx.entities
                             .extend_accessed(&element_state.accessed_entities);
+
+                        // `on_frame` effects still run on a cache hit — that is
+                        // the whole point of the channel: side effects that must
+                        // fire every frame regardless of caching. They are
+                        // replayed from what the subtree recorded when it last
+                        // rendered, *not* by rebuilding the subtree to find
+                        // them again. Rebuilding would run `render` and a full
+                        // `layout_as_root` on every reuse, which is most of
+                        // what the cache is here to skip.
+                        window.replay_frame_effects(&element_state.prepaint_range, cx);
+
                         let prepaint_end = window.prepaint_index();
                         element_state.prepaint_range = prepaint_start..prepaint_end;
 
@@ -339,12 +354,12 @@ impl Element for AnyView {
                     let _t = crate::render_stats::scope("view cache: rebuild");
 
                     // Rebuilding this view normally forces every cached view
-                    // nested inside it to rebuild too, via `refreshing`. See
+                    // nested inside it to rebuild too. See
                     // `nested_view_cache_enabled` for why, and for the opt-in
                     // that lifts it.
-                    let refreshing = window.refreshing;
+                    let nested_cache_suppressed = window.nested_view_cache_suppressed;
                     if !nested_view_cache_enabled() {
-                        window.refreshing = true;
+                        window.nested_view_cache_suppressed = true;
                     }
 
                     let prepaint_start = window.prepaint_index();
@@ -354,6 +369,11 @@ impl Element for AnyView {
                         // conflating them hides which one to go after.
                         let mut element = {
                             let _t = crate::render_stats::scope("  rebuild: render");
+                            // Also counted into the whole-frame bucket. A cached
+                            // view renders from prepaint rather than from
+                            // request_layout, so this is the one place where
+                            // `frame: render` nests under `frame: prepaint`.
+                            let _frame_render = crate::render_stats::scope("frame: render");
                             (self.render)(self, window, cx)
                         };
                         {
@@ -368,7 +388,7 @@ impl Element for AnyView {
                     });
 
                     let prepaint_end = window.prepaint_index();
-                    window.refreshing = refreshing;
+                    window.nested_view_cache_suppressed = nested_cache_suppressed;
 
                     (
                         Some(element),
@@ -392,7 +412,7 @@ impl Element for AnyView {
         &mut self,
         global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         element: &mut Self::PrepaintState,
         window: &mut Window,
@@ -401,31 +421,57 @@ impl Element for AnyView {
         window.with_rendered_view(self.entity_id(), |window| {
             let caching_disabled = window.is_inspector_picking(cx);
             if self.cached_style.is_some() && !caching_disabled {
-                window.with_element_state::<AnyViewState, _>(
-                    global_id.unwrap(),
-                    |element_state, window| {
-                        let mut element_state = element_state.unwrap();
+                let global_id = global_id.unwrap();
+                // `cached` is a layer with a compat policy: every axis
+                // invalidated together, primitive-retained. The decision about
+                // *whether* to reuse was made in prepaint by `AnyViewState`,
+                // which predates layers and reaches things layers cannot see
+                // yet (recorded bounds, text style, the dispatch subtree). The
+                // layer supplies only the retention — which is where the win
+                // is, because it replaces re-inserting every primitive into a
+                // `BoundsTree` with re-emitting orders that are already right.
+                let (layer_key, layer_cache_key) = window.layer_identity(global_id, bounds);
+                let layers_enabled = crate::layer::layers_enabled();
 
-                        let paint_start = window.paint_index();
+                window.with_element_state::<AnyViewState, _>(global_id, |element_state, window| {
+                    let mut element_state = element_state.unwrap();
 
-                        if let Some(element) = element {
-                            // Paired with the prepaint path above.
-                            let refreshing = window.refreshing;
-                            if !nested_view_cache_enabled() {
-                                window.refreshing = true;
-                            }
-                            element.paint(window, cx);
-                            window.refreshing = refreshing;
-                        } else {
-                            window.reuse_paint(element_state.paint_range.clone());
+                    let paint_start = window.paint_index();
+
+                    if let Some(element) = element {
+                        // Paired with the prepaint path above.
+                        let nested_cache_suppressed = window.nested_view_cache_suppressed;
+                        if !nested_view_cache_enabled() {
+                            window.nested_view_cache_suppressed = true;
                         }
+                        if layers_enabled {
+                            window.record_layer(
+                                layer_key,
+                                layer_cache_key,
+                                LayerPolicy::compat(),
+                                |window| element.paint(window, cx),
+                            );
+                        } else {
+                            element.paint(window, cx);
+                        }
+                        window.nested_view_cache_suppressed = nested_cache_suppressed;
+                    } else {
+                        window.reuse_paint_except_scene(&element_state.paint_range);
+                        // The layer can be gone even though prepaint committed
+                        // to reusing — eviction is driven by draw age, and this
+                        // view's element state outlives it. Falling back to the
+                        // recorded scene range keeps that a slower frame rather
+                        // than a missing panel.
+                        if !window.try_composite_layer(layer_key) {
+                            window.replay_scene_range(&element_state.paint_range);
+                        }
+                    }
 
-                        let paint_end = window.paint_index();
-                        element_state.paint_range = paint_start..paint_end;
+                    let paint_end = window.paint_index();
+                    element_state.paint_range = paint_start..paint_end;
 
-                        ((), element_state)
-                    },
-                )
+                    ((), element_state)
+                })
             } else {
                 element.as_mut().unwrap().paint(window, cx);
             }

@@ -32,9 +32,9 @@
 //! your own custom layout algorithm or rendering a code editor.
 
 use crate::{
-    App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId,
-    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
-    util::FluentBuilder, with_element_arena,
+    App, ArenaBox, AvailableSpace, Bounds, ContentMask, Context, DispatchNodeId, DrawPhase, ElementId,
+    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, ReconcileKey, SharedString, Size, Style,
+    Window, util::FluentBuilder, with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -103,10 +103,55 @@ pub trait Element: 'static + IntoElement {
         cx: &mut App,
     );
 
+    /// Runs on every frame this element participates in, cached or not, with
+    /// resolved geometry. Geometry stashing and external-state publication
+    /// belong here, not in [`prepaint`](Self::prepaint) or [`paint`](Self::paint).
+    ///
+    /// The default implementation is empty, so every existing element compiles
+    /// untouched.
+    fn on_frame(
+        &mut self,
+        _geom: ElementGeometry,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    /// A cheap, owned, arena-free fingerprint of this frame's description
+    /// (see [`crate::instance`]), compared against the previous frame's
+    /// fingerprint for the same [`crate::InstanceKey`] to decide whether
+    /// `prepaint`/`paint` may be skipped inside a `.layer()` subtree (#92).
+    ///
+    /// Takes `&Window` — read-only, never `&mut` — because an element's
+    /// rendered output can depend on ambient state that isn't part of `self`
+    /// at all: `Text`'s ambient `TextStyle` comes from `Window::text_style()`,
+    /// not from the string itself. Implementations that need it read through
+    /// this reference; implementations that don't (most of them) ignore it.
+    ///
+    /// The default implementation returns `None`, which opts this element
+    /// type out of reconciliation entirely: it is always treated as changed,
+    /// exactly as every element behaved before this method existed. Every
+    /// existing element compiles untouched. Only `Div`, `SharedString`/`&str`,
+    /// `Img` and `Svg` implement this in the phase that introduced it.
+    fn diff_key(&self, _window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        None
+    }
+
     /// Convert this element into a dynamically-typed [`AnyElement`].
     fn into_any(self) -> AnyElement {
         AnyElement::new(self)
     }
+}
+
+/// Resolved geometry passed to [`Element::on_frame`] every frame.
+#[derive(Clone, Copy, Debug)]
+pub struct ElementGeometry {
+    /// The resolved bounds of this element in pixels.
+    pub bounds: Bounds<Pixels>,
+    /// The content mask active for this element.
+    pub content_mask: ContentMask<Pixels>,
+    /// The window's scale factor.
+    pub scale_factor: f32,
 }
 
 /// Implemented by any type that can be converted into an element.
@@ -296,6 +341,19 @@ trait ElementObject {
 
     fn paint(&mut self, window: &mut Window, cx: &mut App);
 
+    fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App);
+
+    /// The wrapped element's own [`Element::id`], not `AnyElement`'s (which is
+    /// always `None` — see its `Element` impl below). #92's `Div` child loop
+    /// needs this to build the child's `InstanceKey` segment: its own id if it
+    /// has one, or a positional `ElementId::InstanceSlot` if it doesn't.
+    fn inner_id(&self) -> Option<ElementId>;
+
+    /// The wrapped element's own [`Element::diff_key`]. See `inner_id` for why
+    /// this has to go through the trait object rather than `AnyElement`
+    /// itself implementing `Element` meaningfully here.
+    fn inner_diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>>;
+
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -379,6 +437,7 @@ impl<E: Element> Drawable<E> {
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
+                crate::render_stats::count("frame: element tree nodes");
                 let global_id = self.element.id().map(|element_id| {
                     window.element_id_stack.push(element_id);
                     GlobalElementId(Arc::from(&*window.element_id_stack))
@@ -476,6 +535,16 @@ impl<E: Element> Drawable<E> {
                     window,
                     cx,
                 );
+
+                let geom = ElementGeometry {
+                    bounds,
+                    content_mask: window.content_mask(),
+                    scale_factor: window.scale_factor(),
+                };
+                window.invalidator.set_phase(DrawPhase::Effects);
+                self.element.on_frame(geom, window, cx);
+                window.invalidator.set_phase(DrawPhase::Prepaint);
+
                 window.next_frame.dispatch_tree.pop_node();
 
                 if global_id.is_some() {
@@ -601,6 +670,15 @@ impl<E: Element> Drawable<E> {
         }
     }
 
+    pub(crate) fn on_frame(
+        &mut self,
+        geom: ElementGeometry,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.element.on_frame(geom, window, cx);
+    }
+
     pub(crate) fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -679,6 +757,21 @@ where
     }
 
     #[inline]
+    fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App) {
+        Drawable::on_frame(self, geom, window, cx);
+    }
+
+    #[inline]
+    fn inner_id(&self) -> Option<ElementId> {
+        self.element.id()
+    }
+
+    #[inline]
+    fn inner_diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        self.element.diff_key(window)
+    }
+
+    #[inline]
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -741,6 +834,23 @@ impl AnyElement {
         cx: &mut App,
     ) -> Size<Pixels> {
         self.0.layout_as_root(available_space, window, cx)
+    }
+
+    /// Call [`Element::on_frame`] on this element with resolved geometry.
+    /// Runs on every frame, cached or not.
+    pub fn on_frame(&mut self, geom: ElementGeometry, window: &mut Window, cx: &mut App) {
+        self.0.on_frame(geom, window, cx);
+    }
+
+    /// The wrapped element's own [`Element::id`] (#92). Not to be confused
+    /// with `<AnyElement as Element>::id`, which is always `None`.
+    pub(crate) fn inner_id(&self) -> Option<ElementId> {
+        self.0.inner_id()
+    }
+
+    /// The wrapped element's own [`Element::diff_key`] (#92).
+    pub(crate) fn inner_diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>> {
+        self.0.inner_diff_key(window)
     }
 
     /// Prepaints this element at the given absolute origin.

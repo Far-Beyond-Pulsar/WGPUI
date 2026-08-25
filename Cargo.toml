@@ -26,8 +26,9 @@ test-support = [
     "http_client/test-support",
 ]
 inspector = ["gpui_macros/inspector"]
-leak-detection = ["backtrace"]
-flamegraph = ["dep:bincode"]
+    leak-detection = ["backtrace"]
+    flamegraph = ["dep:bincode"]
+    profile-tracy = ["profiling/profile-with-tracy"]
 
 [lib]
 name = "gpui"
@@ -67,6 +68,8 @@ parking_lot = "0.12.1"
 pathfinder_geometry = "0.5"
 pin-project = "1.1.10"
 pollster = "0.4.0"
+# Default features provide only the proc-macros (`scope!`/`function` compile
+# to nothing until a backend like `profile-tracy` is activated).
 profiling = "1"
 rand = "0.10"
 raw-window-handle = "0.6"

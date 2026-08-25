@@ -59,10 +59,15 @@ pub fn background_executor() -> BackgroundExecutor {
     current_platform(true, WgpuOptions::default()).background_executor()
 }
 
-pub(crate) fn current_platform(_headless: bool, wgpu_options: WgpuOptions) -> Rc<dyn Platform> {
-    // TODO(mdeand): Support headless
-    // TODO(mdeand): Monomorphize Platform and its associated types.
-    Rc::new(CrossPlatform::new(wgpu_options).expect("Failed to initialize platform"))
+pub(crate) fn current_platform(headless: bool, wgpu_options: WgpuOptions) -> Rc<CrossPlatform> {
+    if headless {
+        Rc::new(
+            CrossPlatform::new_headless(wgpu_options)
+                .expect("Failed to initialize headless platform"),
+        )
+    } else {
+        Rc::new(CrossPlatform::new(wgpu_options).expect("Failed to initialize platform"))
+    }
 }
 
 pub(crate) trait Platform: 'static {
@@ -794,7 +799,7 @@ impl<T> AtlasTextureList<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::NoUninit)]
 #[repr(C)]
 pub(crate) struct AtlasTile {
     pub(crate) texture_id: AtlasTextureId,
@@ -803,7 +808,7 @@ pub(crate) struct AtlasTile {
     pub(crate) bounds: Bounds<DevicePixels>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::NoUninit)]
 #[repr(C)]
 pub(crate) struct AtlasTextureId {
     // We use u32 instead of usize for Metal Shader Language compatibility
@@ -820,12 +825,13 @@ pub(crate) struct AtlasTextureId {
     ),
     allow(dead_code)
 )]
+#[derive(bytemuck::NoUninit)]
 pub(crate) enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub(crate) struct TileId(pub(crate) u32);
 
@@ -1085,10 +1091,16 @@ pub trait InputHandler: 'static {
 
     /// Allows a given input context to opt into getting raw key repeats instead of
     /// sending these to the platform.
-    /// TODO: Ideally we should be able to set ApplePressAndHoldEnabled in NSUserDefaults
-    /// (which is how iTerm does it) but it doesn't seem to work for me.
+    /// On macOS, tries to set ApplePressAndHoldEnabled via NSUserDefaults to disable
+    /// the press-and-hold character picker, enabling key repeat instead.
     #[allow(dead_code)]
     fn apple_press_and_hold_enabled(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            std::env::set_var("ApplePressAndHoldEnabled", "NO");
+            false
+        }
+        #[cfg(not(target_os = "macos"))]
         true
     }
 
