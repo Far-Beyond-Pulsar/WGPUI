@@ -1,0 +1,15 @@
+[package]
+name = "wgpui-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "wgpui_core"
+path = "src/wgpui_core.rs"
+doctest = false
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
