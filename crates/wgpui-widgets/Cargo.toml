@@ -1,0 +1,15 @@
+[package]
+name = "wgpui-widgets"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "wgpui_widgets"
+path = "src/wgpui_widgets.rs"
+doctest = false
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

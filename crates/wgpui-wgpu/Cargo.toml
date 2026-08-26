@@ -1,0 +1,29 @@
+[package]
+name = "wgpui-wgpu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "wgpui_wgpu"
+path = "src/wgpui_wgpu.rs"
+doctest = false
+
+[dependencies]
+# The only crate that touches a live wgpu::Device (docs/gpu-native-architecture.md
+# §3.5) — this dependency is genuinely needed even at the Phase 0 stub stage
+# because the Phase 0 spike harnesses (benches/) live here and open a real
+# device. Version matches the pin already used by the root gpui-ce crate.
+wgpu = { version = "30", default-features = false, features = [
+    "dx12",
+    "vulkan",
+    "wgsl",
+] }
+pollster = "0.4.0"
+bytemuck = { version = "1.24", features = ["derive"] }
+
+[dev-dependencies]
+rand = "0.10"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
