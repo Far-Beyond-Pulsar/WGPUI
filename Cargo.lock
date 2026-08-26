@@ -6748,6 +6748,9 @@ version = "0.1.0"
 [[package]]
 name = "wgpui-layout"
 version = "0.1.0"
+dependencies = [
+ "taffy",
+]
 
 [[package]]
 name = "wgpui-text"
