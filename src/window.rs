@@ -3558,7 +3558,12 @@ impl Window {
             root_element.layout_as_root(root_size.into(), self, cx);
         }
 
+        // Typed per-cfg: with the inspector off there is no assignment, and an
+        // unannotated empty `let` cannot be inferred (release builds).
+        #[cfg(any(feature = "inspector", debug_assertions))]
         let _inspector_element;
+        #[cfg(not(any(feature = "inspector", debug_assertions)))]
+        let _inspector_element = ();
         let mut sorted_deferred_draws;
         let mut prompt_element;
         let mut active_drag_element;
@@ -4218,6 +4223,47 @@ impl Window {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
             let mask = mask.intersect(&self.content_mask());
+            self.content_mask_stack.push(mask);
+            let result = f(self);
+            self.content_mask_stack.pop();
+            result
+        } else {
+            f(self)
+        }
+    }
+
+    /// [`Self::with_content_mask`], but the given mask replaces the current
+    /// one instead of intersecting with it (#96).
+    ///
+    /// The one legitimate use for this: a texture-retained overscroll
+    /// buffer's *record* pass paints margin content — rows above/below the
+    /// visible rect, deliberately positioned there so the texture covers
+    /// `viewport + 2 × margin` — through this same `content_mask()`
+    /// machinery every other paint uses to clip. An ordinary ancestor's
+    /// `overflow_hidden` (unaware of the margin, clipped to its own
+    /// viewport-sized bounds) sits directly above a buffered scroller in the
+    /// stack just as often as not, and `with_content_mask`'s intersect would
+    /// silently clamp the widened mask straight back down to that ancestor's
+    /// rect — which is indistinguishable, at `Scene::insert_primitive`, from
+    /// "this row is genuinely offscreen," so it gets dropped before it ever
+    /// reaches the layer's item list. Margin content never bakes; the buffer
+    /// covers only whatever happened to overlap the viewport at record time.
+    ///
+    /// Replacing rather than intersecting is safe specifically here because
+    /// nothing this paints is displayed directly: the buffer's *composite*
+    /// re-clips to the layer's own visible rect regardless
+    /// (`paint_layer_texture_surface`'s `visible_bounds`), so painting the
+    /// margin band wide open during record can never leak a pixel past
+    /// whatever the ancestor's real clip is. Anywhere else, replacing would
+    /// be a correctness bug — use [`Self::with_content_mask`] for everything
+    /// that isn't this.
+    pub(crate) fn with_content_mask_unclamped<R>(
+        &mut self,
+        mask: Option<ContentMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        if let Some(mask) = mask {
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -7910,6 +7956,18 @@ impl Window {
             }
         }
         f(&mut None, self)
+    }
+
+    /// Whether the interactive inspector panel is currently open. Cheap
+    /// (`Option::is_some`) — call sites that only need `InspectorElementId`
+    /// bookkeeping for the panel itself, not for flamegraph attribution,
+    /// should check this before doing that work rather than doing it
+    /// unconditionally on every element of every debug build. See
+    /// `Drawable::request_layout`/`Drawable::paint` in `element.rs`, which
+    /// this exists for.
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    pub(crate) fn inspector_is_open(&self) -> bool {
+        self.inspector.is_some()
     }
 
     #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
@@ -13681,6 +13739,448 @@ mod test {
                 assert_eq!(layer.buffer_anchor.y, px(-60.));
             })
             .unwrap();
+    }
+
+    /// A plain scroll container — no virtualized list — under its own
+    /// buffered, keyed layer (#96): scrolling within half the margin shifts
+    /// the composite without repainting any child; crossing half the margin
+    /// refills exactly once.
+    struct BufferedScrollView {
+        paints: std::rc::Rc<std::cell::Cell<usize>>,
+        handle: crate::ScrollHandle,
+    }
+
+    impl crate::Render for BufferedScrollView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("buffered-scroller")
+                    // The key covers what the content depends on. It must not
+                    // include the scroll offset — that is the whole point: the
+                    // wheel handler's notify composites instead of re-recording.
+                    .layer_keyed("buffered-scroller-content")
+                    .layer_with_policy(crate::LayerPolicy {
+                        overdraw_margin: crate::size(px(0.), px(50.)),
+                        ..Default::default()
+                    })
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.handle)
+                    .children((0..40).map(move |_| {
+                        let paints = paints.clone();
+                        crate::canvas(
+                            move |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                paints.set(paints.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::blue()));
+                            },
+                        )
+                        .w_full()
+                        .h(px(28.))
+                    })),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_plain_scrolled_div_shifts_without_rerecording_then_refills(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() || rasterization_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let handle = crate::ScrollHandle::new();
+        let view = BufferedScrollView {
+            paints: paints.clone(),
+            handle: handle.clone(),
+        };
+        let window = cx.open_window(size(px(400.), px(300.)), move |_, _| view);
+        cx.run_until_parked();
+
+        // Settle the buffer: record, notice the un-anchored buffer, refill.
+        clean_frame(cx, window.into());
+        clean_frame(cx, window.into());
+        clean_frame(cx, window.into());
+
+        let key = window
+            .update(cx, |_, this, _| {
+                let (key, layer) = this.layers.iter().next().expect("the layer exists");
+                assert!(
+                    layer.texture_retained,
+                    "a buffered scroller rasterizes regardless of primitive count"
+                );
+                assert!(layer.buffer_anchored, "the refill anchored the buffer");
+                *key
+            })
+            .unwrap();
+
+        let paints_before_scroll = paints.get();
+        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let refill_counter = "scroll: buffer refills";
+        crate::render_stats::set_force_enabled(true);
+        let before = crate::render_stats::snapshot();
+        let before_refills = before.counters.get(refill_counter).copied().unwrap_or(0);
+
+        // A small scroll: within half the margin, so no child repaints.
+        window
+            .update(cx, |_, this, _| {
+                handle.set_offset(crate::Point::new(px(0.), px(-20.)));
+                this.refresh_buffers();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            paints.get(),
+            paints_before_scroll,
+            "a buffered scroll frame must not repaint any child of the scroller"
+        );
+
+        window
+            .update(cx, |_, this, _| {
+                let layer = &this.layers[&key];
+                assert_eq!(
+                    layer.content_offset,
+                    crate::Point::new(px(0.), px(-20.)),
+                    "the shift is recorded as the content offset"
+                );
+                assert_eq!(
+                    layer.transform.offset,
+                    crate::Point::new(px(0.), px(0.) + px(-20.)),
+                    "the layer transform shifts with the content for hit testing"
+                );
+            })
+            .unwrap();
+
+        // Scrolling past half the margin refills exactly once and re-anchors.
+        window
+            .update(cx, |_, this, _| {
+                handle.set_offset(crate::Point::new(px(0.), px(-60.)));
+                this.refresh_buffers();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        clean_frame(cx, window.into());
+
+        let after = crate::render_stats::snapshot();
+        crate::render_stats::set_force_enabled(false);
+
+        assert!(
+            paints.get() > paints_before_scroll,
+            "the refill frame repaints the buffer range"
+        );
+        assert_eq!(
+            after
+                .counters
+                .get(refill_counter)
+                .copied()
+                .unwrap_or(0)
+                - before_refills,
+            1,
+            "exactly one refill for one margin-crossing scroll"
+        );
+        window
+            .update(cx, |_, this, _| {
+                let layer = &this.layers[&key];
+                assert_eq!(
+                    layer.content_offset,
+                    crate::Point::default(),
+                    "the refill re-centres the buffer: no residual shift"
+                );
+                assert_eq!(layer.buffer_anchor.y, px(-60.));
+            })
+            .unwrap();
+    }
+
+    /// The existing shift/refill tests above prove one shift and one refill
+    /// each keep their own bookkeeping correct in isolation. They do not
+    /// prove the buffer stays *correct* over sustained scrolling — a bug that
+    /// only shows up as drift across many consecutive refill cycles (a
+    /// "smooth glide, then a visible snap, repeat" symptom) would pass both
+    /// of those and still be broken. This drives many small scroll steps —
+    /// the same 15px-ish granularity the app's auto-scroll driver uses — well
+    /// past several refill cycles, and after every single step (shift or
+    /// refill) asserts the one invariant a coverage bug would violate: the
+    /// buffer's texture, shifted by its current content offset, must still
+    /// fully cover the viewport.
+    #[gpui::test]
+    fn overscroll_buffer_texture_always_covers_the_viewport_across_many_refills(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() || rasterization_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let handle = crate::ScrollHandle::new();
+        let view = BufferedScrollView {
+            paints: paints.clone(),
+            handle: handle.clone(),
+        };
+        let window = cx.open_window(size(px(400.), px(300.)), move |_, _| view);
+        cx.run_until_parked();
+
+        // Settle the buffer: record, notice the un-anchored buffer, refill.
+        clean_frame(cx, window.into());
+        clean_frame(cx, window.into());
+        clean_frame(cx, window.into());
+
+        let key = window
+            .update(cx, |_, this, _| {
+                let (key, _) = this.layers.iter().next().expect("the layer exists");
+                *key
+            })
+            .unwrap();
+
+        let mut offset_y = px(0.);
+        for step in 0..80 {
+            offset_y -= px(15.);
+            window
+                .update(cx, |_, this, _| {
+                    handle.set_offset(crate::Point::new(px(0.), offset_y));
+                    this.refresh_buffers();
+                })
+                .unwrap();
+            cx.run_until_parked();
+
+            window
+                .update(cx, |_, this, _| {
+                    let layer = &this.layers[&key];
+                    let viewport_top = layer.cache_key.bounds.top();
+                    let viewport_bottom = layer.cache_key.bounds.bottom();
+                    let shifted_top = layer.texture_bounds.top() + layer.content_offset.y;
+                    let shifted_bottom = layer.texture_bounds.bottom() + layer.content_offset.y;
+                    assert!(
+                        shifted_top <= viewport_top && shifted_bottom >= viewport_bottom,
+                        "step {step}: buffer texture must cover the viewport at \
+                         offset {offset_y:?}: shifted [{shifted_top:?}, {shifted_bottom:?}] \
+                         vs viewport [{viewport_top:?}, {viewport_bottom:?}] \
+                         (content_offset={:?}, anchor={:?}, texture_bounds={:?})",
+                        layer.content_offset,
+                        layer.buffer_anchor,
+                        layer.texture_bounds,
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    /// `.track_scroll(..)` promotes a scroll container to a plain, unkeyed
+    /// `.layer()` automatically, with no `.id(..)`/`.layer()` call of its own
+    /// -- the "safe half" of scroll-free-by-default (docs/scroll-free-by-default.md
+    /// section 1). This must NOT require the caller to declare a content key: unlike
+    /// the buffered case, a plain auto-layer re-renders on every notify
+    /// exactly like unlayered content, so there is no dependency claim being
+    /// made on the caller's behalf.
+    struct AutoLayeredScrollView {
+        handle: crate::ScrollHandle,
+    }
+
+    impl crate::Render for AutoLayeredScrollView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div().size_full().child(
+                crate::div()
+                    .id("auto-layered-scroller")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.handle)
+                    .children((0..10).map(|_| crate::div().w_full().h(px(20.)))),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn track_scroll_promotes_to_a_layer_with_no_explicit_layer_call(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let handle = crate::ScrollHandle::new();
+        let view = AutoLayeredScrollView {
+            handle: handle.clone(),
+        };
+        let window = cx.open_window(size(px(400.), px(300.)), move |_, _| view);
+        cx.run_until_parked();
+        clean_frame(cx, window.into());
+
+        window
+            .update(cx, |_, this, _| {
+                assert_eq!(
+                    this.layers.len(),
+                    1,
+                    "a plain track_scroll div with no .layer()/.layer_keyed() of its own should still register exactly one retained layer"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn wgpui_auto_layers_0_reverts_track_scroll_to_needing_an_explicit_layer(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() || crate::layer::auto_layers_enabled() {
+            // Either the whole layer system is off (nothing to compare
+            // against) or this process didn't set WGPUI_AUTO_LAYERS=0 -
+            // env vars are read once and cached, so this test only asserts
+            // anything under the `perf_ab`-style explicit env harness. See
+            // that module's doc comment for how to run it.
+            return;
+        }
+        let handle = crate::ScrollHandle::new();
+        let view = AutoLayeredScrollView {
+            handle: handle.clone(),
+        };
+        let window = cx.open_window(size(px(400.), px(300.)), move |_, _| view);
+        cx.run_until_parked();
+        clean_frame(cx, window.into());
+
+        window
+            .update(cx, |_, this, _| {
+                assert_eq!(
+                    this.layers.len(),
+                    0,
+                    "WGPUI_AUTO_LAYERS=0 must reproduce pre-auto-promotion behaviour exactly: no layer for a track_scroll div that never called .layer()"
+                );
+            })
+            .unwrap();
+    }
+
+    /// Containment (#96, docs/scroll-free-by-default.md §0.-2): a buffered
+    /// plain div with enough real, fixed-height children that some of them
+    /// fall outside the visible+margin window on every frame. Each row
+    /// records its own paint count, so the assertions below can check
+    /// exactly which rows a refill actually painted — the thing a screenshot
+    /// can't verify deterministically.
+    const CONTAINMENT_ROWS: usize = 200;
+    const CONTAINMENT_ROW_HEIGHT: f32 = 24.0;
+
+    struct ContainmentView {
+        handle: crate::ScrollHandle,
+        paint_counts: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl crate::Render for ContainmentView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paint_counts = self.paint_counts.clone();
+            crate::div().size_full().child(
+                crate::div()
+                    .id("containment-scroller")
+                    .layer_keyed("containment-content")
+                    .layer_with_policy(crate::LayerPolicy {
+                        overdraw_margin: crate::size(px(0.), px(48.)),
+                        ..Default::default()
+                    })
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.handle)
+                    .children((0..CONTAINMENT_ROWS).map(move |ix| {
+                        let paint_counts = paint_counts.clone();
+                        // A `div` with an explicit fixed height, wrapping the
+                        // paint-observing canvas — matches
+                        // `plain_scroll_10k.rs`'s actual row shape. Crucially,
+                        // this is what makes `Element::estimated_size` return
+                        // `Some` for the row (only `Div` implements it): the
+                        // canvas itself never does, so a bare `canvas()` row
+                        // would never be containable at all, and a test built
+                        // on one would prove nothing about this path.
+                        crate::div().w_full().h(px(CONTAINMENT_ROW_HEIGHT)).child(
+                            crate::canvas(
+                                move |_, _, _| (),
+                                move |bounds, _, window, _| {
+                                    paint_counts.borrow_mut()[ix] += 1;
+                                    window.paint_quad(crate::fill(bounds, crate::blue()));
+                                },
+                            )
+                            .size_full(),
+                        )
+                    })),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn contained_children_outside_the_buffer_window_are_never_painted_and_visible_ones_always_are(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() || rasterization_off() {
+            return;
+        }
+        let paint_counts = std::rc::Rc::new(std::cell::RefCell::new(vec![0usize; CONTAINMENT_ROWS]));
+        let handle = crate::ScrollHandle::new();
+        let view = ContainmentView {
+            handle: handle.clone(),
+            paint_counts: paint_counts.clone(),
+        };
+        // Viewport shows ~8 rows; margin is 48px (~2 rows) each side.
+        let window = cx.open_window(size(px(300.), px(200.)), move |_, _| view);
+        cx.run_until_parked();
+        // Frame 1 is the necessary cold start: containment needs a prior
+        // frame's viewport measurement to compare against (`Div::request_layout`
+        // returns `None` from `containment` when `handle.bounds()` is still
+        // zero-sized), so every row — including the far-away last one — gets
+        // one real layout here. This is by design, not a gap: see
+        // `docs/scroll-free-by-default.md` §0.-2. What actually matters is
+        // that frames 2 and 3 (the rest of the buffer's settle sequence) do
+        // NOT paint it again.
+        clean_frame(cx, window.into());
+        let last_row_after_cold_start = paint_counts.borrow()[CONTAINMENT_ROWS - 1];
+        assert!(
+            last_row_after_cold_start <= 1,
+            "the cold-start frame should paint every row at most once, including the far one; got {last_row_after_cold_start}"
+        );
+        clean_frame(cx, window.into());
+        clean_frame(cx, window.into());
+
+        // After settling at the top, a row far past the visible+margin window
+        // must not have been painted *again* since the cold start — proof
+        // containment actually skipped its `prepaint`/`paint` on the frames
+        // that had a real viewport measurement to work with.
+        {
+            let counts = paint_counts.borrow();
+            assert!(counts[0] >= 1, "the first visible row must be painted");
+            assert_eq!(
+                counts[CONTAINMENT_ROWS - 1],
+                last_row_after_cold_start,
+                "a row nowhere near the top of a 200-row list must not be painted again once \
+                 the buffer has a real viewport to contain against"
+            );
+        }
+        let row_0_paints_before_scroll = paint_counts.borrow()[0];
+        let last_row_paints_before_scroll = paint_counts.borrow()[CONTAINMENT_ROWS - 1];
+
+        // Scroll deep into the list — far enough that the buffer must
+        // refill — and check the *new* visible range is painted for real
+        // while both the old visible range and the still-far range are not
+        // (re-)painted.
+        let target_row = 150;
+        let offset_y = -px(target_row as f32 * CONTAINMENT_ROW_HEIGHT);
+        window
+            .update(cx, |_, this, _| {
+                handle.set_offset(crate::Point::new(px(0.), offset_y));
+                this.refresh_buffers();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        clean_frame(cx, window.into());
+        clean_frame(cx, window.into());
+        clean_frame(cx, window.into());
+
+        let counts = paint_counts.borrow();
+        assert!(
+            counts[target_row] >= 1,
+            "row {target_row}, now inside the visible window, must have been painted for real \
+             (count = {})",
+            counts[target_row]
+        );
+        assert_eq!(
+            counts[0], row_0_paints_before_scroll,
+            "row 0, now far outside the window, must not have been painted again since the scroll"
+        );
+        assert_eq!(
+            counts[CONTAINMENT_ROWS - 1],
+            last_row_paints_before_scroll,
+            "the still-far last row must not be painted again"
+        );
     }
 
     /// Overdraw regions are exempt from instance-tier occlusion culling

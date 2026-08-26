@@ -137,6 +137,30 @@ pub trait Element: 'static + IntoElement {
         None
     }
 
+    /// A cheap, static size for this element, known without running
+    /// [`request_layout`](Self::request_layout) at all — used by a buffered
+    /// scroll container (`docs/scroll-free-by-default.md` §0.-2) to decide,
+    /// for a child far outside the visible range, whether it can be
+    /// represented by a placeholder leaf instead of recursing into its full
+    /// subtree. This is layout *containment*, the same idea as CSS
+    /// `content-visibility: auto` + `contain-intrinsic-size`: an off-screen
+    /// child's contribution to its container's scroll extent is still
+    /// needed, but its actual content doesn't have to be built to get it, as
+    /// long as the size is known some other cheap way.
+    ///
+    /// The default implementation returns `None`, which opts this element
+    /// out of containment: a container will always give it a real layout
+    /// rather than guess. Returning `Some` is a claim that this exact size is
+    /// what a real layout would have produced — get it wrong and a child
+    /// entering view snaps to its real size, the same "layout shift" a wrong
+    /// `contain-intrinsic-size` produces in a browser. Only `Div` implements
+    /// this, and only when both axes are already a definite length (no
+    /// `auto`, no `%`, no measured/content-dependent sizing) — anything
+    /// content-dependent must be measured for real, so it stays `None`.
+    fn estimated_size(&self, _window: &Window) -> Option<Size<Pixels>> {
+        None
+    }
+
     /// Convert this element into a dynamically-typed [`AnyElement`].
     fn into_any(self) -> AnyElement {
         AnyElement::new(self)
@@ -354,6 +378,10 @@ trait ElementObject {
     /// itself implementing `Element` meaningfully here.
     fn inner_diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>>;
 
+    /// The wrapped element's own [`Element::estimated_size`]. Same reasoning
+    /// as `inner_diff_key`.
+    fn inner_estimated_size(&self, window: &Window) -> Option<Size<Pixels>>;
+
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -395,6 +423,27 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
         prepaint: PrepaintState,
     },
     Painted,
+}
+
+/// Whether anything will actually read an `InspectorElementId` this frame —
+/// the interactive inspector panel, or an active flamegraph capture (which
+/// wants the source-location attribution `InspectorElementId` carries).
+/// `Window::inspector_is_open` and `capture_enabled` are each a single cheap
+/// load; this exists so `request_layout`/`paint` can skip the real
+/// per-element cost (an `Arc` allocation plus a hashmap entry — see
+/// `Window::build_inspector_element_id`) when neither consumer is active,
+/// which is the common case for a debug build that isn't using either.
+#[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
+fn inspector_id_worth_computing(#[allow(unused_variables)] window: &Window) -> bool {
+    #[cfg(any(feature = "inspector", debug_assertions))]
+    if window.inspector_is_open() {
+        return true;
+    }
+    #[cfg(feature = "flamegraph")]
+    if crate::capture_enabled() {
+        return true;
+    }
+    false
 }
 
 /// Builds element attribution for a flamegraph CPU span, reusing the
@@ -446,13 +495,27 @@ impl<E: Element> Drawable<E> {
                 let inspector_id;
                 #[cfg(any(feature = "inspector", debug_assertions, feature = "flamegraph"))]
                 {
-                    inspector_id = self.element.source_location().map(|source| {
-                        let path = crate::InspectorElementPath {
-                            global_id: GlobalElementId(Arc::from(&*window.element_id_stack)),
-                            source_location: source,
-                        };
-                        window.build_inspector_element_id(path)
-                    });
+                    // Gated on real demand, not just the cfg: `build_inspector_element_id`
+                    // does per-element allocation (a second `Arc` over
+                    // `element_id_stack`, distinct from `global_id`'s own two
+                    // lines up, plus a hashmap entry) that only two consumers
+                    // ever read — the interactive inspector panel and
+                    // flamegraph span attribution. Neither being active is
+                    // the common case for every debug build that isn't
+                    // actively using either, so skip the work rather than pay
+                    // it on every element of every frame. See
+                    // `Window::inspector_is_open`'s doc comment.
+                    if inspector_id_worth_computing(window) {
+                        inspector_id = self.element.source_location().map(|source| {
+                            let path = crate::InspectorElementPath {
+                                global_id: GlobalElementId(Arc::from(&*window.element_id_stack)),
+                                source_location: source,
+                            };
+                            window.build_inspector_element_id(path)
+                        });
+                    } else {
+                        inspector_id = None;
+                    }
                 }
                 #[cfg(not(any(feature = "inspector", debug_assertions, feature = "flamegraph")))]
                 {
@@ -772,6 +835,11 @@ where
     }
 
     #[inline]
+    fn inner_estimated_size(&self, window: &Window) -> Option<Size<Pixels>> {
+        self.element.estimated_size(window)
+    }
+
+    #[inline]
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -851,6 +919,11 @@ impl AnyElement {
     /// The wrapped element's own [`Element::diff_key`] (#92).
     pub(crate) fn inner_diff_key(&self, window: &Window) -> Option<Box<dyn ReconcileKey>> {
         self.0.inner_diff_key(window)
+    }
+
+    /// The wrapped element's own [`Element::estimated_size`] (#96).
+    pub(crate) fn inner_estimated_size(&self, window: &Window) -> Option<Size<Pixels>> {
+        self.0.inner_estimated_size(window)
     }
 
     /// Prepaints this element at the given absolute origin.

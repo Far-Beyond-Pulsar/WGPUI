@@ -88,6 +88,14 @@ use crate::{AtlasTextureId, ScaledPixels};
 ///
 /// `WGPUI_SLABS=0` keeps every consumer on the legacy per-frame path. Read
 /// once, at first use — same convention as `layers_enabled`.
+///
+/// Unlike its siblings (`WGPUI_LAYERS` → removal tracked as #97,
+/// `WGPUI_PERSISTENT_LAYOUT` → #93, `WGPUI_INSTANCES` → "a later phase"),
+/// this flag's eventual deletion — and the ~1,700-line dedicated equivalence
+/// suite in `renderer_slab_tests.rs` that exists only to keep the legacy path
+/// honest in the meantime — has no issue tracking it. Fold it into #94/#96's
+/// tracking (the phases that introduced the slab machinery) rather than
+/// letting the escape hatch become permanent by omission.
 pub(crate) fn slabs_enabled() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
         std::env::var("WGPUI_SLABS")

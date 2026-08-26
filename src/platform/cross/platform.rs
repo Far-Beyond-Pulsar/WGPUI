@@ -1160,11 +1160,55 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
         self.drain_main_queue();
 
+        // Cap the idle poll rate (measured: this loop, unthrottled, drove
+        // `request_redraw()` — and therefore `RedrawRequested` and the whole
+        // draw/present path — at 15,000-30,000Hz while genuinely idle,
+        // pinning a full CPU core for no visual benefit; see
+        // docs/scroll-free-by-default.md §0.-1).
+        //
+        // Setting `ControlFlow::WaitUntil` here is NOT sufficient on its own:
+        // `request_redraw()` wakes the event loop immediately regardless of
+        // the `ControlFlow` value, since a pending redraw is itself an event
+        // — so unconditionally calling it below, as this loop used to,
+        // re-arms itself every single iteration no matter what `ControlFlow`
+        // says afterward. The actual bound has to be on *how often we call
+        // `request_redraw()` at all*, tracked per window in
+        // `last_idle_redraw_requested_at`.
+        //
+        // Input and resize handlers (`window_event`, `WindowEvent::Resized`)
+        // call `request_redraw()` directly, outside this loop, and are
+        // unaffected — they still respond immediately. This only bounds the
+        // idle keep-alive tick (the "present for 1s after last input" grace
+        // window in `window.rs`'s `on_request_frame`), which was riding this
+        // loop at event-loop rate instead of a sane one. Coalescing multiple
+        // `about_to_wait` iterations between actual redraw requests also
+        // means multiple raw `WM_SIZE` messages arriving inside one idle
+        // window now share one relayout instead of one each, since
+        // `Window::bounds_changed`'s dirty flag is idempotent and only the
+        // next *actual* redraw consumes it — see the same doc section for
+        // the measured 11-relayouts-per-resize-gesture finding this also
+        // closes.
+        let now = Instant::now();
+        let mut next_wake = now + IDLE_POLL_INTERVAL;
         for window in self.windows.values() {
-            window.window().request_redraw();
+            let due = window
+                .0
+                .state
+                .last_idle_redraw_requested_at
+                .get()
+                .is_none_or(|last| now.duration_since(last) >= IDLE_POLL_INTERVAL);
+            if due {
+                window.0.state.last_idle_redraw_requested_at.set(Some(now));
+                window.window().request_redraw();
+            } else {
+                let last = window.0.state.last_idle_redraw_requested_at.get().unwrap();
+                next_wake = next_wake.min(last + IDLE_POLL_INTERVAL);
+            }
         }
 
         self.clear_active_context();
+
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next_wake.into()));
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {}
@@ -1740,6 +1784,13 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
 const DOUBLE_CLICK_THRESHOLD_MS: u128 = 500;
 const DOUBLE_CLICK_DISTANCE: f32 = 5.0;
+
+/// Ceiling on how often `about_to_wait` re-arms itself while idle (see the
+/// call site in `about_to_wait`). 4ms = 250Hz, comfortably above any current
+/// display's refresh rate, so no platform is ever kept waiting for a frame it
+/// could show — this only removes the tens-of-thousands-of-Hz spin that
+/// `ControlFlow::Poll` produced with nothing to show.
+const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 
 impl ClickState {
     fn update(

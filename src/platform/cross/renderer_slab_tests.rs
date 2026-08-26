@@ -1206,6 +1206,7 @@ impl PixelHarness {
                                 groups.expect("production mode carries slab groups"),
                                 &mut state,
                                 &mut open,
+                                &self.pipelines.globals_bind_group,
                             );
                         }
                         match batch {
@@ -1357,6 +1358,7 @@ impl PixelHarness {
                                     groups,
                                     &mut state,
                                     &mut open,
+                                    &self.pipelines.globals_bind_group,
                                 );
                             }
                             open = Some(super::OpenSlabRun {
@@ -1381,6 +1383,7 @@ impl PixelHarness {
                     groups.expect("production mode carries slab groups"),
                     &mut state,
                     &mut open,
+                    &self.pipelines.globals_bind_group,
                 );
             }
         }
@@ -1589,6 +1592,483 @@ fn cached_slab_groups_survive_clean_only_frames_and_invalidate_per_buffer() -> a
     cache.invalidate_transforms();
     let _sixth = frame_groups(&mut cache, &spliced);
     assert_eq!(cache.creation_count(), 6 + 1 + 4);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Overscroll buffer (#96): bake-then-shift-composite pixel evidence.
+// ---------------------------------------------------------------------
+//
+// The scroll/layer bookkeeping (content offset, texture bounds, anchor
+// tracking) already has a headless CPU proof — see
+// `overscroll_buffer_texture_always_covers_the_viewport_across_many_refills`
+// in window.rs's own test module, which walks 80 scroll steps across many
+// refill cycles and asserts the buffer's advertised extent always covers the
+// viewport. That test cannot see whether the actual GPU work agrees, and it
+// does not: this test currently FAILS, and does so for a confirmed,
+// non-hypothetical reason (docs/scroll-free-by-default.md §0.-4 has the full
+// writeup) —
+//
+// `Scene::insert_primitive` drops any primitive whose bounds don't intersect
+// its own `content_mask` (an ordinary, otherwise-correct optimization: no
+// point recording something fully clipped away). A row painted during a
+// buffered layer's refill gets its position shifted into the margin band
+// (via `window.with_element_offset`) so the *bake* can cover
+// `viewport + 2×margin`, but nothing widens its `content_mask` past the
+// scroll container's own (viewport-only) clip — so every row that lands
+// outside the immediate viewport at record time is silently discarded
+// before it ever reaches the layer's item list, margin content included.
+// The buffer's texture ends up covering only whatever happened to overlap
+// the viewport at the moment of the refill, not the margin it exists to
+// pre-paint — exactly the "rows near the top/bottom go missing, and the
+// picture runs out of real content before the true margin edge" symptom
+// reported against the running app. Fixing it means widening the active
+// content_mask to the layer's `texture_bounds` while painting a buffered
+// refill's children, not touching this GPU-side code at all.
+//
+// This test renders the same striped content two ways — once directly, at
+// the scrolled position, through the ordinary quads pipeline already
+// trusted by every other test above; once through the buffer's
+// bake-once/composite-shifted path (including a row-realistic content_mask
+// on each stripe, which is what triggers the drop above) — and asserts the
+// two pictures are
+// pixel-identical at several offsets spanning the margin.
+
+const STRIPE_HEIGHT: f32 = 20.;
+const STRIPE_COUNT: i32 = 10;
+/// (x, y, w, h) of the visible viewport in the harness's window space.
+const BUFFER_VIEWPORT: (f32, f32, f32, f32) = (0., 50., 40., 80.);
+const BUFFER_MARGIN: f32 = 60.;
+
+fn buffer_texture_bounds() -> SceneBounds<ScaledPixels> {
+    let (x, y, w, h) = BUFFER_VIEWPORT;
+    rect(x, y - BUFFER_MARGIN, w, h + 2. * BUFFER_MARGIN)
+}
+
+fn buffer_viewport_bounds() -> SceneBounds<ScaledPixels> {
+    let (x, y, w, h) = BUFFER_VIEWPORT;
+    rect(x, y, w, h)
+}
+
+fn stripe_quad(bounds: SceneBounds<ScaledPixels>, color: Hsla, clip: SceneBounds<ScaledPixels>) -> Quad {
+    Quad {
+        bounds,
+        content_mask: ContentMask { bounds: clip },
+        background: color.into(),
+        ..Default::default()
+    }
+}
+
+/// The 10 stripes, positioned so stripe `i` sits at
+/// `texture_bounds.origin.y + i * STRIPE_HEIGHT`, offset by `dy` (a
+/// window-space shift — the scroll delta since the layout was recorded) and
+/// clipped to `clip` — the viewport for a direct/unbuffered render, or the
+/// widened buffer extent for a buffered layer's record pass post-fix (#96).
+fn stripe_quads(dy: f32, clip: SceneBounds<ScaledPixels>) -> Vec<Quad> {
+    let tb = buffer_texture_bounds();
+    (0..STRIPE_COUNT)
+        .map(|i| {
+            let y = tb.origin.y.0 + dy + i as f32 * STRIPE_HEIGHT;
+            stripe_quad(
+                rect(tb.origin.x.0, y, tb.size.width.0, STRIPE_HEIGHT),
+                Hsla { h: i as f32 / STRIPE_COUNT as f32, s: 1., l: 0.5, a: 1. },
+                clip,
+            )
+        })
+        .collect()
+}
+
+/// Ground truth: the stripes painted directly at scroll offset `dy` through
+/// the ordinary (unbuffered) quads pipeline.
+fn render_stripes_direct(harness: &PixelHarness, dy: f32) -> Vec<u8> {
+    let mut scene = Scene::default();
+    for quad in stripe_quads(dy, buffer_viewport_bounds()) {
+        scene.insert_primitive(quad);
+    }
+    scene.finish();
+    harness.upload_legacy_arrays(&scene);
+    harness.render_and_read_back(&scene, None)
+}
+
+/// The stripes through the overscroll-buffer path: bake once at `dy = 0`
+/// into an offscreen texture via the same oversized-viewport-plus-scissor
+/// technique `emit_layer_texture_render`'s render pass uses in production,
+/// then composite that texture shifted by `content_offset` through
+/// `surfaces_pipeline` — the same shader and bind-group shape
+/// `paint_layer_texture_surface` builds in production.
+fn render_stripes_via_buffer(
+    harness: &mut PixelHarness,
+    content_offset: f32,
+) -> anyhow::Result<Vec<u8>> {
+    let texture_bounds = buffer_texture_bounds();
+    let key = LayerKey(9001);
+    let layer_id = crate::LayerId(1);
+
+    let mut recording = Scene::default();
+    recording.begin_layer(key, texture_bounds, true);
+    // Post-fix (#96): a buffered layer's own children paint under the
+    // widened, ancestor-unclamped mask (`with_content_mask_unclamped` in
+    // div.rs), not the plain viewport clip — otherwise every margin row is
+    // dropped by `Scene::insert_primitive` before it reaches this layer's
+    // item list at all, which was the actual bug.
+    for quad in stripe_quads(0., texture_bounds) {
+        recording.insert_primitive(quad);
+    }
+    let items = recording.end_layer().unwrap();
+    let mut packed = match crate::scene_pack::pack_layer_items(&items) {
+        crate::scene_pack::PackOutcome::Packed(packed) => packed,
+        crate::scene_pack::PackOutcome::FellBack(reason) => {
+            anyhow::bail!("stripe recipe unexpectedly fell back: {reason:?}")
+        }
+    };
+    let origin = [texture_bounds.origin.x.0, texture_bounds.origin.y.0];
+    crate::platform::cross::slab_gpu::make_packed_relative(&mut packed, origin);
+    let runs: Vec<SlabRun> = packed
+        .runs
+        .iter()
+        .map(|run| SlabRun {
+            kind: run.kind,
+            start: run.start,
+            count: run.count,
+            texture_id: run.texture_id,
+        })
+        .collect();
+    let totals = [
+        packed.quads.len() as u32,
+        packed.shadows.len() as u32,
+        packed.total_path_vertices(),
+        packed.underlines.len() as u32,
+        packed.mono_sprites.len() as u32,
+        packed.poly_sprites.len() as u32,
+    ];
+    let target = crate::scene::LayerTextureTarget {
+        layer_id,
+        key,
+        content_token: 1,
+        texture_bounds,
+    };
+
+    let mut scene = Scene::default();
+    scene.push_layer_slab_span(
+        texture_bounds,
+        key,
+        1,
+        origin,
+        totals,
+        runs.clone(),
+        Arc::from(packed),
+        Some(target),
+    );
+    scene.finish();
+
+    let groups = harness.prepare_spans(&scene);
+    harness.upload_legacy_arrays(&scene);
+
+    // `PixelHarness::prepare_spans` unconditionally sets the layer transform
+    // to `span.origin` — correct for every existing test in this file, none
+    // of which use a texture-backed span. Production's real sync path
+    // (`resolve_slab_spans`, renderer.rs) branches: a texture-backed span
+    // gets an *identity* translate, because its pack is already
+    // origin-relative (`make_packed_relative`) and the oversized-viewport
+    // bake pass, not the transform, is what repositions it. Reusing
+    // `span.origin` here would silently cancel that relativity and hide
+    // exactly the bug under test, so it must be corrected before the bake
+    // pass reads the transform slot.
+    harness.registry.set_layer_translate(key, [0., 0.]);
+    {
+        let transforms_buffer = harness.buffers.transforms_buffer().clone();
+        let stride = harness.buffers.transform_slot_stride;
+        for (slot, transform) in harness.registry.take_dirty_transforms() {
+            harness.context.queue.write_buffer(
+                &transforms_buffer,
+                slot as u64 * stride,
+                bytemuck::bytes_of(&transform),
+            );
+        }
+    }
+
+    // Bake: render the span into an offscreen texture sized to
+    // `texture_bounds`, via the same oversized-viewport + scissor redirect
+    // production's layer-texture render pass uses.
+    let tex_w = texture_bounds.size.width.0.max(0.).ceil() as u32;
+    let tex_h = texture_bounds.size.height.0.max(0.).ceil() as u32;
+    let bake_texture = harness.context.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("overscroll buffer test bake texture"),
+        size: wgpu::Extent3d { width: tex_w, height: tex_h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let bake_view = bake_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let slabs = harness.registry.entry_slabs(key).expect("span just synced");
+    let slot = harness.registry.transform_slot(key).expect("span just synced");
+    let stride = harness.buffers.transform_slot_stride;
+
+    // The bake pass gets its own globals, sized to the texture rather than
+    // the shared window-sized one every other pass uses — a buffered
+    // layer's texture (`viewport + 2 × margin`) routinely exceeds the
+    // window's own extent, and content past whatever `globals.viewport_size`
+    // claims produces an NDC coordinate outside [-1, 1] and gets clipped by
+    // the rasterizer before the scissor ever runs. Mirrors
+    // `emit_layer_texture_render`'s own bake-specific globals bind group.
+    let bake_globals = GlobalParams {
+        viewport_size: [tex_w as f32, tex_h as f32],
+        premultimated_alpha: 0,
+        pad: 0,
+    };
+    let bake_globals_buffer = harness.context.device.create_buffer_init(
+        &wgpu::util::BufferInitDescriptor {
+            label: Some("overscroll buffer test bake globals"),
+            contents: bytemuck::bytes_of(&bake_globals),
+            usage: wgpu::BufferUsages::UNIFORM,
+        },
+    );
+    let bake_globals_bind_group = harness.context.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("overscroll buffer test bake globals bind group"),
+        layout: &harness.pipelines.globals_bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: bake_globals_buffer.as_entire_binding(),
+        }],
+    });
+
+    let mut encoder = harness.context.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("overscroll buffer test bake pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &bake_view,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                resolve_target: None,
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        // The exact technique under test: a texture-sized viewport (matching
+        // this pass's own bake globals uniform's NDC conversion) at origin
+        // (0, 0) — the already texture-relative packed geometry needs a
+        // scale-matching affine, not a further offset — clipped to the
+        // texture's own bounds by the scissor rect. The same call
+        // `emit_layer_texture_render`'s render pass makes in production.
+        pass.set_viewport(0., 0., tex_w as f32, tex_h as f32, 0., 1.);
+        pass.set_scissor_rect(0, 0, tex_w, tex_h);
+        let mut bind_state = PassBindState::default();
+        for run in &runs {
+            flush_slab_run_with_state(
+                &harness.pipelines,
+                stride,
+                &mut pass,
+                &slabs,
+                &groups,
+                slot,
+                &SlabPendingRun {
+                    kind: run.kind,
+                    texture_id: run.texture_id,
+                    start: run.start,
+                    count: run.count,
+                },
+                &mut bind_state,
+                &bake_globals_bind_group,
+            );
+        }
+    }
+    harness.context.queue.submit(Some(encoder.finish()));
+    if std::env::var_os("WGPUI_DIAG_FIT_VIEWPORT").is_some() {
+        // Restore window-sized globals for the composite pass, which draws
+        // onto the full-size composite target and needs the normal mapping.
+        harness.upload_legacy_arrays(&scene);
+    }
+
+    // Composite: draw the baked texture, shifted by `content_offset`,
+    // through `surfaces_pipeline`.
+    let composite_target = harness.context.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("overscroll buffer test composite target"),
+        size: wgpu::Extent3d { width: WIDTH, height: HEIGHT, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let composite_view = composite_target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let viewport_bounds = buffer_viewport_bounds();
+    let params = SurfaceParams {
+        bounds: Bounds {
+            origin: [texture_bounds.origin.x.0, texture_bounds.origin.y.0 + content_offset],
+            size: [texture_bounds.size.width.0, texture_bounds.size.height.0],
+        },
+        content_mask: Bounds {
+            origin: [viewport_bounds.origin.x.0, viewport_bounds.origin.y.0],
+            size: [viewport_bounds.size.width.0, viewport_bounds.size.height.0],
+        },
+    };
+    let params_buffer = harness.context.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("overscroll buffer test surface params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let sampler = harness.context.device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+    let surface_bind_group = harness.context.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("overscroll buffer test surface bind group"),
+        layout: &harness.pipelines.surfaces_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &params_buffer,
+                    offset: 0,
+                    size: None,
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&bake_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    let mut encoder = harness.context.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("overscroll buffer test composite pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &composite_view,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                resolve_target: None,
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&harness.pipelines.surfaces_pipeline);
+        pass.set_bind_group(0, &harness.pipelines.globals_bind_group, &[]);
+        pass.set_bind_group(1, &surface_bind_group, &[]);
+        pass.draw(0..4, 0..1);
+    }
+
+    let bytes_per_pixel = 4u32;
+    let unpadded_row = WIDTH * bytes_per_pixel;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_row = unpadded_row.div_ceil(align) * align;
+    let staging = harness.context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("overscroll buffer test staging"),
+        size: (padded_row * HEIGHT) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        composite_target.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d { width: WIDTH, height: HEIGHT, depth_or_array_layers: 1 },
+    );
+    harness.context.queue.submit(Some(encoder.finish()));
+    let slice = staging.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = harness.context.device.poll(wgpu::PollType::wait_indefinitely());
+    let data = slice.get_mapped_range().expect("staging map succeeded");
+    let mut out = Vec::with_capacity((unpadded_row * HEIGHT) as usize);
+    for row in 0..HEIGHT {
+        let start = (row * padded_row) as usize;
+        out.extend_from_slice(&data[start..start + unpadded_row as usize]);
+    }
+    drop(data);
+    staging.unmap();
+    Ok(out)
+}
+
+#[test]
+fn overscroll_buffer_bake_and_composite_match_a_direct_render_at_the_same_scroll_position()
+-> anyhow::Result<()> {
+    let Some(mut harness) = headless_harness() else {
+        eprintln!(
+            "skipping overscroll_buffer_bake_and_composite_match_a_direct_render_at_the_same_scroll_position: no wgpu adapter"
+        );
+        return Ok(());
+    };
+
+    // content_offset values spanning the margin (60px) in both directions:
+    // aligned, a small shift, exactly half the margin (the refill trigger),
+    // and near the full margin (the hard clamp edge).
+    for &dy in &[0.0_f32, -20., -30., -55., 20., 30., 55.] {
+        let direct = render_stripes_direct(&harness, dy);
+        let buffered = render_stripes_via_buffer(&mut harness, dy)?;
+
+        if std::env::var_os("WGPUI_DUMP_ROWS").is_some() {
+            let (vx, vy, vw, vh) = BUFFER_VIEWPORT;
+            eprintln!("=== content_offset {dy} ===");
+            for row in (vy as usize)..((vy + vh) as usize) {
+                let idx = ((vx as usize + 5) + row * WIDTH as usize) * 4;
+                eprintln!(
+                    "row {row}: direct={:?} buffered={:?}",
+                    &direct[idx..idx + 4],
+                    &buffered[idx..idx + 4]
+                );
+            }
+        }
+
+        let differing: Vec<usize> = direct
+            .iter()
+            .zip(buffered.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "content_offset {dy}: {} differing bytes between the direct render \
+             and the overscroll buffer's bake+composite; first at byte {} \
+             (row {}, col {})",
+            differing.len(),
+            differing.first().copied().unwrap_or(usize::MAX),
+            differing.first().copied().unwrap_or(0) / (WIDTH as usize * 4),
+            (differing.first().copied().unwrap_or(0) / 4) % WIDTH as usize,
+        );
+    }
+
+    // Guard against a trivially-blank comparison: the viewport center at
+    // offset 0 must show a real stripe color, not the clear color.
+    let (vx, vy, vw, vh) = BUFFER_VIEWPORT;
+    let probe_x = (vx + vw / 2.) as usize;
+    let probe_y = (vy + vh / 2.) as usize;
+    let probe =
+        ((probe_x + probe_y * WIDTH as usize) * 4)..((probe_x + probe_y * WIDTH as usize) * 4 + 4);
+    let direct0 = render_stripes_direct(&harness, 0.0);
+    assert_ne!(&direct0[probe], &[0, 0, 0, 255][..]);
 
     Ok(())
 }

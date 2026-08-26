@@ -435,6 +435,35 @@ pub(crate) fn layers_enabled() -> bool {
     *ENABLED
 }
 
+/// Whether a scroll container (`.track_scroll(..)`) promotes itself to a
+/// plain, unkeyed `.layer()` automatically when nothing has already set one.
+///
+/// This is deliberately narrower than "layers are on by default everywhere":
+/// it only ever sets the *safe* default — a plain `.layer()`, which
+/// re-renders on every notify exactly as unlayered content already does, so
+/// there is no new correctness claim being made on the caller's behalf. It
+/// does not, and structurally cannot, auto-enable the texture-retained
+/// overscroll buffer (`layer_with_policy`'s non-zero `overdraw_margin`),
+/// because that path only stays correct through a scroll notify when paired
+/// with a `.layer_keyed(..)` dependency declaration — a claim about what
+/// `render` reads that only the caller can make. See
+/// `docs/scroll-free-by-default.md` §1 for the reasoning and what was
+/// rejected (a fully-automatic dependency key) and why.
+///
+/// `WGPUI_AUTO_LAYERS=0` reverts every scroll container to needing an
+/// explicit `.layer()` (or `.layer_keyed()`/`.layer_with_policy()`), exactly
+/// as before this existed — following the `WGPUI_LAYERS` precedent.
+///
+/// Read once, at first use.
+pub(crate) fn auto_layers_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("WGPUI_AUTO_LAYERS")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
 /// Whether layers may be rasterized into persistent textures (#96).
 ///
 /// `WGPUI_LAYERS_RASTERIZE=0` forces every layer to stay primitive-retained

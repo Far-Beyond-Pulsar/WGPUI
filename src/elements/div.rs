@@ -1207,8 +1207,26 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     }
 
     /// Track the scroll state of this element with the given handle.
+    ///
+    /// A scroll container promotes itself to a plain, unkeyed `.layer()`
+    /// automatically unless one is already set — see
+    /// [`crate::layer::auto_layers_enabled`] for exactly what this does and
+    /// does not buy on its own, and `docs/scroll-free-by-default.md` for the
+    /// reasoning. In short: this is the *safe* half of "scroll should be
+    /// free" (instance reconciliation, persistent layout, local ordering for
+    /// this subtree — real wins with no correctness claim attached). It does
+    /// NOT auto-enable the texture-retained overscroll buffer
+    /// (`.layer_with_policy(LayerPolicy { overdraw_margin, .. })`), which
+    /// needs a `.layer_keyed(..)` dependency declaration only the caller can
+    /// make correctly — see [`Self::layer_keyed`]'s doc comment. Call
+    /// `.layer_keyed(..)` and `.layer_with_policy(..)` explicitly for that;
+    /// they compose with this unchanged, since both only ever *set* the
+    /// policy, and this only sets it when nothing already has.
     fn track_scroll(mut self, scroll_handle: &ScrollHandle) -> Self {
         self.interactivity().tracked_scroll_handle = Some(scroll_handle.clone());
+        if crate::layer::auto_layers_enabled() && self.interactivity().layer.is_none() {
+            self.interactivity().layer = Some(LayerPolicy::default());
+        }
         self
     }
 
@@ -1459,6 +1477,11 @@ impl Div {
 /// bounds of the children after the layout phase is complete.
 pub struct DivFrameState {
     child_layout_ids: SmallVec<[LayoutId; 2]>,
+    /// Parallel to `child_layout_ids`: which children `request_layout`
+    /// contained (#96, docs/scroll-free-by-default.md §0.-2) rather than
+    /// laying out for real. Empty when this div isn't a buffered scroll
+    /// container — the common case, and the cheap one to check.
+    child_contained: SmallVec<[bool; 2]>,
 }
 
 /// [`Div`]'s [`Element::PrepaintState`] (#92).
@@ -1488,6 +1511,14 @@ enum ChildReconciliation {
     /// `diff_key`. `paint` must call `child.paint` normally, exactly as before
     /// this phase existed.
     Untracked,
+    /// `request_layout` contained this child (#96,
+    /// docs/scroll-free-by-default.md §0.-2): it's outside the buffered
+    /// scroll container's visible+margin window and got a placeholder Taffy
+    /// leaf instead of a real layout. `prepaint` never ran for it either —
+    /// nothing here to reconcile — so `paint` skips it too. No hitbox, no
+    /// primitives: correct, since it has no visible pixels this frame by
+    /// construction.
+    Contained,
     /// `prepaint` found this child unchanged and skipped its `prepaint`
     /// entirely. `paint` must likewise skip `child.paint` and instead replay
     /// the retained items and paint range recorded under `key` in `layer`.
@@ -1602,6 +1633,40 @@ impl Element for Div {
             .zip(global_id)
             .map(|(_, global_id)| LayerKey::from_global_element_id(global_id));
 
+        // Containment window (#96, docs/scroll-free-by-default.md §0.-2):
+        // set up once, read-only, before anything below takes `&mut
+        // self.interactivity`/`&mut self.children` — costs one `is_some()`
+        // check and nothing else for the overwhelming common case (anything
+        // that isn't a buffered scroll container). Deciding per child
+        // in-line in the loop below, rather than building a
+        // `Vec<ChildContainment>` up front, avoids a heap allocation and a
+        // second full pass over the child list every single frame — real
+        // overhead at 10,000 children that a two-pass version was paying
+        // whether or not anything actually changed.
+        let mut containment_window = self.interactivity.tracked_scroll_handle.as_ref().and_then(
+            |handle| {
+                let margin = self
+                    .interactivity
+                    .layer
+                    .as_ref()
+                    .map(|policy| policy.overdraw_margin)
+                    .filter(|margin| *margin != Size::default())?;
+                let viewport = handle.bounds().size;
+                if viewport.height <= px(0.) {
+                    // No prior frame to base an estimate on yet (first mount
+                    // before this container has ever been measured) — every
+                    // child gets a real layout this frame, same as always.
+                    return None;
+                }
+                Some(super::scroll_buffer::ContainmentWindow::new(
+                    handle.offset().y,
+                    viewport.height,
+                    margin.height,
+                ))
+            },
+        );
+        let mut child_contained: SmallVec<[bool; 2]> = SmallVec::new();
+
         let mut request = |window: &mut Window| {
             self.interactivity.request_layout(
                 global_id,
@@ -1618,17 +1683,68 @@ impl Element for Div {
                                 let id = child
                                     .inner_id()
                                     .unwrap_or(ElementId::InstanceSlot(index as u32));
-                                // #93: pushed for the sole purpose of letting
-                                // this child's own `request_layout` — several
-                                // stack frames down, inside `child.request_layout`
-                                // — resolve `window.current_instance_key()` to
-                                // its own path when it reaches its own
-                                // `request_layout_or_reuse` call. Mirrors
-                                // `prepaint_reconciled_child`'s identical push,
-                                // one phase earlier, for the identical reason.
-                                window.with_instance_slot(id, |window| {
-                                    child.request_layout(window, cx)
-                                })
+                                let contained_size = containment_window.as_mut().and_then(|w| {
+                                    match w.decide(child.inner_estimated_size(window)) {
+                                        super::scroll_buffer::ChildContainment::Contained(size) => {
+                                            Some(size)
+                                        }
+                                        super::scroll_buffer::ChildContainment::Real => None,
+                                    }
+                                });
+                                child_contained.push(contained_size.is_some());
+                                if let Some(size) = contained_size {
+                                    // Skipped entirely: no reconciliation, no
+                                    // style resolution, no recursion into this
+                                    // child's subtree — just a leaf Taffy node
+                                    // reporting the size `estimated_size`
+                                    // already knew for free. `prepaint`/`paint`
+                                    // must also skip this child; see
+                                    // `child_contained` above.
+                                    //
+                                    // Deliberately NOT cached across frames
+                                    // (a `Layer::contained_layouts`-style
+                                    // per-instance Taffy-node cache was tried
+                                    // and reverted): this closure's freshly
+                                    // built `child_layout_ids` is discarded
+                                    // whenever `request_layout_or_reuse`
+                                    // below decides the *container's own*
+                                    // node is reusable — in that case a
+                                    // cached placeholder id would be a live,
+                                    // "touched" Taffy node with no parent
+                                    // wiring it in, which a later frame's
+                                    // reuse attempt turns into a real crash
+                                    // (`invalid SlotMap key used` once the
+                                    // orphan is eventually swept and its slot
+                                    // recycled). Fresh insertion is correct;
+                                    // it just isn't free — see
+                                    // docs/scroll-free-by-default.md §0.-3
+                                    // for the measured cost this leaves open.
+                                    window.request_layout(
+                                        Style {
+                                            size: Size {
+                                                width: crate::Length::Definite(size.width.into()),
+                                                height: crate::Length::Definite(
+                                                    size.height.into(),
+                                                ),
+                                            },
+                                            ..Style::default()
+                                        },
+                                        [],
+                                        cx,
+                                    )
+                                } else {
+                                    // #93: pushed for the sole purpose of letting
+                                    // this child's own `request_layout` — several
+                                    // stack frames down, inside `child.request_layout`
+                                    // — resolve `window.current_instance_key()` to
+                                    // its own path when it reaches its own
+                                    // `request_layout_or_reuse` call. Mirrors
+                                    // `prepaint_reconciled_child`'s identical push,
+                                    // one phase earlier, for the identical reason.
+                                    window.with_instance_slot(id, |window| {
+                                        child.request_layout(window, cx)
+                                    })
+                                }
                             })
                             .collect::<SmallVec<_>>();
 
@@ -1648,7 +1764,13 @@ impl Element for Div {
             None => request(window),
         });
 
-        (layout_id, DivFrameState { child_layout_ids })
+        (
+            layout_id,
+            DivFrameState {
+                child_layout_ids,
+                child_contained,
+            },
+        )
     }
 
     #[stacksafe]
@@ -1719,6 +1841,10 @@ impl Element for Div {
         // actually ran — see `ChildReconciliation`'s doc comment.
         let mut child_reconciliation: SmallVec<[ChildReconciliation; 2]> = SmallVec::new();
 
+        // Read before `interactivity.prepaint` takes its borrow; the closure
+        // below captures `children` mutably.
+        let is_scroll_container = self.interactivity.scroll_offset.is_some();
+
         let prepaint = |window: &mut Window| {
             self.interactivity.prepaint(
                 global_id,
@@ -1732,13 +1858,110 @@ impl Element for Div {
                         return hitbox;
                     }
 
-                    window.with_element_offset(scroll_offset, |window| {
+                    // Overscroll buffer (#96): a scroll container under a
+                    // buffered layer joins the same protocol the virtualized
+                    // lists use. When the enclosing texture-retained layer is
+                    // about to composite shifted, skip the children entirely —
+                    // they are already recorded in the layer's texture, and
+                    // scrolling this frame costs one content offset, not a
+                    // re-record. The skipped children keep their hitboxes,
+                    // listeners and paint ranges from the frame the texture
+                    // was rendered; the composite replays those.
+                    //
+                    // Gated on this element actually being a scroll container:
+                    // a static div under a buffered layer has nothing to shift,
+                    // and consulting the buffer with a constant offset would
+                    // only churn the anchor bookkeeping.
+                    //
+                    // Note the pairing this needs to actually reach `Skip`: a
+                    // wheel tick notifies the view, and a *plain* `.layer()`
+                    // treats any notified view as rebuilt — so a buffered
+                    // scroller must be `.layer_keyed(..)` over everything its
+                    // content depends on EXCEPT the scroll offset. With the key,
+                    // the notify that scroll itself produces composites instead
+                    // of re-recording.
+                    let mut buffer_record_margin: Option<Size<Pixels>> = None;
+                    if is_scroll_container {
+                        let frame =
+                            super::scroll_buffer::prepare_scroll_buffer(window, scroll_offset);
+                        if matches!(frame, super::scroll_buffer::ScrollBufferFrame::Skip) {
+                            return hitbox;
+                        }
+                        // Not a shift frame: every child is about to be laid
+                        // out regardless of `frame`'s margin, because a plain
+                        // div's children are a real, fully-materialized Vec —
+                        // "lay out the buffer range" only bounds cost for
+                        // virtualized lists (`uniform_list`/`virtual_list`/
+                        // `h_list`), which synthesize just that range. A
+                        // buffered plain div still pays this cost on every
+                        // refill (first mount, every resize, every scroll
+                        // past the margin), scaling with total child count —
+                        // see docs/scroll-free-by-default.md §0.-1.3, measured
+                        // at ~1.3s per refill for 10,000 rows. Warn once so
+                        // this footgun is visible in development instead of
+                        // discovered as "scrolling is laggy" in production.
+                        #[cfg(debug_assertions)]
+                        {
+                            const LARGE_UNBOUNDED_REFILL: usize = 500;
+                            if self.children.len() > LARGE_UNBOUNDED_REFILL {
+                                warn_unbounded_buffered_refill_once(self.children.len());
+                            }
+                        }
+                        if let super::scroll_buffer::ScrollBufferFrame::Buffer { margin } = frame {
+                            buffer_record_margin = Some(margin);
+                        }
+                    }
+
+                    // A confirmed record frame (#96): widen the active
+                    // content_mask to the buffer's full extent — viewport +
+                    // margin, not just the viewport — for exactly this
+                    // child loop, replacing rather than intersecting with
+                    // the ambient (viewport-only) mask. Otherwise every row
+                    // painted into the margin band, positioned there by
+                    // `with_element_offset` below, has bounds outside its
+                    // own content_mask and `Scene::insert_primitive` drops
+                    // it before it ever reaches this layer's item list —
+                    // margin content silently never bakes, and the buffer
+                    // only ever covers whatever happened to overlap the
+                    // viewport at record time (docs/scroll-free-by-default.md
+                    // §0.-4). Gated on rasterization actually applying: only
+                    // a texture-retained composite re-clips downstream
+                    // (`paint_layer_texture_surface`'s `visible_bounds`) —
+                    // the legacy composite re-emits each primitive under its
+                    // own recorded mask with no such backstop, so an
+                    // unclamped mask there would paint margin rows visibly
+                    // past the true viewport. `Interactivity::prepaint`'s
+                    // own (still ambient-intersected) widening is what this
+                    // replaces; see its doc comment for why it can't do this
+                    // unclamped widening itself.
+                    let widened_mask = buffer_record_margin
+                        .filter(|_| {
+                            crate::layer::rasterization_enabled()
+                                && crate::scene_pack::slabs_enabled()
+                        })
+                        .map(|margin| {
+                            let mut mask = window.content_mask();
+                            mask.bounds = crate::layer::inflate_bounds(mask.bounds, margin);
+                            mask
+                        });
+
+                    let mut paint_children = |window: &mut Window| {
+                        window.with_element_offset(scroll_offset, |window| {
                         for (index, (child, child_layout_id)) in self
                             .children
                             .iter_mut()
                             .zip(request_layout.child_layout_ids.iter().copied())
                             .enumerate()
                         {
+                            if request_layout
+                                .child_contained
+                                .get(index)
+                                .copied()
+                                .unwrap_or(false)
+                            {
+                                child_reconciliation.push(ChildReconciliation::Contained);
+                                continue;
+                            }
                             child_reconciliation.push(prepaint_reconciled_child(
                                 index,
                                 child,
@@ -1747,7 +1970,12 @@ impl Element for Div {
                                 cx,
                             ));
                         }
-                    });
+                        })
+                    };
+                    match widened_mask {
+                        Some(mask) => window.with_content_mask_unclamped(Some(mask), paint_children),
+                        None => paint_children(window),
+                    }
 
                     if let Some(listener) = self.prepaint_listener.as_ref() {
                         listener(children_bounds, window, cx);
@@ -1920,6 +2148,42 @@ impl Element for Div {
             children,
         }))
     }
+
+    fn estimated_size(&self, window: &Window) -> Option<Size<Pixels>> {
+        // What actually matters for containment is the axis the scroll
+        // container accumulates along (see `scroll_buffer::estimate_offsets`)
+        // — for a vertical list that's height, and it must be *exact*: a
+        // wrong height is a real layout shift once the child is revealed.
+        // Width has no bearing on which children are in range, so it's
+        // treated more permissively: `w_full()` (`DefiniteLength::Fraction`)
+        // resolves against the window's own viewport as a stand-in for "the
+        // parent," which is exactly right for the common case (a scroller
+        // filling its container's width) and only wrong when the immediate
+        // parent is narrower — visually harmless either way, since a
+        // contained child never paints; it only has to be *some* size Taffy
+        // can lay siblings out against.
+        let resolve = |length: Option<crate::Length>, parent: Pixels| match length {
+            Some(crate::Length::Definite(def)) => {
+                Some(def.to_pixels(crate::AbsoluteLength::Pixels(parent), window.rem_size()))
+            }
+            _ => None,
+        };
+        let width = resolve(
+            self.interactivity.base_style.size.width,
+            window.viewport_size().width,
+        )?;
+        // Height alone must be exact — see above — so it does not get the
+        // viewport-width fallback's leniency: `Fraction` here would need the
+        // *real* parent height, which is unknowable without doing the work
+        // containment exists to skip, so it stays `None` rather than guess.
+        let height = match self.interactivity.base_style.size.height {
+            Some(crate::Length::Definite(crate::DefiniteLength::Absolute(abs))) => {
+                abs.to_pixels(window.rem_size())
+            }
+            _ => return None,
+        };
+        Some(crate::size(width, height))
+    }
 }
 
 /// One child's contribution to its parent's [`DivDiffKey`]: identity plus the
@@ -2086,6 +2350,35 @@ pub(crate) fn classify_style_change(new: &StyleRefinement, old: &StyleRefinement
         axes = Invalidation::all();
     }
     axes
+}
+
+/// Warn, once per process, that a buffered scroll container (`.layer_keyed`
+/// + non-zero `overdraw_margin` over a plain, non-virtualized div) has enough
+/// real children that its refill cost is unbounded — see the call site's
+/// comment and docs/scroll-free-by-default.md §0.-1.3. Debug builds only:
+/// this is a development-time footgun diagnostic, not a runtime cost worth
+/// paying in release.
+#[cfg(debug_assertions)]
+fn warn_unbounded_buffered_refill_once(child_count: usize) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        log::warn!(
+            target: "scroll_buffer",
+            "a buffered scroll container ({child_count} real children) refills by laying out \
+             every child, not just the visible range — the overscroll buffer only makes shift \
+             frames free for plain divs, not refills. For lists this large, use uniform_list, \
+             virtual_list, or h_list instead, which synthesize only the visible range. See \
+             docs/scroll-free-by-default.md §0.-1.3. (This warning prints once per process.)"
+        );
+    }
 }
 
 /// Prepaint one child of a `.layer()` subtree, reconciling against its
@@ -2258,6 +2551,7 @@ fn paint_reconciled_child(
         ChildReconciliation::Untracked => {
             child.paint(window, cx);
         }
+        ChildReconciliation::Contained => {}
         ChildReconciliation::Reused { layer, key } => {
             crate::render_stats::count("instance: reused (paint)");
             // The layer record cannot have been evicted since `prepaint` saw
@@ -2543,6 +2837,23 @@ impl Interactivity {
                     // texture instead of being clipped at the viewport edge.
                     // The composite clips back to the visible rect, so the
                     // margin never paints outside the layer.
+                    //
+                    // This mask is still *intersected* with the ambient one
+                    // (the ordinary `with_content_mask`, not the unclamped
+                    // variant) — deliberately so: `prepare_scroll_buffer`
+                    // (called from `Div::prepaint`'s own closure, further
+                    // down `f`) reads `self.content_mask()` to build the
+                    // cache key its shift-vs-refill prediction compares
+                    // against the layer's *stored* cache key, computed by an
+                    // ancestor before this div's own prepaint ever ran — an
+                    // unclamped mask here would make that comparison see a
+                    // wider mask than the stored key expects and permanently
+                    // mismatch, turning every shift frame into a spurious
+                    // refill. The real, unclamped widening that lets margin
+                    // rows survive `Scene::insert_primitive`'s clip has to
+                    // wait until *after* that read, scoped to just the child
+                    // loop — see `Div::prepaint`'s own buffered-frame
+                    // handling.
                     let overflow_mask = style
                         .overflow_mask(bounds, window.rem_size())
                         .map(|mut mask| {

@@ -37,6 +37,13 @@ pub(crate) struct CrossWindowState {
     pub(crate) is_hovered: Cell<bool>,
     pub(crate) resize_detector: ResizeDetector,
     pub(crate) app_id: RefCell<Option<String>>,
+    /// Last time `about_to_wait`'s idle loop asked this window to redraw.
+    /// `None` means never — always due. See `about_to_wait`'s doc comment:
+    /// `request_redraw()` wakes the event loop on its own, so throttling the
+    /// *rate winit is told about* (rather than `ControlFlow`, which a
+    /// self-triggered redraw request bypasses) is what actually bounds idle
+    /// CPU use.
+    pub(crate) last_idle_redraw_requested_at: Cell<Option<crate::time_ext::Instant>>,
 }
 
 #[derive(Default)]

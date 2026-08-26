@@ -793,6 +793,11 @@ struct WgpuPipelines {
     /// that can draw slab content. Dynamic-offset so one small uniform serves
     /// all layers; slot 0 is permanently zero for legacy draws.
     layer_transform_bind_group_layout: wgpu::BindGroupLayout,
+    /// Stored (unlike every other one-off layout here) so a texture-retained
+    /// layer's bake pass can build its own globals bind group, sized to the
+    /// layer's texture rather than the window (#96) — see
+    /// `emit_layer_texture_render`'s render pass.
+    globals_bind_group_layout: wgpu::BindGroupLayout,
 
     globals_bind_group: wgpu::BindGroup,
     color_adjustments_bind_group: wgpu::BindGroup,
@@ -1319,6 +1324,7 @@ impl WgpuPipelines {
             poly_sprites_bind_group_layout,
             paths_bind_group_layout,
             layer_transform_bind_group_layout,
+            globals_bind_group_layout,
 
             globals_bind_group,
             color_adjustments_bind_group,
@@ -2867,6 +2873,7 @@ impl WgpuRenderer {
                 groups,
                 state,
                 open_run,
+                &self.pipelines.globals_bind_group,
             );
             *open_run = Some(OpenSlabRun {
                 key: span.key,
@@ -2891,6 +2898,7 @@ impl WgpuRenderer {
         groups: &SlabDrawGroups,
         transform_slot_stride: u64,
         state: &mut PassBindState,
+        globals_bind_group: &wgpu::BindGroup,
     ) {
         if self.slab_registry.is_awaiting_rerecord(span.key) {
             self.slab_registry.note_span_skipped_awaiting_rerecord();
@@ -2931,6 +2939,7 @@ impl WgpuRenderer {
                 groups,
                 state,
                 &mut one,
+                globals_bind_group,
             );
         }
     }
@@ -3529,6 +3538,7 @@ impl WgpuRenderer {
                                 groups,
                                 &mut pass_state,
                                 &mut open_slab_run,
+                                &self.pipelines.globals_bind_group,
                             );
                         }
                         batch
@@ -3551,6 +3561,7 @@ impl WgpuRenderer {
                                     groups,
                                     &mut pass_state,
                                     &mut open_slab_run,
+                                    &self.pipelines.globals_bind_group,
                                 );
                             }
                             drop(pass);
@@ -3646,24 +3657,63 @@ impl WgpuRenderer {
                             }
                             pass_state.reset();
 
-                            // The packed coordinates are texture-relative, but
-                            // every slab vertex shader maps window pixels
-                            // through NDC using the window size. A viewport
-                            // whose affine maps window space onto the texture
-                            // (origin at -texture_origin, size = window) makes
-                            // the existing pipelines draw texture-space
-                            // geometry exactly where the texture lives — no
-                            // shader variants needed.
-                            let viewport_size = self.surface_configuration.width as f32;
-                            let viewport_height = self.surface_configuration.height as f32;
-                            pass.set_viewport(
-                                -target.texture_bounds.origin.x.0,
-                                -target.texture_bounds.origin.y.0,
-                                viewport_size,
-                                viewport_height,
-                                0.0,
-                                1.0,
+                            // The packed coordinates are already texture-relative
+                            // (`resolve_slab_spans` gives a texture-backed span an
+                            // identity layer translate, on top of a pack built
+                            // origin-relative to `texture_bounds.origin` in the
+                            // first place — see that translate assignment's own
+                            // comment), so the viewport is a plain identity affine
+                            // at origin (0, 0) — no `-texture_origin` offset (that
+                            // shifted already-relative geometry a second time; see
+                            // this pass's other fix, just above in git blame).
+                            //
+                            // What it must NOT be is the window-sized globals
+                            // every other pass shares: every slab vertex shader
+                            // divides by `globals.viewport_size` to reach NDC, and
+                            // a buffered layer's texture — `viewport + 2 × margin`
+                            // — routinely stands taller (or wider) than the
+                            // window itself. Content past the window's own extent
+                            // would produce an NDC coordinate outside [-1, 1] and
+                            // get clipped by the rasterizer before the scissor
+                            // ever runs, silently dropping exactly the far margin
+                            // band a large-enough buffer needs. So this pass gets
+                            // its own globals, sized to the texture rather than
+                            // the window, bound in place of `globals_bind_group`
+                            // for these draws only — confirmed by
+                            // `overscroll_buffer_bake_and_composite_match_a_direct_render_at_the_same_scroll_position`
+                            // in renderer_slab_tests.rs, which fails at extreme
+                            // margins without this and passes with it.
+                            let bake_viewport_size = [
+                                target.texture_bounds.size.width.0.max(1.0),
+                                target.texture_bounds.size.height.0.max(1.0),
+                            ];
+                            let bake_globals = GlobalParams {
+                                viewport_size: bake_viewport_size,
+                                premultimated_alpha: match self.surface_configuration.alpha_mode {
+                                    wgpu::CompositeAlphaMode::PreMultiplied => 1,
+                                    _ => 0,
+                                },
+                                pad: 0,
+                            };
+                            let bake_globals_buffer = self.context.device.create_buffer_init(
+                                &wgpu::util::BufferInitDescriptor {
+                                    label: Some("layer_texture_bake_globals"),
+                                    contents: bytemuck::bytes_of(&bake_globals),
+                                    usage: wgpu::BufferUsages::UNIFORM,
+                                },
                             );
+                            let bake_globals_bind_group = self.context.device.create_bind_group(
+                                &wgpu::BindGroupDescriptor {
+                                    label: Some("layer_texture_bake_globals_bind_group"),
+                                    layout: &self.pipelines.globals_bind_group_layout,
+                                    entries: &[wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: bake_globals_buffer.as_entire_binding(),
+                                    }],
+                                },
+                            );
+
+                            pass.set_viewport(0.0, 0.0, bake_viewport_size[0], bake_viewport_size[1], 0.0, 1.0);
                             pass.set_scissor_rect(0, 0, target.texture_bounds.size.width.0.ceil() as u32, target.texture_bounds.size.height.0.ceil() as u32);
 
                             if let Some(groups) = slab_groups.as_ref() {
@@ -3674,6 +3724,7 @@ impl WgpuRenderer {
                                         groups,
                                         transform_slot_stride,
                                         &mut pass_state,
+                                        &bake_globals_bind_group,
                                     );
                                 }
                             }
@@ -4478,6 +4529,7 @@ impl WgpuRenderer {
                     groups,
                     &mut pass_state,
                     &mut open_slab_run,
+                    &self.pipelines.globals_bind_group,
                 );
             }
         }
@@ -5000,6 +5052,7 @@ fn flush_slab_run(
         transform_slot,
         run,
         &mut untracked,
+        &pipelines.globals_bind_group,
     );
 }
 
@@ -5007,6 +5060,11 @@ fn flush_slab_run(
 /// that would repeat what the pass already holds are skipped. Skipping is
 /// pixel-neutral because tracked ids match only when the bound resource,
 /// layout slot, and dynamic offsets are all identical.
+///
+/// `globals_bind_group` is a parameter rather than always
+/// `&pipelines.globals_bind_group` so a texture-retained layer's bake pass
+/// can bind its own, texture-sized globals instead of the shared,
+/// window-sized one (#96) — see that pass's own call site for why.
 fn flush_slab_run_with_state(
     pipelines: &WgpuPipelines,
     transform_slot_stride: u64,
@@ -5016,6 +5074,7 @@ fn flush_slab_run_with_state(
     transform_slot: u32,
     run: &SlabPendingRun,
     state: &mut PassBindState,
+    globals_bind_group: &wgpu::BindGroup,
 ) {
     profiling::scope!("wgpui: flush slab runs");
     let dynamic_offsets = [(transform_slot as u64 * transform_slot_stride) as u32];
@@ -5024,21 +5083,21 @@ fn flush_slab_run_with_state(
     match run.kind {
         SlabKind::Quads => {
             state.set_pipeline(pass, DrawPipelineId::Quads, &pipelines.quads_pipeline);
-            state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+            state.set_bind_group(pass, 0, BoundGroupId::Globals, globals_bind_group, &[]);
             state.set_bind_group(pass, 1, BoundGroupId::SlabStorage(SlabKind::Quads), &groups.quads, &[]);
             state.set_bind_group(pass, 2, transform_id, &groups.layer_transform, &dynamic_offsets);
             pass.draw(0..4, range_base..range_base + run.count);
         }
         SlabKind::Shadows => {
             state.set_pipeline(pass, DrawPipelineId::Shadows, &pipelines.shadows_pipeline);
-            state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+            state.set_bind_group(pass, 0, BoundGroupId::Globals, globals_bind_group, &[]);
             state.set_bind_group(pass, 1, BoundGroupId::SlabStorage(SlabKind::Shadows), &groups.shadows, &[]);
             state.set_bind_group(pass, 2, transform_id, &groups.layer_transform, &dynamic_offsets);
             pass.draw(0..4, range_base..range_base + run.count);
         }
             SlabKind::Underlines => {
                 state.set_pipeline(pass, DrawPipelineId::Underlines, &pipelines.underlines_pipeline);
-                state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+                state.set_bind_group(pass, 0, BoundGroupId::Globals, globals_bind_group, &[]);
                 state.set_bind_group(pass, 1, BoundGroupId::SlabStorage(SlabKind::Underlines), &groups.underlines, &[]);
                 state.set_bind_group(pass, 2, transform_id, &groups.layer_transform, &dynamic_offsets);
                 pass.draw(0..4, range_base..range_base + run.count);
@@ -5054,7 +5113,7 @@ fn flush_slab_run_with_state(
                     return;
                 };
                 state.set_pipeline(pass, DrawPipelineId::MonoSprites, &pipelines.mono_sprites_pipeline);
-                state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+                state.set_bind_group(pass, 0, BoundGroupId::Globals, globals_bind_group, &[]);
                 state.set_bind_group(pass, 1, BoundGroupId::ColorAdjustments, &pipelines.color_adjustments_bind_group, &[]);
                 state.set_bind_group(
                     pass,
@@ -5078,7 +5137,7 @@ fn flush_slab_run_with_state(
                     return;
                 };
                 state.set_pipeline(pass, DrawPipelineId::PolySprites, &pipelines.poly_sprites_pipeline);
-                state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+                state.set_bind_group(pass, 0, BoundGroupId::Globals, globals_bind_group, &[]);
                 state.set_bind_group(
                     pass,
                     1,
@@ -5095,7 +5154,7 @@ fn flush_slab_run_with_state(
             SlabKind::Paths => {
                 let base = slabs.slab(SlabKind::Paths).base;
                 state.set_pipeline(pass, DrawPipelineId::Paths, &pipelines.paths_pipeline);
-                state.set_bind_group(pass, 0, BoundGroupId::Globals, &pipelines.globals_bind_group, &[]);
+                state.set_bind_group(pass, 0, BoundGroupId::Globals, globals_bind_group, &[]);
                 state.set_bind_group(pass, 1, BoundGroupId::SlabStorage(SlabKind::Paths), &groups.paths_vertices, &[]);
                 state.set_bind_group(pass, 2, transform_id, &groups.layer_transform, &dynamic_offsets);
                 pass.draw(base + run.start..base + run.start + run.count, 0..1);
@@ -5115,6 +5174,7 @@ fn flush_open_slab_run(
     groups: &SlabDrawGroups,
     state: &mut PassBindState,
     open: &mut Option<OpenSlabRun>,
+    globals_bind_group: &wgpu::BindGroup,
 ) {
     if let Some(open) = open.take() {
         let pending = open.as_pending();
@@ -5127,6 +5187,7 @@ fn flush_open_slab_run(
             open.transform_slot,
             &pending,
             state,
+            globals_bind_group,
         );
     }
 }
