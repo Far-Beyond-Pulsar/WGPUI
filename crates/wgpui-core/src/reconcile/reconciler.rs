@@ -449,6 +449,7 @@ impl Reconciler {
 mod tests {
     use super::*;
     use crate::reconcile::diff_key::{AlwaysDirty, ReconcileKey, compare_by_equality};
+    use crate::reconcile::state::{ElementStateStore, StateKey};
     use std::any::Any;
 
     struct Panel;
@@ -486,6 +487,262 @@ mod tests {
                     .diff_key(Fingerprint(value))
                     .child(leaf(value)),
             )
+    }
+
+    /// Recursively confirm a description tree names no element and opts into
+    /// nothing — the "zero API touched anywhere in the test" half of gate #2,
+    /// checked mechanically rather than by reading the helper above.
+    fn assert_names_nothing(description: &Description) {
+        assert!(
+            description.element_id().is_none(),
+            "gate #2 requires an element tree with no explicit id anywhere"
+        );
+        assert!(
+            !description.is_uncached(),
+            "gate #2 requires an element tree that opts out of nothing"
+        );
+        for child in description.child_descriptions() {
+            assert_names_nothing(child);
+        }
+    }
+
+    /// **Phase 1 gate #2** (§4.0, §8): a plain, unboundaried, three-level-deep
+    /// element tree that renders identically to the previous frame keeps the
+    /// same layout-node identity and skips its equivalent of `prepaint` and
+    /// `paint`.
+    ///
+    /// Zero boundary API, zero explicit id, zero opt-in of any kind is touched
+    /// — [`assert_names_nothing`] checks the first two mechanically, and the
+    /// third is an absence in [`Reconciler::reconcile`]'s own signature: it
+    /// takes a description tree and a layout tree, and has no parameter a
+    /// caller could fence it with.
+    #[test]
+    fn gate_2_an_unboundaried_three_level_tree_keeps_its_nodes_and_skips_prepaint_and_paint()
+    -> Result<(), ReconcileError> {
+        let mut reconciler = Reconciler::new();
+        let mut layout = LayoutTree::new();
+
+        let first_description = tree(0);
+        assert_names_nothing(&first_description);
+        let first = reconciler.reconcile(first_description, &mut layout)?;
+        assert_eq!(first.stats().visited, 6);
+        assert_eq!(
+            first.nodes().iter().map(|node| node.depth).max(),
+            Some(2),
+            "the tree must actually be three levels deep"
+        );
+
+        let second_description = tree(0);
+        assert_names_nothing(&second_description);
+        let second = reconciler.reconcile(second_description, &mut layout)?;
+
+        assert!(
+            second.nodes().iter().all(PlannedNode::skipped_prepaint_and_paint),
+            "every element in an unchanged unboundaried tree must skip prepaint/paint"
+        );
+        assert_eq!(second.stats().reused, 6);
+        assert_eq!(second.stats().rebuilt, 0);
+        assert_eq!(second.stats().layout_nodes_created, 0);
+        assert_eq!(second.stats().layout_nodes_reused, 6);
+        assert_eq!(second.stats().layout_nodes_swept, 0);
+        assert_eq!(second.stats().instances_swept, 0);
+
+        for node in second.nodes() {
+            let instance = match node.instance {
+                Some(instance) => instance,
+                None => panic!("a reconciled element must have an instance record"),
+            };
+            let before = first
+                .node_for_instance(instance)
+                .map(|node| node.layout_node);
+            assert_eq!(
+                before,
+                Some(node.layout_node),
+                "a clean element must keep the exact layout node it had last frame"
+            );
+            assert!(layout.is_live(node.layout_node));
+        }
+        Ok(())
+    }
+
+    /// **Phase 1 gate #3** (§4.2, §8): a subtree marked `.uncached()` allocates
+    /// no retained instance record, and its children's separately-keyed state
+    /// survives across frames identically to a reconciled subtree's.
+    ///
+    /// The tree holds two structurally identical panels side by side — one
+    /// reconciled, one `.uncached()` — so "identically" is checked against a
+    /// live control rather than an asserted constant.
+    #[test]
+    fn gate_3_uncached_allocates_no_instance_while_state_survives_identically()
+    -> Result<(), ReconcileError> {
+        #[derive(Debug, PartialEq)]
+        struct Visits(u32);
+
+        fn panels() -> Description {
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(0))
+                .child(
+                    Description::new::<Panel>()
+                        .diff_key(Fingerprint(0))
+                        .child(leaf(0)),
+                )
+                .child(
+                    Description::new::<Panel>()
+                        .uncached()
+                        .diff_key(Fingerprint(0))
+                        .child(leaf(0)),
+                )
+        }
+
+        fn visit_state(store: &mut ElementStateStore, scope: StateScope, frame: u64) -> u32 {
+            store
+                .with_state(
+                    StateKey::new::<Visits>(scope),
+                    frame,
+                    || Visits(0),
+                    |visits| {
+                        visits.0 += 1;
+                        visits.0
+                    },
+                )
+                .unwrap_or(0)
+        }
+
+        let reconciled_leaf = StateScope::from_path(&[
+            ElementId::Slot(0),
+            ElementId::Slot(0),
+            ElementId::Slot(0),
+        ]);
+        let uncached_leaf = StateScope::from_path(&[
+            ElementId::Slot(0),
+            ElementId::Slot(1),
+            ElementId::Slot(0),
+        ]);
+
+        let mut reconciler = Reconciler::new();
+        let mut layout = LayoutTree::new();
+        let mut state = ElementStateStore::new();
+        let mut plan = reconciler.reconcile(panels(), &mut layout)?;
+
+        for frame in 1..=3u64 {
+            if frame > 1 {
+                plan = reconciler.reconcile(panels(), &mut layout)?;
+            }
+
+            let reconciled = match plan.node_for_state(reconciled_leaf) {
+                Some(node) => *node,
+                None => panic!("the reconciled leaf must appear in the plan"),
+            };
+            let uncached = match plan.node_for_state(uncached_leaf) {
+                Some(node) => *node,
+                None => panic!("an uncached element is still visited, and still planned"),
+            };
+
+            assert!(reconciled.instance.is_some());
+            assert_eq!(
+                uncached.instance, None,
+                "no retained record exists for anything inside an `.uncached()` subtree"
+            );
+            assert_eq!(uncached.outcome, NodeOutcome::Uncached);
+            assert_eq!(plan.stats().uncached, 2, "the flag applies to the subtree");
+            assert_eq!(
+                reconciler.instances().len(),
+                3,
+                "only the root and the reconciled panel's two elements are retained"
+            );
+
+            let reconciled_visits = visit_state(&mut state, reconciled_leaf, frame);
+            let uncached_visits = visit_state(&mut state, uncached_leaf, frame);
+            assert_eq!(
+                reconciled_visits, uncached_visits,
+                "state must survive identically on both sides of the flag"
+            );
+            assert_eq!(reconciled_visits, frame as u32);
+            assert_eq!(
+                state.sweep(frame),
+                0,
+                "an uncached element visits its state like any other, so nothing is swept"
+            );
+        }
+
+        // The control half: while state behaved identically, reconciliation did
+        // not — which is what makes the two mechanisms decoupled rather than
+        // merely both present.
+        assert!(
+            plan.node_for_state(reconciled_leaf)
+                .is_some_and(PlannedNode::skipped_prepaint_and_paint)
+        );
+        assert!(
+            !plan.node_for_state(uncached_leaf)
+                .is_some_and(PlannedNode::skipped_prepaint_and_paint)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_element_that_stops_being_uncached_is_reconciled_again() -> Result<(), ReconcileError> {
+        let mut reconciler = Reconciler::new();
+        let mut layout = LayoutTree::new();
+        reconciler.reconcile(
+            Description::new::<Panel>()
+                .uncached()
+                .diff_key(Fingerprint(0))
+                .child(leaf(0)),
+            &mut layout,
+        )?;
+        assert!(reconciler.instances().is_empty());
+
+        reconciler.reconcile(
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(0))
+                .child(leaf(0)),
+            &mut layout,
+        )?;
+        assert_eq!(reconciler.instances().len(), 2);
+        let plan = reconciler.reconcile(
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(0))
+                .child(leaf(0)),
+            &mut layout,
+        )?;
+        assert!(plan.fully_reused());
+        Ok(())
+    }
+
+    #[test]
+    fn an_element_that_becomes_uncached_drops_the_records_it_had() -> Result<(), ReconcileError> {
+        let mut reconciler = Reconciler::new();
+        let mut layout = LayoutTree::new();
+        reconciler.reconcile(tree(0), &mut layout)?;
+        assert_eq!(reconciler.instances().len(), 6);
+
+        let mut uncached_root = tree(0);
+        uncached_root = uncached_root.uncached();
+        reconciler.reconcile(uncached_root, &mut layout)?;
+        assert!(
+            reconciler.instances().is_empty(),
+            "the bookkeeping must go away immediately, not at the next sweep"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_uncached_subtrees_stay_suppressed_past_the_inner_one()
+    -> Result<(), ReconcileError> {
+        let mut reconciler = Reconciler::new();
+        let mut layout = LayoutTree::new();
+        let plan = reconciler.reconcile(
+            Description::new::<Panel>().diff_key(Fingerprint(0)).child(
+                Description::new::<Panel>()
+                    .uncached()
+                    .child(Description::new::<Panel>().uncached().child(leaf(0)))
+                    .child(leaf(0)),
+            ),
+            &mut layout,
+        )?;
+        assert_eq!(plan.stats().uncached, 4);
+        assert_eq!(reconciler.instances().len(), 1);
+        Ok(())
     }
 
     #[test]
