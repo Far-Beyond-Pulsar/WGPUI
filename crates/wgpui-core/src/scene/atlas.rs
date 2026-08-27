@@ -149,6 +149,53 @@ pub struct GlyphTile {
     pub bearing: [f32; 2],
 }
 
+/// One glyph's rasterised bitmap: the pixels an allocated tile is supposed to
+/// hold, plus where they sit relative to the pen.
+///
+/// The other half of [`GlyphTileSource`]'s vocabulary, and it lives here for the
+/// same reason the trait does. `wgpui-text` produces one of these (it is the
+/// crate that owns `cosmic-text`, and therefore `swash`); `wgpui-wgpu` consumes
+/// one (it is the crate that owns the atlas pages the texels are copied into).
+/// Neither names the other, so the type they agree on is here.
+///
+/// Phase 5 left this half of the seam as a closure parameter with no type behind
+/// it, because nothing rasterised. Phase 5.5 is that closure's implementation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RasterizedGlyph {
+    /// The bitmap's size in texels, `[width, height]`.
+    pub size: [u32; 2],
+    /// Which atlas the texels belong in, and therefore how wide a texel is.
+    pub kind: AtlasKind,
+    /// Offset from the pen position to the bitmap's top-left, in pixels.
+    ///
+    /// The legacy `glyph_raster_bounds` returns exactly this as its bounds
+    /// origin: `(placement.left, -placement.top)`.
+    pub bearing: [f32; 2],
+    /// The texels, row-major, tightly packed at [`AtlasKind::bytes_per_pixel`]
+    /// bytes each. No row padding: alignment is a GPU-upload concern and is
+    /// applied at the copy, exactly as the legacy `WgpuAtlasState::upload_texture`
+    /// does it.
+    pub texels: Vec<u8>,
+}
+
+impl RasterizedGlyph {
+    /// How many bytes [`Self::texels`] must hold for [`Self::size`] and
+    /// [`Self::kind`].
+    pub fn expected_texel_bytes(&self) -> usize {
+        self.size[0] as usize * self.size[1] as usize * self.kind.bytes_per_pixel() as usize
+    }
+
+    /// Whether the bitmap's length agrees with its declared size and kind.
+    ///
+    /// Checked rather than assumed at every boundary this crosses: a bitmap
+    /// whose length disagrees with its size would be blitted into an atlas page
+    /// row by row, and a short one would silently take texels from the next
+    /// glyph's row.
+    pub fn is_well_formed(&self) -> bool {
+        self.texels.len() == self.expected_texel_bytes()
+    }
+}
+
 /// Where a shaped glyph's raster comes from.
 ///
 /// §6's accounting, made into a trait: "`wgpui-text` produces glyph positions

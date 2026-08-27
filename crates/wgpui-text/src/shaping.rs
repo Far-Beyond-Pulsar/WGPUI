@@ -394,6 +394,14 @@ struct LoadedFont {
     face: Arc<CosmicFont>,
     features: cosmic_text::FontFeatures,
     is_known_emoji_font: bool,
+    /// The weight this face was loaded at.
+    ///
+    /// Held because `cosmic_text::CacheKey` takes it, and the rasteriser
+    /// ([`crate::raster`]) has to reproduce the legacy cache key exactly or it
+    /// gets a different bitmap for the same glyph. Loading is what decides it,
+    /// so loading is what records it — recovering it later from the database
+    /// would be re-deriving something already known.
+    weight: fontdb::Weight,
 }
 
 /// Cache identity of a shape request.
@@ -601,6 +609,7 @@ impl TextShaper {
             face,
             features,
             is_known_emoji_font,
+            weight,
         });
         self.font_ids_by_database_id.insert(database_id, font_id);
         self.stats.fonts_resolved += 1;
@@ -616,6 +625,32 @@ impl TextShaper {
     /// Whether a resolved face is a colour emoji face.
     pub fn is_emoji_font(&self, font_id: FontId) -> Result<bool, ShapeError> {
         Ok(self.loaded(font_id)?.is_known_emoji_font)
+    }
+
+    /// The database identity and weight of a resolved face — everything
+    /// `cosmic_text::CacheKey` needs to name an outline.
+    ///
+    /// Returned by value rather than by reference so a caller can hold it while
+    /// borrowing [`Self::font_system_mut`], which rasterising requires: the same
+    /// split the legacy `CosmicTextSystemState` gets for free by keeping the
+    /// swash cache, the font system, and the loaded-face table in one struct.
+    pub(crate) fn raster_face(
+        &self,
+        font_id: FontId,
+    ) -> Result<(fontdb::ID, fontdb::Weight), ShapeError> {
+        let loaded = self.loaded(font_id)?;
+        Ok((loaded.face.id(), loaded.weight))
+    }
+
+    /// The font database this shaper shapes against.
+    ///
+    /// `pub(crate)` and not public: `cosmic_text::FontSystem` is an
+    /// implementation detail §3.3 keeps inside this crate, and handing it out
+    /// would let a caller mutate the database a cached `ShapedLine` was shaped
+    /// against. [`crate::raster`] needs it because `SwashCache::get_image` takes
+    /// it, and `crate::raster` is inside this crate for exactly that reason.
+    pub(crate) fn font_system_mut(&mut self) -> &mut FontSystem {
+        &mut self.font_system
     }
 
     /// Shape one line of text.
