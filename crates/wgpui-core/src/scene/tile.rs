@@ -201,7 +201,7 @@ impl TileGrid {
     pub fn new(tile_size: Size<Pixels>) -> Option<TileGrid> {
         let width = tile_size.width.value();
         let height = tile_size.height.value();
-        if !(width >= TileGrid::MIN_EDGE) || !(height >= TileGrid::MIN_EDGE) {
+        if !at_least_min_edge(width) || !at_least_min_edge(height) {
             return None;
         }
         Some(TileGrid { width, height })
@@ -729,6 +729,20 @@ pub fn tile_visibility(
         slots.push([tile.base, if visible { tile.count } else { 0 }, 0, 0]);
     }
     TileVisibility { slots, in_range }
+}
+
+/// Whether an edge length is usable, with NaN answering `false`.
+///
+/// Written against `partial_cmp` rather than as `!(edge >= MIN_EDGE)` for the
+/// reason [`Rect::is_empty`] gives for the same shape: the two spellings
+/// disagree on NaN, and this one has to answer "unusable" for it. A tile size
+/// that is not a number must produce no grid, not a grid whose arithmetic
+/// silently propagates NaN into every coordinate it computes.
+fn at_least_min_edge(edge: f32) -> bool {
+    matches!(
+        edge.partial_cmp(&TileGrid::MIN_EDGE),
+        Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+    )
 }
 
 /// `f32::floor` narrowed to `i32`, saturating rather than wrapping.

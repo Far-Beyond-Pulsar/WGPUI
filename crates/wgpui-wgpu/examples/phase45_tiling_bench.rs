@@ -54,7 +54,7 @@ use wgpui_core::scene::{TileDescriptor, encode_tiles};
 use wgpui_core::test_support::ui_walk::{NodeGraphSpec, TiledCanvasDriver};
 use wgpui_wgpu::render::compute::indirect_args_pass::{IndirectArgsBuffers, IndirectArgsPass};
 use wgpui_wgpu::render::compute::tile_visibility_pass::{
-    TileViewport, TileVisibilityBuffers, TileVisibilityPass,
+    ArgsTarget, TileViewport, TileVisibilityBuffers, TileVisibilityPass,
 };
 use wgpui_wgpu::render::device::{ComputeContext, headless_compute_context};
 
@@ -275,12 +275,14 @@ fn time_visibility(
             &context.device,
             &context.queue,
             &buffers,
-            &indirect,
-            &args,
+            ArgsTarget {
+                pass: &indirect,
+                buffers: &args,
+                vertex_count: QUAD_VERTEX_COUNT,
+                first_instance: FirstInstance::Zero,
+            },
             &tile_bytes,
             params,
-            QUAD_VERTEX_COUNT,
-            FirstInstance::Zero,
         )
         .ok()?;
         context.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;

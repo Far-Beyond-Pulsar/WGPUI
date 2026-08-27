@@ -42,7 +42,7 @@ use wgpui_core::ordering::BLOCK_SIZE;
 use wgpui_core::scene::TILE_DESCRIPTOR_STRIDE;
 
 use crate::render::compute::indirect_args_pass::{
-    IndirectArgsBuffers, IndirectArgsOutput, IndirectArgsPass,
+    GeneratedSlots, IndirectArgsBuffers, IndirectArgsOutput, IndirectArgsPass,
 };
 use crate::render::readback::{ReadbackError, read_u32_buffer};
 
@@ -167,6 +167,30 @@ impl TileVisibilityBuffers {
     pub fn fits(&self, tiles: u32) -> bool {
         self.tile_capacity >= tiles
     }
+}
+
+/// Where a tile-visibility result turns into draw arguments: the pass that does
+/// it, the buffers it writes, and the encoding it writes them in.
+///
+/// One type rather than four parameters because all four are properties of the
+/// same argument-generation stage, and the two that are not obviously paired
+/// still are: `vertex_count` and `first_instance` together *are* the record
+/// encoding, and splitting them across a call site is how a record ends up
+/// carrying a base the shader is not expecting (`indirect.rs`'s
+/// `FirstInstance` doc has the full story). Also what keeps
+/// [`TileVisibilityPass::run_into_args`] inside clippy's argument limit without
+/// a suppression, which is the same finding and the same resolution Phases 3
+/// and 4 both recorded.
+#[derive(Copy, Clone)]
+pub struct ArgsTarget<'a> {
+    /// The argument-generation pass.
+    pub pass: &'a IndirectArgsPass,
+    /// Its arena-shaped buffers.
+    pub buffers: &'a IndirectArgsBuffers,
+    /// Vertices one instance draws.
+    pub vertex_count: u32,
+    /// Where each record's base index is carried.
+    pub first_instance: FirstInstance,
 }
 
 /// The compiled tile-visibility pipeline. Build once, dispatch once per tiled
@@ -316,28 +340,33 @@ impl TileVisibilityPass {
     /// The whole of §4.3's draw path in one call, and it is two dispatches: this
     /// pass writes the slots, [`IndirectArgsPass::run_with_slots`] turns them
     /// into arguments. Nothing between them is read back.
-    #[allow(clippy::too_many_arguments)]
     pub fn run_into_args(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         buffers: &TileVisibilityBuffers,
-        indirect: &IndirectArgsPass,
-        args: &IndirectArgsBuffers,
+        target: ArgsTarget<'_>,
         tiles: &[u8],
         viewport: TileViewport,
-        vertex_count: u32,
-        first_instance: FirstInstance,
     ) -> Result<IndirectArgsOutput, TileVisibilityError> {
-        let tile_count = self.run(device, queue, buffers, tiles, viewport, args.arena_slots)?;
-        Ok(indirect.run_with_slots(
+        let tile_count = self.run(
             device,
             queue,
-            args,
-            &buffers.slots,
-            tile_count,
-            vertex_count,
-            first_instance,
+            buffers,
+            tiles,
+            viewport,
+            target.buffers.arena_slots,
+        )?;
+        Ok(target.pass.run_with_slots(
+            device,
+            queue,
+            target.buffers,
+            GeneratedSlots {
+                buffer: &buffers.slots,
+                count: tile_count,
+            },
+            target.vertex_count,
+            target.first_instance,
         ))
     }
 

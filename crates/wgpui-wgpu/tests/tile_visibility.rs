@@ -24,7 +24,7 @@ use wgpui_core::scene::{TileCoord, TileDescriptor, TileGrid, encode_tiles, tile_
 
 use wgpui_wgpu::render::compute::indirect_args_pass::{IndirectArgsBuffers, IndirectArgsPass};
 use wgpui_wgpu::render::compute::tile_visibility_pass::{
-    TileViewport, TileVisibilityBuffers, TileVisibilityPass,
+    ArgsTarget, TileViewport, TileVisibilityBuffers, TileVisibilityPass,
 };
 use wgpui_wgpu::render::device::context_or_report;
 
@@ -205,12 +205,14 @@ fn arguments_generated_from_the_gpu_written_slot_table_match_the_cpu_reference()
                 &context.device,
                 &context.queue,
                 &visibility_buffers,
-                &indirect,
-                &args_buffers,
+                ArgsTarget {
+                    pass: &indirect,
+                    buffers: &args_buffers,
+                    vertex_count: QUAD_VERTEX_COUNT,
+                    first_instance: FirstInstance::Zero,
+                },
                 &tile_bytes,
                 tile_viewport(pan),
-                QUAD_VERTEX_COUNT,
-                FirstInstance::Zero,
             )
             .expect("the two dispatches must succeed");
         assert_eq!(output.slot_count, tiles.len() as u32);

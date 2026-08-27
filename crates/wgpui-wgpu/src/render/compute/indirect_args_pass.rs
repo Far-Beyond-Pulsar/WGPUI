@@ -162,6 +162,22 @@ impl IndirectArgsBuffers {
     }
 }
 
+/// A slot table that lives on the device, and how many records it holds.
+///
+/// The two travel together because neither is checkable against the other once
+/// the CPU has stopped reading the table: a count from one pass paired with
+/// another pass's buffer would generate arguments for records that are not
+/// there, silently. Same reasoning as Phase 4's `CompositePlan` — see
+/// `docs/phase-4-results.md` §1 — and the same resolution to the same clippy
+/// finding, which is to make the pairing a type rather than a convention.
+#[derive(Copy, Clone)]
+pub struct GeneratedSlots<'a> {
+    /// One `[base, count, 0, 0]` record per slot.
+    pub buffer: &'a wgpu::Buffer,
+    /// How many records the buffer holds.
+    pub count: u32,
+}
+
 /// What one dispatch decided, as far as the CPU is allowed to know it without
 /// asking.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -319,8 +335,10 @@ impl IndirectArgsPass {
             device,
             queue,
             buffers,
-            &slot_buffer,
-            slot_count,
+            GeneratedSlots {
+                buffer: &slot_buffer,
+                count: slot_count,
+            },
             vertex_count,
             first_instance,
         );
@@ -355,22 +373,13 @@ impl IndirectArgsPass {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         buffers: &IndirectArgsBuffers,
-        slot_buffer: &wgpu::Buffer,
-        slot_count: u32,
+        slots: GeneratedSlots<'_>,
         vertex_count: u32,
         first_instance: FirstInstance,
     ) -> IndirectArgsOutput {
-        self.dispatch_with_slots(
-            device,
-            queue,
-            buffers,
-            slot_buffer,
-            slot_count,
-            vertex_count,
-            first_instance,
-        );
+        self.dispatch_with_slots(device, queue, buffers, slots, vertex_count, first_instance);
         IndirectArgsOutput {
-            slot_count,
+            slot_count: slots.count,
             first_instance,
             vertex_count,
         }
@@ -381,11 +390,11 @@ impl IndirectArgsPass {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         buffers: &IndirectArgsBuffers,
-        slot_buffer: &wgpu::Buffer,
-        slot_count: u32,
+        slots: GeneratedSlots<'_>,
         vertex_count: u32,
         first_instance: FirstInstance,
     ) {
+        let slot_count = slots.count;
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("indirect args params"),
             size: 16,
@@ -408,7 +417,7 @@ impl IndirectArgsPass {
             layout: &self.layout,
             entries: &[
                 binding(0, &params),
-                binding(1, slot_buffer),
+                binding(1, slots.buffer),
                 binding(2, &buffers.draw_order),
                 binding(3, &buffers.culled),
                 binding(4, &buffers.visible),
