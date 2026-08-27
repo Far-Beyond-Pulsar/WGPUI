@@ -36,12 +36,14 @@
 //! the revision reports [`RebuildReason::ChildrenChanged`] rather than
 //! pretending the element's own key changed.
 
+use crate::boundary::identity::BoundaryIdentity;
 use crate::invalidation::axes::Invalidation;
 use crate::reconcile::description::{Description, ElementId};
 use crate::reconcile::instance::{InstanceKey, InstanceTable, RetainedElement};
 use crate::reconcile::plan::{FramePlan, NodeOutcome, PlannedNode, RebuildReason};
 use crate::reconcile::state::StateScope;
 use crate::reconcile::uncached::UncachedScope;
+use crate::scene::layer::BoundaryId;
 use wgpui_layout::taffy_tree::{LayoutError, LayoutNodeId, LayoutStyle, LayoutTree};
 
 /// Reconciliation could not complete.
@@ -81,6 +83,16 @@ struct WalkPosition {
     /// Set when an ancestor is being rebuilt in a way that invalidates
     /// descendants' retained records — today, only a type mismatch.
     force_rebuild: bool,
+    /// The nearest enclosing `.boundary()`, or [`BoundaryId::ROOT`].
+    ///
+    /// Carried through the walk rather than looked up, because a boundary's
+    /// identity is derived from the path and the path is exactly what the walk
+    /// already has. Note what this is *not*: nothing below reads it before
+    /// deciding whether to reuse an element. It is recorded on the plan and
+    /// consumed downstream by `patch::emit`, which is what keeps §4.0's
+    /// "reconciliation is not fenced by a boundary" true by construction rather
+    /// than by discipline.
+    boundary: BoundaryId,
 }
 
 /// The mutable state the walk threads through, kept together so the recursion
@@ -179,6 +191,7 @@ impl Reconciler {
             depth: 0,
             scope: UncachedScope::new(),
             force_rebuild: false,
+            boundary: BoundaryId::ROOT,
         };
         {
             let mut context = WalkContext {
@@ -233,10 +246,14 @@ impl Reconciler {
         let Description {
             type_id,
             diff_key,
+            boundary,
+            scroll_offset,
+            emitter,
             layout_style,
             children,
             ..
         } = description;
+        let declared_boundary = boundary.map(|_| BoundaryIdentity::from_path(&self.path));
 
         let previous = self.instances.get(instance_key);
         let previous_node = previous.map(|instance| instance.layout_node());
@@ -286,7 +303,12 @@ impl Reconciler {
         }
 
         let plan_index = context.plan.push(PlannedNode {
+            address: instance_key,
             instance: Some(instance_key),
+            boundary: position.boundary,
+            declared_boundary,
+            boundary_policy: boundary,
+            scroll_offset,
             state,
             // Provisional: filled in below, once the children have been
             // visited and the reuse decision has settled. Recorded now so the
@@ -296,11 +318,13 @@ impl Reconciler {
             outcome,
             invalidation,
         });
+        context.plan.set_emitter(plan_index, emitter);
 
         let child_position = WalkPosition {
             depth: position.depth + 1,
             scope: position.scope,
             force_rebuild: position.force_rebuild || type_mismatched,
+            boundary: declared_boundary.unwrap_or(position.boundary),
         };
         let mut child_nodes = Vec::with_capacity(children.len());
         let mut child_instances = Vec::with_capacity(children.len());
@@ -378,7 +402,7 @@ impl Reconciler {
         &mut self,
         instance_key: InstanceKey,
         state: StateScope,
-        description: Description,
+        mut description: Description,
         position: WalkPosition,
         context: &mut WalkContext<'_>,
     ) -> Result<VisitResult, ReconcileError> {
@@ -392,19 +416,32 @@ impl Reconciler {
         } else {
             NodeOutcome::Rebuilt(RebuildReason::ReconciliationDisabled)
         };
+        // An uncached subtree still composites and still emits (§4.2), so its
+        // boundary declaration and its emitter are recorded exactly as a
+        // reconciled element's are — the flag suppresses diffing, not drawing.
+        let declared_boundary = description
+            .boundary
+            .map(|_| BoundaryIdentity::from_path(&self.path));
         let plan_index = context.plan.push(PlannedNode {
+            address: instance_key,
             instance: None,
+            boundary: position.boundary,
+            declared_boundary,
+            boundary_policy: description.boundary,
+            scroll_offset: description.scroll_offset,
             state,
             layout_node: LayoutNodeId::from_raw(0),
             depth: position.depth,
             outcome,
             invalidation: Invalidation::all(),
         });
+        context.plan.set_emitter(plan_index, description.emitter.take());
 
         let child_position = WalkPosition {
             depth: position.depth + 1,
             scope: position.scope,
             force_rebuild: true,
+            boundary: declared_boundary.unwrap_or(position.boundary),
         };
         let mut child_nodes = Vec::with_capacity(description.children.len());
         for (index, child) in description.children.into_iter().enumerate() {

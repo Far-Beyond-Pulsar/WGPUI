@@ -18,5 +18,6 @@ pub mod regular;
 pub mod taffy_tree;
 
 pub use taffy_tree::{
-    LayoutError, LayoutFrameStats, LayoutNodeId, LayoutRect, LayoutStyle, LayoutTree,
+    AvailableSpace, Dimension, Display, FlexDirection, LayoutError, LayoutFrameStats, LayoutNodeId,
+    LayoutRect, LayoutSize, LayoutStyle, LayoutTree, definite,
 };

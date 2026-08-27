@@ -25,8 +25,8 @@
 use std::collections::HashSet;
 use taffy::TaffyTree;
 use taffy::geometry::Size as TaffySize;
-use taffy::style::AvailableSpace;
 use taffy::tree::NodeId;
+pub use taffy::style::AvailableSpace;
 
 /// The style a layout node is laid out with.
 ///
@@ -35,6 +35,25 @@ use taffy::tree::NodeId;
 /// *produces* one of these (§7), and an intermediate copy here would be a
 /// third representation of the same thing with nothing to say for itself.
 pub type LayoutStyle = taffy::style::Style;
+
+/// A width/height pair, as Taffy spells one.
+pub type LayoutSize<T> = TaffySize<T>;
+
+pub use taffy::style::{Dimension, Display, FlexDirection};
+
+/// The available space for a subtree with a known width and height.
+///
+/// A convenience for the common case, so a caller with two numbers does not
+/// have to name [`AvailableSpace`] itself — [`LayoutTree::compute_layout`]'s
+/// signature already obliges every caller to name `taffy`'s types, which is a
+/// leak §3.2 does not intend; this and the re-exports above are the narrowest
+/// way to close it without wrapping the style type §10 rules out of scope.
+pub const fn definite(width: f32, height: f32) -> LayoutSize<AvailableSpace> {
+    TaffySize {
+        width: AvailableSpace::Definite(width),
+        height: AvailableSpace::Definite(height),
+    }
+}
 
 /// A retained layout node's identity, stable for as long as the node lives.
 ///
@@ -321,13 +340,6 @@ mod tests {
                 height: Dimension::length(height),
             },
             ..LayoutStyle::default()
-        }
-    }
-
-    fn definite(width: f32, height: f32) -> TaffySize<AvailableSpace> {
-        TaffySize {
-            width: AvailableSpace::Definite(width),
-            height: AvailableSpace::Definite(height),
         }
     }
 

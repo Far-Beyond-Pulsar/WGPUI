@@ -28,6 +28,7 @@
 //! range" — the extension that makes an O(1) delta upload expressible at all.
 
 pub mod apply;
+pub mod emit;
 pub mod primitive;
 
 use crate::patch::primitive::{EncodeError, PrimitiveKind};
