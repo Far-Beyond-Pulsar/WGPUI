@@ -15,6 +15,7 @@
 pub mod app;
 pub mod boundary;
 pub mod geometry;
+pub mod indirect;
 pub mod invalidation;
 pub mod occlusion;
 pub mod ordering;

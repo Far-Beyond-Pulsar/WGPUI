@@ -22,6 +22,7 @@ pub use slab::{Reallocation, SlabAllocator, SlabOverflow};
 pub use slab_range::{SlabRange, UploadRange, coalesce_uploads, uploaded_byte_count};
 pub use tile::TileCoord;
 
+use crate::indirect::{DrawSlot, SlotTable};
 use crate::patch::primitive::{GlyphRun, PrimitiveKind, Quad};
 
 /// The persistent, patched-not-rebuilt scene (R-N Pillar III, §2's picture).
@@ -88,6 +89,55 @@ impl Scene {
             }
         }
         ranges
+    }
+
+    /// The fixed (layer, kind) slot sequence §5.3's indirect draw issues every
+    /// frame, grouped by kind and ascending by layer within a kind.
+    ///
+    /// This is [`Self::draw_ranges`]'s successor and the difference between the
+    /// two is the whole of §8's Phase 4 gate. `draw_ranges` reports how many
+    /// instances each slot draws, which is a fact about the scene's *contents*;
+    /// this reports only where each slot's reservation lives, which is a fact
+    /// about its *residency*. The instance count is what the GPU decides
+    /// ([`crate::indirect`]), so the CPU never asks for it and never learns it.
+    ///
+    /// Cost is `O(layers × kinds)` — one `SlabRange` read per slot, no
+    /// primitive touched — which is exactly the claim §8's Phase 4 gate makes
+    /// falsifiable.
+    ///
+    /// Layers holding nothing of a kind are omitted: a slot with no reservation
+    /// has no base to draw from, and it reappears the frame its layer is given
+    /// one.
+    pub fn draw_slots(&self) -> SlotTable {
+        let ids = self.layers.ids();
+        let mut slots = Vec::with_capacity(ids.len() * PrimitiveKind::COUNT);
+        for kind in PrimitiveKind::ALL {
+            for layer in &ids {
+                let range = match kind {
+                    PrimitiveKind::Quad => self.quads.slab(*layer),
+                    PrimitiveKind::GlyphRun => self.glyph_runs.slab(*layer),
+                };
+                if range.is_empty() {
+                    continue;
+                }
+                slots.push(DrawSlot {
+                    layer: *layer,
+                    kind,
+                    base: range.base,
+                    count: range.count,
+                });
+            }
+        }
+        SlotTable::from_grouped(slots).unwrap_or_default()
+    }
+
+    /// How many slots one kind's arena currently holds — the length of the
+    /// arena-shaped buffers [`crate::indirect`] addresses.
+    /// Saturating rather than fallible: an arena wider than `u32::MAX` slots
+    /// cannot exist, because every `SlabRange::base` is already a `u32` and the
+    /// allocator rejects a reservation it cannot address (`SlabOverflow`).
+    pub fn arena_slots(&self, kind: PrimitiveKind) -> u32 {
+        u32::try_from(self.allocator.arena_slot_capacity(kind)).unwrap_or(u32::MAX)
     }
 
     /// Drop a layer and release every reservation and record it held.
@@ -168,6 +218,89 @@ mod tests {
             .map(|(_, _, range)| range.instance_count);
         assert_eq!(runs, Some(5), "a glyph run draws one instance per glyph");
         Ok(())
+    }
+
+    /// §5.3/§8's Phase 4 gate, at the level `wgpui-core` can state it: the
+    /// slot table is a function of residency, not of contents. Two scenes with
+    /// the same layers and wildly different primitive counts produce slot
+    /// tables of the same length, and neither table names an instance count.
+    #[test]
+    fn the_slot_table_is_the_same_length_however_many_primitives_a_layer_holds()
+    -> Result<(), crate::patch::PatchError> {
+        use crate::patch::apply::{ScenePatch, apply};
+
+        let build = |per_layer: u32| -> Result<SlotTable, crate::patch::PatchError> {
+            let mut scene = Scene::new();
+            let mut patch = ScenePatch::new();
+            let mut key = 0u64;
+            for boundary in 0..4u64 {
+                let layer = scene.layer(LayerKey::untiled(BoundaryId::from_raw(boundary + 1)));
+                for index in 0..per_layer {
+                    key += 1;
+                    patch
+                        .quads
+                        .append(layer, crate::patch::RecordKey::from_raw(key), index, Quad::ZERO);
+                }
+            }
+            apply(&mut scene, &patch)?;
+            Ok(scene.draw_slots())
+        };
+
+        let small = build(4)?;
+        let large = build(40_000)?;
+        assert_eq!(small.len(), 4);
+        assert_eq!(
+            small.len(),
+            large.len(),
+            "the fixed draw sequence is one entry per (layer, kind) slot, \
+             independent of resident primitive count"
+        );
+        assert_eq!(large.kind_slots(PrimitiveKind::Quad).len(), 4);
+        assert!(large.kind_slots(PrimitiveKind::GlyphRun).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn slots_name_a_reservation_and_never_an_instance_count()
+    -> Result<(), crate::patch::PatchError> {
+        use crate::patch::apply::{ScenePatch, apply};
+
+        let mut scene = Scene::new();
+        let layer = scene.layer(LayerKey::untiled(BoundaryId::from_raw(9)));
+        let mut patch = ScenePatch::new();
+        for index in 0..7u32 {
+            patch.quads.append(
+                layer,
+                crate::patch::RecordKey::from_raw(index as u64 + 1),
+                index,
+                Quad::ZERO,
+            );
+        }
+        apply(&mut scene, &patch)?;
+
+        let table = scene.draw_slots();
+        let slot = table.slots().first().copied();
+        assert_eq!(
+            slot,
+            Some(DrawSlot {
+                layer,
+                kind: PrimitiveKind::Quad,
+                base: scene.quads.slab(layer).base,
+                count: 7,
+            })
+        );
+        assert!(scene.arena_slots(PrimitiveKind::Quad) >= 7);
+        Ok(())
+    }
+
+    #[test]
+    fn a_layer_with_no_reservation_of_a_kind_gets_no_slot() {
+        let mut scene = Scene::new();
+        scene.layer(LayerKey::untiled(BoundaryId::ROOT));
+        assert!(
+            scene.draw_slots().is_empty(),
+            "a slot with no base has nothing to draw from"
+        );
     }
 
     #[test]
