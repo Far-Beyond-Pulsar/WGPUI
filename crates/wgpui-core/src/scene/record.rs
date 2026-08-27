@@ -99,14 +99,16 @@ impl<T> Default for RecordStore<T> {
     }
 }
 
-impl<T: Clone> RecordStore<T> {
+impl<T> RecordStore<T> {
     /// An empty store.
     pub fn new() -> Self {
         Self {
             layers: HashMap::new(),
         }
     }
+}
 
+impl<T: Clone> RecordStore<T> {
     /// Apply every patch in `list`, in order.
     ///
     /// Stops at the first failure. A partially applied list leaves the store

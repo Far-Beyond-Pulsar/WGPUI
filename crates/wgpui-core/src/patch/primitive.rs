@@ -160,13 +160,17 @@ impl<'a> SlotWriter<'a> {
     /// Advance over `count` bytes of explicit padding, zeroing them so two
     /// encodings of equal values always produce equal bytes.
     fn write_padding(&mut self, count: usize) -> Result<(), EncodeError> {
-        let end = self.offset + count;
+        let end = self.offset.checked_add(count).ok_or(EncodeError {
+            expected: usize::MAX,
+            actual: self.destination.len(),
+        })?;
+        let available = self.destination.len();
         let slice = self
             .destination
             .get_mut(self.offset..end)
             .ok_or(EncodeError {
                 expected: end,
-                actual: self.destination.len(),
+                actual: available,
             })?;
         slice.fill(0);
         self.offset = end;
@@ -174,13 +178,17 @@ impl<'a> SlotWriter<'a> {
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
-        let end = self.offset + bytes.len();
+        let end = self.offset.checked_add(bytes.len()).ok_or(EncodeError {
+            expected: usize::MAX,
+            actual: self.destination.len(),
+        })?;
+        let available = self.destination.len();
         let slice = self
             .destination
             .get_mut(self.offset..end)
             .ok_or(EncodeError {
                 expected: end,
-                actual: self.destination.len(),
+                actual: available,
             })?;
         slice.copy_from_slice(bytes);
         self.offset = end;
