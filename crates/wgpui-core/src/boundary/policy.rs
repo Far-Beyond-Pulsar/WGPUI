@@ -21,6 +21,8 @@
 //! their frozen counterparts have. Whichever phase moves geometry into the
 //! workspace replaces them and nothing else in this file changes.
 
+use crate::scene::tile::TileGrid;
+
 /// A length in logical pixels.
 #[derive(Copy, Clone, Debug, Default, PartialEq, PartialOrd)]
 pub struct Pixels(pub f32);
@@ -94,10 +96,15 @@ pub enum Buffering {
     /// arbitrarily-positioned, pannable-in-any-direction content, where
     /// `Margin` would have to grow multiplicatively in both axes.
     ///
-    /// **Not implemented in Phase 2.** A boundary declaring this is buffered as
-    /// `Margin(None)` today; see [`Buffering::is_implemented`].
+    /// Built in Phase 4.5: [`crate::scene::tile`] is the grid, the visibility
+    /// predicate, and the residency budget, and
+    /// [`crate::boundary::compositor::Compositor::visit_tiled`] is what a frame
+    /// calls to get this boundary's live tile set.
     Tiled {
         /// Edge length of one tile.
+        ///
+        /// [`crate::scene::TileGrid::DEFAULT_EDGE`] is the measured starting
+        /// point; see `docs/phase-4.5-results.md` for the sweep it came from.
         tile_size: Size<Pixels>,
         /// How many tiles beyond the viewport stay resident.
         retain_radius: u32,
@@ -120,25 +127,51 @@ impl Buffering {
     /// The overdraw margin this buffering asks for, given the boundary's
     /// viewport.
     ///
-    /// [`Buffering::Tiled`] reports the auto margin rather than a tile-derived
-    /// one: its own mechanism does not exist yet (Phase 4.5), and reporting
-    /// zero would silently make a boundary that asked for *more* buffering
-    /// receive *none*.
+    /// **[`Buffering::Tiled`] now reports its real margin**, which is its retain
+    /// radius measured in pixels — `retain_radius × tile_size` on each axis.
+    /// Until Phase 4.5 it reported the auto margin instead, as a placeholder
+    /// with a stated reason (reporting zero would have made a boundary asking
+    /// for *more* buffering receive none). That placeholder is closed: the
+    /// number below is what the mechanism actually keeps resident, so a caller
+    /// reading it gets an answer about this boundary rather than about the
+    /// variant it fell back to. A tile size this crate cannot build a grid from
+    /// still reports the auto margin, because such a boundary really does fall
+    /// back to untiled buffering — see
+    /// [`crate::boundary::compositor::Compositor::visit_tiled`].
     pub fn margin(self, viewport: Size<Pixels>) -> Size<Pixels> {
         match self {
             Buffering::None => Size::ZERO,
             Buffering::Margin(Some(margin)) => margin,
-            Buffering::Margin(None) | Buffering::Tiled { .. } => {
-                viewport.scaled(Self::AUTO_MARGIN_FRACTION)
-            }
+            Buffering::Margin(None) => viewport.scaled(Self::AUTO_MARGIN_FRACTION),
+            Buffering::Tiled {
+                tile_size,
+                retain_radius,
+            } => match TileGrid::new(tile_size) {
+                Some(_) => tile_size.scaled(retain_radius as f32),
+                None => viewport.scaled(Self::AUTO_MARGIN_FRACTION),
+            },
         }
     }
 
-    /// Whether this variant's own mechanism is built. `false` for
-    /// [`Buffering::Tiled`] until Phase 4.5, which is recorded here rather than
-    /// only in prose so a caller can assert on it.
-    pub const fn is_implemented(self) -> bool {
-        !matches!(self, Buffering::Tiled { .. })
+    /// The tile grid this buffering describes, or `None` for a variant that is
+    /// not tiled — or a tile size no grid can be built from.
+    ///
+    /// The two `None` cases are deliberately one: a caller's response to both is
+    /// the same, which is to buffer this boundary the untiled way.
+    pub fn tile_grid(self) -> Option<TileGrid> {
+        match self {
+            Buffering::Tiled { tile_size, .. } => TileGrid::new(tile_size),
+            _ => None,
+        }
+    }
+
+    /// How many tiles beyond the viewport this buffering keeps resident, or `0`
+    /// for a variant that has no tiles.
+    pub const fn retain_radius(self) -> u32 {
+        match self {
+            Buffering::Tiled { retain_radius, .. } => retain_radius,
+            _ => 0,
+        }
     }
 }
 
@@ -170,8 +203,19 @@ pub struct BoundaryPolicy {
     /// How this boundary buffers ahead of scroll or pan.
     pub buffering: Buffering,
     /// Frames a boundary may go unvisited before its retained resources are
-    /// returned to the pool (R-N §3.4's mark-and-sweep interval).
+    /// returned to the pool (R-N §3.4's mark-and-sweep interval). Under
+    /// [`Buffering::Tiled`] the same interval applies per tile, with "unvisited"
+    /// meaning "out of range" (§4.3).
     pub evict_after_frames: u32,
+    /// The total resident-tile cap for a [`Buffering::Tiled`] boundary, beyond
+    /// which the least recently visited tiles are evicted.
+    ///
+    /// §4.3 and §9's risk table both call this out as a first-class part of the
+    /// mechanism rather than a follow-up: `evict_after_frames` is a per-tile
+    /// timer, and an erratic pan can hold far more tiles inside that interval at
+    /// once than R-N's one-buffer-per-layer design ever had to bound. Ignored by
+    /// every other [`Buffering`] variant, which has one buffer and needs no cap.
+    pub resident_tile_budget: usize,
 }
 
 impl BoundaryPolicy {
@@ -180,6 +224,17 @@ impl BoundaryPolicy {
 
     /// R-N §3.4's default eviction interval, unchanged.
     pub const DEFAULT_EVICT_AFTER_FRAMES: u32 = 60;
+
+    /// The default resident-tile cap.
+    ///
+    /// Sized against what the default grid actually needs: a 2560×1440 viewport
+    /// at [`crate::scene::TileGrid::DEFAULT_EDGE`] with a retain radius of 1 is
+    /// 12×8 = 96 tiles in range, so a budget below that would be permanently
+    /// over-budget on an ordinary window. 256 leaves room for roughly two and a
+    /// half viewports' worth of recently-visited tiles beyond the live set,
+    /// which is what bounds a direction reversal without discarding the tiles it
+    /// is about to reverse back onto.
+    pub const DEFAULT_RESIDENT_TILE_BUDGET: usize = 256;
 
     /// Which retention a boundary holding `primitive_count` primitives gets.
     pub const fn retention_for(&self, primitive_count: usize) -> Retention {
@@ -197,6 +252,7 @@ impl Default for BoundaryPolicy {
             rasterize_above: Self::DEFAULT_RASTERIZE_ABOVE,
             buffering: Buffering::default(),
             evict_after_frames: Self::DEFAULT_EVICT_AFTER_FRAMES,
+            resident_tile_budget: Self::DEFAULT_RESIDENT_TILE_BUDGET,
         }
     }
 }
@@ -232,19 +288,42 @@ mod tests {
         );
     }
 
+    /// Phase 2 left this variant reporting `Margin(None)`'s auto margin with an
+    /// `is_implemented()` flag saying so. Phase 4.5 closes both: the margin is
+    /// now the retain radius in pixels, which is what the mechanism keeps.
     #[test]
-    fn tiled_is_declared_but_not_implemented_in_this_phase() {
+    fn a_tiled_boundarys_margin_is_its_retain_radius_in_pixels() {
         let tiled = Buffering::Tiled {
             tile_size: Size::pixels(256.0, 256.0),
-            retain_radius: 1,
+            retain_radius: 2,
         };
-        assert!(!tiled.is_implemented());
-        assert!(Buffering::default().is_implemented());
+        assert_eq!(tiled.margin(Size::pixels(800.0, 600.0)), Size::pixels(512.0, 512.0));
+        assert_eq!(tiled.retain_radius(), 2);
+        assert!(tiled.tile_grid().is_some());
+
+        let unbuffered = Buffering::Tiled {
+            tile_size: Size::pixels(256.0, 256.0),
+            retain_radius: 0,
+        };
+        assert_eq!(unbuffered.margin(Size::pixels(800.0, 600.0)), Size::ZERO);
+    }
+
+    #[test]
+    fn a_tile_size_no_grid_can_be_built_from_falls_back_to_the_auto_margin() {
+        // The fallback the Phase 2 placeholder's reasoning was right about, kept
+        // for the one case that still needs it: such a boundary really is
+        // buffered untiled, so reporting zero would still hand a boundary that
+        // asked for more buffering none at all.
+        let broken = Buffering::Tiled {
+            tile_size: Size::pixels(0.0, 0.0),
+            retain_radius: 4,
+        };
         assert_eq!(
-            tiled.margin(Size::pixels(800.0, 600.0)),
-            Buffering::Margin(None).margin(Size::pixels(800.0, 600.0)),
-            "an unbuilt variant must fall back to more buffering, never to none"
+            broken.margin(Size::pixels(800.0, 600.0)),
+            Buffering::Margin(None).margin(Size::pixels(800.0, 600.0))
         );
+        assert!(broken.tile_grid().is_none());
+        assert!(Buffering::default().tile_grid().is_none());
     }
 
     #[test]
