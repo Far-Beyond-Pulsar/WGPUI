@@ -12,9 +12,12 @@
 //! effect to detect, and Phase 3's compute passes get a consumable description
 //! of the frame rather than a callback to hook.
 
+use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::axes::Invalidation;
+use crate::patch::emit::Emit;
 use crate::reconcile::instance::InstanceKey;
 use crate::reconcile::state::StateScope;
+use crate::scene::layer::BoundaryId;
 use wgpui_layout::taffy_tree::LayoutNodeId;
 
 /// What reconciliation decided for one element.
@@ -61,11 +64,39 @@ pub enum RebuildReason {
 }
 
 /// One element's entry in a [`FramePlan`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+///
+/// Not [`Eq`], because a boundary policy and a scroll offset are both
+/// float-valued and the crate does not invent a total order for floats — the
+/// same reason `ScenePatch` stops at [`PartialEq`].
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct PlannedNode {
+    /// The element's path-derived address, present for **every** element the
+    /// walk visited — including elements inside an `.uncached()` subtree, which
+    /// have no retained record but still emit primitives every frame (§4.2).
+    ///
+    /// Distinct from [`PlannedNode::instance`] on purpose: that field answers
+    /// "is a record retained here," this one answers "what is this element
+    /// called," and §4.2's decoupling depends on the second having an answer
+    /// wherever the first does not.
+    pub address: InstanceKey,
     /// The element's retained instance, or `None` inside an `.uncached()`
     /// subtree where no record exists.
     pub instance: Option<InstanceKey>,
+    /// The compositing boundary this element's own primitives belong to.
+    ///
+    /// For a boundary root this is its *parent's* boundary, not the one it
+    /// declares: a scroll container's own background does not scroll with its
+    /// contents, so its own paint stays in the layer around it. What it
+    /// declares is [`PlannedNode::declared_boundary`], and that is what its
+    /// children get.
+    pub boundary: BoundaryId,
+    /// The boundary this element declared, if it called `.boundary()`.
+    pub declared_boundary: Option<BoundaryId>,
+    /// The tuning that boundary was declared with.
+    pub boundary_policy: Option<BoundaryPolicy>,
+    /// The displacement this element applies to its children (§4.1's scroll
+    /// signal, as a value rather than as an event).
+    pub scroll_offset: [f32; 2],
     /// The element's state scope, which exists regardless of reconciliation
     /// (§4.2: state retention and reconciliation-suppression are decoupled).
     pub state: StateScope,
@@ -113,11 +144,44 @@ pub struct FrameStats {
 /// Everything reconciliation decided for one frame, in visit order.
 ///
 /// Visit order is pre-order (a parent precedes its children), so index `0` is
-/// always the tree root.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// always the tree root. Depth is recorded per node, so the tree's shape is
+/// recoverable from the flat list with a stack and no back-pointers — which is
+/// what `patch::emit` walks.
+///
+/// # The emitter table, and why it lives here
+///
+/// A plan carries one optional [`Emit`] per node, parallel to [`FramePlan::
+/// nodes`]. It has to live somewhere: [`crate::reconcile::reconciler::
+/// Reconciler::reconcile`] consumes the description (see [`crate::reconcile::
+/// description::Description`]'s own doc for why), and the emit walk runs after
+/// layout has been computed, so an element's emitter must survive the gap
+/// between the two. Attaching it to the plan the emit walk already consumes is
+/// the shortest such path.
+///
+/// The cost, stated plainly: a boxed trait object is neither [`Clone`] nor
+/// [`PartialEq`], so `FramePlan` is neither. Nothing this loses is load-bearing
+/// — §2's "the seam is pure data, never a callback" claim is about
+/// [`crate::patch::apply::ScenePatch`], which is still exactly that, and is
+/// what actually crosses into the backend.
+#[derive(Default)]
 pub struct FramePlan {
     nodes: Vec<PlannedNode>,
+    emitters: Vec<Option<Box<dyn Emit>>>,
     stats: FrameStats,
+}
+
+impl std::fmt::Debug for FramePlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FramePlan")
+            .field("nodes", &self.nodes)
+            .field(
+                "emitters",
+                &self.emitters.iter().filter(|slot| slot.is_some()).count(),
+            )
+            .field("stats", &self.stats)
+            .finish()
+    }
 }
 
 impl FramePlan {
@@ -131,7 +195,27 @@ impl FramePlan {
         Self::count(&mut self.stats, node.outcome, 1);
         self.stats.visited += 1;
         self.nodes.push(node);
+        self.emitters.push(None);
         self.nodes.len() - 1
+    }
+
+    /// Attach an element's emitter, if it had one.
+    ///
+    /// Separate from [`FramePlan::push`] for the same reason
+    /// [`FramePlan::set_layout_node`] is: the reconciler records a node before
+    /// visiting its children and settles the rest afterwards, and threading a
+    /// second value through that split would put an `Option` in the hot
+    /// constructor for the benefit of the minority of elements that emit
+    /// anything.
+    pub(crate) fn set_emitter(&mut self, index: usize, emitter: Option<Box<dyn Emit>>) {
+        if let Some(slot) = self.emitters.get_mut(index) {
+            *slot = emitter;
+        }
+    }
+
+    /// The emitter for the element at `index`, if it has one.
+    pub fn emitter(&self, index: usize) -> Option<&dyn Emit> {
+        self.emitters.get(index)?.as_deref()
     }
 
     /// Revise a previously recorded element's outcome.
@@ -247,7 +331,12 @@ mod tests {
 
     fn node(outcome: NodeOutcome, depth: u32, raw: u64) -> PlannedNode {
         PlannedNode {
+            address: InstanceKey::from_raw(raw),
             instance: Some(InstanceKey::from_raw(raw)),
+            boundary: BoundaryId::ROOT,
+            declared_boundary: None,
+            boundary_policy: None,
+            scroll_offset: [0.0, 0.0],
             state: StateScope::from_path(&[ElementId::Slot(raw as u32)]),
             layout_node: LayoutNodeId::from_raw(raw),
             depth,
@@ -329,5 +418,28 @@ mod tests {
         let mut plan = FramePlan::new();
         plan.amend(7, NodeOutcome::Uncached, Invalidation::all());
         assert_eq!(plan.stats(), FrameStats::default());
+    }
+
+    #[test]
+    fn a_node_carries_no_emitter_until_one_is_attached() {
+        let mut plan = FramePlan::new();
+        let index = plan.push(node(NodeOutcome::Reused, 0, 1));
+        assert!(plan.emitter(index).is_none());
+        plan.set_emitter(
+            index,
+            Some(Box::new(|_: &crate::patch::emit::EmitContext, _: &mut crate::patch::emit::Emission| {})),
+        );
+        assert!(plan.emitter(index).is_some());
+        assert!(plan.emitter(index + 1).is_none());
+    }
+
+    #[test]
+    fn attaching_an_emitter_out_of_range_is_inert() {
+        let mut plan = FramePlan::new();
+        plan.set_emitter(
+            7,
+            Some(Box::new(|_: &crate::patch::emit::EmitContext, _: &mut crate::patch::emit::Emission| {})),
+        );
+        assert!(plan.emitter(7).is_none());
     }
 }

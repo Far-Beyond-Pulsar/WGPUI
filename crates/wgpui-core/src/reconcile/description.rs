@@ -20,6 +20,8 @@
 //! a scope flag, and children. Every element type in `wgpui-widgets` will
 //! produce one of these; nothing here knows or cares which.
 
+use crate::boundary::policy::BoundaryPolicy;
+use crate::patch::emit::Emit;
 use crate::reconcile::diff_key::ReconcileKey;
 use std::any::TypeId;
 use std::sync::Arc;
@@ -80,6 +82,9 @@ pub struct Description {
     pub(crate) type_name: &'static str,
     pub(crate) diff_key: Option<Box<dyn ReconcileKey>>,
     pub(crate) uncached: bool,
+    pub(crate) boundary: Option<BoundaryPolicy>,
+    pub(crate) scroll_offset: [f32; 2],
+    pub(crate) emitter: Option<Box<dyn Emit>>,
     pub(crate) layout_style: LayoutStyle,
     pub(crate) children: Vec<Description>,
 }
@@ -92,6 +97,9 @@ impl std::fmt::Debug for Description {
             .field("type_name", &self.type_name)
             .field("has_diff_key", &self.diff_key.is_some())
             .field("uncached", &self.uncached)
+            .field("boundary", &self.boundary)
+            .field("scroll_offset", &self.scroll_offset)
+            .field("has_emitter", &self.emitter.is_some())
             .field("children", &self.children.len())
             .finish()
     }
@@ -113,6 +121,9 @@ impl Description {
             type_name: std::any::type_name::<T>(),
             diff_key: None,
             uncached: false,
+            boundary: None,
+            scroll_offset: [0.0, 0.0],
+            emitter: None,
             layout_style: LayoutStyle::default(),
             children: Vec::new(),
         }
@@ -140,6 +151,60 @@ impl Description {
     /// [`crate::reconcile::state::ElementStateStore`].
     pub fn uncached(mut self) -> Self {
         self.uncached = true;
+        self
+    }
+
+    /// Make this element a compositing boundary (§4.1).
+    ///
+    /// Takes no arguments, and that is the whole design: the subtree beneath it
+    /// is already being reconciled (§4.0), so this asks only for independent
+    /// compositing — its own layer, its own retention decision, and the ability
+    /// to resolve a scroll to a transform rather than to re-emitted content.
+    /// No `.id()` is needed either: the boundary's identity comes from its
+    /// position (SFD §1.0), via
+    /// [`crate::boundary::identity::BoundaryIdentity`]. A forgotten `.id()`
+    /// costs the boundary its identity only across a sibling reorder, and even
+    /// then costs one rebuilt frame rather than correctness.
+    pub fn boundary(self) -> Self {
+        self.boundary_with_policy(BoundaryPolicy::default())
+    }
+
+    /// Make this element a compositing boundary with tuning.
+    ///
+    /// [`BoundaryPolicy`] never affects whether the boundary is considered
+    /// dirty — only how a boundary already known to be dirty is rasterized and
+    /// buffered.
+    pub fn boundary_with_policy(mut self, policy: BoundaryPolicy) -> Self {
+        self.boundary = Some(policy);
+        self
+    }
+
+    /// Displace this element's children by `offset`.
+    ///
+    /// This is a scroll or pan offset, expressed as what it does rather than as
+    /// a scroll position, because the two paths that consume it consume it
+    /// identically: a boundary installs it as its layer's transform and leaves
+    /// its children's emitted positions alone, while an ordinary element folds
+    /// it into those positions. That symmetry is what makes `.boundary()` a
+    /// pure optimization — removing it changes which of the two happens and
+    /// nothing else about the frame.
+    ///
+    /// Deliberately not part of any `diff_key`: SFD §1.1's whole finding is
+    /// that a scroll container's key must cover everything *except* its offset,
+    /// and here it cannot accidentally be included because the offset is not
+    /// something an element's fingerprint can see.
+    pub fn scroll_offset(mut self, offset: [f32; 2]) -> Self {
+        self.scroll_offset = offset;
+        self
+    }
+
+    /// Give this element something to emit into the scene, given its resolved
+    /// bounds.
+    ///
+    /// See [`Emit`] for the shape and for why this is optional: an element that
+    /// only groups children — most of a real tree — emits nothing itself.
+    pub fn emit(mut self, emitter: impl Emit) -> Self {
+        self.emitter = Some(Box::new(emitter));
         self
     }
 
@@ -185,6 +250,30 @@ impl Description {
     /// Whether this element opted its subtree out of reconciliation.
     pub fn is_uncached(&self) -> bool {
         self.uncached
+    }
+
+    /// Whether this element declared itself a compositing boundary.
+    pub fn is_boundary(&self) -> bool {
+        self.boundary.is_some()
+    }
+
+    /// The tuning this element's boundary was declared with, if any.
+    ///
+    /// `Some(BoundaryPolicy::default())` is what a bare `.boundary()` produces,
+    /// which is how a test can check "zero policy arguments" mechanically
+    /// rather than by reading the call site.
+    pub fn boundary_policy(&self) -> Option<BoundaryPolicy> {
+        self.boundary
+    }
+
+    /// The displacement this element applies to its children.
+    pub fn scroll_offset_of(&self) -> [f32; 2] {
+        self.scroll_offset
+    }
+
+    /// Whether this element emits anything of its own.
+    pub fn emits(&self) -> bool {
+        self.emitter.is_some()
     }
 
     /// The style this element's layout node is laid out with.
