@@ -22,7 +22,7 @@ pub use slab::{Reallocation, SlabAllocator, SlabOverflow};
 pub use slab_range::{SlabRange, UploadRange, coalesce_uploads, uploaded_byte_count};
 pub use tile::TileCoord;
 
-use crate::patch::primitive::{GlyphRun, Quad};
+use crate::patch::primitive::{GlyphRun, PrimitiveKind, Quad};
 
 /// The persistent, patched-not-rebuilt scene (R-N Pillar III, §2's picture).
 ///
@@ -65,6 +65,31 @@ impl Scene {
         self.layers.insert(key)
     }
 
+    /// Every layer's CPU-computed instanced draw range, per kind, in layer
+    /// order.
+    ///
+    /// Phase 1's scope is explicit that draw ranges stay CPU-computed —
+    /// "same as today, just through the new protocol" (§8) — so this is
+    /// deliberately the same first-instance/count pair the legacy renderer
+    /// derives, read straight off the slab reservations the patches produced
+    /// rather than off a per-frame scene walk. Phase 3/4 replace this with
+    /// GPU-computed indirect draw args (§5.1–§5.3) over the identical slabs.
+    ///
+    /// Layers holding nothing of a kind are omitted, not reported as
+    /// zero-length: an empty entry would become an empty draw call.
+    pub fn draw_ranges(&self) -> Vec<(LayerId, PrimitiveKind, DrawRange)> {
+        let mut ranges = Vec::new();
+        for layer in self.layers.ids() {
+            if let Some(range) = self.quads.draw_range(layer) {
+                ranges.push((layer, PrimitiveKind::Quad, range));
+            }
+            if let Some(range) = self.glyph_runs.draw_range(layer) {
+                ranges.push((layer, PrimitiveKind::GlyphRun, range));
+            }
+        }
+        ranges
+    }
+
     /// Drop a layer and release every reservation and record it held.
     ///
     /// Returns whether the layer existed. Releasing the primitive stores'
@@ -93,6 +118,56 @@ mod tests {
         assert!(scene.layers.is_empty());
         assert!(scene.quads.resident_bytes().is_empty());
         assert!(scene.glyph_runs.resident_bytes().is_empty());
+    }
+
+    #[test]
+    fn draw_ranges_come_straight_off_the_slabs_the_patches_produced()
+    -> Result<(), crate::patch::PatchError> {
+        use crate::patch::apply::{ScenePatch, apply};
+        use crate::patch::primitive::{Glyph, GlyphRun};
+
+        let mut scene = Scene::new();
+        let empty = scene.layer(LayerKey::untiled(BoundaryId::from_raw(1)));
+        let populated = scene.layer(LayerKey::untiled(BoundaryId::from_raw(2)));
+
+        let mut patch = ScenePatch::new();
+        for index in 0..3u32 {
+            patch
+                .quads
+                .append(populated, crate::patch::RecordKey::from_raw(index as u64 + 1), index, Quad::ZERO);
+        }
+        patch.glyph_runs.insert(
+            populated,
+            crate::patch::RecordKey::from_raw(100),
+            0,
+            GlyphRun {
+                color: [1.0, 1.0, 1.0, 1.0],
+                glyphs: vec![Glyph::ZERO; 5],
+            },
+        );
+        apply(&mut scene, &patch)?;
+
+        let ranges = scene.draw_ranges();
+        assert_eq!(ranges.len(), 2, "the empty layer issues no draw at all");
+        assert!(ranges.iter().all(|(layer, _, _)| *layer == populated));
+        assert!(!scene.layers.contains(empty) || scene.quads.draw_range(empty).is_none());
+        let quads = ranges
+            .iter()
+            .find(|(_, kind, _)| *kind == PrimitiveKind::Quad)
+            .map(|(_, _, range)| *range);
+        assert_eq!(
+            quads,
+            Some(DrawRange {
+                first_instance: scene.quads.slab(populated).base,
+                instance_count: 3,
+            })
+        );
+        let runs = ranges
+            .iter()
+            .find(|(_, kind, _)| *kind == PrimitiveKind::GlyphRun)
+            .map(|(_, _, range)| range.instance_count);
+        assert_eq!(runs, Some(5), "a glyph run draws one instance per glyph");
+        Ok(())
     }
 
     #[test]
