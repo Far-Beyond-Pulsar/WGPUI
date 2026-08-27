@@ -613,6 +613,126 @@ impl Default for SceneDriver {
     }
 }
 
+/// The same walk driven into *several* layers instead of one — what Phase 4
+/// needs, because a fixed draw sequence "one per (layer, kind) slot" is
+/// untestable against a scene with one slot in it.
+///
+/// A frame's quads are split into contiguous chunks in paint order, one chunk
+/// per layer. Contiguous rather than by panel, deliberately: paint order across
+/// layers *is* layer order, in the legacy backend and here, so a contiguous
+/// split is the faithful shape and it needs nothing from
+/// [`build_frame`]'s internal structure. What it does not model is a layer whose
+/// content interleaves another's in paint order, which the layer concept does
+/// not allow anyway.
+pub struct MultiLayerSceneDriver {
+    /// The scene under test.
+    pub scene: Scene,
+    /// The window rectangle every primitive clips to.
+    pub clip: Rect,
+    /// The frame's filter regions.
+    pub poison: Vec<PoisonRegion>,
+    layers: Vec<LayerId>,
+    resident: Vec<usize>,
+}
+
+impl MultiLayerSceneDriver {
+    /// A driver over an empty scene with `layer_count` declared layers.
+    pub fn new(layer_count: usize) -> MultiLayerSceneDriver {
+        let mut scene = Scene::new();
+        let layers: Vec<LayerId> = (0..layer_count.max(1))
+            .map(|index| {
+                scene.layer(LayerKey::untiled(BoundaryId::from_raw(index as u64 + 1)))
+            })
+            .collect();
+        let resident = vec![0usize; layers.len()];
+        MultiLayerSceneDriver {
+            scene,
+            clip: Rect::EMPTY,
+            poison: Vec::new(),
+            layers,
+            resident,
+        }
+    }
+
+    /// Every declared layer, in draw order.
+    pub fn layers(&self) -> &[LayerId] {
+        &self.layers
+    }
+
+    /// Bring the scene to `frame`, splitting its quads across the layers.
+    pub fn apply_frame(&mut self, frame: &UiFrame) -> Result<(), PatchError> {
+        self.clip = frame.clip;
+        self.poison.clone_from(&frame.poison);
+        let layer_count = self.layers.len();
+        let chunk = frame.quads.len().div_ceil(layer_count.max(1)).max(1);
+        for index in 0..layer_count {
+            let start = (index * chunk).min(frame.quads.len());
+            let end = ((index + 1) * chunk).min(frame.quads.len());
+            let quads = frame.quads.get(start..end).unwrap_or(&[]).to_vec();
+            self.set_layer(index, &quads)?;
+        }
+        Ok(())
+    }
+
+    /// Bring one layer to exactly `quads`, through the real patch protocol.
+    pub fn set_layer(&mut self, index: usize, quads: &[Quad]) -> Result<(), PatchError> {
+        let Some(layer) = self.layers.get(index).copied() else {
+            return Ok(());
+        };
+        let resident = self.resident.get(index).copied().unwrap_or(0);
+        let mut patch = ScenePatch::new();
+        let shared = resident.min(quads.len());
+        for position in 0..shared {
+            let key = RecordKey::from_raw(position as u64 + 1);
+            let Some(quad) = quads.get(position) else {
+                continue;
+            };
+            if self.scene.quads.get(layer, key) != Some(quad) {
+                patch.quads.update(layer, key, *quad);
+            }
+        }
+        for position in shared..quads.len() {
+            let Some(quad) = quads.get(position) else {
+                continue;
+            };
+            patch.quads.append(
+                layer,
+                RecordKey::from_raw(position as u64 + 1),
+                u32::try_from(position).unwrap_or(u32::MAX),
+                *quad,
+            );
+        }
+        for position in (quads.len()..resident).rev() {
+            patch
+                .quads
+                .remove(layer, RecordKey::from_raw(position as u64 + 1));
+        }
+        if let Some(slot) = self.resident.get_mut(index) {
+            *slot = quads.len();
+        }
+        apply(&mut self.scene, &patch)?;
+        Ok(())
+    }
+
+    /// One layer's primitives, read back out of the store in paint order.
+    pub fn layer_quads(&self, layer: LayerId) -> Vec<Quad> {
+        self.scene
+            .quads
+            .keys(layer)
+            .into_iter()
+            .filter_map(|key| self.scene.quads.get(layer, key).copied())
+            .collect()
+    }
+
+    /// One layer's primitives as occlusion inputs.
+    pub fn coverage_items(&self, layer: LayerId) -> Vec<CoverageItem> {
+        self.layer_quads(layer)
+            .iter()
+            .map(|quad| quad_coverage_item(quad, self.clip, false))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

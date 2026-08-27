@@ -105,9 +105,13 @@ impl Scene {
     /// primitive touched — which is exactly the claim §8's Phase 4 gate makes
     /// falsifiable.
     ///
-    /// Layers holding nothing of a kind are omitted: a slot with no reservation
-    /// has no base to draw from, and it reappears the frame its layer is given
-    /// one.
+    /// **Every live layer contributes a slot for every kind, including the
+    /// kinds it holds nothing of.** §5.3's wording is deliberate — "one per
+    /// (layer, kind) slot that *could* be populated … regardless of how many
+    /// are actually zero" — and omitting the empty ones would make the sequence
+    /// change shape whenever a layer gained or lost its first glyph run, which
+    /// is precisely the per-frame CPU re-planning the phase exists to stop. An
+    /// unreserved slot reports `base: 0, count: 0` and draws zero instances.
     pub fn draw_slots(&self) -> SlotTable {
         let ids = self.layers.ids();
         let mut slots = Vec::with_capacity(ids.len() * PrimitiveKind::COUNT);
@@ -117,9 +121,6 @@ impl Scene {
                     PrimitiveKind::Quad => self.quads.slab(*layer),
                     PrimitiveKind::GlyphRun => self.glyph_runs.slab(*layer),
                 };
-                if range.is_empty() {
-                    continue;
-                }
                 slots.push(DrawSlot {
                     layer: *layer,
                     kind,
@@ -248,7 +249,7 @@ mod tests {
 
         let small = build(4)?;
         let large = build(40_000)?;
-        assert_eq!(small.len(), 4);
+        assert_eq!(small.len(), 4 * PrimitiveKind::COUNT);
         assert_eq!(
             small.len(),
             large.len(),
@@ -256,7 +257,18 @@ mod tests {
              independent of resident primitive count"
         );
         assert_eq!(large.kind_slots(PrimitiveKind::Quad).len(), 4);
-        assert!(large.kind_slots(PrimitiveKind::GlyphRun).is_empty());
+        assert_eq!(
+            large.kind_slots(PrimitiveKind::GlyphRun).len(),
+            4,
+            "§5.3: a kind a layer holds nothing of is still a slot that could \
+             be populated, so it keeps its place in the sequence"
+        );
+        assert!(
+            large
+                .kind_slots(PrimitiveKind::GlyphRun)
+                .iter()
+                .all(|slot| slot.count == 0)
+        );
         Ok(())
     }
 
@@ -294,13 +306,16 @@ mod tests {
     }
 
     #[test]
-    fn a_layer_with_no_reservation_of_a_kind_gets_no_slot() {
+    fn a_layer_with_no_reservation_of_a_kind_still_holds_its_place_in_the_sequence() {
         let mut scene = Scene::new();
         scene.layer(LayerKey::untiled(BoundaryId::ROOT));
+        let table = scene.draw_slots();
+        assert_eq!(table.len(), PrimitiveKind::COUNT);
         assert!(
-            scene.draw_slots().is_empty(),
-            "a slot with no base has nothing to draw from"
+            table.slots().iter().all(|slot| slot.count == 0),
+            "an unreserved slot draws zero instances rather than being omitted"
         );
+        assert!(Scene::new().draw_slots().is_empty(), "no layers, no slots");
     }
 
     #[test]
