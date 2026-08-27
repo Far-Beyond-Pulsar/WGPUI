@@ -585,9 +585,7 @@ impl FrameRenderer {
                 &self.composite,
                 &composite_frame_group,
                 &self.composite_args,
-                &composite_plan.prepared,
-                composite_plan.culled,
-                composite_plan.unavailable,
+                &composite_plan,
                 input.mode,
                 &composite_resolved,
             ));

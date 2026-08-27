@@ -48,6 +48,7 @@ use crate::render::compute::indirect_args_pass::IndirectArgsBuffers;
 use crate::render::device::IndirectSupport;
 use crate::render::pipelines::{CompositePipeline, QuadPipeline};
 use crate::render::readback::{ReadbackError, StagingReader};
+use crate::render::textures::external_surface::CompositePlan;
 
 /// How the fixed draw sequence reaches the device.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -434,26 +435,27 @@ pub struct PreparedComposite {
 /// (`wgpui_core::boundary::compositor::visible_composites`): a culled entry
 /// never reaches here, so it costs no bind group, no texture fetch, and — for
 /// an external surface — no interaction with `SurfaceRegistry` whatsoever.
-/// `culled` and `unavailable` are how many entries did not make it this far,
-/// carried in only so the stats can account for every entry the frame was
-/// given.
+/// `plan` carries the prepared entries beside the two counts of entries that
+/// did not make it this far, so the stats can account for every entry the frame
+/// was given. Taking the plan rather than its three fields separately is what
+/// keeps this signature inside clippy's argument limit *and* what stops a caller
+/// pairing one frame's entries with another's counts.
 pub fn issue_composites(
     pass: &mut wgpu::RenderPass<'_>,
     pipeline: &CompositePipeline,
     frame_group: &wgpu::BindGroup,
     args: &IndirectArgsBuffers,
-    entries: &[PreparedComposite],
-    culled: u32,
-    unavailable: u32,
+    plan: &CompositePlan,
     mode: DrawMode,
     resolved: &ResolvedArgs,
 ) -> DrawStats {
+    let entries = &plan.prepared;
     let mut stats = DrawStats {
         composite_entries_visited: u32::try_from(entries.len()).unwrap_or(u32::MAX)
-            + culled
-            + unavailable,
-        composite_entries_culled: culled,
-        composite_entries_unavailable: unavailable,
+            + plan.culled
+            + plan.unavailable,
+        composite_entries_culled: plan.culled,
+        composite_entries_unavailable: plan.unavailable,
         readback_words: resolved.words_read(),
         instances_known_to_cpu: if mode.reads_back() { Some(0) } else { None },
         ..DrawStats::default()
