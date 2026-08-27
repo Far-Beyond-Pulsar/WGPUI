@@ -50,6 +50,55 @@ use crate::patch::primitive::AtlasTileId;
 use crate::scene::layer::LayerId;
 use crate::scene::Scene;
 
+/// Which atlas a raster belongs in.
+///
+/// Not a rendering detail that could live in `wgpui-wgpu`: it decides which
+/// texture format a tile is allocated out of, and the crate that *shapes* the
+/// text is the only one that knows whether a glyph came from a colour emoji
+/// face. So the vocabulary is shared here, where both sides can name it, and
+/// neither side has to depend on the other (§3.3, §3.5).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AtlasKind {
+    /// Single-channel coverage: ordinary text.
+    #[default]
+    Monochrome,
+    /// Full colour: emoji, and image sprites.
+    Polychrome,
+}
+
+/// The exact identity of one rasterised glyph.
+///
+/// # Why the fields rather than a hash
+///
+/// An atlas keyed by a `u64` hash is one collision away from drawing the wrong
+/// glyph, silently, in a way that reproduces only for one user with one font at
+/// one zoom level. The field set is small enough to compare directly, so it is
+/// compared directly. Every field is part of the identity for a reason:
+///
+/// - `font` and `glyph` name the outline. Both are needed: glyph indices are
+///   font-local, so glyph 42 means different things in different faces — and
+///   fallback means one run can span faces.
+/// - `font_size_bits` because a raster is resolution-specific; the same outline
+///   at 12px and 13px are two different bitmaps.
+/// - `subpixel` because a glyph drawn at a fractional pixel offset is a
+///   different bitmap again, and quantising the offset into a small number of
+///   variants is what makes text look right without a raster per position.
+/// - `kind` because a colour emoji and a coverage mask are not interchangeable
+///   even when everything else matches.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GlyphRasterKey {
+    /// The face the outline comes from, as the shaper numbers its faces.
+    pub font: u32,
+    /// The font-local glyph index.
+    pub glyph: u32,
+    /// Bit pattern of the pixel size the glyph is rasterised at.
+    pub font_size_bits: u32,
+    /// Quantised sub-pixel position, `[x, y]`.
+    pub subpixel: [u8; 2],
+    /// Which atlas the raster belongs in.
+    pub kind: AtlasKind,
+}
+
 /// What the atlas allocator dropped.
 ///
 /// Two granularities because the allocator has two: a whole page is destroyed

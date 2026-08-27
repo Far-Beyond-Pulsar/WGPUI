@@ -25,6 +25,11 @@ wgpu = { version = "30", default-features = false, features = [
     "wgsl",
 ] }
 pollster = "0.4.0"
+# The bin-packing allocator behind `render/atlas.rs`, at the same version the
+# root crate pins — the legacy atlas (`src/platform/cross/atlas.rs`) uses the
+# same `BucketedAtlasAllocator`, so packing behaviour is shared rather than
+# re-derived while both backends exist.
+etagere = "0.2"
 bytemuck = { version = "1.24", features = ["derive"] }
 # `render/surface_registry.rs` is a mechanical move of the legacy file (§5.5,
 # §9: "moved, not rebuilt"), and that file logs. Taking the dependency is what
