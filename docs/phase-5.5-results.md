@@ -79,13 +79,17 @@ the two crates the brief named.
 |---|---|---|
 | `wgpui-text/src/raster.rs` | +587 (new) | `GlyphRasterizer`, `RasterizedGlyph` production, `RasterError`, the `SwashContent` conversions |
 | `wgpui-text/src/test_fonts.rs` | +37 (new) | One embedded face, for tests that assert about real pixels |
-| `wgpui-text/tests/legacy_raster_differential.rs` | +561 (new) | The gate: the transcribed legacy rasteriser, and 2,592 comparisons |
-| `wgpui-wgpu/src/render/atlas_upload.rs` | +292 (new) | `AtlasTextures` — texture creation, row padding, `write_texture` |
+| `wgpui-text/tests/legacy_raster_differential.rs` | +554 (new) | The gate: the transcribed legacy rasteriser, and 2,592 comparisons |
+| `wgpui-wgpu/src/render/atlas_upload.rs` | +290 (new) | `AtlasTextures` — texture creation, row padding, `write_texture` |
 | `wgpui-wgpu/tests/glyph_atlas_upload.rs` | +363 (new) | Four GPU tests, including shape→raster→pack→upload→read back |
-| `wgpui-wgpu/src/render/atlas.rs` | +563 / −45 | Page texel buffers, `get_or_insert_raster`, `PendingUpload`, `tile_texels` |
-| `wgpui-core/src/scene/atlas.rs` | +79 / −8 | `RasterizedGlyph`, `AtlasKind::bytes_per_pixel`, `GlyphRasterKey::scale_factor_bits` |
+| `wgpui-wgpu/src/render/atlas.rs` | +520 / −43 | Page texel buffers, `get_or_insert_raster`, `PendingUpload`, `tile_texels` |
+| `wgpui-core/src/scene/atlas.rs` | +78 / −1 | `RasterizedGlyph`, `AtlasKind::bytes_per_pixel`, `GlyphRasterKey::scale_factor_bits` |
 | `wgpui-text/src/shaping.rs` | +35 | `LoadedFont::weight`, `raster_face`, `font_system_mut` |
-| `wgpui-text/src/wgpui_text.rs`, `patch.rs`, `wgpui-core/src/scene.rs`, both manifests | small | module wiring, the new key field, the dev-dependency |
+| `wgpui-text/src/wgpui_text.rs`, `patch.rs`, `wgpui-core/src/scene.rs`, both manifests | +36 | module wiring, the new key field, the dev-dependency |
+
+In total +2,500 / −44 under `crates/`, of which 917 lines are the two
+integration-test files — not counting the `#[cfg(test)]` modules inside
+`raster.rs` and `atlas.rs`, which are a good deal more.
 
 **Two files outside §3's map**, both recorded rather than glossed:
 
