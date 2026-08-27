@@ -149,48 +149,48 @@ not "invent a new one."
 ## 2. Target shape, in one picture
 
 ```
-                    ┌─────────────────────────────────────────────┐
+                    ┌──────────────────────────────────────────────┐
                     │  Frontend (frozen surface — §7)              │
                     │  Render / Entity<T> / Context<T> / Styled DSL│
                     │  actions, keymap, elements/* constructors    │
-                    └───────────────────┬───────────────────────────┘
-                                         │ render() — arbitrary CPU code,
-                                         │ runs exactly as it does today
-                                         ▼
-                    ┌─────────────────────────────────────────────┐
+                    └───────────────────┬──────────────────────────┘
+                                        │ render() — arbitrary CPU code,
+                                        │ runs exactly as it does today
+                                        ▼
+                    ┌──────────────────────────────────────────────┐
                     │  Description (per-frame, arena — unchanged)  │
-                    └───────────────────┬───────────────────────────┘
+                    └──────────────────┬───────────────────────────┘
                                          │ reconcile against retained
                                          │ instance tree (R-N Pillar I,
                                          │ already exists — instance.rs)
                                          ▼
-                    ┌─────────────────────────────────────────────┐
+                    ┌──────────────────────────────────────────────┐
                     │  Patch list — the ONE frontend/backend       │
                     │  boundary. Pure data: inserts/updates/       │
                     │  removals of primitives, layout inputs,      │
                     │  hitboxes, dispatch nodes. No control flow.  │
-                    └───────────────────┬───────────────────────────┘
+                    └────────────────────┬─────────────────────────┘
                                          │
                      ┌───────────────────┼───────────────────┐
                      ▼                   ▼                   ▼
-             ┌───────────────┐  ┌────────────────┐  ┌─────────────────┐
-             │ CPU: Taffy for │  │ CPU: cosmic-text│  │ CPU: hit-test,  │
-             │ heterogeneous  │  │ shaping (§6 —   │  │ focus, actions, │
-             │ layout only    │  │ not GPU-portable)│  │ input dispatch  │
-             └───────┬───────┘  └────────┬────────┘  └─────────────────┘
+             ┌───────────────┐  ┌──────────────────┐  ┌─────────────────┐
+             │ CPU: Taffy for│  │ CPU: cosmic-text │  │ CPU: hit-test,  │
+             │ heterogeneous │  │ shaping (§6 —    │  │ focus, actions, │
+             │ layout only   │  │ not GPU-portable)│  │ input dispatch  │
+             └───────┬───────┘  └────────┬─────────┘  └─────────────────┘
                      │                   │
                      ▼                   ▼
-          ┌───────────────────────────────────────────────────┐
+          ┌────────────────────────────────────────────────────┐
           │  Persistent GPU-resident scene (per-layer slabs,   │
           │  patched not rebuilt — R-N Pillar III, extended)   │
-          └───────────────────────┬─────────────────────────────┘
+          └────────────────────────┬───────────────────────────┘
                                    │ compute passes, every frame,
                                    │ over resident + newly-patched data
                                    ▼
-     ┌─────────────────────────────────────────────────────────────┐
-     │ GPU compute: regular-content layout (§6) · ordering (§5.1) · │
+     ┌───────────────────────────────────────────────────────────────┐
+     │ GPU compute: regular-content layout (§6) · ordering (§5.1) ·  │
      │ occlusion culling (§5.2) · indirect draw-arg generation (§5.3)│
-     └───────────────────────────────┬─────────────────────────────┘
+     └────────────────────────────────┬──────────────────────────────┘
                                       ▼
                     indirect multi-draw, instanced, per layer
 ```
@@ -1196,7 +1196,7 @@ Phase 8, after parity is demonstrated, not assumed.
 | Phase | Work | Gate |
 |---|---|---|
 | **0** | Workspace scaffold (`crates/wgpui-core`, `-layout`, `-text`, `-widgets`, `-devtools`, `-wgpu`, empty or thin). Port `flamegraph_gpu.rs`'s GPU timestamp capture as the baseline instrumentation. **Spike, not build**: a synthetic 100K-quad scene's ordering+occlusion as a compute pass vs. today's CPU `BoundsTree`; a 10,000-row uniform grid's layout as a compute kernel vs. today's CPU loop. **Executed** — see `docs/phase-0-results.md` on branch `wgpui-2.0/phase-0-scaffold-and-spikes` (scaffold + spike code, not yet merged to `main`). Scaffold: `cargo check --workspace` passes, `gpui-ce` standalone check is byte-for-byte unchanged. Spike A (ordering+occlusion): ~6–7× faster via GPU compute, exact correctness match (0/100,000 mismatches), measured on a real adapter (RTX 4060 Laptop GPU, Vulkan) — **Phase 3 proceeds as scoped.** Spike B (uniform-list layout as a standalone dispatch): ~1000–1150× *slower* — the CPU loop for 10,000 rows costs ~20–29µs total (it was never the bottleneck; `uniform_list` already bypasses Taffy), while dispatch/submit/poll overhead alone costs ~20–32ms — **Phase 6.1 as originally scoped is killed by this data; see its rescoped row below.** One machine/driver so far; re-run on other hardware before treating either result as final. | Numbers exist, on real target hardware, for the two spikes that decide whether Phases 3 and 6.1 are worth building at all. If a spike doesn't win, the corresponding phase is rescoped or dropped here, not discovered mid-build. **Met** for Phase 3 (proceed); **met in the negative** for Phase 6.1 (rescope or drop, per below) — this is the gate working as designed, not a failure of it. |
-| **1** | `wgpui-core::patch` — the patch-list protocol (§2): insert/update/remove for primitives, layout inputs, hitboxes, dispatch nodes. `wgpui-core::scene` — persistent per-layer slabs (R-N Pillar III's concept, 2.0's mechanics), accepting patches instead of full-range rewrites. **Ambient reconciliation (§4.0) ships here, window-wide, with no `.boundary()` involved at all** — `diff_key`/`InstanceKey` reconciliation and Taffy node reuse apply to every element in the tree by construction, not fenced to any subtree. **`.uncached()` (§4.2) ships in this same phase, not later** — shipping the default without its escape hatch would leave high-frequency-update UIs (the game-engine-editor workloads this crate targets) with no way to opt out of reconciliation bookkeeping that provably never pays off for them. No compute yet; CPU-computed draw ranges, same as today, just through the new protocol. | A round-trip test: apply a patch sequence, read back the resident buffer, matches an equivalent full-rebuild reference exactly. **Separately, and just as load-bearing**: a plain, unboundaried three-level-deep div that renders identically to last frame keeps the same `LayoutId` and skips `prepaint`/`paint` — with zero `.boundary()`, zero `.id()`, zero API touched anywhere in the test. **A third, symmetric check**: a `.uncached()` subtree allocates no `ElementInstance` and its children's state (`use_state`, focus) survives across frames identically to a reconciled subtree's — proving the two mechanisms are actually decoupled, not just documented as such. **A fourth check, per §5.0**: changing one primitive's value inside a large layer issues one `write_buffer` call sized to that primitive's stride, not the layer's full range — the actual delta-upload guarantee, checked from Phase 1 rather than assumed to fall out of the compute phases later. |
+| **1** | `wgpui-core::patch` — the patch-list protocol (§2): insert/update/remove for primitives, layout inputs, hitboxes, dispatch nodes. `wgpui-core::scene` — persistent per-layer slabs (R-N Pillar III's concept, 2.0's mechanics), accepting patches instead of full-range rewrites. **Ambient reconciliation (§4.0) ships here, window-wide, with no `.boundary()` involved at all** — `diff_key`/`InstanceKey` reconciliation and Taffy node reuse apply to every element in the tree by construction, not fenced to any subtree. **`.uncached()` (§4.2) ships in this same phase, not later** — shipping the default without its escape hatch would leave high-frequency-update UIs (the game-engine-editor workloads this crate targets) with no way to opt out of reconciliation bookkeeping that provably never pays off for them. No compute yet; CPU-computed draw ranges, same as today, just through the new protocol. **Executed** — branch `wgpui-2.0/phase-1-patch-protocol` (pushed to origin, not merged, no PR yet), off `2.0` after Phase 0. Two passes: the first left a commit that didn't compile (missing inter-crate dependency, an uncompiled 1,075-line scene module, and a 5-line stub sitting exactly where the round-trip gate needed to live — caught and fixed by verifying rather than trusting the report, same discipline this document tries to model); the second made `Scene` the real assembly point, wrote `patch/apply.rs` in full, and added the two gate tests (3, a strengthened 2) that had no coverage at all. All four gates pass with real named tests, `cargo check --workspace`/`cargo test -p wgpui-core`/`-p wgpui-layout` pass (128 + 6 tests), clippy is clean on both crates with three real fixes (not suppressions), and the diff touches nothing under `src/` or the root `Cargo.toml` — confirmed by `git diff`, not assumed. Two honest gaps, not gate failures: (a) `gpui-ce`'s own legacy test binary did not finish in 11+ minutes of CPU-bound running during verification — unmodified by this branch per the diff, so not a regression, but unconfirmed as passing; a human should let it finish once. (b) **Nothing yet produces a `Description`/`ScenePatch` from a real element** — the reconciler and patch protocol are tested end-to-end against synthetic inputs, not *driven* by anything, because deciding what primitives an element emits needs the element vocabulary §3.4 puts in `wgpui-widgets`, which doesn't exist yet. This isn't a missed gate (none asked for it) — it's the seam the next phase that touches real elements lands on, named here so it isn't rediscovered as a surprise. Full write-up: `docs/phase-1-results.md` on that branch. | A round-trip test: apply a patch sequence, read back the resident buffer, matches an equivalent full-rebuild reference exactly — **met**, via an independent oracle scene compared record-for-record (the first version derived the "rebuild reference" from the patched scene's own output, which could only prove the encoder deterministic, not correct — caught during verification, not shipped). **Separately, and just as load-bearing**: a plain, unboundaried three-level-deep div that renders identically to last frame keeps the same layout-node identity and skips its equivalent of `prepaint`/`paint` — with zero `.boundary()`, zero `.id()`, zero API touched anywhere in the test — **met**, and now mechanically checks the "zero API touched" clause instead of only asserting the identity claim. `wgpui-core` has no `prepaint`/`paint` of its own (those take `Window`/`App`, §3 puts them elsewhere); "skipped" here means the reconciler's `FramePlan` marks the node `Reused`. **A third, symmetric check**: a `.uncached()` subtree allocates no `ElementInstance` and its children's state survives across frames identically to a reconciled subtree's — **met**; had zero coverage before the second pass. `use_state`/focus don't exist yet, so this is checked structurally (`state.rs` and `instance.rs` do not import each other) plus behaviorally against a live reconciled control, not a hardcoded constant. **A fourth check, per §5.0**: changing one primitive's value inside a large layer issues one upload entry sized to that primitive's stride, not the layer's full range — **met** as headless data (an `UploadPlan` entry list; no real `wgpu::Buffer`/`write_buffer` exists yet, correctly deferred to `wgpui-wgpu`). Building 10,000 quads by appends was measured to upload 2.6× the layer's final size from size-class relocations — §5.0's disclosed non-O(1) insert/remove case, working as documented, and not what the gate measures (the gate measures one steady-state update, not a bulk build). |
 | **2** | `.boundary()` (§4.1) implemented as a pure compositing/buffering policy on top of Phase 1's already-ambient reconciliation: independent GPU texture retention, auto positional identity for the boundary root, and the `Reason::Scroll` signal (§5.4) from day one — not retrofitted. Old `.layer()`/`.layer_keyed()` etc. keep working unchanged in the legacy backend; `.boundary()` only exists in `wgpui-core`. **`WgpuSurface` gets real (positional) identity + a trivial `(bounds, style, surface_id)` `diff_key` here too (§5.5, Gap 1)** — it depends on the same positional-identity work this phase already builds, and unblocks Phase 4's compositing unification. | `.boundary()` with zero policy arguments reaches R-N's fast path (transform-only recomposite on scroll) on a plain `overflow_y_scroll` div with no other API touched — the exact test SFD Pass A's gate specifies, now true by default rather than by opt-in. Additionally: removing `.boundary()` from that same test case degrades the scroll case to a per-tick recomposite (no independent texture) but does **not** reintroduce full rebuild — confirming boundary and reconciliation are actually decoupled, not just documented as such. **`WgpuSurface` check**: an unmoved, unresized `wgpu_surface()` element skips `request_layout`/`prepaint`/`paint` across frames exactly like a reconciled `div` would. |
 | **3** | GPU compute ordering + occlusion (§5.1, §5.2) over Phase 1's slabs. `WGPUI_OCCLUSION=validate`-equivalent differential harness ported and run against the compute path. | Culled/unculled scenes match exactly over a scripted UI walk (R-N §8.5's bar, unchanged). Spike numbers from Phase 0 reproduced on the real pipeline, not just the synthetic case. |
 | **4** | Indirect draw-arg generation + `multi_draw_indirect` (§5.3), with the CPU-readback fallback for drivers/WASM that can't take it. **`WgpuSurface`/`SurfaceRegistry` compositing unification (§5.5, Gap 2)**: the *consuming* half of `SurfaceRegistry`'s composite path is folded into the same indirect-draw entry mechanism `.boundary()`'s texture-retained layers use; `SurfaceRegistry`'s producer-side triple-buffer, atomic generation tracking, and `gpu_submit_lock` cross-thread synchronization are untouched — nothing about how the external render thread paces itself changes. | A clean window's CPU-side draw-issuing work is O(layer slots), independent of resident primitive count, measured directly (same `render_stats`-style counters R-N used, ported into `wgpui-core`). **`WgpuSurface` check**: a viewport panel fully covered by a modal (occlusion-culled per §5.2/Phase 3) issues zero draws for its embedded 3D content, and `WgpuSurfaceHandle`'s existing concurrency tests (`submit_guard`, backpressure via `has_unconsumed_frame`) pass unmodified against the unified consumer path. |
@@ -1227,6 +1227,7 @@ default, and it's gated on parity being demonstrated, not scheduled.
 | **Ambient reconciliation (§4.0/constraint 5) means a `diff_key`/reconciliation bug's blast radius is the entire application from Phase 1 onward, not one opted-in subtree** — this is the direct cost of the correction that makes 2.0's default posture right | Kill switch from Phase 1 (`WGPUI_INSTANCES=0`'s precedent, `view.rs:103`, now gating the *default* path rather than an edge feature); the Phase 1 gate's second clause (a plain unboundaried div reusing its `LayoutId`) is a targeted regression test for exactly this, run continuously, not just once at Phase 1's landing. |
 | Unifying `WgpuSurface`'s composite path with `.boundary()`'s (§5.5, Gap 2) accidentally touches `SurfaceRegistry`'s cross-thread producer-side synchronization (`gpu_submit_lock`, atomic generation tracking, GPU-synced buffer swaps) — hard-won, carefully-documented concurrency code that has nothing to do with the bug being fixed | Scope Phase 4's change explicitly to the *consumer* side only — how an already-produced texture enters the ordered scene and gets drawn. `SurfaceRegistry`'s producer API (`back_buffer_view`, `present_synced`, `submit_guard`, backpressure) is untouched, and its existing tests are the gate (Phase 4's row, §8), not a new test suite reverse-engineered from the concurrency doc comments. |
 | `Buffering::Tiled` (§4.3) picks a tile size that's wrong for a given workload — too small inflates per-tile/draw-call overhead, too large approaches `Margin`'s whole-region-refill cost — and an erratic pan pattern keeps more tiles "recently visited" than a per-tile eviction timer alone bounds | Tile size starts from measured common-compositor practice (~256–512px) and is validated against a representative node-graph workload in Phase 4.5, not asserted (same Phase 0 spike discipline); a total resident-tile budget with LRU eviction is a first-class part of the mechanism, not a follow-up, exactly because R-N §3.4's per-layer timer alone was never designed for grid-many tiles. |
+| **Discovered during Phase 1, not assumed**: `PrimitiveStore::reflow` (`wgpui-core::scene`) is O(n) per insert/remove, so building a scene by repeated appends is O(n²) — measured directly as 2.6× the final layer size uploaded during a 10,000-quad bulk build, from size-class relocations. The O(1) value-update path (§5.0's actual steady-state guarantee) doesn't go through it, so this doesn't violate Phase 1's gate, but Phase 3's 100K-primitive scale (validated by Spike A for *ordering/occlusion*, not for *population*) could hit this hard if a scene is ever built by naive one-at-a-time appends rather than a bulk-insert path | Not yet mitigated — flagged for whichever phase first needs to construct large scenes at speed (Phase 3 or the widget work that precedes it). A bulk-insert/reserve API on `PrimitiveStore` that pre-sizes before reflowing is the likely fix; add it when a real workload needs it, per this document's own measure-before-building discipline, not preemptively. |
 
 ---
 
@@ -1301,28 +1302,34 @@ default, and it's gated on parity being demonstrated, not scheduled.
 
 ## 11. Immediate next actions
 
-Phase 0 (§8) has run once — workspace scaffold + both spikes, on branch
-`wgpui-2.0/phase-0-scaffold-and-spikes`, full write-up in
-`docs/phase-0-results.md` on that branch. Not yet merged to `main`. The
-concrete next steps, in order:
+Phase 0 is merged (`2.0`, via PR #149) — workspace scaffold + both spikes,
+write-up in `docs/phase-0-results.md`. Phase 1 has run — patch protocol,
+persistent slabs, ambient reconciliation, `.uncached()` — on branch
+`wgpui-2.0/phase-1-patch-protocol` (pushed to origin, not yet merged, no PR
+open), write-up in `docs/phase-1-results.md` on that branch. The concrete
+next steps, in order:
 
-1. Review and merge the workspace scaffold (`[workspace]` in the root
-   `Cargo.toml`, the six stub crates matching §3) — mechanical, zero risk,
-   confirmed by `cargo check --workspace` passing and the standalone
-   `gpui-ce` check being byte-for-byte unchanged. This is the one item from
-   the prior revision of this list that's now done, pending merge rather
-   than pending work.
-2. Re-run both spikes on at least one non-NVIDIA/non-Windows configuration
-   (integrated GPU, macOS/Metal, Linux/Vulkan) before treating either
-   result as settled — Phase 0 so far is one machine, one driver, one
-   backend. Spike A's ~6–7× win and Spike B's ~1000× loss are both large
-   enough margins that a second data point confirming the same *direction*
-   is what's actually needed, not a demand for the same exact multiplier.
-3. Decide Phase 6.1's fate for real: either run the fused-dispatch
-   follow-up spike sketched in its rescoped row (§8) or drop the phase
-   outright and remove it from the phase table rather than leaving it as a
-   permanently-open question.
-4. Start Phase 1 (the patch protocol) — independently low-risk regardless
-   of where 2–3 land, and every later phase depends on it. Spike A's result
-   is enough to proceed with Phase 3's design as scoped; nothing about
-   Phase 1 was gated on either spike in the first place.
+1. Review and merge `wgpui-2.0/phase-1-patch-protocol` into `2.0`. All four
+   gates pass with real tests, `cargo check --workspace` and the standalone
+   `gpui-ce` check are unchanged, clippy is clean on both new crates — but
+   let `gpui-ce`'s own legacy test binary actually finish once before
+   merging (it ran 11+ minutes without completing during verification; the
+   diff proves it's unmodified, so this is very likely pre-existing
+   suite-runtime, not a regression, but "very likely" and "confirmed" are
+   different things for a merge to main-line-adjacent `2.0`).
+2. Re-run both Phase 0 spikes on at least one non-NVIDIA/non-Windows
+   configuration (integrated GPU, macOS/Metal, Linux/Vulkan) before treating
+   either result as settled — still one machine, one driver, one backend.
+3. Decide Phase 6.1's fate for real: run the fused-dispatch follow-up spike
+   sketched in its rescoped row (§8), or drop the phase outright and remove
+   it from the table rather than leaving it permanently open.
+4. Close Phase 1's named seam before starting Phase 2 in earnest: nothing
+   yet produces a `Description`/`ScenePatch` from a real element, because
+   no element vocabulary exists in `wgpui-widgets` yet to decide what one
+   emits. `.boundary()` (Phase 2) needs something real to wrap — either a
+   minimal element type lands first (a small, explicit addition to the
+   phase table, not assumed to fall out of Phase 2 for free), or Phase 2 is
+   scoped to include it. Decide which before starting, not mid-phase.
+5. The `PrimitiveStore::reflow` O(n²)-bulk-build finding (§9's newest risk
+   row) doesn't block anything yet — no phase has needed to construct a
+   large scene at speed. Address it when one does, not before.
