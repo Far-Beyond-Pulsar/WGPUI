@@ -7,4 +7,4 @@ pub mod request;
 
 pub use axes::Invalidation;
 pub use reason::Reason;
-pub use request::{InvalidationRequest, InvalidationScope};
+pub use request::{FrameSignals, InvalidationRequest, InvalidationScope};

@@ -101,11 +101,49 @@ impl LayerId {
     }
 }
 
+/// Where a layer's content is composited relative to the coordinate space its
+/// primitives were emitted in.
+///
+/// R-N §3's `Layer` sketch carries a `LayerTransform`; this is that field, and
+/// Phase 2 is the phase that finally sets it. A translation is deliberately all
+/// it holds: §5.4's whole point is that a scroll tick costs "one changed
+/// matrix, zero everything else," and the two motions that actually reach a
+/// boundary today — a scroll tick and a pan — are translations. Widening it to
+/// a full affine matrix when rotation or scale need one changes this type and
+/// nothing that consumes it, because every consumer asks it the same question:
+/// where does this layer's content land.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct LayerTransform {
+    /// Translation applied to every primitive in the layer, in the parent
+    /// space's logical pixels.
+    pub translation: [f32; 2],
+}
+
+impl LayerTransform {
+    /// No displacement: content composites exactly where it was emitted.
+    pub const IDENTITY: LayerTransform = LayerTransform {
+        translation: [0.0, 0.0],
+    };
+
+    /// A pure translation.
+    pub const fn translated(x: f32, y: f32) -> Self {
+        Self {
+            translation: [x, y],
+        }
+    }
+
+    /// Whether this transform displaces nothing.
+    pub fn is_identity(self) -> bool {
+        self.translation == [0.0, 0.0]
+    }
+}
+
 /// One layer's retained record.
 #[derive(Clone, Debug)]
 pub struct Layer {
     key: LayerKey,
     slabs: [SlabRange; PrimitiveKind::COUNT],
+    transform: LayerTransform,
     invalidation: Invalidation,
     generation: u64,
 }
@@ -114,6 +152,14 @@ impl Layer {
     /// The layer's cross-frame address.
     pub const fn key(&self) -> LayerKey {
         self.key
+    }
+
+    /// Where this layer's content composites.
+    ///
+    /// The one number a `TRANSFORM`-only frame changes (§5.4), and the reason
+    /// a scrolling boundary can leave every primitive it owns untouched.
+    pub const fn transform(&self) -> LayerTransform {
+        self.transform
     }
 
     /// This layer's reservation in `kind`'s arena.
@@ -174,6 +220,7 @@ impl LayerTable {
                 Layer {
                     key,
                     slabs: [SlabRange::EMPTY; PrimitiveKind::COUNT],
+                    transform: LayerTransform::IDENTITY,
                     invalidation: Invalidation::all(),
                     generation,
                 },
@@ -226,6 +273,29 @@ impl LayerTable {
             Some(layer) => {
                 layer.slabs[kind.index() % PrimitiveKind::COUNT] = range;
                 layer.generation = generation;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move a layer's content to a new composite transform.
+    ///
+    /// Raises [`Invalidation::TRANSFORM`] and nothing else, which is the whole
+    /// mechanism §5.4 says the legacy backend has a bit for and never fires:
+    /// the layer's slab, its records, and its bytes are all untouched, so a
+    /// frame that only calls this uploads nothing (§5.0's third case). Setting
+    /// the transform a layer already has is inert — a boundary that is asked to
+    /// re-composite where it already is must not report itself dirty.
+    pub fn set_transform(&mut self, id: LayerId, transform: LayerTransform) -> bool {
+        let generation = self.next_generation();
+        match self.layers.get_mut(&id) {
+            Some(layer) => {
+                if layer.transform != transform {
+                    layer.transform = transform;
+                    layer.invalidation |= Invalidation::TRANSFORM;
+                    layer.generation = generation;
+                }
                 true
             }
             None => false,
@@ -343,6 +413,49 @@ mod tests {
         assert!(table.remove(LayerId::from_raw(99)).is_none());
         assert!(!table.invalidate(LayerId::from_raw(99), Invalidation::HIT));
         assert!(!table.mark_clean(LayerId::from_raw(99)));
+        assert!(!table.set_transform(LayerId::from_raw(99), LayerTransform::translated(1.0, 0.0)));
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn a_layer_starts_at_the_identity_transform() {
+        let mut table = LayerTable::new();
+        let id = table.insert(LayerKey::untiled(BoundaryId::ROOT));
+        assert_eq!(table.get(id).map(Layer::transform), Some(LayerTransform::IDENTITY));
+        assert!(LayerTransform::IDENTITY.is_identity());
+    }
+
+    #[test]
+    fn moving_a_layer_raises_transform_and_only_transform() {
+        let mut table = LayerTable::new();
+        let id = table.insert(LayerKey::untiled(BoundaryId::ROOT));
+        assert!(table.mark_clean(id));
+        assert!(table.set_transform(id, LayerTransform::translated(0.0, -120.0)));
+        assert_eq!(
+            table.get(id).map(Layer::invalidation),
+            Some(Invalidation::TRANSFORM),
+            "a scroll tick must not imply DISPLAY, LAYOUT, or HIT"
+        );
+        assert_eq!(
+            table.get(id).map(Layer::transform),
+            Some(LayerTransform::translated(0.0, -120.0))
+        );
+        assert_eq!(
+            table.get(id).map(|layer| layer.slab(PrimitiveKind::Quad)),
+            Some(SlabRange::EMPTY),
+            "the layer's residency is untouched by a move"
+        );
+    }
+
+    #[test]
+    fn re_setting_the_transform_a_layer_already_has_is_inert() {
+        let mut table = LayerTable::new();
+        let id = table.insert(LayerKey::untiled(BoundaryId::ROOT));
+        assert!(table.set_transform(id, LayerTransform::translated(4.0, 8.0)));
+        assert!(table.mark_clean(id));
+        let generation = table.get(id).map(Layer::generation);
+        assert!(table.set_transform(id, LayerTransform::translated(4.0, 8.0)));
+        assert_eq!(table.get(id).map(Layer::is_clean), Some(true));
+        assert_eq!(table.get(id).map(Layer::generation), generation);
     }
 }
