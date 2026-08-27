@@ -685,6 +685,131 @@ mod tests {
         assert_eq!(&bytes[16..20], &7u32.to_le_bytes());
     }
 
+    /// **Phase 3 gate #1, CPU arm** (docs/gpu-native-architecture.md §8, Phase
+    /// 3: "culled/unculled scenes match exactly over a scripted UI walk"; R-N
+    /// §8.5).
+    ///
+    /// Runs the scripted walk twice per frame — once emitting every primitive,
+    /// once emitting only what the coverage test kept — and asserts the two
+    /// framebuffers are bit-identical. Culling is a pure optimization or this
+    /// fails.
+    ///
+    /// A third rasterization checks the other half of the phase: painting in
+    /// the computed painter order must be indistinguishable from painting in
+    /// emission order, which is what makes §5.1's reordering safe to do at all.
+    #[test]
+    fn gate_1_culled_and_unculled_scenes_are_pixel_identical_over_a_scripted_walk() {
+        use crate::ordering::{draw_order, painter_orders_via_tree};
+        use crate::test_support::raster::{paint_order, rasterize};
+        use crate::test_support::ui_walk::{SceneDriver, UiSceneSpec, scripted_walk};
+
+        let spec = UiSceneSpec::small();
+        let width = spec.width as u32;
+        let height = spec.height as u32;
+        let mut driver = SceneDriver::new();
+        let mut total_culled = 0usize;
+        let mut total_primitives = 0usize;
+
+        for frame in scripted_walk(&spec) {
+            driver
+                .apply_frame(&frame.quads)
+                .expect("the walk's frames must apply to a real scene");
+            // Read the primitives back out of the resident scene rather than
+            // reusing the generator's `Vec`: the gate is about what the scene
+            // holds, not about what produced it.
+            let quads = driver.resident_quads();
+            let bounds: Vec<Rect> = quads
+                .iter()
+                .map(|quad| Rect::from_origin_size(quad.origin, quad.size))
+                .collect();
+            let items: Vec<CoverageItem> = quads
+                .iter()
+                .map(|quad| quad_coverage_item(quad, frame.clip, false))
+                .collect();
+
+            let orders = painter_orders_via_tree(&bounds);
+            let draw = draw_order(&orders);
+            let (keep, stats) = keep_mask_with_stats(&items, &frame.poison);
+
+            let unculled = rasterize(&quads, &draw, None, width, height);
+            let culled = rasterize(&quads, &draw, Some(&keep), width, height);
+            assert_eq!(
+                unculled.first_difference(&culled),
+                None,
+                "frame {}: culling changed the rendered output",
+                frame.label
+            );
+
+            let emission_order = rasterize(&quads, &paint_order(quads.len()), None, width, height);
+            assert_eq!(
+                unculled.first_difference(&emission_order),
+                None,
+                "frame {}: the painter order changed the rendered output",
+                frame.label
+            );
+
+            assert!(
+                unculled.painted_pixel_count() > (width * height / 2) as usize,
+                "frame {} painted almost nothing, so comparing it proves nothing",
+                frame.label
+            );
+            assert!(
+                stats.culled > 0,
+                "frame {} culled nothing, so this frame tested nothing",
+                frame.label
+            );
+            total_culled += stats.culled;
+            total_primitives += quads.len();
+        }
+
+        assert!(
+            total_culled * 20 > total_primitives,
+            "the walk culled only {total_culled} of {total_primitives} primitives — \
+             too few for the comparison to be meaningful"
+        );
+    }
+
+    /// The gate above is only worth anything if its comparison can fail. This
+    /// culls one primitive that is *not* covered and asserts the rasterizer
+    /// notices — otherwise a coverage test that returned `true` for everything
+    /// would pass gate #1.
+    #[test]
+    fn the_gate_1_comparison_actually_detects_a_wrong_cull() {
+        use crate::test_support::raster::{paint_order, rasterize};
+        use crate::test_support::ui_walk::{UiSceneSpec, build_frame};
+
+        let spec = UiSceneSpec::small();
+        let frame = build_frame("initial", &spec);
+        let width = spec.width as u32;
+        let height = spec.height as u32;
+        let order = paint_order(frame.quads.len());
+        let honest = rasterize(&frame.quads, &order, None, width, height);
+
+        let mut wrong = vec![true; frame.quads.len()];
+        // The *topmost* primitive, deliberately: it is the one thing in the
+        // scene nothing can be painted over, so if it paints at all, dropping
+        // it must change pixels. Picking the bottom-most primitive would not
+        // work here and the reason is worth recording — the window background
+        // is completely tiled over by the panels and the chrome, so dropping it
+        // is invisible, which is exactly the situation the occlusion pass
+        // exists to find.
+        assert!(
+            frame
+                .quads
+                .last()
+                .is_some_and(|quad| quad.background[3] > 0.0 && quad.size[0] * quad.size[1] > 0.0),
+            "the topmost primitive paints nothing, so dropping it proves nothing"
+        );
+        if let Some(last) = wrong.last_mut() {
+            *last = false;
+        }
+        let damaged = rasterize(&frame.quads, &order, Some(&wrong), width, height);
+        assert!(
+            honest.first_difference(&damaged).is_some(),
+            "the differential harness cannot see a wrong cull"
+        );
+    }
+
     #[test]
     fn the_mode_switch_reads_the_environment_r_n_8_5_specifies() {
         // Serialised implicitly: this is the only test that touches the var.

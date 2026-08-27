@@ -273,8 +273,23 @@ impl<P: Primitive> PrimitiveStore<P> {
             requested_slots: slots,
         };
 
-        let mut total_slots: u64 = 0;
-        for key in order.iter() {
+        // Records before the edit point cannot have moved, so their offsets are
+        // already current and only the tail needs recomputing. Phase 1's own
+        // results doc (§6, item 8) and 2.0 §9's risk table both flag the
+        // previous whole-layer recomputation as the reason a bulk build was
+        // O(N²); Phase 3 is the first phase that constructs a hundred-thousand-
+        // primitive layer, which is the "when a real workload needs it" §9 said
+        // to wait for. The three §5.0 cases stay auditable in this one function,
+        // which is what the whole-layer version was protecting.
+        let resume_at = first_dirty
+            .checked_sub(1)
+            .and_then(|previous| order.get(previous))
+            .and_then(|key| records.get(key))
+            .map(|stored| stored.slot_offset as u64 + stored.slot_count as u64)
+            .unwrap_or(0);
+
+        let mut total_slots: u64 = resume_at;
+        for key in order.iter().skip(first_dirty) {
             let stored = records
                 .get_mut(key)
                 .ok_or(PatchError::UnknownKey { layer, key: *key })?;
@@ -708,6 +723,52 @@ mod tests {
                 len: 2
             })
         );
+    }
+
+    #[test]
+    fn reflow_only_renumbers_from_the_edit_point_onward() {
+        // The observable consequence of the incremental reflow: an interior
+        // edit leaves every earlier record's slot address untouched, and a
+        // variable-size edit shifts exactly its successors. Asserted on
+        // addresses rather than on timing, so it stays a correctness test.
+        let mut harness: Harness<GlyphRun> = Harness::new();
+        let mut seed = PatchList::new();
+        for index in 0..8u64 {
+            seed.insert(LAYER, key(index + 1), index as u32, run(3));
+        }
+        assert_eq!(harness.apply(&seed), Ok(()));
+        let _ = harness.take_uploads();
+        let before: Vec<_> = (1..=8)
+            .filter_map(|index| harness.store.record_byte_range(LAYER, key(index)))
+            .collect();
+
+        let mut edit = PatchList::new();
+        edit.update(LAYER, key(5), run(7));
+        assert_eq!(harness.apply(&edit), Ok(()));
+        let after: Vec<_> = (1..=8)
+            .filter_map(|index| harness.store.record_byte_range(LAYER, key(index)))
+            .collect();
+
+        assert_eq!(before[..4], after[..4], "records before the edit never move");
+        assert_ne!(before[5], after[5], "records after it do");
+    }
+
+    #[test]
+    fn a_bulk_append_still_places_every_record_contiguously() {
+        // The incremental reflow's correctness obligation: after N appends the
+        // layer is still one packed run with no gaps and no overlaps.
+        let mut harness: Harness<Quad> = Harness::new();
+        seed_quads(&mut harness, 512);
+        assert_eq!(harness.store.slab(LAYER).count, 512);
+        let mut expected = harness.store.slab(LAYER).base as u64 * Quad::SLOT_STRIDE as u64;
+        for index in 0..512u64 {
+            let span = harness
+                .store
+                .record_byte_range(LAYER, key(index + 1))
+                .expect("every appended record has an address");
+            assert_eq!(span.start, expected, "record {index} is not contiguous");
+            expected = span.end;
+        }
     }
 
     #[test]

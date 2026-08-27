@@ -10,6 +10,11 @@ path = "src/wgpui_wgpu.rs"
 doctest = false
 
 [dependencies]
+# Phase 3's compute passes dispatch shader source and consume input encodings
+# that wgpui-core owns (§3.1: "shader source as text, buffer/binding layout
+# descriptors as plain Rust structs"). The edge runs one way only — wgpui-core
+# names nothing here, and cannot, since it is forbidden a live device.
+wgpui-core = { path = "../wgpui-core" }
 # The only crate that touches a live wgpu::Device (docs/gpu-native-architecture.md
 # §3.5) — this dependency is genuinely needed even at the Phase 0 stub stage
 # because the Phase 0 spike harnesses (benches/) live here and open a real

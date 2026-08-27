@@ -6767,6 +6767,7 @@ dependencies = [
  "pollster 0.4.0",
  "rand 0.10.0",
  "wgpu",
+ "wgpui-core",
 ]
 
 [[package]]
