@@ -17,6 +17,8 @@
 //! order, because §5.2's differential harness compares them for exact equality
 //! rather than for approximate agreement.
 
+use std::cmp::Ordering;
+
 /// An axis-aligned rectangle in the owning layer's coordinate space.
 ///
 /// Stored as min/max rather than origin/size because every predicate below
@@ -69,8 +71,14 @@ impl Rect {
     /// Matches the legacy sweep's own test (`src/occlusion.rs` treats a clipped
     /// region with non-positive width or height as absent), so a zero-height
     /// rectangle is empty rather than a hairline.
+    ///
+    /// Written against `partial_cmp` rather than as `max <= min` because the two
+    /// disagree on NaN and this one has to answer "empty". The legacy sweep
+    /// works in `ScaledPixels` and cannot produce a NaN edge; this type takes
+    /// raw floats, and an unordered edge must never read as covering area.
     pub fn is_empty(&self) -> bool {
-        !(self.max_x > self.min_x) || !(self.max_y > self.min_y)
+        !matches!(self.max_x.partial_cmp(&self.min_x), Some(Ordering::Greater))
+            || !matches!(self.max_y.partial_cmp(&self.min_y), Some(Ordering::Greater))
     }
 
     /// The overlapping region, which may be empty.

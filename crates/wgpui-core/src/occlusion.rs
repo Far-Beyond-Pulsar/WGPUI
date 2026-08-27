@@ -234,11 +234,9 @@ fn union_of(mut regions: impl Iterator<Item = Rect>) -> Rect {
 /// answer.
 pub fn keep_mask(items: &[CoverageItem], poison: &[PoisonRegion]) -> Vec<bool> {
     let hierarchy = CoverageHierarchy::build(items);
-    let mut keep = vec![true; items.len()];
-    for index in 0..items.len() {
-        keep[index] = keep_item(items, poison, Some(&hierarchy), index);
-    }
-    keep
+    (0..items.len())
+        .map(|index| keep_item(items, poison, Some(&hierarchy), index))
+        .collect()
 }
 
 /// [`keep_mask`] with the hierarchy removed: every item scans every item above
@@ -249,11 +247,9 @@ pub fn keep_mask(items: &[CoverageItem], poison: &[PoisonRegion]) -> Vec<bool> {
 /// a pruning bug that makes the fast path miss a candidate is invisible against
 /// itself.
 pub fn keep_mask_exhaustive(items: &[CoverageItem], poison: &[PoisonRegion]) -> Vec<bool> {
-    let mut keep = vec![true; items.len()];
-    for index in 0..items.len() {
-        keep[index] = keep_item(items, poison, None, index);
-    }
-    keep
+    (0..items.len())
+        .map(|index| keep_item(items, poison, None, index))
+        .collect()
 }
 
 /// [`keep_mask`] plus R-N §8.5's counters.

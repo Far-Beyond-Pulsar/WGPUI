@@ -112,21 +112,17 @@ impl BoundsTree {
         let mut max_intersecting = 0u32;
         // Descend to the best-fit leaf, collecting the highest intersecting
         // order out of every subtree not descended into.
-        loop {
-            let (left, right) = match self.nodes.get_mut(index) {
-                Some(Node::Internal {
-                    left,
-                    right,
-                    bounds: node_bounds,
-                    ..
-                }) => {
-                    *node_bounds = node_bounds.union(&bounds);
-                    (*left, *right)
-                }
-                // A leaf, or — unreachable by construction — a dangling index.
-                // Either way this is where the descent stops.
-                _ => break,
-            };
+        // The descent stops at a leaf or — unreachable by construction — a
+        // dangling index; either way the pattern stops matching.
+        while let Some(Node::Internal {
+            left,
+            right,
+            bounds: node_bounds,
+            ..
+        }) = self.nodes.get_mut(index)
+        {
+            *node_bounds = node_bounds.union(&bounds);
+            let (left, right) = (*left, *right);
             self.parents.push(index);
 
             let left_cost = self.child_cost(left, bounds);

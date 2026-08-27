@@ -1056,19 +1056,16 @@ fn main() {
     let gpu_culled = read_storage_buffer_u32(&device, &queue, &culled_buffer, n);
     let gpu_changed = read_storage_buffer_u32(&device, &queue, &changed_buffer, 1);
 
-    let mut order_mismatches = 0usize;
-    for i in 0..n {
-        if gpu_orders[i] != cpu.orders[i] {
-            order_mismatches += 1;
-        }
-    }
-    let mut cull_mismatches = 0usize;
-    for i in 0..n {
-        let gpu_bool = gpu_culled[i] != 0;
-        if gpu_bool != cpu.culled[i] {
-            cull_mismatches += 1;
-        }
-    }
+    let order_mismatches = gpu_orders
+        .iter()
+        .zip(&cpu.orders)
+        .filter(|(gpu, reference)| gpu != reference)
+        .count();
+    let cull_mismatches = gpu_culled
+        .iter()
+        .zip(&cpu.culled)
+        .filter(|(gpu, reference)| (**gpu != 0) != **reference)
+        .count();
 
     println!();
     println!("--- GPU path (compute: relax x{RELAX_ITERATIONS} + bitonic sort + cull, end-to-end) ---");

@@ -122,6 +122,26 @@ impl From<ReadbackError> for OrderingError {
     }
 }
 
+/// The buffers both of a run's bind groups name identically.
+///
+/// Only the order and change buffers ping-pong; everything else is the same in
+/// group 0 and group 1, so naming the difference is clearer than passing nine
+/// buffers twice.
+struct SharedBuffers<'a> {
+    params: &'a wgpu::Buffer,
+    bounds: &'a wgpu::Buffer,
+    hierarchy: &'a wgpu::Buffer,
+    sort_key: &'a wgpu::Buffer,
+    sort_value: &'a wgpu::Buffer,
+}
+
+/// What a relaxation batch binds, independent of which batch it is.
+struct Relaxation<'a> {
+    data_groups: &'a [wgpu::BindGroup; 2],
+    stage_group: &'a wgpu::BindGroup,
+    changed: &'a [&'a wgpu::Buffer; 2],
+}
+
 /// GPU-resident results of one ordering dispatch.
 ///
 /// The buffers stay on the device. Reading them back is the caller's separate,
@@ -305,24 +325,25 @@ impl OrderingPass {
         // Two bind groups differing only in which order and change buffers are
         // the input. `data_groups[k]` reads `[a, b][k]`, so after using group
         // `k` the freshly written buffers are the other pair.
+        let shared = SharedBuffers {
+            params: &params,
+            bounds: &bounds_buffer,
+            hierarchy: &hierarchy,
+            sort_key: &sort_key,
+            sort_value: &sort_value,
+        };
         let data_groups = [
             self.data_group(
                 device,
-                &params,
-                &bounds_buffer,
-                &hierarchy,
+                &shared,
                 (&order_a, &order_b),
                 (&changed_a, &changed_b),
-                (&sort_key, &sort_value),
             ),
             self.data_group(
                 device,
-                &params,
-                &bounds_buffer,
-                &hierarchy,
+                &shared,
                 (&order_b, &order_a),
                 (&changed_b, &changed_a),
-                (&sort_key, &sort_value),
             ),
         ];
         let changed_buffers = [&changed_a, &changed_b];
@@ -349,11 +370,14 @@ impl OrderingPass {
         });
         dispatch(&mut encoder, &self.build_blocks, &data_groups[parity], &stage_group, 0, block_groups);
         dispatch(&mut encoder, &self.build_superblocks, &data_groups[parity], &stage_group, 0, superblock_groups);
+        let relaxation = Relaxation {
+            data_groups: &data_groups,
+            stage_group: &stage_group,
+            changed: &changed_buffers,
+        };
         parity = self.encode_relaxation(
             &mut encoder,
-            &data_groups,
-            &stage_group,
-            &changed_buffers,
+            &relaxation,
             parity,
             RELAX_FIRST_BATCH,
             relax_groups,
@@ -381,15 +405,7 @@ impl OrderingPass {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("ordering relaxation"),
             });
-            parity = self.encode_relaxation(
-                &mut encoder,
-                &data_groups,
-                &stage_group,
-                &changed_buffers,
-                parity,
-                batch,
-                relax_groups,
-            );
+            parity = self.encode_relaxation(&mut encoder, &relaxation, parity, batch, relax_groups);
             iterations += batch;
             batch = (batch * 2).min(RELAX_BATCH_CEILING);
             queue.submit(Some(encoder.finish()));
@@ -465,26 +481,23 @@ impl OrderingPass {
     fn data_group(
         &self,
         device: &wgpu::Device,
-        params: &wgpu::Buffer,
-        bounds: &wgpu::Buffer,
-        hierarchy: &wgpu::Buffer,
+        shared: &SharedBuffers<'_>,
         order: (&wgpu::Buffer, &wgpu::Buffer),
         changed: (&wgpu::Buffer, &wgpu::Buffer),
-        sort: (&wgpu::Buffer, &wgpu::Buffer),
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ordering data"),
             layout: &self.data_layout,
             entries: &[
-                binding(0, params),
-                binding(1, bounds),
-                binding(2, hierarchy),
+                binding(0, shared.params),
+                binding(1, shared.bounds),
+                binding(2, shared.hierarchy),
                 binding(3, order.0),
                 binding(4, order.1),
                 binding(5, changed.0),
                 binding(6, changed.1),
-                binding(7, sort.0),
-                binding(8, sort.1),
+                binding(7, shared.sort_key),
+                binding(8, shared.sort_value),
             ],
         })
     }
@@ -538,21 +551,19 @@ impl OrderingPass {
     fn encode_relaxation(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        data_groups: &[wgpu::BindGroup; 2],
-        stage_group: &wgpu::BindGroup,
-        changed: &[&wgpu::Buffer; 2],
+        relaxation: &Relaxation<'_>,
         parity: usize,
         count: u32,
         workgroups: u32,
     ) -> usize {
         let mut parity = parity;
         for _ in 0..count {
-            encoder.clear_buffer(changed[parity ^ 1], 0, None);
+            encoder.clear_buffer(relaxation.changed[parity ^ 1], 0, None);
             dispatch(
                 encoder,
                 &self.relax,
-                &data_groups[parity],
-                stage_group,
+                &relaxation.data_groups[parity],
+                relaxation.stage_group,
                 0,
                 workgroups,
             );

@@ -33,6 +33,8 @@
 //! a culled primitive's pixels are bit-identical to what the occluder writes
 //! over them. The harness therefore asserts bit equality, not a tolerance.
 
+use std::cmp::Ordering;
+
 use crate::geometry::Rect;
 use crate::patch::primitive::Quad;
 
@@ -199,7 +201,10 @@ fn paint(framebuffer: &mut Framebuffer, quad: &Quad) {
 }
 
 fn clamp_to_pixels(value: f32, limit: u32) -> u32 {
-    if !(value > 0.0) {
+    // Written against `partial_cmp` rather than as `value <= 0.0` because the
+    // two differ on NaN, and NaN has to clamp to zero: a degenerate quad must
+    // rasterize to nothing rather than to an unbounded span.
+    if !matches!(value.partial_cmp(&0.0), Some(Ordering::Greater)) {
         return 0;
     }
     let limit_f32 = limit as f32;
