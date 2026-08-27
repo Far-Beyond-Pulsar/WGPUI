@@ -47,10 +47,22 @@ use crate::render::readback::{ReadbackError, read_u32_buffer};
 /// [`RELAX_BATCH`] and cost extra round trips rather than correctness.
 const RELAX_FIRST_BATCH: u32 = 16;
 
-/// Relaxation iterations per follow-up submission, once the first did not
-/// converge. Larger than the first batch because a scene that needed more than
-/// sixteen is likely to need many more, and each batch costs a round trip.
-const RELAX_BATCH: u32 = 48;
+/// Relaxation iterations in the first follow-up submission, once the first did
+/// not converge. Each subsequent batch doubles, up to [`RELAX_BATCH_CEILING`].
+///
+/// Doubling rather than a fixed size because both failure modes cost real time
+/// and they pull in opposite directions: too small a batch pays a round trip per
+/// handful of iterations, too large a one keeps dispatching over a layer that
+/// settled early in the batch. Geometric growth bounds the wasted iterations by
+/// roughly the number genuinely needed while keeping the round trips
+/// logarithmic, without either number being fitted to a particular scene. A
+/// fixed 48 measurably overshot: the zoomed-out node graph settles in the low
+/// twenties and was paying for sixty-four.
+const RELAX_BATCH: u32 = 8;
+
+/// Largest follow-up batch, so a pathological layer cannot overshoot its own
+/// convergence point by thousands of iterations in one submission.
+const RELAX_BATCH_CEILING: u32 = 128;
 
 /// Hard ceiling on total iterations.
 ///
@@ -320,10 +332,10 @@ impl OrderingPass {
 
         let block_groups = blocks.div_ceil(BLOCK_SIZE).max(1);
         let superblock_groups = superblocks.div_ceil(BLOCK_SIZE).max(1);
-        // The relaxation kernel is one invocation per *block*, not per
-        // primitive — see `ordering.wgsl`'s note on collapsing a block's
-        // internal overlap chain inside one invocation.
-        let relax_groups = block_groups;
+        // The relaxation kernel is one *workgroup* per block — its 64 lanes are
+        // the block's 64 primitives during the scan phase, and lane 0 alone
+        // resolves the block's internal chain afterwards. See `ordering.wgsl`.
+        let relax_groups = blocks;
         let sort_groups = padded_count.div_ceil(BLOCK_SIZE);
 
         let mut parity = 0usize;
@@ -358,6 +370,7 @@ impl OrderingPass {
         submissions += 1;
 
         let mut still_changing = self.read_changed(device, queue, changed_buffers[parity])?;
+        let mut batch = RELAX_BATCH;
         while still_changing != 0 {
             if iterations >= RELAX_ITERATION_LIMIT {
                 return Err(OrderingError::NotConverged {
@@ -374,10 +387,11 @@ impl OrderingPass {
                 &stage_group,
                 &changed_buffers,
                 parity,
-                RELAX_BATCH,
+                batch,
                 relax_groups,
             );
-            iterations += RELAX_BATCH;
+            iterations += batch;
+            batch = (batch * 2).min(RELAX_BATCH_CEILING);
             queue.submit(Some(encoder.finish()));
             submissions += 1;
             still_changing = self.read_changed(device, queue, changed_buffers[parity])?;

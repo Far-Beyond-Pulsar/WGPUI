@@ -225,44 +225,78 @@ fn scan_earlier_blocks(block: u32, query: vec4<f32>, floor: u32) -> u32 {
     return best;
 }
 
-// One invocation per *block*, walking its 64 primitives in paint order and
-// using the values it has just computed for its own earlier members.
+// The contribution each of a block's primitives draws from *outside* the block,
+// and the value each ends up with. Workgroup-scoped because the two phases
+// below are split across a barrier.
+var<workgroup> external_best: array<u32, BLOCK_SIZE>;
+var<workgroup> resolved_here: array<u32, BLOCK_SIZE>;
+
+// One *workgroup* per block, in two phases either side of a barrier.
 //
 // This is the second lever on the iteration count, and the larger one. A
 // per-primitive kernel advances the overlap chain exactly one primitive per
 // iteration, so a layer whose deepest painter order is 577 needs 577 passes.
-// Collapsing a block's internal chain inside one invocation advances it by up
-// to a whole block instead, which on the measured zoomed-out node graph cut the
-// iteration count by more than an order of magnitude. The cost is parallelism:
-// this dispatches `primitives / 64` invocations rather than `primitives`, so
-// each one does 64 times the work. That trade is only worth making because the
-// iteration count was what dominated.
+// Resolving a block's internal chain within one dispatch advances it by up to a
+// whole block instead, which on the measured zoomed-out node graph cut the
+// iteration count from hundreds to tens.
 //
-// Reading a freshly computed value for a same-block predecessor makes this
+// The two phases exist because only one of them is actually sequential:
+//
+//   Phase 1, all 64 lanes. Each primitive's scan over the blocks *before* this
+//   one is independent of every other primitive's, and it is where nearly all
+//   the time goes — it walks the hierarchy, while phase 2 walks at most 63
+//   cached neighbours. Running it one lane per primitive is what keeps the
+//   block collapse from costing 64× the parallelism, which an earlier
+//   single-lane version of this kernel did pay: it made the zoomed-out node
+//   graph 1.9× slower than the CPU `BoundsTree` despite the lower iteration
+//   count.
+//
+//   Phase 2, lane 0 alone. A primitive's value depends on its own block's
+//   earlier members, so this genuinely cannot be parallel — but it reads
+//   `external_best` and the block's own bounds and nothing else, so the
+//   serialized part is 64 cached comparisons rather than 64 hierarchy walks.
+//
+// Reading a freshly computed value for a same-block predecessor makes phase 2
 // Gauss-Seidel rather than Jacobi. The fixed point is unchanged: the iteration
 // is monotone and starts below the fixed point, so any fair update order
 // converges to the same least fixed point — the argument is written out in
 // `ordering.rs`.
 @compute @workgroup_size(64)
-fn relax(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let block = global_id.x;
+fn relax(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    let block = workgroup_id.x;
+    // Uniform across the workgroup, so the barrier below is still reached by
+    // every lane that reaches this point.
     if (block >= params.block_count) {
         return;
     }
     let first_item = block * BLOCK_SIZE;
     let last_item = min(first_item + BLOCK_SIZE, params.count);
 
-    var resolved_here: array<u32, 64>;
+    let target_index = first_item + lane;
+    if (target_index < last_item) {
+        external_best[lane] = scan_earlier_blocks(block, bounds[target_index], 0u);
+    } else {
+        external_best[lane] = 0u;
+    }
+    workgroupBarrier();
+
+    if (lane != 0u) {
+        return;
+    }
+
     var moved = false;
     var slot: u32 = 0u;
     loop {
-        let target_index = first_item + slot;
-        if (target_index >= last_item) {
+        let index = first_item + slot;
+        if (index >= last_item) {
             break;
         }
-        let query = bounds[target_index];
-        let current = order_in[target_index];
-        var best = scan_earlier_blocks(block, query, 0u);
+        let query = bounds[index];
+        let current = order_in[index];
+        var best = external_best[slot];
 
         var earlier: u32 = 0u;
         loop {
@@ -282,7 +316,7 @@ fn relax(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // see this file's header and `ordering.rs`.
         let resolved = max(current, best + 1u);
         resolved_here[slot] = resolved;
-        order_out[target_index] = resolved;
+        order_out[index] = resolved;
         if (resolved != current) {
             moved = true;
         }

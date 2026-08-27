@@ -77,7 +77,17 @@ const NODES: u32 = 12_000;
 const DENSE_SCALE: f32 = 0.16;
 const DENSE_LIST_ROWS: u32 = 400;
 const DENSE_NODES: u32 = 16_000;
-const RUNS: u32 = 4;
+const RUNS: u32 = 6;
+/// Runs discarded before any timing is recorded, on both sides equally.
+///
+/// Phase 0's Spike A reported a 14.7× first run against a 5.5–6.9× cluster and
+/// concluded, correctly, that the outlier was warm-up rather than signal — but
+/// it had no way to separate them, because every run was a fresh process. Here
+/// the runs share one, so the warm-up can simply be excluded and *named*
+/// instead of being averaged in and then argued away. The CPU side discards the
+/// same count for the same reason: its first pass is the one that faults in the
+/// scene's pages.
+const WARMUP_RUNS: u32 = 2;
 
 struct CpuTiming {
     ordering: Duration,
@@ -203,7 +213,10 @@ fn measure(
     let mut cpu_reference_draw = Vec::new();
     let mut cpu_reference_keep = Vec::new();
 
-    println!("\n  --- CPU path (BoundsTree + stable sort + accelerated coverage sweep) ---");
+    println!(
+        "\n  --- CPU path (BoundsTree + stable sort + accelerated coverage sweep) ---\n      \
+         the first {WARMUP_RUNS} runs are warm-up and are excluded from the summary"
+    );
     let mut cpu_timings = Vec::new();
     for run in 1..=RUNS {
         let ordering_start = Instant::now();
@@ -224,14 +237,17 @@ fn measure(
             occlusion: occlusion_time,
         };
         println!(
-            "    run {run}: BoundsTree {:>10.3?}  sort {:>10.3?}  occlusion {:>10.3?}  \
+            "    run {run}{}: BoundsTree {:>10.3?}  sort {:>10.3?}  occlusion {:>10.3?}  \
              total {:>10.3?}",
+            if run <= WARMUP_RUNS { " (warm-up)" } else { "         " },
             timing.ordering,
             timing.sort,
             timing.occlusion,
             timing.total()
         );
-        cpu_timings.push(timing);
+        if run > WARMUP_RUNS {
+            cpu_timings.push(timing);
+        }
         cpu_reference_orders = orders;
         cpu_reference_draw = draw;
         cpu_reference_keep = keep;
@@ -248,7 +264,10 @@ fn measure(
     );
 
     // --- GPU path.
-    println!("\n  --- GPU compute path (end-to-end: encode, upload, dispatch, submit, poll) ---");
+    println!(
+        "\n  --- GPU compute path (end-to-end: encode, upload, dispatch, submit, poll) ---\n      \
+         the first {WARMUP_RUNS} runs are warm-up and are excluded from the summary"
+    );
     let mut bounds_bytes = Vec::new();
     let mut item_bytes = Vec::new();
     let mut poison_bytes = Vec::new();
@@ -294,13 +313,20 @@ fn measure(
         let total = ordering_time + occlusion_time;
 
         println!(
-            "    run {run}: ordering {:>10.3?} ({} relax iterations, {} submissions)  \
+            "    run {run}{}: ordering {:>10.3?} ({} relax iterations, {} submissions)  \
              occlusion {:>10.3?}  total {:>10.3?}",
-            ordering_time, ordered.iterations, ordered.submissions, occlusion_time, total
+            if run <= WARMUP_RUNS { " (warm-up)" } else { "         " },
+            ordering_time,
+            ordered.iterations,
+            ordered.submissions,
+            occlusion_time,
+            total
         );
-        gpu_totals.push(total);
-        gpu_ordering_totals.push(ordering_time);
-        gpu_occlusion_totals.push(occlusion_time);
+        if run > WARMUP_RUNS {
+            gpu_totals.push(total);
+            gpu_ordering_totals.push(ordering_time);
+            gpu_occlusion_totals.push(occlusion_time);
+        }
 
         // --- Correctness, outside the measured window.
         let gpu_orders = match ordering.read_orders(&context.device, &context.queue, &ordered) {
@@ -326,21 +352,29 @@ fn measure(
         );
     }
 
-    // --- Summary.
-    let cpu_median = median(cpu_timings.iter().map(CpuTiming::total).collect());
-    let cpu_ordering_median = median(cpu_timings.iter().map(|t| t.ordering + t.sort).collect());
-    let cpu_occlusion_median = median(cpu_timings.iter().map(|t| t.occlusion).collect());
-    let gpu_median = median(gpu_totals);
-    let gpu_ordering_median = median(gpu_ordering_totals);
-    let gpu_occlusion_median = median(gpu_occlusion_totals);
+    // --- Summary. Median and best are both reported: one statistic alone
+    // either hides the variance or lets an outlier stand in for the number.
+    let cpu_total: Vec<Duration> = cpu_timings.iter().map(CpuTiming::total).collect();
+    let cpu_order: Vec<Duration> = cpu_timings.iter().map(|t| t.ordering + t.sort).collect();
+    let cpu_occlude: Vec<Duration> = cpu_timings.iter().map(|t| t.occlusion).collect();
 
-    println!("\n  --- Summary ({} primitives) ---", quads.len());
-    report("ordering (tree+sort vs. relax+bitonic)", cpu_ordering_median, gpu_ordering_median);
-    report("occlusion (coverage sweep)", cpu_occlusion_median, gpu_occlusion_median);
-    report("both", cpu_median, gpu_median);
+    println!(
+        "\n  --- Summary ({} primitives, {} timed runs after {WARMUP_RUNS} warm-up) ---",
+        quads.len(),
+        cpu_timings.len()
+    );
+    report("ordering (tree+sort vs. relax+bitonic)", &cpu_order, &gpu_ordering_totals);
+    report("occlusion (coverage sweep)", &cpu_occlude, &gpu_occlusion_totals);
+    report("both", &cpu_total, &gpu_totals);
 }
 
-fn report(what: &str, cpu: Duration, gpu: Duration) {
+fn report(what: &str, cpu: &[Duration], gpu: &[Duration]) {
+    println!("    {what}");
+    line("median", median(cpu), median(gpu));
+    line("best", best(cpu), best(gpu));
+}
+
+fn line(statistic: &str, cpu: Duration, gpu: Duration) {
     let verdict = if gpu.is_zero() || cpu.is_zero() {
         "unmeasurable".to_string()
     } else if gpu < cpu {
@@ -348,7 +382,11 @@ fn report(what: &str, cpu: Duration, gpu: Duration) {
     } else {
         format!("GPU {:.2}x SLOWER", gpu.as_secs_f64() / cpu.as_secs_f64())
     };
-    println!("    {what:<42} CPU {cpu:>10.3?}   GPU {gpu:>10.3?}   {verdict}");
+    println!("      {statistic:<8} CPU {cpu:>10.3?}   GPU {gpu:>10.3?}   {verdict}");
+}
+
+fn best(values: &[Duration]) -> Duration {
+    values.iter().copied().min().unwrap_or(Duration::ZERO)
 }
 
 fn mismatches<T: PartialEq>(left: &[T], right: &[T]) -> usize {
@@ -358,13 +396,16 @@ fn mismatches<T: PartialEq>(left: &[T], right: &[T]) -> usize {
     left.iter().zip(right).filter(|(a, b)| a != b).count()
 }
 
-fn median(mut values: Vec<Duration>) -> Duration {
+fn median(values: &[Duration]) -> Duration {
+    let mut values = values.to_vec();
+    values.sort_unstable();
     if values.is_empty() {
         return Duration::ZERO;
     }
-    values.sort_unstable();
+    // For an even count, the lower of the two middles rather than their mean:
+    // every number this prints is then a duration that was actually observed.
     values
-        .get(values.len() / 2)
+        .get((values.len() - 1) / 2)
         .copied()
         .unwrap_or(Duration::ZERO)
 }
