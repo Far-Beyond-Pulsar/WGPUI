@@ -315,6 +315,53 @@ pub fn visible_composites(entries: &[CompositeEntry]) -> Vec<bool> {
         .collect()
 }
 
+impl BoundaryComposite {
+    /// The composite entry this boundary contributes, or `None` when it has
+    /// none.
+    ///
+    /// **The one signal `wgpui-core` owes `wgpui-wgpu` about texture
+    /// retention**, and deliberately the smallest one. `Retention::Primitives`
+    /// returns `None`: such a boundary has no texture and its slab is drawn
+    /// directly, which is R-N §3.3's "a layer holding twelve quads is cheaper
+    /// to re-emit than to composite through a texture."
+    /// [`Retention::Texture`] returns an entry naming this boundary as its
+    /// source, and `wgpui-wgpu`'s texture pool is what turns that name into a
+    /// `wgpu::Texture`.
+    ///
+    /// `content_token` is the generation the caller wants baked — in practice
+    /// `crate::scene::Layer::generation`, which already changes on every
+    /// reservation, resize, release, and content edit. Taking it as an argument
+    /// rather than reading it here is what keeps this file free of the scene:
+    /// the compositor decides *whether* a boundary composites through a
+    /// texture, and the scene knows *what version* of its content that texture
+    /// would hold.
+    ///
+    /// `source_is_opaque` is false and stays false. A baked boundary texture is
+    /// transparent wherever its content is, and nothing in Phase 2 or Phase 4
+    /// computes a boundary's own opaque region; a caller that has computed one
+    /// may set the field, and until then the layer tier never culls under a
+    /// boundary texture.
+    pub fn composite_entry(
+        &self,
+        bounds: Rect,
+        content_mask: Rect,
+        content_token: u64,
+    ) -> Option<CompositeEntry> {
+        if self.retention != Retention::Texture {
+            return None;
+        }
+        Some(CompositeEntry::sampled(
+            CompositeSource::BoundaryTexture(self.boundary),
+            bounds,
+            content_mask,
+        ))
+        .map(|entry| CompositeEntry {
+            content_token,
+            ..entry
+        })
+    }
+}
+
 /// Every live compositing boundary, across frames.
 #[derive(Debug, Default)]
 pub struct Compositor {
@@ -606,6 +653,42 @@ mod tests {
             "an evicted boundary must name the layer it owned, so its caller can release it"
         );
         assert!(compositor.is_empty());
+    }
+
+    /// The bridge Phase 4 consumes: only a texture-retained boundary
+    /// contributes a composite entry, and it names itself as the source.
+    #[test]
+    fn only_a_texture_retained_boundary_contributes_a_composite_entry() {
+        let mut compositor = compositor_with_panel();
+        let bounds = Rect::from_origin_size([10.0, 10.0], [200.0, 150.0]);
+
+        let small = compositor
+            .resolve(PANEL, Reason::Scroll, false, 12, false)
+            .expect("the panel is declared");
+        assert_eq!(small.retention, Retention::Primitives);
+        assert_eq!(
+            small.composite_entry(bounds, bounds, 7),
+            None,
+            "R-N §3.3: a boundary holding twelve quads re-emits rather than \
+             compositing through a texture"
+        );
+
+        let large = compositor
+            .resolve(PANEL, Reason::Scroll, false, 4_000, false)
+            .expect("the panel is declared");
+        assert_eq!(large.retention, Retention::Texture);
+        let entry = large
+            .composite_entry(bounds, bounds, 7)
+            .expect("a texture-retained boundary has an entry");
+        assert_eq!(entry.source, CompositeSource::BoundaryTexture(PANEL));
+        assert_eq!(entry.content_token, 7);
+        assert_eq!(entry.bounds, bounds);
+        assert!(
+            !entry.source_is_opaque,
+            "a baked boundary texture is transparent wherever its content is, \
+             so it must not occlude by default"
+        );
+        assert_eq!(entry.opaque_region(), None);
     }
 
     fn rect(x: f32, y: f32, width: f32, height: f32) -> Rect {

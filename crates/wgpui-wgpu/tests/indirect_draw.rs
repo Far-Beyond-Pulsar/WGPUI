@@ -188,7 +188,9 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
         },
     );
 
-    let measure = |frame: &wgpui_core::test_support::ui_walk::UiFrame| -> (FrameOutput, Duration) {
+    let measure = |frame: &wgpui_core::test_support::ui_walk::UiFrame,
+                   mode: DrawMode|
+     -> (FrameOutput, Duration) {
         let mut scene = MultiLayerSceneDriver::new(LAYERS);
         scene.apply_frame(frame).expect("the frame applies");
         let mut renderer = FrameRenderer::new(&context.device);
@@ -205,7 +207,7 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
             composites: &[],
             registry: None,
             viewport: [spec.width, spec.height],
-            mode: DrawMode::best_available(context.indirect),
+            mode,
         };
         renderer
             .render(&context.device, &context.queue, &dirty, &target)
@@ -231,27 +233,63 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
         (output, best)
     };
 
-    let (small_output, small_time) = measure(&small);
-    let (large_output, large_time) = measure(&large);
+    // Every available mode, not just the best one: the gate's claim is about
+    // the fixed sequence, and a mode that collapses it to one call would satisfy
+    // "the same at both counts" trivially while telling us nothing about the
+    // per-slot path a featureless device takes.
+    let mut small_output = None;
+    let mut large_output = None;
+    for mode in modes(&context) {
+        let (small_result, small_time) = measure(&small, mode);
+        let (large_result, large_time) = measure(&large, mode);
+        println!(
+            "gate_1_draw_issuance [{}]: {} primitives -> {} slots, {} draw calls, \
+             {} binds, best draw-issue {:?}",
+            mode.name(),
+            small_result.primitives_resident,
+            small_result.stats.slots_visited,
+            small_result.stats.draw_calls_issued,
+            small_result.stats.bind_group_binds,
+            small_time
+        );
+        println!(
+            "gate_1_draw_issuance [{}]: {} primitives -> {} slots, {} draw calls, \
+             {} binds, best draw-issue {:?}",
+            mode.name(),
+            large_result.primitives_resident,
+            large_result.stats.slots_visited,
+            large_result.stats.draw_calls_issued,
+            large_result.stats.bind_group_binds,
+            large_time
+        );
+        assert_eq!(
+            large_result.stats.draw_calls_issued, small_result.stats.draw_calls_issued,
+            "[{}] draw-issuing work must not grow with the primitive count",
+            mode.name()
+        );
+        assert_eq!(
+            large_result.stats.bind_group_binds, small_result.stats.bind_group_binds,
+            "[{}] bind-group work must not grow with the primitive count",
+            mode.name()
+        );
+        assert_eq!(
+            large_result.stats.slots_visited, small_result.stats.slots_visited,
+            "[{}] the fixed sequence must be the same length at both counts",
+            mode.name()
+        );
+        if mode == DrawMode::PerSlotIndirect {
+            assert_eq!(
+                large_result.stats.draw_calls_issued as usize, LAYERS,
+                "the per-slot path must issue exactly one call per slot — the \
+                 form of the claim that is not satisfiable by collapsing"
+            );
+            small_output = Some(small_result);
+            large_output = Some(large_result);
+        }
+    }
 
-    println!(
-        "gate_1_draw_issuance: {} primitives -> {} slots, {} draw calls, {} binds, \
-         best draw-issue {:?}",
-        small_output.primitives_resident,
-        small_output.stats.slots_visited,
-        small_output.stats.draw_calls_issued,
-        small_output.stats.bind_group_binds,
-        small_time
-    );
-    println!(
-        "gate_1_draw_issuance: {} primitives -> {} slots, {} draw calls, {} binds, \
-         best draw-issue {:?}",
-        large_output.primitives_resident,
-        large_output.stats.slots_visited,
-        large_output.stats.draw_calls_issued,
-        large_output.stats.bind_group_binds,
-        large_time
-    );
+    let small_output = small_output.expect("the per-slot path is always available");
+    let large_output = large_output.expect("the per-slot path is always available");
 
     assert!(
         large_output.primitives_resident > small_output.primitives_resident * 20,
