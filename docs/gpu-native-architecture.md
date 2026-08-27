@@ -1098,6 +1098,24 @@ mechanisms whose correctness depends on an assumption nobody validated.
   self-documented gap (`Img`/`StyledText` never got `diff_key`, R-N Phase 7
   table; SFD §3) as an ordinary consequence of giving every primitive kind
   the same patch path, not as a special case.
+- **Path tessellation stays on the CPU**, via `lyon` (`PathBuilder`'s fill/
+  stroke tessellation into a triangle mesh, unchanged from today), for the
+  same class of reason as text shaping: turning arbitrary bezier curves into
+  triangles is sequential, precision-sensitive geometry, not a data-parallel
+  win with today's tooling. No phase through 4.5 has touched it —
+  `wgpui-wgpu`'s own `pipelines.rs` names this directly as unbuilt work, not
+  a silent gap. What moves to the GPU is exactly the same split as every
+  other primitive kind: the tessellated triangles are patched and rasterized
+  through the ordinary persistent-slab/indirect-draw path (§2, §5), same as
+  a quad or a glyph — only the CPU-side geometry generation is unmoved.
+  Worth being precise about scope here: this is a narrow slice of "drawing."
+  `div()`/text/`img()`/SVG-as-sprite content never touches path tessellation
+  at all (SVG in particular is rasterized to a bitmap by `resvg` before it
+  ever reaches the GPU, an even more CPU-heavy path than Lyon's vector
+  tessellation) — only `PathBuilder`-drawn shapes and `canvas()` closures
+  that choose to build one go through it, and `canvas()` itself is a plain
+  escape hatch that can paint ordinary primitives directly without ever
+  touching `PathBuilder`.
 - **Hit-testing, focus, actions, and input dispatch stay on the CPU.** These
   are small, latency-critical (must resolve within one input event, not one
   frame), and already cheap — R-N §5.2's point-transform hit test (inverse-
