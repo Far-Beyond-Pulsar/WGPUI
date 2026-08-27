@@ -5,33 +5,45 @@
 //! # The split this file draws, and why it is where it is
 //!
 //! §6's accounting says `wgpui-text` produces glyph positions and atlas tile
-//! *requests*, and this crate turns requests into tile coordinates. That is the
-//! whole contract, and it means the allocator is pure bin-packing over integer
-//! rectangles: [`GlyphAtlas`] opens no device, creates no texture, and uploads
-//! no texels. Those are real work and they belong in this crate too — the
-//! legacy file does texture creation, `write_texture` upload batching, and
-//! reference-counted page destruction in the same 539 lines — but they are
-//! *separable* work, and separating them buys something specific: every
-//! assertion in this module's tests runs headlessly, on any machine, with no
-//! adapter. An atlas whose packing decisions can only be checked on hardware is
-//! an atlas whose packing decisions do not get checked.
+//! *requests*, and this crate turns requests into tile coordinates. The
+//! allocator is pure bin-packing over integer rectangles, and — since Phase 5.5
+//! — the CPU-side page buffers those rectangles address: [`GlyphAtlas`] opens no
+//! device, creates no texture, and issues no `write_texture`. It holds the
+//! texels; `render/atlas_upload.rs` is what copies them onto a GPU it owns a
+//! handle to.
+//!
+//! That split is the same one Phase 5 drew and for the same stated reason, moved
+//! one step further along: every assertion in this module's tests runs
+//! headlessly, on any machine, with no adapter — including, now, assertions
+//! about the actual pixels landing at the actual coordinates. An atlas whose
+//! blitting can only be checked on hardware is an atlas whose blitting does not
+//! get checked.
 //!
 //! `etagere`'s `BucketedAtlasAllocator` is the same allocator the legacy file
 //! uses, at the same version the root crate pins, so packing behaviour is
 //! shared rather than re-derived.
 //!
+//! # Page buffers, and what they cost
+//!
+//! A page is `page_size²` texels at [`AtlasKind::bytes_per_pixel`] bytes each —
+//! 1 MiB for a monochrome 1024² page, 4 MiB for a colour one — held on the CPU
+//! for the lifetime of the page. The legacy atlas does not do this: it writes
+//! straight through to the texture and keeps no copy. The copy is kept here
+//! because it is what makes the whole path testable without a device, and
+//! because it is what a `write_texture` reads from anyway; if a real workload
+//! ever shows the resident cost mattering, dropping a page's buffer after its
+//! last upload is a self-contained change behind [`GlyphAtlas::page_texels`].
+//!
 //! # What is deliberately not here
 //!
-//! Texture creation, upload batching, and the `Monochrome`/`Polychrome`
-//! `wgpu::TextureFormat` mapping. The legacy file has all three and they are a
-//! mechanical move once something in 2.0 actually draws a glyph — which nothing
-//! does yet, because there is no sprite pipeline (`render/pipelines.rs` names
-//! its own unbuilt work). Writing the upload path now would mean writing it
-//! against an imagined consumer. Named here rather than left as a silent gap.
+//! `wgpu::Texture` creation, the `Monochrome`/`Polychrome` `TextureFormat`
+//! mapping, and the row-alignment padding a copy needs. Those live in
+//! `render/atlas_upload.rs`, which is the only part of the glyph path that
+//! needs a device.
 
 use std::collections::HashMap;
 use wgpui_core::patch::primitive::AtlasTileId;
-use wgpui_core::scene::atlas::{AtlasEviction, AtlasKind, GlyphRasterKey};
+use wgpui_core::scene::atlas::{AtlasEviction, AtlasKind, GlyphRasterKey, RasterizedGlyph};
 
 /// Side length of a page, in texels, when the atlas opens one.
 ///
@@ -93,6 +105,30 @@ pub enum AtlasError {
     /// reported rather than wrapped because a wrapped tile id aliases a live
     /// one, which is the corruption R-N §4.3's hazard is about.
     OutOfTileIds,
+    /// A bitmap's byte count disagrees with the size and kind it declares.
+    ///
+    /// Refused rather than blitted as far as it goes: the copy walks rows, so a
+    /// bitmap one row short would either read past its own end or leave a row of
+    /// whatever the page held before — and the page held another glyph.
+    MalformedBitmap {
+        /// Bytes the declared size and kind imply.
+        expected: usize,
+        /// Bytes the bitmap actually carries.
+        actual: usize,
+    },
+    /// A raster was requested out of one atlas and its bitmap belongs in the
+    /// other.
+    ///
+    /// A coverage mask written into a colour page is not a rendering artefact,
+    /// it is three quarters of a row of the next glyph — so the two are checked
+    /// against each other rather than assumed consistent because one caller
+    /// happens to derive both from the same key.
+    KindMismatch {
+        /// What the key asked for.
+        requested: AtlasKind,
+        /// What the bitmap says it is.
+        rasterized: AtlasKind,
+    },
 }
 
 impl std::fmt::Display for AtlasError {
@@ -111,6 +147,17 @@ impl std::fmt::Display for AtlasError {
             AtlasError::OutOfTileIds => {
                 formatter.write_str("the atlas has no tile ids left to issue")
             }
+            AtlasError::MalformedBitmap { expected, actual } => write!(
+                formatter,
+                "a raster declared {expected} bytes of texels and carries {actual}"
+            ),
+            AtlasError::KindMismatch {
+                requested,
+                rasterized,
+            } => write!(
+                formatter,
+                "a {rasterized:?} bitmap cannot satisfy a {requested:?} request"
+            ),
         }
     }
 }
@@ -132,6 +179,26 @@ pub struct AtlasStats {
     pub evictions: u64,
 }
 
+/// A rectangle of one page whose texels have changed since the last upload.
+///
+/// Recorded per written tile rather than coalesced into a per-page dirty
+/// rectangle: a page fills from many small glyphs scattered by the bin packer,
+/// so the bounding box of a frame's writes is very nearly the whole page, and
+/// uploading it would cost megabytes to move a few kilobytes. The legacy atlas
+/// makes the same choice — one `write_texture` per tile, in
+/// `WgpuAtlasState::upload_texture`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PendingUpload {
+    /// Which page the rectangle is in.
+    pub page: u32,
+    /// Which atlas that page belongs to, and therefore its texture format.
+    pub kind: AtlasKind,
+    /// Top-left of the rectangle within the page, in texels.
+    pub origin: [u32; 2],
+    /// Size of the rectangle, in texels.
+    pub size: [u32; 2],
+}
+
 struct Page {
     index: u32,
     kind: AtlasKind,
@@ -143,6 +210,13 @@ struct Page {
     allocations: Vec<Option<etagere::AllocId>>,
     free_slots: Vec<u32>,
     live: usize,
+    /// The page's texels, row-major, `page_size * bytes_per_pixel` per row.
+    ///
+    /// A freed tile's texels are left as they are rather than cleared, exactly
+    /// as the legacy atlas leaves them: what makes a stale reference safe is the
+    /// eviction event, not the texels being blanked, and clearing would cost a
+    /// write per eviction to change nothing observable.
+    texels: Vec<u8>,
 }
 
 impl Page {
@@ -157,6 +231,51 @@ impl Page {
             Some(slot) => Some(slot),
             None => u32::try_from(self.allocations.len()).ok(),
         }
+    }
+
+    /// Copy `texels` into the page at `origin`, row by row.
+    ///
+    /// Bounds are re-derived from the page's own dimensions rather than trusted
+    /// from the placement, so a caller that hands over a rectangle the page
+    /// cannot hold writes nothing instead of writing into the next row.
+    fn blit(&mut self, page_size: u32, origin: [u32; 2], size: [u32; 2], texels: &[u8]) -> bool {
+        let bytes_per_pixel = self.kind.bytes_per_pixel() as usize;
+        let page_stride = page_size as usize * bytes_per_pixel;
+        let row_bytes = size[0] as usize * bytes_per_pixel;
+        if origin[0].saturating_add(size[0]) > page_size
+            || origin[1].saturating_add(size[1]) > page_size
+            || texels.len() != row_bytes * size[1] as usize
+        {
+            return false;
+        }
+        for row in 0..size[1] as usize {
+            let source = row * row_bytes;
+            let destination =
+                (origin[1] as usize + row) * page_stride + origin[0] as usize * bytes_per_pixel;
+            let (Some(from), Some(into)) = (
+                texels.get(source..source + row_bytes),
+                self.texels
+                    .get_mut(destination..destination + row_bytes),
+            ) else {
+                return false;
+            };
+            into.copy_from_slice(from);
+        }
+        true
+    }
+
+    /// The texels of one rectangle of this page, tightly packed.
+    fn read(&self, page_size: u32, origin: [u32; 2], size: [u32; 2]) -> Option<Vec<u8>> {
+        let bytes_per_pixel = self.kind.bytes_per_pixel() as usize;
+        let page_stride = page_size as usize * bytes_per_pixel;
+        let row_bytes = size[0] as usize * bytes_per_pixel;
+        let mut out = Vec::with_capacity(row_bytes * size[1] as usize);
+        for row in 0..size[1] as usize {
+            let start =
+                (origin[1] as usize + row) * page_stride + origin[0] as usize * bytes_per_pixel;
+            out.extend_from_slice(self.texels.get(start..start + row_bytes)?);
+        }
+        Some(out)
     }
 }
 
@@ -183,6 +302,7 @@ pub struct GlyphAtlas {
     tiles_by_key: HashMap<GlyphRasterKey, TilePlacement>,
     keys_by_tile: HashMap<AtlasTileId, GlyphRasterKey>,
     pending_evictions: Vec<AtlasEviction>,
+    pending_uploads: Vec<PendingUpload>,
     stats: AtlasStats,
 }
 
@@ -202,8 +322,14 @@ impl GlyphAtlas {
             tiles_by_key: HashMap::new(),
             keys_by_tile: HashMap::new(),
             pending_evictions: Vec::new(),
+            pending_uploads: Vec::new(),
             stats: AtlasStats::default(),
         }
+    }
+
+    /// The side length, in texels, of every page in this atlas.
+    pub fn page_size(&self) -> u32 {
+        self.page_size
     }
 
     /// What this atlas currently holds.
@@ -223,11 +349,14 @@ impl GlyphAtlas {
         self.tiles_by_key.get(key).copied()
     }
 
-    /// Where `key`'s raster lives, allocating a tile for it if it is not
-    /// resident.
+    /// Reserve space for `key`'s raster without supplying its texels.
     ///
-    /// `size` is the raster's dimensions in texels; the caller has already
-    /// rasterised, or is about to, and this decides where the texels go.
+    /// The space-only half, kept from Phase 5 for the callers that genuinely
+    /// only decide placement — the packing tests, and anything measuring how a
+    /// glyph set packs without paying to rasterise it. A tile reserved this way
+    /// holds whatever the page held before, so a caller that draws from it is
+    /// drawing another glyph's texels; [`Self::get_or_insert_raster`] is the one
+    /// to use when the pixels exist.
     pub fn get_or_insert(
         &mut self,
         key: GlyphRasterKey,
@@ -237,7 +366,58 @@ impl GlyphAtlas {
             self.stats.cache_hits += 1;
             return Ok(*placement);
         }
+        self.insert_new(key, metrics)
+    }
 
+    /// Where `key`'s raster lives, allocating a tile and writing its texels into
+    /// the page if it is not already resident.
+    ///
+    /// This is the whole point of the phase: the bitmap `wgpui-text`'s
+    /// rasteriser produced ends up in the space the allocator reserved for it,
+    /// and [`Self::drain_uploads`] then names the rectangle a device has to be
+    /// told about.
+    ///
+    /// A resident key is answered without looking at `raster` at all — the
+    /// caller is expected to have checked [`Self::get`] first if rasterising is
+    /// what it wants to avoid, which is exactly what [`AtlasTileSource`] does.
+    pub fn get_or_insert_raster(
+        &mut self,
+        key: GlyphRasterKey,
+        raster: &RasterizedGlyph,
+    ) -> Result<TilePlacement, AtlasError> {
+        if let Some(placement) = self.tiles_by_key.get(&key) {
+            self.stats.cache_hits += 1;
+            return Ok(*placement);
+        }
+        if raster.kind != key.kind {
+            return Err(AtlasError::KindMismatch {
+                requested: key.kind,
+                rasterized: raster.kind,
+            });
+        }
+        if !raster.is_well_formed() {
+            return Err(AtlasError::MalformedBitmap {
+                expected: raster.expected_texel_bytes(),
+                actual: raster.texels.len(),
+            });
+        }
+
+        let placement = self.insert_new(
+            key,
+            RasterMetrics {
+                size: raster.size,
+                bearing: raster.bearing,
+            },
+        )?;
+        self.write_texels(placement, &raster.texels);
+        Ok(placement)
+    }
+
+    fn insert_new(
+        &mut self,
+        key: GlyphRasterKey,
+        metrics: RasterMetrics,
+    ) -> Result<TilePlacement, AtlasError> {
         let size = metrics.size;
         let [width, height] = size;
         if width == 0 || height == 0 {
@@ -255,6 +435,86 @@ impl GlyphAtlas {
         self.keys_by_tile.insert(placement.tile, key);
         self.stats.allocations += 1;
         Ok(placement)
+    }
+
+    /// Copy a tile's texels into its page and queue the upload that carries them
+    /// to a texture.
+    ///
+    /// A blit that does not fit is dropped rather than partially applied and the
+    /// upload is not queued, so a page never reports a rectangle whose texels it
+    /// did not actually write. `placement` comes from this atlas, so a rejection
+    /// here is a bug in this file rather than a caller error, which is why it
+    /// reports nothing back: there is no caller decision to make.
+    fn write_texels(&mut self, placement: TilePlacement, texels: &[u8]) {
+        let page_size = self.page_size;
+        let origin = [placement.origin[0] as u32, placement.origin[1] as u32];
+        let size = [placement.size[0] as u32, placement.size[1] as u32];
+        let Some(index) = placement.tile.page() else {
+            return;
+        };
+        let Some(page) = self.pages.iter_mut().find(|page| page.index == index) else {
+            return;
+        };
+        if !page.blit(page_size, origin, size, texels) {
+            return;
+        }
+        self.pending_uploads.push(PendingUpload {
+            page: index,
+            kind: placement.kind,
+            origin,
+            size,
+        });
+    }
+
+    /// The texels a resident tile currently holds, tightly packed.
+    ///
+    /// The read half of [`Self::get_or_insert_raster`], and what lets a test
+    /// assert that a glyph's pixels are where the allocator said they would be
+    /// without opening a device.
+    pub fn tile_texels(&self, placement: TilePlacement) -> Option<Vec<u8>> {
+        let index = placement.tile.page()?;
+        let page = self.pages.iter().find(|page| page.index == index)?;
+        page.read(
+            self.page_size,
+            [placement.origin[0] as u32, placement.origin[1] as u32],
+            [placement.size[0] as u32, placement.size[1] as u32],
+        )
+    }
+
+    /// A whole page's texels, row-major.
+    pub fn page_texels(&self, page_index: u32) -> Option<&[u8]> {
+        self.pages
+            .iter()
+            .find(|page| page.index == page_index)
+            .map(|page| page.texels.as_slice())
+    }
+
+    /// Which atlas a live page belongs to.
+    pub fn page_kind(&self, page_index: u32) -> Option<AtlasKind> {
+        self.pages
+            .iter()
+            .find(|page| page.index == page_index)
+            .map(|page| page.kind)
+    }
+
+    /// Every live page, in the order they were opened.
+    pub fn page_indices(&self) -> Vec<u32> {
+        self.pages.iter().map(|page| page.index).collect()
+    }
+
+    /// Take the page rectangles written since the last drain.
+    ///
+    /// Destructive, like [`Self::drain_evictions`], and for the same reason:
+    /// one upload, one uploader. A caller that drops these without uploading
+    /// them leaves the texture behind the page buffer, which is why nothing
+    /// but the uploader should call it.
+    pub fn drain_uploads(&mut self) -> Vec<PendingUpload> {
+        std::mem::take(&mut self.pending_uploads)
+    }
+
+    /// Whether any texels are waiting to reach a texture.
+    pub fn has_pending_uploads(&self) -> bool {
+        !self.pending_uploads.is_empty()
     }
 
     fn allocate(
@@ -360,6 +620,9 @@ impl GlyphAtlas {
             requested: [self.page_size, self.page_size],
             page_size: self.page_size,
         })?;
+        let texel_bytes = self.page_size as usize
+            * self.page_size as usize
+            * kind.bytes_per_pixel() as usize;
         self.pages.push(Page {
             index,
             kind,
@@ -367,6 +630,11 @@ impl GlyphAtlas {
             allocations: Vec::new(),
             free_slots: Vec::new(),
             live: 0,
+            // Zeroed, so an unwritten region of a page is transparent rather
+            // than whatever the allocator happened to be handed — which matters
+            // because `get_or_insert` reserves space without texels, and a
+            // sprite sampling that space should draw nothing, not noise.
+            texels: vec![0; texel_bytes],
         });
         Ok(self.pages.len() - 1)
     }
@@ -414,6 +682,12 @@ impl GlyphAtlas {
         // The page is removed from the list; its index is never reissued, which
         // is what `next_page_index` is for.
         self.pages.remove(position);
+        // Its queued uploads go with it. An upload names a page and a rectangle
+        // and the uploader reads the texels back out of the page, so a queued
+        // upload for a page that no longer exists is either a silent no-op or a
+        // read of the wrong page, depending on how carefully the uploader is
+        // written — and neither is a thing to leave to the uploader.
+        self.pending_uploads.retain(|upload| upload.page != page_index);
         self.pending_evictions
             .push(AtlasEviction::Page(page_index));
         self.stats.evictions += dropped_count as u64;
@@ -472,16 +746,16 @@ pub struct RasterMetrics {
 
 /// A [`GlyphTileSource`] built from an atlas and a rasteriser.
 ///
-/// # Why the rasteriser is a closure and not a type in this crate
+/// # Why the rasteriser is still a closure
 ///
-/// Rasterising a glyph means `swash` (which `cosmic-text` already carries) plus
-/// a decision about hinting, gamma, and colour-emoji handling, and the shape of
-/// that decision is set by what draws the result. Nothing draws glyphs in 2.0
-/// yet — `render/pipelines.rs` names the missing sprite pipeline itself — so
-/// writing a rasteriser now would mean writing it against an imagined consumer
-/// and then rewriting it. This closes the seam without guessing: the atlas half
-/// is real and tested, the rasteriser half is a parameter, and the phase that
-/// builds the sprite pipeline supplies it without touching anything here.
+/// Phase 5 made it a parameter because nothing rasterised and writing one would
+/// have meant writing it against an imagined consumer. Phase 5.5 wrote one — in
+/// `wgpui-text`, where `cosmic-text` and therefore `swash` live — and the
+/// parameter stays, because the dependency edge §3.3/§3.5 draw runs the other
+/// way: `wgpui-wgpu` cannot name `wgpui_text::raster::GlyphRasterizer` without
+/// depending on the crate that shapes text, which would put a font database
+/// inside the crate whose job is a device. The closure is how the two meet, and
+/// [`wgpui_core::scene::atlas::RasterizedGlyph`] is the vocabulary they meet in.
 pub struct AtlasTileSource<'atlas, Rasterize> {
     atlas: &'atlas mut GlyphAtlas,
     rasterize: Rasterize,
@@ -489,7 +763,7 @@ pub struct AtlasTileSource<'atlas, Rasterize> {
 
 impl<'atlas, Rasterize> AtlasTileSource<'atlas, Rasterize>
 where
-    Rasterize: FnMut(GlyphRasterKey) -> Option<RasterMetrics>,
+    Rasterize: FnMut(GlyphRasterKey) -> Option<RasterizedGlyph>,
 {
     /// A tile source over `atlas`, rasterising with `rasterize`.
     pub fn new(atlas: &'atlas mut GlyphAtlas, rasterize: Rasterize) -> Self {
@@ -499,7 +773,7 @@ where
 
 impl<Rasterize> wgpui_core::scene::atlas::GlyphTileSource for AtlasTileSource<'_, Rasterize>
 where
-    Rasterize: FnMut(GlyphRasterKey) -> Option<RasterMetrics>,
+    Rasterize: FnMut(GlyphRasterKey) -> Option<RasterizedGlyph>,
 {
     fn tile_for(&mut self, key: GlyphRasterKey) -> Option<wgpui_core::scene::atlas::GlyphTile> {
         // A resident tile answers without rasterising, which is the point of the
@@ -512,12 +786,12 @@ where
                 placement
             }
             None => {
-                let metrics = (self.rasterize)(key)?;
+                let raster = (self.rasterize)(key)?;
                 // A refused allocation is `None`, not an error the caller has to
                 // handle: one glyph failing to find atlas space degrades to a
                 // blank glyph rather than failing the frame. A caller that wants
-                // to know why asks `get_or_insert` directly.
-                self.atlas.get_or_insert(key, metrics).ok()?
+                // to know why asks `get_or_insert_raster` directly.
+                self.atlas.get_or_insert_raster(key, &raster).ok()?
             }
         };
         Some(wgpui_core::scene::atlas::GlyphTile {
@@ -537,6 +811,17 @@ mod tests {
         RasterMetrics {
             size: [width, height],
             bearing: [0.0, 0.0],
+        }
+    }
+
+    /// A bitmap whose every texel is `fill`, so a blit can be checked for
+    /// landing in the right rectangle *and* for not spilling out of it.
+    fn bitmap(width: u32, height: u32, kind: AtlasKind, fill: u8) -> RasterizedGlyph {
+        RasterizedGlyph {
+            size: [width, height],
+            kind,
+            bearing: [0.0, 0.0],
+            texels: vec![fill; (width * height * kind.bytes_per_pixel()) as usize],
         }
     }
 
@@ -744,9 +1029,9 @@ mod tests {
         {
             let mut source = AtlasTileSource::new(&mut atlas, |_key| {
                 rasterised += 1;
-                Some(RasterMetrics {
-                    size: [8, 12],
+                Some(RasterizedGlyph {
                     bearing: [0.5, -9.0],
+                    ..bitmap(8, 12, AtlasKind::Monochrome, 0xAB)
                 })
             });
             let first = source.tile_for(key(1)).expect("a raster with metrics");
@@ -774,16 +1059,203 @@ mod tests {
         use wgpui_core::scene::atlas::GlyphTileSource;
 
         let mut atlas = GlyphAtlas::new(16);
-        let mut source = AtlasTileSource::new(&mut atlas, |_key| {
-            Some(RasterMetrics {
-                size: [64, 64],
-                bearing: [0.0, 0.0],
-            })
-        });
+        let mut source =
+            AtlasTileSource::new(&mut atlas, |_key| Some(bitmap(64, 64, AtlasKind::Monochrome, 1)));
         assert_eq!(
             source.tile_for(key(1)),
             None,
             "one oversized glyph must not take the frame down with it"
+        );
+    }
+
+    #[test]
+    fn a_rasters_texels_land_in_the_rectangle_the_allocator_reserved_for_it() {
+        let mut atlas = GlyphAtlas::new(64);
+        let placement = atlas
+            .get_or_insert_raster(key(1), &bitmap(8, 4, AtlasKind::Monochrome, 0x7F))
+            .expect("allocate");
+        assert_eq!(
+            atlas.tile_texels(placement),
+            Some(vec![0x7F; 32]),
+            "the tile must read back exactly what was written into it"
+        );
+
+        // And nowhere else. Everything outside the tile is still the zero the
+        // page opened with, which is what proves the blit respected its stride
+        // rather than writing 32 contiguous bytes.
+        let page = atlas.page_texels(0).expect("page 0 is live");
+        assert_eq!(page.len(), 64 * 64);
+        let written: usize = page.iter().filter(|texel| **texel == 0x7F).count();
+        assert_eq!(written, 32, "a 8x4 blit must touch 32 texels and no more");
+        let origin = [placement.origin[0] as usize, placement.origin[1] as usize];
+        for row in 0..4usize {
+            let start = (origin[1] + row) * 64 + origin[0];
+            assert_eq!(
+                page.get(start..start + 8),
+                Some([0x7F; 8].as_slice()),
+                "row {row} of the tile must sit at its own stride offset"
+            );
+        }
+    }
+
+    #[test]
+    fn a_colour_raster_is_four_bytes_per_texel_in_its_page() {
+        let mut atlas = GlyphAtlas::new(16);
+        let colour_key = GlyphRasterKey {
+            kind: AtlasKind::Polychrome,
+            ..key(1)
+        };
+        let mut raster = bitmap(2, 2, AtlasKind::Polychrome, 0);
+        raster.texels = vec![
+            1, 2, 3, 4, 5, 6, 7, 8, // row 0
+            9, 10, 11, 12, 13, 14, 15, 16, // row 1
+        ];
+        let placement = atlas
+            .get_or_insert_raster(colour_key, &raster)
+            .expect("allocate");
+        assert_eq!(atlas.tile_texels(placement), Some(raster.texels));
+        assert_eq!(
+            atlas.page_texels(placement.tile.page().expect("a page")).map(<[u8]>::len),
+            Some(16 * 16 * 4)
+        );
+    }
+
+    #[test]
+    fn neighbouring_tiles_do_not_write_over_each_other() {
+        let mut atlas = GlyphAtlas::new(64);
+        let first = atlas
+            .get_or_insert_raster(key(1), &bitmap(16, 16, AtlasKind::Monochrome, 0x11))
+            .expect("allocate");
+        let second = atlas
+            .get_or_insert_raster(key(2), &bitmap(16, 16, AtlasKind::Monochrome, 0x22))
+            .expect("allocate");
+        assert_ne!(first.origin, second.origin);
+        assert_eq!(atlas.tile_texels(first), Some(vec![0x11; 256]));
+        assert_eq!(atlas.tile_texels(second), Some(vec![0x22; 256]));
+    }
+
+    #[test]
+    fn a_resident_raster_is_not_written_a_second_time() {
+        let mut atlas = GlyphAtlas::new(64);
+        atlas
+            .get_or_insert_raster(key(1), &bitmap(8, 8, AtlasKind::Monochrome, 0x11))
+            .expect("allocate");
+        assert_eq!(atlas.drain_uploads().len(), 1);
+
+        // A second request with *different* texels must not rewrite the tile:
+        // the key is the raster's identity, and a caller handing over different
+        // pixels for the same key has already disagreed with the atlas about
+        // what the key means.
+        let placement = atlas
+            .get_or_insert_raster(key(1), &bitmap(8, 8, AtlasKind::Monochrome, 0x99))
+            .expect("resident");
+        assert_eq!(atlas.tile_texels(placement), Some(vec![0x11; 64]));
+        assert!(!atlas.has_pending_uploads());
+    }
+
+    #[test]
+    fn every_write_queues_exactly_one_upload_naming_its_own_rectangle() {
+        let mut atlas = GlyphAtlas::new(64);
+        let first = atlas
+            .get_or_insert_raster(key(1), &bitmap(8, 4, AtlasKind::Monochrome, 1))
+            .expect("allocate");
+        let second = atlas
+            .get_or_insert_raster(key(2), &bitmap(2, 6, AtlasKind::Monochrome, 2))
+            .expect("allocate");
+        let uploads = atlas.drain_uploads();
+        assert_eq!(
+            uploads,
+            vec![
+                PendingUpload {
+                    page: 0,
+                    kind: AtlasKind::Monochrome,
+                    origin: [first.origin[0] as u32, first.origin[1] as u32],
+                    size: [8, 4],
+                },
+                PendingUpload {
+                    page: 0,
+                    kind: AtlasKind::Monochrome,
+                    origin: [second.origin[0] as u32, second.origin[1] as u32],
+                    size: [2, 6],
+                },
+            ]
+        );
+        assert!(atlas.drain_uploads().is_empty(), "draining is destructive");
+    }
+
+    #[test]
+    fn destroying_a_page_takes_its_queued_uploads_with_it() {
+        let mut atlas = GlyphAtlas::new(64);
+        atlas
+            .get_or_insert_raster(key(1), &bitmap(8, 8, AtlasKind::Monochrome, 1))
+            .expect("allocate");
+        assert!(atlas.has_pending_uploads());
+        assert!(atlas.destroy_page(0));
+        assert!(
+            !atlas.has_pending_uploads(),
+            "an upload naming a page that no longer exists has nothing to read from"
+        );
+    }
+
+    #[test]
+    fn a_bitmap_whose_length_disagrees_with_its_size_is_refused_rather_than_blitted() {
+        let mut atlas = GlyphAtlas::new(64);
+        let mut short = bitmap(8, 8, AtlasKind::Monochrome, 1);
+        short.texels.pop();
+        assert_eq!(
+            atlas.get_or_insert_raster(key(1), &short),
+            Err(AtlasError::MalformedBitmap {
+                expected: 64,
+                actual: 63
+            })
+        );
+        assert_eq!(atlas.stats().pages, 0, "a refused raster opens no page");
+        assert!(!atlas.has_pending_uploads());
+    }
+
+    #[test]
+    fn a_bitmap_of_the_wrong_kind_is_refused_rather_than_reinterpreted() {
+        let mut atlas = GlyphAtlas::new(64);
+        assert_eq!(
+            atlas.get_or_insert_raster(key(1), &bitmap(8, 8, AtlasKind::Polychrome, 1)),
+            Err(AtlasError::KindMismatch {
+                requested: AtlasKind::Monochrome,
+                rasterized: AtlasKind::Polychrome
+            })
+        );
+    }
+
+    /// A fresh page is transparent, and a *reused* rectangle is not.
+    ///
+    /// Both halves are the same claim from two sides, and the second is the one
+    /// worth pinning down: freeing a tile does not blank its texels (the legacy
+    /// atlas does not either), so a tile whose space was reserved without
+    /// supplying pixels can read back as the glyph that used to live there.
+    /// That is safe only because the eviction event — not a blanked page — is
+    /// what makes a stale reference visible, and because nothing samples a tile
+    /// it did not write. Asserted rather than left as a comment, so a future
+    /// change that starts clearing on eviction has to notice this is the reason
+    /// it did not before.
+    #[test]
+    fn a_fresh_page_is_transparent_and_a_reused_rectangle_keeps_its_old_texels() {
+        let mut atlas = GlyphAtlas::new(64);
+        let untouched = atlas.get_or_insert(key(9), raster(4, 4)).expect("allocate");
+        assert_eq!(
+            atlas.tile_texels(untouched),
+            Some(vec![0; 16]),
+            "a page opens zeroed, so unwritten space samples as nothing"
+        );
+        assert!(!atlas.has_pending_uploads(), "reserving space uploads nothing");
+
+        atlas
+            .get_or_insert_raster(key(1), &bitmap(16, 16, AtlasKind::Monochrome, 0xFF))
+            .expect("allocate");
+        assert!(atlas.evict(&key(1)));
+        let reused = atlas.get_or_insert(key(2), raster(16, 16)).expect("allocate");
+        assert_eq!(
+            atlas.tile_texels(reused),
+            Some(vec![0xFF; 256]),
+            "the freed rectangle still holds the evicted glyph's texels"
         );
     }
 
