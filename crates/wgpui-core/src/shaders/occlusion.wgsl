@@ -15,7 +15,7 @@
 //
 //   * The occluder set is capped at MAX_OCCLUDERS (a shader has no growable
 //     per-invocation storage). Dropping occluders can only miss a cull.
-//   * Candidates are gathered by walking forward from the target rather than by
+//   * Candidates are gathered by walking forward from the query rather than by
 //     accumulating a set backwards, because every invocation decides its own
 //     item with no state carried from any other.
 //
@@ -173,10 +173,10 @@ fn is_poisoned(index: u32, region: vec4<f32>) -> bool {
 }
 
 // `coverage::fully_covered`, over the first `gathered` entries of `occluders`.
-// Clips them to the target in place first, exactly as the CPU reference clips
+// Clips them to the query in place first, exactly as the CPU reference clips
 // into its own array before building the edge list.
-fn fully_covered(target: vec4<f32>, gathered: u32) -> bool {
-    if (is_empty(target)) {
+fn fully_covered(query: vec4<f32>, gathered: u32) -> bool {
+    if (is_empty(query)) {
         return true;
     }
 
@@ -186,7 +186,7 @@ fn fully_covered(target: vec4<f32>, gathered: u32) -> bool {
         if (index >= gathered) {
             break;
         }
-        let overlap = intersect(occluders[index], target);
+        let overlap = intersect(occluders[index], query);
         if (!is_empty(overlap)) {
             // Compaction is safe in place: clipped_count never exceeds index.
             occluders[clipped_count] = overlap;
@@ -199,9 +199,9 @@ fn fully_covered(target: vec4<f32>, gathered: u32) -> bool {
     }
 
     var edge_count: u32 = 0u;
-    edges[edge_count] = target.x;
+    edges[edge_count] = query.x;
     edge_count = edge_count + 1u;
-    edges[edge_count] = target.z;
+    edges[edge_count] = query.z;
     edge_count = edge_count + 1u;
     index = 0u;
     loop {
@@ -291,7 +291,7 @@ fn fully_covered(target: vec4<f32>, gathered: u32) -> bool {
             ordered = ordered + 1u;
         }
 
-        var covered_to = target.y;
+        var covered_to = query.y;
         var walked: u32 = 0u;
         loop {
             if (walked >= interval_count) {
@@ -306,11 +306,11 @@ fn fully_covered(target: vec4<f32>, gathered: u32) -> bool {
             if (bottom > covered_to) {
                 covered_to = bottom;
             }
-            if (covered_to >= target.w) {
+            if (covered_to >= query.w) {
                 break;
             }
         }
-        if (covered_to < target.w) {
+        if (covered_to < query.w) {
             covered = false;
             break;
         }
@@ -322,7 +322,7 @@ fn fully_covered(target: vec4<f32>, gathered: u32) -> bool {
 // `target_index`, in ascending paint order, and return how many. The ascending
 // walk is what makes the cap deterministic and therefore comparable against the
 // CPU reference, which caps the same way.
-fn gather_occluders(target_index: u32, target: vec4<f32>) -> u32 {
+fn gather_occluders(target_index: u32, query: vec4<f32>) -> u32 {
     var gathered: u32 = 0u;
     var done = false;
     var super_index = target_index / (SUPERBLOCK_SIZE * BLOCK_SIZE);
@@ -330,14 +330,14 @@ fn gather_occluders(target_index: u32, target: vec4<f32>) -> u32 {
         if (done || super_index >= params.superblock_count) {
             break;
         }
-        if (overlaps(superblocks[super_index], target)) {
+        if (overlaps(superblocks[super_index], query)) {
             var block = super_index * SUPERBLOCK_SIZE;
             let block_end = min(block + SUPERBLOCK_SIZE, params.block_count);
             loop {
                 if (done || block >= block_end) {
                     break;
                 }
-                if (overlaps(blocks[block], target)) {
+                if (overlaps(blocks[block], query)) {
                     let first = block * BLOCK_SIZE;
                     var probe = max(first, target_index + 1u);
                     let probe_end = min(first + BLOCK_SIZE, params.count);
@@ -353,7 +353,7 @@ fn gather_occluders(target_index: u32, target: vec4<f32>) -> u32 {
                         let usable = (candidate.flags & FLAG_HAS_OPAQUE) != 0u
                             && (candidate.flags & FLAG_PROTECTED) == 0u
                             && !is_poisoned(probe, candidate.visible)
-                            && !is_empty(intersect(candidate.opaque, target));
+                            && !is_empty(intersect(candidate.opaque, query));
                         if (usable) {
                             occluders[gathered] = candidate.opaque;
                             gathered = gathered + 1u;

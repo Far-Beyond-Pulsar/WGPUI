@@ -137,7 +137,7 @@ fn relax(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (target_index >= params.count) {
         return;
     }
-    let target = bounds[target_index];
+    let query = bounds[target_index];
     var best: u32 = 0u;
 
     var super_index: u32 = 0u;
@@ -150,7 +150,7 @@ fn relax(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if (super_index * SUPERBLOCK_SIZE * BLOCK_SIZE >= target_index) {
             break;
         }
-        if (overlaps(superblocks[super_index], target)) {
+        if (overlaps(superblocks[super_index], query)) {
             var block = super_index * SUPERBLOCK_SIZE;
             let block_end = min(block + SUPERBLOCK_SIZE, params.block_count);
             loop {
@@ -161,14 +161,14 @@ fn relax(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 if (first >= target_index) {
                     break;
                 }
-                if (overlaps(blocks[block], target)) {
+                if (overlaps(blocks[block], query)) {
                     var probe = first;
                     let probe_end = min(first + BLOCK_SIZE, target_index);
                     loop {
                         if (probe >= probe_end) {
                             break;
                         }
-                        if (overlaps(bounds[probe], target)) {
+                        if (overlaps(bounds[probe], query)) {
                             let candidate = order_in[probe];
                             if (candidate > best) {
                                 best = candidate;
