@@ -10,6 +10,11 @@ path = "src/wgpui_widgets.rs"
 doctest = false
 
 [dependencies]
+# Elements produce `Description`s and `ReconcileKey`s, and name the layout
+# style and resolved rectangle their emission is placed against. Both edges run
+# one way: neither core crate names anything in `wgpui-widgets`.
+wgpui-core = { path = "../wgpui-core" }
+wgpui-layout = { path = "../wgpui-layout" }
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
