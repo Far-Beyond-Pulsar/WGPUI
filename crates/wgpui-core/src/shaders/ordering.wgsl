@@ -177,8 +177,8 @@ fn build_superblocks(@builtin(global_invocation_id) global_id: vec3<u32>) {
 // The highest order among primitives in blocks strictly before `block` that
 // overlap `query`, never below `best`. Prunes spatially (AABB) and temporally
 // (settled blocks contribute nothing new).
-fn scan_earlier_blocks(block: u32, query: vec4<f32>, best: u32) -> u32 {
-    var best = best;
+fn scan_earlier_blocks(block: u32, query: vec4<f32>, floor: u32) -> u32 {
+    var best = floor;
     var super_index: u32 = 0u;
     loop {
         if (super_index >= params.superblock_count) {

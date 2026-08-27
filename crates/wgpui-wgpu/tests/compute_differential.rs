@@ -264,20 +264,11 @@ fn the_compute_passes_agree_with_a_hand_computed_answer() {
     );
 }
 
-/// A layer whose overlap chain is deeper than the first relaxation batch must
-/// still come out exact — the difference between "runs to a fixed point" and
-/// "runs a budget and hopes," which is the thing Phase 0's spike did not have
-/// to answer.
-#[test]
-fn a_chain_deeper_than_one_relaxation_batch_still_converges() {
-    let Some(context) = context_or_skip("deep_chain") else {
-        return;
-    };
-    let ordering = OrderingPass::new(&context.device);
-
-    // 300 squares, each overlapping its predecessor by one pixel: the painter
-    // order is exactly 1..300 and no smaller number of iterations reaches it.
-    let count = 300u32;
+/// A single overlap chain, at two depths, is the sharpest test of the
+/// relaxation's iteration count as well as its exactness — the painter order is
+/// exactly `1..count` and nothing shallower reaches it.
+fn ordered_chain(context: &ComputeContext, ordering: &OrderingPass, count: u32) -> (Vec<u32>, u32) {
+    // Each square overlaps its predecessor by one pixel and nothing else.
     let bounds: Vec<Rect> = (0..count)
         .map(|index| Rect::from_origin_size([index as f32 * 4.0, 0.0], [5.0, 10.0]))
         .collect();
@@ -286,17 +277,49 @@ fn a_chain_deeper_than_one_relaxation_batch_still_converges() {
     encode_ordering_items(&bounds, &mut bounds_bytes);
     let ordered = ordering
         .run(&context.device, &context.queue, &bounds_bytes)
-        .expect("the ordering pass must converge even past its first batch");
+        .expect("the ordering pass must converge");
     let orders = ordering
         .read_orders(&context.device, &context.queue, &ordered)
         .expect("reading painter orders back must succeed");
 
     assert_eq!(orders, painter_orders_via_tree(&bounds));
     assert_eq!(orders.last().copied(), Some(count));
+    (orders, ordered.submissions)
+}
+
+/// A layer whose overlap chain is deeper than the first relaxation batch must
+/// still come out exact — the difference between "runs to a fixed point" and
+/// "runs a budget and hopes," which is the thing Phase 0's spike did not have
+/// to answer.
+///
+/// The depth at which that second submission becomes necessary is itself the
+/// measurement this test carries. A per-primitive kernel advanced one primitive
+/// per iteration, so 300 already needed several batches; the block-collapsing
+/// kernel advances up to 64, so 300 now settles inside the first batch and it
+/// takes a chain spanning more than `RELAX_FIRST_BATCH` blocks to leave it.
+/// Both are asserted, so a regression in either direction — losing exactness,
+/// or quietly losing the collapse — fails here rather than only showing up as a
+/// slower benchmark.
+#[test]
+fn a_chain_deeper_than_one_relaxation_batch_still_converges() {
+    let Some(context) = context_or_skip("deep_chain") else {
+        return;
+    };
+    let ordering = OrderingPass::new(&context.device);
+
+    let (_, submissions) = ordered_chain(&context, &ordering, 300);
+    assert_eq!(
+        submissions, 1,
+        "a 300-deep chain spans 5 blocks and must settle inside the first batch"
+    );
+
+    // 2,048 primitives is 32 blocks, twice `RELAX_FIRST_BATCH`, so the
+    // convergence loop genuinely has to run a second time.
+    let (_, submissions) = ordered_chain(&context, &ordering, 2_048);
     assert!(
-        ordered.submissions > 1,
-        "a {count}-deep chain should have needed more than one submission, took {}",
-        ordered.submissions
+        submissions > 1,
+        "a 2048-deep chain spans more blocks than the first batch has iterations, \
+         so it should have needed more than one submission, took {submissions}"
     );
 }
 

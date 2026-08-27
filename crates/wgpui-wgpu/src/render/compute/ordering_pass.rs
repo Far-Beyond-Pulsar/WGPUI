@@ -344,7 +344,7 @@ impl OrderingPass {
             &changed_buffers,
             parity,
             RELAX_FIRST_BATCH,
-            item_groups,
+            relax_groups,
         );
         iterations += RELAX_FIRST_BATCH;
         self.encode_sort(
@@ -375,7 +375,7 @@ impl OrderingPass {
                 &changed_buffers,
                 parity,
                 RELAX_BATCH,
-                item_groups,
+                relax_groups,
             );
             iterations += RELAX_BATCH;
             queue.submit(Some(encoder.finish()));
