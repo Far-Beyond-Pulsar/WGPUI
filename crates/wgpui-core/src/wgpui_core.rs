@@ -14,8 +14,10 @@
 
 pub mod app;
 pub mod boundary;
+pub mod geometry;
 pub mod invalidation;
 pub mod occlusion;
+pub mod ordering;
 pub mod patch;
 pub mod reconcile;
 pub mod scene;
