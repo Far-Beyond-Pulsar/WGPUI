@@ -99,6 +99,50 @@ pub struct GlyphRasterKey {
     pub kind: AtlasKind,
 }
 
+/// A resident glyph raster: where its texels are, and where they go relative to
+/// the pen.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct GlyphTile {
+    /// The tile's identity, which a resident [`crate::patch::primitive::Glyph`]
+    /// carries and an eviction names.
+    pub tile: AtlasTileId,
+    /// Top-left of the raster within its atlas page, in texels.
+    pub atlas_origin: [f32; 2],
+    /// Size of the raster, in texels.
+    pub atlas_size: [f32; 2],
+    /// Offset from the pen position to the raster's top-left, in pixels.
+    ///
+    /// Shaping gives a glyph's *pen* position; a raster's ink sits at some
+    /// offset from it (a comma's ink hangs below the baseline, a capital's sits
+    /// well above). That offset is a property of the rasterised bitmap, which is
+    /// why it arrives from the tile source rather than from shaping.
+    pub bearing: [f32; 2],
+}
+
+/// Where a shaped glyph's raster comes from.
+///
+/// §6's accounting, made into a trait: "`wgpui-text` produces glyph positions
+/// and atlas tile *requests*; `wgpui-wgpu`'s atlas allocator turns requests into
+/// actual tile coordinates; neither owns the other's job." This is the seam
+/// between those two sentences, and it lives in `wgpui-core` so that it costs no
+/// dependency edge in either direction — `wgpui-text` calls it, `wgpui-wgpu`
+/// implements it, and neither crate names the other.
+///
+/// An implementation is expected to rasterise on demand and cache: the caller
+/// asks for the same key many times per frame (every `e` in a paragraph is one
+/// key) and takes no steps to deduplicate, because the source is the thing that
+/// already has to hold a map from key to tile.
+pub trait GlyphTileSource {
+    /// The tile holding `key`'s raster, rasterising and allocating if needed.
+    ///
+    /// `None` means "this glyph draws nothing" — whitespace, a zero-coverage
+    /// control character, or a raster the atlas refused. All three are ordinary
+    /// and produce a positioned glyph carrying [`AtlasTileId::NONE`], never a
+    /// dropped glyph: `line_layout`'s index-to-position mapping counts on every
+    /// shaped glyph being present.
+    fn tile_for(&mut self, key: GlyphRasterKey) -> Option<GlyphTile>;
+}
+
 /// What the atlas allocator dropped.
 ///
 /// Two granularities because the allocator has two: a whole page is destroyed

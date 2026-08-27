@@ -54,6 +54,13 @@ pub struct TilePlacement {
     pub origin: [f32; 2],
     /// Size of the raster, in texels.
     pub size: [f32; 2],
+    /// Offset from the pen position to the raster's top-left, in pixels.
+    ///
+    /// Held here rather than recomputed by the caller because it is a property
+    /// of the rasterised bitmap, and the atlas is already what remembers that
+    /// the bitmap exists — so a cache hit answers with it too, rather than
+    /// forcing a re-rasterise to recover a number nothing else knows.
+    pub bearing: [f32; 2],
 }
 
 /// An allocation could not be made.
@@ -224,13 +231,14 @@ impl GlyphAtlas {
     pub fn get_or_insert(
         &mut self,
         key: GlyphRasterKey,
-        size: [u32; 2],
+        metrics: RasterMetrics,
     ) -> Result<TilePlacement, AtlasError> {
         if let Some(placement) = self.tiles_by_key.get(&key) {
             self.stats.cache_hits += 1;
             return Ok(*placement);
         }
 
+        let size = metrics.size;
         let [width, height] = size;
         if width == 0 || height == 0 {
             return Err(AtlasError::EmptyRaster);
@@ -242,7 +250,7 @@ impl GlyphAtlas {
             });
         }
 
-        let placement = self.allocate(key, size)?;
+        let placement = self.allocate(key, metrics)?;
         self.tiles_by_key.insert(key, placement);
         self.keys_by_tile.insert(placement.tile, key);
         self.stats.allocations += 1;
@@ -252,8 +260,9 @@ impl GlyphAtlas {
     fn allocate(
         &mut self,
         key: GlyphRasterKey,
-        size: [u32; 2],
+        metrics: RasterMetrics,
     ) -> Result<TilePlacement, AtlasError> {
+        let size = metrics.size;
         let requested = etagere::size2(
             i32::try_from(size[0]).map_err(|_| AtlasError::TooLargeForAPage {
                 requested: size,
@@ -273,13 +282,13 @@ impl GlyphAtlas {
             if kind != key.kind {
                 continue;
             }
-            if let Some(placement) = self.allocate_in(index, key, size, requested)? {
+            if let Some(placement) = self.allocate_in(index, key, metrics, requested)? {
                 return Ok(placement);
             }
         }
 
         let index = self.open_page(key.kind)?;
-        self.allocate_in(index, key, size, requested)?
+        self.allocate_in(index, key, metrics, requested)?
             .ok_or(AtlasError::TooLargeForAPage {
                 requested: size,
                 page_size: self.page_size,
@@ -290,9 +299,10 @@ impl GlyphAtlas {
         &mut self,
         index: usize,
         key: GlyphRasterKey,
-        size: [u32; 2],
+        metrics: RasterMetrics,
         requested: etagere::Size,
     ) -> Result<Option<TilePlacement>, AtlasError> {
+        let size = metrics.size;
         let page_index = match self.pages.get(index) {
             Some(page) => page.index,
             None => return Ok(None),
@@ -334,6 +344,7 @@ impl GlyphAtlas {
                 allocation.rectangle.min.y as f32,
             ],
             size: [size[0] as f32, size[1] as f32],
+            bearing: metrics.bearing,
         }))
     }
 
@@ -450,9 +461,84 @@ impl GlyphAtlas {
     }
 }
 
+/// The dimensions and placement of one rasterised glyph bitmap.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct RasterMetrics {
+    /// The bitmap's size in texels.
+    pub size: [u32; 2],
+    /// Offset from the pen position to the bitmap's top-left, in pixels.
+    pub bearing: [f32; 2],
+}
+
+/// A [`GlyphTileSource`] built from an atlas and a rasteriser.
+///
+/// # Why the rasteriser is a closure and not a type in this crate
+///
+/// Rasterising a glyph means `swash` (which `cosmic-text` already carries) plus
+/// a decision about hinting, gamma, and colour-emoji handling, and the shape of
+/// that decision is set by what draws the result. Nothing draws glyphs in 2.0
+/// yet — `render/pipelines.rs` names the missing sprite pipeline itself — so
+/// writing a rasteriser now would mean writing it against an imagined consumer
+/// and then rewriting it. This closes the seam without guessing: the atlas half
+/// is real and tested, the rasteriser half is a parameter, and the phase that
+/// builds the sprite pipeline supplies it without touching anything here.
+pub struct AtlasTileSource<'atlas, Rasterize> {
+    atlas: &'atlas mut GlyphAtlas,
+    rasterize: Rasterize,
+}
+
+impl<'atlas, Rasterize> AtlasTileSource<'atlas, Rasterize>
+where
+    Rasterize: FnMut(GlyphRasterKey) -> Option<RasterMetrics>,
+{
+    /// A tile source over `atlas`, rasterising with `rasterize`.
+    pub fn new(atlas: &'atlas mut GlyphAtlas, rasterize: Rasterize) -> Self {
+        Self { atlas, rasterize }
+    }
+}
+
+impl<Rasterize> wgpui_core::scene::atlas::GlyphTileSource for AtlasTileSource<'_, Rasterize>
+where
+    Rasterize: FnMut(GlyphRasterKey) -> Option<RasterMetrics>,
+{
+    fn tile_for(&mut self, key: GlyphRasterKey) -> Option<wgpui_core::scene::atlas::GlyphTile> {
+        // A resident tile answers without rasterising, which is the point of the
+        // atlas holding a key map at all: a paragraph asks for the same 'e'
+        // dozens of times per frame, and the caller deliberately does not
+        // deduplicate (`wgpui-text`'s `patch` module says so).
+        let placement = match self.atlas.get(&key) {
+            Some(placement) => {
+                self.atlas.stats.cache_hits += 1;
+                placement
+            }
+            None => {
+                let metrics = (self.rasterize)(key)?;
+                // A refused allocation is `None`, not an error the caller has to
+                // handle: one glyph failing to find atlas space degrades to a
+                // blank glyph rather than failing the frame. A caller that wants
+                // to know why asks `get_or_insert` directly.
+                self.atlas.get_or_insert(key, metrics).ok()?
+            }
+        };
+        Some(wgpui_core::scene::atlas::GlyphTile {
+            tile: placement.tile,
+            atlas_origin: placement.origin,
+            atlas_size: placement.size,
+            bearing: placement.bearing,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raster(width: u32, height: u32) -> RasterMetrics {
+        RasterMetrics {
+            size: [width, height],
+            bearing: [0.0, 0.0],
+        }
+    }
 
     fn key(glyph: u32) -> GlyphRasterKey {
         GlyphRasterKey {
@@ -467,8 +553,8 @@ mod tests {
     #[test]
     fn a_raster_is_allocated_once_and_returned_thereafter() {
         let mut atlas = GlyphAtlas::default();
-        let first = atlas.get_or_insert(key(1), [8, 12]).expect("allocate");
-        let second = atlas.get_or_insert(key(1), [8, 12]).expect("hit");
+        let first = atlas.get_or_insert(key(1), raster(8, 12)).expect("allocate");
+        let second = atlas.get_or_insert(key(1), raster(8, 12)).expect("hit");
         assert_eq!(first, second);
         assert_eq!(atlas.stats().allocations, 1);
         assert_eq!(atlas.stats().cache_hits, 1);
@@ -479,8 +565,8 @@ mod tests {
     #[test]
     fn different_rasters_get_different_tiles_that_do_not_overlap() {
         let mut atlas = GlyphAtlas::default();
-        let a = atlas.get_or_insert(key(1), [16, 16]).expect("allocate");
-        let b = atlas.get_or_insert(key(2), [16, 16]).expect("allocate");
+        let a = atlas.get_or_insert(key(1), raster(16, 16)).expect("allocate");
+        let b = atlas.get_or_insert(key(2), raster(16, 16)).expect("allocate");
         assert_ne!(a.tile, b.tile);
 
         let overlaps = a.origin[0] < b.origin[0] + b.size[0]
@@ -513,9 +599,9 @@ mod tests {
             },
         ];
         let mut atlas = GlyphAtlas::default();
-        let original = atlas.get_or_insert(base, [8, 8]).expect("allocate");
+        let original = atlas.get_or_insert(base, raster(8, 8)).expect("allocate");
         for variant in variants {
-            let placement = atlas.get_or_insert(variant, [8, 8]).expect("allocate");
+            let placement = atlas.get_or_insert(variant, raster(8, 8)).expect("allocate");
             assert_ne!(
                 placement.tile, original.tile,
                 "{variant:?} must not share a tile with {base:?}"
@@ -526,14 +612,14 @@ mod tests {
     #[test]
     fn a_colour_raster_never_lands_in_a_monochrome_page() {
         let mut atlas = GlyphAtlas::default();
-        let mono = atlas.get_or_insert(key(1), [8, 8]).expect("allocate");
+        let mono = atlas.get_or_insert(key(1), raster(8, 8)).expect("allocate");
         let colour = atlas
             .get_or_insert(
                 GlyphRasterKey {
                     kind: AtlasKind::Polychrome,
                     ..key(1)
                 },
-                [8, 8],
+                raster(8, 8),
             )
             .expect("allocate");
         assert_ne!(
@@ -551,7 +637,7 @@ mod tests {
         let placements: Vec<TilePlacement> = (0..8)
             .map(|glyph| {
                 atlas
-                    .get_or_insert(key(glyph), [32, 32])
+                    .get_or_insert(key(glyph), raster(32, 32))
                     .expect("a full page must spill to a new one")
             })
             .collect();
@@ -567,7 +653,7 @@ mod tests {
     fn a_raster_larger_than_a_page_is_reported_rather_than_growing_the_page() {
         let mut atlas = GlyphAtlas::new(64);
         assert_eq!(
-            atlas.get_or_insert(key(1), [65, 8]),
+            atlas.get_or_insert(key(1), raster(65, 8)),
             Err(AtlasError::TooLargeForAPage {
                 requested: [65, 8],
                 page_size: 64
@@ -579,14 +665,14 @@ mod tests {
     #[test]
     fn a_zero_area_raster_is_refused() {
         let mut atlas = GlyphAtlas::default();
-        assert_eq!(atlas.get_or_insert(key(1), [0, 8]), Err(AtlasError::EmptyRaster));
-        assert_eq!(atlas.get_or_insert(key(1), [8, 0]), Err(AtlasError::EmptyRaster));
+        assert_eq!(atlas.get_or_insert(key(1), raster(0, 8)), Err(AtlasError::EmptyRaster));
+        assert_eq!(atlas.get_or_insert(key(1), raster(8, 0)), Err(AtlasError::EmptyRaster));
     }
 
     #[test]
     fn evicting_a_raster_reports_its_tile_and_frees_the_space() {
         let mut atlas = GlyphAtlas::new(64);
-        let placement = atlas.get_or_insert(key(1), [32, 32]).expect("allocate");
+        let placement = atlas.get_or_insert(key(1), raster(32, 32)).expect("allocate");
         assert_eq!(atlas.live_tiles_in_page(0), Some(1));
 
         assert!(atlas.evict(&key(1)));
@@ -603,9 +689,9 @@ mod tests {
     #[test]
     fn a_freed_slot_is_reused_so_the_slot_field_bounds_live_tiles_not_lifetime_allocations() {
         let mut atlas = GlyphAtlas::new(64);
-        let first = atlas.get_or_insert(key(1), [8, 8]).expect("allocate");
+        let first = atlas.get_or_insert(key(1), raster(8, 8)).expect("allocate");
         atlas.evict(&key(1));
-        let second = atlas.get_or_insert(key(2), [8, 8]).expect("allocate");
+        let second = atlas.get_or_insert(key(2), raster(8, 8)).expect("allocate");
         assert_eq!(
             first.tile.slot(),
             second.tile.slot(),
@@ -617,7 +703,7 @@ mod tests {
     fn destroying_a_page_reports_one_event_however_many_tiles_it_held() {
         let mut atlas = GlyphAtlas::new(64);
         for glyph in 0..4 {
-            atlas.get_or_insert(key(glyph), [32, 32]).expect("allocate");
+            atlas.get_or_insert(key(glyph), raster(32, 32)).expect("allocate");
         }
         assert_eq!(atlas.stats().tiles, 4);
 
@@ -634,13 +720,65 @@ mod tests {
     #[test]
     fn a_destroyed_pages_index_is_never_reissued() {
         let mut atlas = GlyphAtlas::new(64);
-        atlas.get_or_insert(key(0), [8, 8]).expect("allocate");
+        atlas.get_or_insert(key(0), raster(8, 8)).expect("allocate");
         assert!(atlas.destroy_page(0));
-        let reopened = atlas.get_or_insert(key(1), [8, 8]).expect("allocate");
+        let reopened = atlas.get_or_insert(key(1), raster(8, 8)).expect("allocate");
         assert_ne!(
             reopened.tile.page(),
             Some(0),
             "reissuing a destroyed page's index would let a stale slab start sampling real texels again"
+        );
+    }
+
+    #[test]
+    fn a_tile_source_rasterises_once_and_answers_from_the_atlas_thereafter() {
+        use wgpui_core::scene::atlas::GlyphTileSource;
+
+        let mut atlas = GlyphAtlas::default();
+        let mut rasterised = 0usize;
+        {
+            let mut source = AtlasTileSource::new(&mut atlas, |_key| {
+                rasterised += 1;
+                Some(RasterMetrics {
+                    size: [8, 12],
+                    bearing: [0.5, -9.0],
+                })
+            });
+            let first = source.tile_for(key(1)).expect("a raster with metrics");
+            let second = source.tile_for(key(1)).expect("resident");
+            assert_eq!(first, second);
+            assert_eq!(first.bearing, [0.5, -9.0]);
+            assert_eq!(first.atlas_size, [8.0, 12.0]);
+        }
+        assert_eq!(rasterised, 1, "a resident glyph must not be rasterised again");
+        assert_eq!(atlas.stats().allocations, 1);
+        assert_eq!(atlas.stats().cache_hits, 1);
+    }
+
+    #[test]
+    fn a_glyph_the_rasteriser_declines_becomes_a_blank_rather_than_an_error() {
+        use wgpui_core::scene::atlas::GlyphTileSource;
+
+        let mut atlas = GlyphAtlas::default();
+        let mut source = AtlasTileSource::new(&mut atlas, |_key| None);
+        assert_eq!(source.tile_for(key(1)), None);
+    }
+
+    #[test]
+    fn a_glyph_the_atlas_cannot_fit_becomes_a_blank_rather_than_failing_the_frame() {
+        use wgpui_core::scene::atlas::GlyphTileSource;
+
+        let mut atlas = GlyphAtlas::new(16);
+        let mut source = AtlasTileSource::new(&mut atlas, |_key| {
+            Some(RasterMetrics {
+                size: [64, 64],
+                bearing: [0.0, 0.0],
+            })
+        });
+        assert_eq!(
+            source.tile_for(key(1)),
+            None,
+            "one oversized glyph must not take the frame down with it"
         );
     }
 
@@ -657,8 +795,8 @@ mod tests {
         use wgpui_core::scene::Scene;
 
         let mut atlas = GlyphAtlas::new(64);
-        let placement = atlas.get_or_insert(key(1), [8, 8])?;
-        let untouched = atlas.get_or_insert(key(2), [8, 8])?;
+        let placement = atlas.get_or_insert(key(1), raster(8, 8))?;
+        let untouched = atlas.get_or_insert(key(2), raster(8, 8))?;
 
         let mut scene = Scene::new();
         let with_text = scene.layer(LayerKey::untiled(BoundaryId::from_raw(1)));

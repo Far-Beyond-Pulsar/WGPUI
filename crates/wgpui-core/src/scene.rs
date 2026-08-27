@@ -16,7 +16,7 @@ pub mod slab;
 pub mod slab_range;
 pub mod tile;
 
-pub use atlas::{AtlasEviction, AtlasKind, GlyphRasterKey};
+pub use atlas::{AtlasEviction, AtlasKind, GlyphRasterKey, GlyphTile, GlyphTileSource};
 pub use layer::{BoundaryId, Layer, LayerId, LayerKey, LayerTable};
 pub use primitive_store::{DrawRange, PrimitiveStore};
 pub use record::{DispatchNode, Hitbox, LayoutInput, RecordStore};
