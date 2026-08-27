@@ -512,6 +512,26 @@ impl Compositor {
     ///   nothing else, which is §5.4's path, live since Phase 2.
     /// - An **evicted** tile is a layer the caller removes, releasing its slab
     ///   through [`crate::scene::Scene::remove_layer`] like any other.
+    ///
+    /// # Two ordering and lifetime facts worth knowing before calling this
+    ///
+    /// **Position the boundary after declaring it.**
+    /// [`Compositor::set_transform`] reports `false` rather than creating a
+    /// boundary, so moving one the compositor has never seen is inert and the
+    /// span below would resolve at the identity. On a boundary's first frame,
+    /// call [`Compositor::visit`] (or this method) before setting the transform
+    /// that positions it. Every later frame is unaffected.
+    ///
+    /// **A boundary switched away from `Tiled` keeps its tile layers until it is
+    /// swept.** This method returns `None` for a non-tiled policy without
+    /// touching the residency, so the tiles stay recorded and
+    /// [`Compositor::sweep`] still names them when the boundary itself is
+    /// evicted — nothing is lost, but nothing is released early either. Changing
+    /// a live boundary's buffering from `Tiled` to `Margin` therefore holds its
+    /// tile slabs until the boundary leaves the tree. Recorded rather than
+    /// fixed: releasing them here would mean this method returning layers on the
+    /// path where it reports having no tile set at all, and no caller in this
+    /// phase changes a boundary's buffering mid-life.
     pub fn visit_tiled(
         &mut self,
         boundary: BoundaryId,
@@ -637,12 +657,29 @@ impl Compositor {
     /// nothing else knows when the interval has elapsed.
     pub fn sweep(&mut self, frame: u64) -> Vec<LayerId> {
         let mut evicted = Vec::new();
-        self.boundaries.retain(|_, state| {
+        self.boundaries.retain(|boundary, state| {
             let elapsed = frame.saturating_sub(state.last_visited_frame);
             if elapsed <= u64::from(state.policy.evict_after_frames) {
                 return true;
             }
             evicted.push(state.layer);
+            // **Every** layer the boundary owned, not just its own. Before
+            // Phase 4.5 a boundary had exactly one layer and `state.layer` was
+            // the complete answer; a tiled boundary has one per resident tile,
+            // and dropping its `BoundaryState` here is what makes this the last
+            // moment anything knows those tiles existed. Returning only
+            // `state.layer` left every tile's slab reservation resident for the
+            // lifetime of the scene — this method's own doc is the argument for
+            // why: the layer entry "is the compositor's to release, and nothing
+            // else knows when the interval has elapsed."
+            if let Some(tiles) = &state.tiles {
+                evicted.extend(
+                    tiles
+                        .resident()
+                        .into_iter()
+                        .map(|tile| LayerId::from_key(LayerKey::tiled(*boundary, tile))),
+                );
+            }
             false
         });
         evicted
@@ -960,6 +997,150 @@ mod tests {
         assert_eq!(
             visible_composites(&[target, external]).first().copied(),
             Some(false)
+        );
+    }
+
+    fn tiled_policy() -> BoundaryPolicy {
+        BoundaryPolicy {
+            buffering: Buffering::Tiled {
+                tile_size: crate::boundary::policy::Size::pixels(256.0, 256.0),
+                retain_radius: 1,
+            },
+            ..BoundaryPolicy::default()
+        }
+    }
+
+    fn canvas_viewport() -> Rect {
+        Rect::from_origin_size([0.0, 0.0], [900.0, 600.0])
+    }
+
+    #[test]
+    fn a_tiled_boundary_resolves_a_visible_span_and_reveals_it_once() {
+        let mut compositor = Compositor::new();
+        let first = compositor
+            .visit_tiled(PANEL, tiled_policy(), 1, canvas_viewport())
+            .expect("a tiled policy with a usable tile size resolves");
+        assert!(first.visible.len() > 1, "a 900x600 viewport spans several tiles");
+        assert_eq!(
+            first.revealed.len(),
+            first.visible.len(),
+            "every tile is new on the first frame"
+        );
+        assert_eq!(first.resident, first.visible.len());
+        assert_eq!(first.over_budget, 0);
+
+        // The same frame again reveals nothing: residency is idempotent, the
+        // same way `visit` is.
+        let second = compositor
+            .visit_tiled(PANEL, tiled_policy(), 2, canvas_viewport())
+            .expect("still tiled");
+        assert!(second.revealed.is_empty());
+        assert_eq!(second.visible, first.visible);
+    }
+
+    #[test]
+    fn a_boundary_that_is_not_tiled_reports_no_tile_set_at_all() {
+        let mut compositor = Compositor::new();
+        assert!(
+            compositor
+                .visit_tiled(PANEL, BoundaryPolicy::default(), 1, canvas_viewport())
+                .is_none(),
+            "Margin(None) has no grid, so there is nothing to resolve"
+        );
+        assert!(
+            compositor
+                .visit_tiled(
+                    PANEL,
+                    BoundaryPolicy {
+                        buffering: Buffering::Tiled {
+                            tile_size: crate::boundary::policy::Size::pixels(0.0, 0.0),
+                            retain_radius: 1,
+                        },
+                        ..BoundaryPolicy::default()
+                    },
+                    1,
+                    canvas_viewport(),
+                )
+                .is_none(),
+            "an unusable tile size must fall back rather than resolve a grid"
+        );
+        // Either way the boundary itself is still declared — falling back means
+        // buffering it the untiled way, not dropping it.
+        assert!(compositor.state(PANEL).is_some());
+        assert!(
+            compositor
+                .state(PANEL)
+                .and_then(BoundaryState::tiles)
+                .is_none()
+        );
+    }
+
+    /// The bug this test exists because of: `sweep` returned only
+    /// `state.layer`, which was the complete answer when a boundary had exactly
+    /// one layer and silently leaked every tile's reservation once it could have
+    /// many.
+    #[test]
+    fn sweeping_a_tiled_boundary_names_every_layer_it_owned_not_just_its_own() {
+        let mut compositor = Compositor::new();
+        let visit = compositor
+            .visit_tiled(PANEL, tiled_policy(), 1, canvas_viewport())
+            .expect("a tiled boundary");
+        let tiles = visit.visible.clone();
+        assert!(tiles.len() > 4, "the premise: several tiles are resident");
+
+        let interval = u64::from(BoundaryPolicy::DEFAULT_EVICT_AFTER_FRAMES);
+        let evicted = compositor.sweep(2 + interval);
+        assert!(compositor.is_empty());
+
+        let expected: std::collections::BTreeSet<LayerId> = tiles
+            .iter()
+            .map(|tile| LayerId::from_key(LayerKey::tiled(PANEL, *tile)))
+            .chain(Some(LayerId::from_key(LayerKey::untiled(PANEL))))
+            .collect();
+        assert_eq!(
+            evicted.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            expected,
+            "an evicted tiled boundary must name its overlay and every resident \
+             tile, or their slab reservations outlive the scene"
+        );
+        assert_eq!(
+            evicted.len(),
+            tiles.len() + 1,
+            "and must not name any layer twice"
+        );
+    }
+
+    #[test]
+    fn panning_a_tiled_boundary_reveals_only_what_the_pan_uncovered() {
+        let mut compositor = Compositor::new();
+        // 8px in, so the viewport does not start on a tile boundary — see
+        // `ui_walk`'s gate for why that distinction is load-bearing.
+        compositor.set_transform(PANEL, LayerTransform::translated(-8.0, -8.0));
+        let first = compositor
+            .visit_tiled(PANEL, tiled_policy(), 1, canvas_viewport())
+            .expect("a tiled boundary");
+        assert!(
+            compositor.set_transform(PANEL, LayerTransform::translated(-8.0, -8.0)),
+            "the boundary now exists, so positioning it takes effect"
+        );
+
+        compositor.set_transform(PANEL, LayerTransform::translated(-264.0, -8.0));
+        let panned = compositor
+            .visit_tiled(PANEL, tiled_policy(), 2, canvas_viewport())
+            .expect("still tiled");
+        assert!(!panned.revealed.is_empty(), "one tile of pan reveals a column");
+        assert!(
+            panned.revealed.len() < first.visible.len(),
+            "a one-tile pan revealed {} of {} tiles, which is a refill",
+            panned.revealed.len(),
+            first.visible.len()
+        );
+        assert!(
+            panned
+                .revealed
+                .iter()
+                .all(|tile| !first.visible.contains(tile)),
+            "a tile already resident must not be reported as revealed"
         );
     }
 

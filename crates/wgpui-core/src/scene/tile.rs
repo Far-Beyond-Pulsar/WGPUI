@@ -115,12 +115,23 @@ impl TileSpan {
     /// Every tile in the span, row-major and ascending — a deterministic order,
     /// so a caller that turns this into layers gets the same layer order every
     /// frame.
+    ///
+    /// **Stops at [`TileSpan::MAX_TILES`].** [`TileGrid::visible_span`] already
+    /// refuses to produce a span above that, so this cap is unreachable through
+    /// the path that resolves a frame's visibility. It exists because
+    /// [`TileSpan`] is two public coordinate pairs a caller can build directly,
+    /// and a span of a billion tiles would otherwise be a hang rather than an
+    /// error — which is a worse failure than a truncated list.
     pub fn tiles(&self) -> Vec<TileCoord> {
-        let mut tiles = Vec::with_capacity(self.tile_count().min(TileSpan::MAX_TILES) as usize);
+        let capacity = self.tile_count().min(TileSpan::MAX_TILES) as usize;
+        let mut tiles = Vec::with_capacity(capacity);
         let mut y = self.min.y;
         while y <= self.max.y {
             let mut x = self.min.x;
             while x <= self.max.x {
+                if tiles.len() >= capacity {
+                    return tiles;
+                }
                 tiles.push(TileCoord::new(x, y));
                 if x == i32::MAX {
                     break;
@@ -1161,6 +1172,19 @@ mod tests {
             visible - 8,
             "the shortfall is reported, not absorbed"
         );
+    }
+
+    #[test]
+    fn a_directly_built_span_of_a_billion_tiles_truncates_rather_than_hangs() {
+        // Unreachable through `visible_span`, which refuses such a span outright
+        // — but `TileSpan` is two public coordinate pairs, and a hang is a worse
+        // failure than a short list.
+        let span = TileSpan {
+            min: TileCoord::new(-1_000_000, -1_000_000),
+            max: TileCoord::new(1_000_000, 1_000_000),
+        };
+        assert!(span.tile_count() > TileSpan::MAX_TILES);
+        assert_eq!(span.tiles().len(), TileSpan::MAX_TILES as usize);
     }
 
     #[test]
