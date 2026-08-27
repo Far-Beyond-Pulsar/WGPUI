@@ -33,12 +33,17 @@
 //! consume. Going through `wgpui-widgets` would add a layer neither gate asks
 //! about between the generator and the thing under test.
 
+use crate::boundary::compositor::Compositor;
+use crate::boundary::policy::{BoundaryPolicy, Buffering, Size};
 use crate::geometry::Rect;
+use crate::invalidation::axes::Invalidation;
 use crate::occlusion::{CoverageItem, PoisonRegion, quad_coverage_item};
 use crate::patch::apply::{ScenePatch, UploadPlan, apply};
 use crate::patch::primitive::Quad;
 use crate::patch::{PatchError, RecordKey};
-use crate::scene::{BoundaryId, LayerId, LayerKey, Scene};
+use crate::scene::layer::{Layer, LayerTransform};
+use crate::scene::{BoundaryId, LayerId, LayerKey, Scene, TileCoord, TileGrid};
+use std::collections::HashMap;
 
 /// What one frame of the walk looks like.
 #[derive(Clone, Debug, PartialEq)]
@@ -733,6 +738,434 @@ impl MultiLayerSceneDriver {
     }
 }
 
+/// A node-graph canvas on an unbounded content plane, driven through
+/// `Buffering::Tiled` into a real [`Scene`].
+/// See docs/gpu-native-architecture.md §4.3, §8 Phase 4.5.
+///
+/// # Why this is a second generator rather than a `UiSceneSpec` flag
+///
+/// [`build_frame`]'s scene is an *editor*: everything in it is positioned
+/// relative to a window, and its viewport is one panel among several. §4.3's
+/// case is the opposite shape — content at arbitrary positions on a plane with
+/// no origin corner, a window that moves over it, and no linear index to
+/// virtualize by. Bolting a pan offset onto the editor spec would produce a
+/// scene whose content still fundamentally lives in window space, which is the
+/// exact thing `Buffering::Margin` already handles and `Tiled` exists because it
+/// does not.
+///
+/// # What it measures, and why it measures it this way
+///
+/// Every frame emits patches for **every visible tile**, not only the revealed
+/// ones. That is deliberate and it is what makes the gate a measurement rather
+/// than a restatement: if the driver skipped resident tiles, "panning costs zero
+/// render work" would be true because the harness declined to do any. Instead
+/// the harness offers the work every frame and the patch protocol's own
+/// cross-frame addressing (§5.0) is what reduces it to nothing — so a
+/// [`TiledFrameStats`] reading zero is a fact about the mechanism.
+pub struct TiledCanvasDriver {
+    /// The scene under test.
+    pub scene: Scene,
+    /// The compositor holding this boundary's tile residency.
+    pub compositor: Compositor,
+    /// The boundary the canvas lives in.
+    pub boundary: BoundaryId,
+    /// The policy it was declared with.
+    pub policy: BoundaryPolicy,
+    /// The window rectangle the canvas is seen through.
+    pub viewport: Rect,
+    graph: NodeGraph,
+    resident: HashMap<LayerId, usize>,
+    frame: u64,
+}
+
+/// What one frame of a tiled pan cost, in the terms §8's Phase 4.5 gate is
+/// written in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TiledFrameStats {
+    /// Tiles newly in range this frame — the ones that must render.
+    pub revealed: Vec<TileCoord>,
+    /// Tiles in range this frame.
+    pub visible_tiles: usize,
+    /// Tiles resident after the sweep.
+    pub resident_tiles: usize,
+    /// Tiles evicted this frame.
+    pub evicted: usize,
+    /// Resident tiles the budget could not account for.
+    pub over_budget: usize,
+    /// Layers whose composite transform this frame changed — **one per visible
+    /// tile on a pan**, which is the gate's own wording.
+    pub transform_updates: usize,
+    /// Layers this frame created, i.e. tiles that became layers.
+    pub layers_created: usize,
+    /// Layers this frame destroyed.
+    pub layers_removed: usize,
+    /// Primitives written into the scene this frame — inserts plus updates.
+    /// **The render/reconcile work the gate requires to be zero on a pan inside
+    /// the resident grid.**
+    pub primitives_written: usize,
+    /// How many of [`TiledFrameStats::primitives_written`] landed on the
+    /// unbuffered overlay rather than in a tile.
+    ///
+    /// Tracked separately because of what it turned out to be worth: a tile
+    /// crossing dirties the overlay as well as the revealed tiles, since a wire
+    /// reaching into the new column is spanning content and spanning content
+    /// lives there. That is a real consequence of the rule
+    /// [`crate::scene::TilePlacement`] picks, and separating the two counts is
+    /// what lets the gate state it instead of averaging it away.
+    pub overlay_primitives_written: usize,
+    /// Bytes §5.0's upload instructions cover this frame.
+    pub upload_bytes: u64,
+    /// Layers that ended the frame carrying `DISPLAY`.
+    pub display_layers: Vec<LayerId>,
+    /// Layers that ended the frame carrying `TRANSFORM` and nothing else.
+    pub transform_only_layers: usize,
+}
+
+impl TiledFrameStats {
+    /// Whether this frame did no rendering, reconciling, or uploading at all.
+    pub fn is_transform_only(&self) -> bool {
+        self.primitives_written == 0
+            && self.upload_bytes == 0
+            && self.display_layers.is_empty()
+            && self.layers_created == 0
+    }
+}
+
+/// The graph's content, laid out once on the plane and never re-laid-out.
+struct NodeGraph {
+    quads: Vec<(Rect, Quad)>,
+}
+
+/// How big a node-graph canvas is and what is on it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct NodeGraphSpec {
+    /// How many node columns the plane holds.
+    pub columns: u32,
+    /// How many node rows.
+    pub rows: u32,
+    /// Horizontal distance between node origins.
+    pub column_pitch: f32,
+    /// Vertical distance between node origins.
+    pub row_pitch: f32,
+    /// Whether wires between horizontally adjacent nodes are emitted. Wires are
+    /// the content that genuinely spans tiles, so turning them off is what
+    /// isolates the overlay's cost.
+    pub wires: bool,
+}
+
+impl NodeGraphSpec {
+    /// A plane large enough that no realistic pan ever sees all of it.
+    pub fn large() -> NodeGraphSpec {
+        NodeGraphSpec {
+            columns: 40,
+            rows: 40,
+            column_pitch: 220.0,
+            row_pitch: 180.0,
+            wires: true,
+        }
+    }
+}
+
+const GRAPH_NODE_WIDTH: f32 = 130.0;
+const GRAPH_NODE_HEIGHT: f32 = 70.0;
+
+impl NodeGraph {
+    fn build(spec: &NodeGraphSpec) -> NodeGraph {
+        let mut quads = Vec::new();
+        let mut push = |bounds: Rect, quad: Quad| quads.push((bounds, quad));
+        let origin_of = |column: u32, row: u32| {
+            // Centred on the plane's origin, so panning in every direction
+            // reaches content and negative tile coordinates are ordinary rather
+            // than an edge case.
+            let x = (column as f32 - spec.columns as f32 * 0.5) * spec.column_pitch
+                + jitter(column.wrapping_mul(31).wrapping_add(row), spec.column_pitch * 0.25);
+            let y = (row as f32 - spec.rows as f32 * 0.5) * spec.row_pitch
+                + jitter(row.wrapping_mul(17).wrapping_add(column), spec.row_pitch * 0.2);
+            [x, y]
+        };
+
+        for row in 0..spec.rows {
+            for column in 0..spec.columns {
+                let [x, y] = origin_of(column, row);
+                let body = rect(x, y, GRAPH_NODE_WIDTH, GRAPH_NODE_HEIGHT);
+                push(
+                    body,
+                    Quad {
+                        origin: [body.min_x, body.min_y],
+                        size: [body.width(), body.height()],
+                        background: solid(0.19, 0.20, 0.24),
+                        border_color: translucent(0.55, 0.58, 0.66, 0.5),
+                        corner_radius: 6.0,
+                        border_width: 1.0,
+                    },
+                );
+                let header = rect(x + 6.0, y + 6.0, GRAPH_NODE_WIDTH - 12.0, 16.0);
+                push(header, plain(header, solid(0.28, 0.32, 0.42)));
+                for index in 0..3u32 {
+                    let port = rect(x - 4.0, y + 30.0 + index as f32 * 12.0, 8.0, 8.0);
+                    push(
+                        port,
+                        Quad {
+                            origin: [port.min_x, port.min_y],
+                            size: [port.width(), port.height()],
+                            background: solid(0.72, 0.66, 0.30),
+                            border_color: [0.0, 0.0, 0.0, 0.0],
+                            corner_radius: 4.0,
+                            border_width: 0.0,
+                        },
+                    );
+                }
+
+                // Wires. This is the content §4.3 names as needing a rule, and
+                // a real graph has both lengths: most connections are to the
+                // next column along and fit inside a tile, and some skip
+                // several columns and cannot fit in any tile at all. Both are
+                // generated, because the placement rule has a different answer
+                // for each and a workload with only one kind would leave half of
+                // it untested.
+                if spec.wires && column + 1 < spec.columns {
+                    let [next_x, next_y] = origin_of(column + 1, row);
+                    let start_x = x + GRAPH_NODE_WIDTH;
+                    let wire = rect(
+                        start_x,
+                        y + 34.0,
+                        (next_x - start_x).max(1.0),
+                        (next_y - y).abs().max(2.0),
+                    );
+                    push(wire, plain(wire, translucent(0.60, 0.66, 0.78, 0.8)));
+                }
+                if spec.wires && column % 7 == 0 && column + 4 < spec.columns {
+                    let [far_x, far_y] = origin_of(column + 4, row);
+                    let start_x = x + GRAPH_NODE_WIDTH;
+                    let wire = rect(
+                        start_x,
+                        y + 46.0,
+                        (far_x - start_x).max(1.0),
+                        (far_y - y).abs().max(2.0),
+                    );
+                    push(wire, plain(wire, translucent(0.70, 0.60, 0.50, 0.8)));
+                }
+            }
+        }
+        NodeGraph { quads }
+    }
+
+    /// Every primitive whose bounds intersect `region`, in plane order.
+    fn quads_in(&self, region: Rect) -> Vec<(Rect, Quad)> {
+        self.quads
+            .iter()
+            .filter(|(bounds, _)| bounds.intersects(&region))
+            .copied()
+            .collect()
+    }
+}
+
+impl TiledCanvasDriver {
+    /// A canvas over an empty scene, at the identity pan.
+    pub fn new(spec: &NodeGraphSpec, viewport: Rect, policy: BoundaryPolicy) -> TiledCanvasDriver {
+        TiledCanvasDriver {
+            scene: Scene::new(),
+            compositor: Compositor::new(),
+            boundary: BoundaryId::from_raw(1),
+            policy,
+            viewport,
+            graph: NodeGraph::build(spec),
+            resident: HashMap::new(),
+            frame: 0,
+        }
+    }
+
+    /// The policy a node-graph canvas is declared with by default.
+    pub fn tiled_policy(tile_edge: f32, retain_radius: u32, budget: usize) -> BoundaryPolicy {
+        BoundaryPolicy {
+            buffering: Buffering::Tiled {
+                tile_size: Size::pixels(tile_edge, tile_edge),
+                retain_radius,
+            },
+            resident_tile_budget: budget,
+            ..BoundaryPolicy::default()
+        }
+    }
+
+    /// Pan the canvas so its content composites at `translation`, and bring the
+    /// scene up to date. Returns what that frame cost.
+    ///
+    /// The order is the one a real frame would run in: move, resolve visibility,
+    /// create the revealed tiles' layers, offer every visible tile its content,
+    /// slide every visible tile, then release what was evicted.
+    pub fn pan_to(&mut self, translation: [f32; 2]) -> Result<TiledFrameStats, PatchError> {
+        self.frame += 1;
+        let frame = self.frame;
+        let transform = LayerTransform::translated(translation[0], translation[1]);
+        // Declared before it is moved, and the order matters on the first frame
+        // only: `Compositor::set_transform` is documented to report `false`
+        // rather than create a boundary, so positioning one the compositor has
+        // never seen is inert. Written the other way round, this driver's first
+        // frame silently resolved its tile span at the identity and the next
+        // frame's ordinary pan then looked like a tile crossing.
+        self.compositor.visit(self.boundary, self.policy, frame);
+        self.compositor.set_transform(self.boundary, transform);
+
+        let Some(visit) =
+            self.compositor
+                .visit_tiled(self.boundary, self.policy, frame, self.viewport)
+        else {
+            return Ok(TiledFrameStats::default());
+        };
+
+        let mut stats = TiledFrameStats {
+            revealed: visit.revealed.clone(),
+            visible_tiles: visit.visible.len(),
+            resident_tiles: visit.resident,
+            evicted: visit.evicted.len(),
+            over_budget: visit.over_budget,
+            ..TiledFrameStats::default()
+        };
+
+        // Layers for tiles that became visible. A brand-new layer starts fully
+        // invalidated on `LayerTable::insert`'s own rule — nothing here marks a
+        // tile dirty, which is §4.3's point that this is ordinary machinery.
+        for tile in &visit.revealed {
+            let key = LayerKey::tiled(self.boundary, *tile);
+            if !self.scene.layers.contains(LayerId::from_key(key)) {
+                stats.layers_created += 1;
+            }
+            self.scene.layer(key);
+        }
+        let overlay = visit.overlay_layer();
+        if !self.scene.layers.contains(overlay) {
+            stats.layers_created += 1;
+        }
+        self.scene.layer(LayerKey::untiled(self.boundary));
+
+        // Offer every visible tile its content, plus the overlay. A resident
+        // tile's content is unchanged, so this produces no patch at all — which
+        // is the property the gate reads, established by the protocol rather
+        // than by this loop declining to run.
+        let mut patch = ScenePatch::new();
+        let mut written = 0usize;
+        for tile in &visit.visible {
+            let layer = visit.tile_layer(*tile);
+            let bounds = visit.grid.tile_bounds(*tile);
+            let quads: Vec<Quad> = self
+                .graph
+                .quads_in(bounds)
+                .into_iter()
+                .filter(|(quad_bounds, _)| visit.placement_layer(*quad_bounds) == layer)
+                .map(|(_, quad)| quad)
+                .collect();
+            written += self.stage_layer(&mut patch, layer, &quads);
+        }
+        let overlay_region = visit.grid.bounds_of(&visit.visible);
+        let overlay_quads: Vec<Quad> = self
+            .graph
+            .quads_in(overlay_region)
+            .into_iter()
+            .filter(|(quad_bounds, _)| visit.placement_layer(*quad_bounds) == overlay)
+            .map(|(_, quad)| quad)
+            .collect();
+        let overlay_written = self.stage_layer(&mut patch, overlay, &overlay_quads);
+        written += overlay_written;
+
+        let plan = apply(&mut self.scene, &patch)?;
+        stats.primitives_written = written;
+        stats.overlay_primitives_written = overlay_written;
+        stats.upload_bytes = plan.byte_count();
+
+        // Slide every visible tile, and the overlay with them. `set_transform`
+        // raises TRANSFORM and nothing else, and is inert when the layer is
+        // already there — so a frame that did not move counts zero.
+        for layer in visit.visible_layers().into_iter().chain(Some(overlay)) {
+            let before = self.scene.layers.get(layer).map(Layer::transform);
+            self.scene.layers.set_transform(layer, transform);
+            if before != Some(transform) {
+                stats.transform_updates += 1;
+            }
+        }
+
+        for evicted in &visit.evicted {
+            let layer = visit.tile_layer(evicted.coord);
+            if self.scene.remove_layer(layer) {
+                stats.layers_removed += 1;
+                self.resident.remove(&layer);
+            }
+        }
+
+        for layer in self.scene.layers.ids() {
+            let Some(record) = self.scene.layers.get(layer) else {
+                continue;
+            };
+            let invalidation = record.invalidation();
+            if invalidation.contains(Invalidation::DISPLAY) {
+                stats.display_layers.push(layer);
+            } else if invalidation == Invalidation::TRANSFORM {
+                stats.transform_only_layers += 1;
+            }
+        }
+        stats.display_layers.sort_unstable();
+        Ok(stats)
+    }
+
+    /// Mark every layer clean, as the end of a rendered frame would.
+    pub fn settle(&mut self) {
+        for layer in self.scene.layers.ids() {
+            self.scene.layers.mark_clean(layer);
+        }
+    }
+
+    /// Stage one layer's content, returning how many primitives were actually
+    /// written — inserted or changed, never merely offered.
+    fn stage_layer(&mut self, patch: &mut ScenePatch, layer: LayerId, quads: &[Quad]) -> usize {
+        let resident = self.resident.get(&layer).copied().unwrap_or(0);
+        let mut written = 0usize;
+        let shared = resident.min(quads.len());
+        for position in 0..shared {
+            let key = RecordKey::from_raw(position as u64 + 1);
+            let Some(quad) = quads.get(position) else {
+                continue;
+            };
+            if self.scene.quads.get(layer, key) != Some(quad) {
+                patch.quads.update(layer, key, *quad);
+                written += 1;
+            }
+        }
+        for position in shared..quads.len() {
+            let Some(quad) = quads.get(position) else {
+                continue;
+            };
+            patch.quads.append(
+                layer,
+                RecordKey::from_raw(position as u64 + 1),
+                u32::try_from(position).unwrap_or(u32::MAX),
+                *quad,
+            );
+            written += 1;
+        }
+        for position in (quads.len()..resident).rev() {
+            patch
+                .quads
+                .remove(layer, RecordKey::from_raw(position as u64 + 1));
+            written += 1;
+        }
+        self.resident.insert(layer, quads.len());
+        written
+    }
+
+    /// How many primitives the whole scene currently holds.
+    pub fn resident_primitives(&self) -> usize {
+        self.resident.values().sum()
+    }
+
+    /// How many primitives sit on the unbuffered overlay layer — the honest
+    /// price of [`crate::scene::TilePlacement::Overlay`].
+    pub fn overlay_primitives(&self) -> usize {
+        self.resident
+            .get(&LayerId::from_key(LayerKey::untiled(self.boundary)))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -855,6 +1288,261 @@ mod tests {
             !frame.poison.is_empty(),
             "no filter region: poisoning and the blur margin are untested"
         );
+    }
+
+    fn canvas() -> TiledCanvasDriver {
+        TiledCanvasDriver::new(
+            &NodeGraphSpec::large(),
+            rect(0.0, 0.0, 1024.0, 768.0),
+            TiledCanvasDriver::tiled_policy(TileGrid::DEFAULT_EDGE, 1, 256),
+        )
+    }
+
+    /// §8's Phase 4.5 gate, second clause: *panning within the resident grid
+    /// costs one `TRANSFORM` update per visible tile and zero render/reconcile/
+    /// layout work anywhere.*
+    ///
+    /// The pan is deliberately sub-tile — 24px on a 256px grid — and repeated,
+    /// so the frame genuinely moves without the visible span changing. The
+    /// harness offers every visible tile its content on every one of these
+    /// frames (see [`TiledCanvasDriver`]); the zeros below are what the patch
+    /// protocol makes of that offer, not what the harness declined to do.
+    ///
+    /// **The baseline pan is 8px, not zero, and that is not cosmetic.** A
+    /// 1024×768 viewport at the identity has both its right and bottom edges on
+    /// exact multiples of 256, so it starts perfectly tile-aligned and the very
+    /// first pixel of any pan reveals a whole new column — which is a tile
+    /// crossing, i.e. the *other* gate. Starting 8px into a tile is what makes
+    /// the eight steps below land inside the resident grid, and it is the
+    /// condition the first assertion in the loop checks rather than assumes.
+    #[test]
+    fn gate_panning_inside_the_resident_grid_is_transform_only() -> Result<(), PatchError> {
+        let mut canvas = canvas();
+        let first = canvas.pan_to([-8.0, -8.0])?;
+        assert!(
+            first.layers_created > 0 && first.primitives_written > 0,
+            "the first frame must actually render, or the comparison is empty"
+        );
+        canvas.settle();
+
+        for step in 1..=8u32 {
+            let stats = canvas.pan_to([-8.0 - step as f32 * 24.0, -8.0])?;
+            assert_eq!(
+                stats.revealed,
+                Vec::<TileCoord>::new(),
+                "step {step} crossed a tile boundary, so it is not this gate's case"
+            );
+            assert_eq!(
+                stats.primitives_written, 0,
+                "step {step} re-rendered {} primitives for a pan",
+                stats.primitives_written
+            );
+            assert_eq!(stats.upload_bytes, 0, "step {step} uploaded bytes for a pan");
+            assert_eq!(stats.layers_created, 0);
+            assert_eq!(
+                stats.display_layers,
+                Vec::<LayerId>::new(),
+                "step {step} left a layer needing re-display"
+            );
+            assert_eq!(
+                stats.transform_updates,
+                stats.visible_tiles + 1,
+                "one TRANSFORM per visible tile, plus the overlay"
+            );
+            assert_eq!(
+                stats.transform_only_layers,
+                stats.transform_updates,
+                "every layer this frame touched carries TRANSFORM and nothing else"
+            );
+            assert!(stats.is_transform_only());
+            canvas.settle();
+        }
+        Ok(())
+    }
+
+    /// §8's Phase 4.5 gate, first clause: *panning across a tile boundary
+    /// renders only the newly-revealed tile(s) — measured directly, not
+    /// inferred.*
+    ///
+    /// "Measured directly" is the load-bearing phrase, so the assertion is not
+    /// that the count is small — it is that the set of *tile* layers carrying
+    /// `DISPLAY` after the frame is exactly the set belonging to the revealed
+    /// tiles, no more and no fewer.
+    ///
+    /// # One layer beyond the revealed tiles re-displays, and it is the overlay
+    ///
+    /// This is what running the gate found rather than what writing it assumed.
+    /// A crossing dirties the revealed tiles *and the unbuffered overlay*,
+    /// because a wire reaching into the newly-revealed column is content that
+    /// spans tiles, and [`crate::scene::TilePlacement`]'s rule puts spanning
+    /// content on the overlay. So the gate's "only the newly-revealed tile(s)"
+    /// is exactly true of the tile grid and not quite true of the boundary: the
+    /// overlay is a third thing, and it re-renders whenever the visible region's
+    /// spanning content changes.
+    ///
+    /// The test asserts both halves separately rather than widening the first
+    /// one to fit — the tile set is exact, and the overlay's share of the
+    /// frame's work is measured and bounded, because an overlay that re-rendered
+    /// most of the scene on every crossing would defeat the mechanism while
+    /// still passing an "exactly the revealed tiles" check on the tiles alone.
+    #[test]
+    fn gate_crossing_a_tile_boundary_renders_only_the_revealed_tiles() -> Result<(), PatchError> {
+        let mut canvas = canvas();
+        canvas.pan_to([-8.0, -8.0])?;
+        canvas.settle();
+        let resident_after_first = canvas.resident_primitives();
+
+        // A whole tile's worth of pan to the left, so a new column is revealed
+        // on the right and nothing else changes.
+        let stats = canvas.pan_to([-8.0 - TileGrid::DEFAULT_EDGE, -8.0])?;
+        assert!(
+            !stats.revealed.is_empty(),
+            "the pan did not cross a tile boundary, so this gate tested nothing"
+        );
+        assert!(
+            stats.revealed.len() < stats.visible_tiles,
+            "a whole-tile pan revealed {} of {} visible tiles, which is a refill, \
+             not a tile crossing",
+            stats.revealed.len(),
+            stats.visible_tiles
+        );
+
+        let overlay = LayerId::from_key(LayerKey::untiled(canvas.boundary));
+        let revealed_layers: std::collections::BTreeSet<LayerId> = stats
+            .revealed
+            .iter()
+            .map(|tile| LayerId::from_key(LayerKey::tiled(canvas.boundary, *tile)))
+            .collect();
+        let displayed_tiles: std::collections::BTreeSet<LayerId> = stats
+            .display_layers
+            .iter()
+            .copied()
+            .filter(|layer| *layer != overlay)
+            .collect();
+        assert_eq!(
+            displayed_tiles, revealed_layers,
+            "exactly the revealed tiles re-displayed — no more, and no fewer"
+        );
+        assert!(
+            stats.primitives_written > 0,
+            "the revealed tiles rendered nothing, so the crossing is not real"
+        );
+
+        // The overlay half, disclosed rather than folded into the count above.
+        let tile_written = stats.primitives_written - stats.overlay_primitives_written;
+        assert!(
+            tile_written > 0,
+            "every primitive the crossing wrote landed on the overlay, which \
+             would mean the tile grid is not carrying the content at all"
+        );
+        assert!(
+            stats.overlay_primitives_written < tile_written,
+            "the overlay wrote {} primitives against the tiles' {tile_written}; \
+             spanning content has become the dominant cost of a crossing, which \
+             is the failure mode TilePlacement's doc discloses",
+            stats.overlay_primitives_written
+        );
+        assert!(
+            canvas.resident_primitives() > resident_after_first,
+            "the newly-revealed tiles added residency"
+        );
+        Ok(())
+    }
+
+    /// The comparison that makes the crossing a *win* rather than a number: the
+    /// same pan under `Buffering::Margin`'s rule re-renders the whole buffered
+    /// region, which is §4.3's stated complaint about it.
+    ///
+    /// Modelled rather than run through a second mechanism, and the model is the
+    /// honest one — R-N §7's refill is "the *entire* viewport+margin region
+    /// re-renders", so the comparison is against the primitive count of the
+    /// whole visible span. That count is read out of this same scene, so the
+    /// ratio is a fact about this workload rather than a quoted constant.
+    #[test]
+    fn a_tile_crossing_renders_a_small_fraction_of_what_a_margin_refill_would()
+    -> Result<(), PatchError> {
+        let mut canvas = canvas();
+        canvas.pan_to([-8.0, -8.0])?;
+        canvas.settle();
+        let whole_region = canvas.resident_primitives();
+
+        let stats = canvas.pan_to([-8.0 - TileGrid::DEFAULT_EDGE, -8.0])?;
+        assert!(
+            stats.primitives_written * 4 < whole_region,
+            "a crossing wrote {} primitives against a refill's {whole_region}; \
+             tiling is supposed to be much better than that, not marginally",
+            stats.primitives_written
+        );
+        Ok(())
+    }
+
+    /// The overlay's price, measured rather than asserted — see
+    /// [`crate::scene::TilePlacement`] for why spanning content goes there.
+    #[test]
+    fn wires_are_what_lands_on_the_overlay_and_nodes_are_not() -> Result<(), PatchError> {
+        let viewport = rect(0.0, 0.0, 1024.0, 768.0);
+        let policy = TiledCanvasDriver::tiled_policy(TileGrid::DEFAULT_EDGE, 1, 256);
+
+        let mut with_wires =
+            TiledCanvasDriver::new(&NodeGraphSpec::large(), viewport, policy);
+        with_wires.pan_to([0.0, 0.0])?;
+
+        let mut without_wires = TiledCanvasDriver::new(
+            &NodeGraphSpec {
+                wires: false,
+                ..NodeGraphSpec::large()
+            },
+            viewport,
+            policy,
+        );
+        without_wires.pan_to([0.0, 0.0])?;
+
+        assert!(
+            with_wires.overlay_primitives() > without_wires.overlay_primitives(),
+            "wires are the spanning content; if they do not reach the overlay, \
+             the placement rule is not being exercised"
+        );
+        assert!(
+            with_wires.overlay_primitives() * 3 < with_wires.resident_primitives(),
+            "the overlay holds {} of {} primitives — the unbuffered layer has \
+             become most of the scene, which is the failure mode this rule's \
+             doc discloses",
+            with_wires.overlay_primitives(),
+            with_wires.resident_primitives()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pan_far_enough_to_leave_the_grid_evicts_the_tiles_behind_it()
+    -> Result<(), PatchError> {
+        let mut canvas = TiledCanvasDriver::new(
+            &NodeGraphSpec::large(),
+            rect(0.0, 0.0, 1024.0, 768.0),
+            BoundaryPolicy {
+                evict_after_frames: 2,
+                ..TiledCanvasDriver::tiled_policy(TileGrid::DEFAULT_EDGE, 1, 256)
+            },
+        );
+        canvas.pan_to([0.0, 0.0])?;
+        canvas.settle();
+        let mut evicted_total = 0usize;
+        let mut removed_total = 0usize;
+        for step in 1..=12u32 {
+            let stats = canvas.pan_to([-(step as f32) * 512.0, 0.0])?;
+            evicted_total += stats.evicted;
+            removed_total += stats.layers_removed;
+            canvas.settle();
+        }
+        assert!(
+            evicted_total > 0,
+            "panning right across six tiles left everything behind it resident"
+        );
+        assert_eq!(
+            evicted_total, removed_total,
+            "every evicted tile must actually release its layer"
+        );
+        Ok(())
     }
 
     #[test]

@@ -218,6 +218,20 @@ impl TileGrid {
         }
     }
 
+    /// The smallest rectangle covering every tile in `tiles`, or
+    /// [`Rect::EMPTY`] for none.
+    pub fn bounds_of(&self, tiles: &[TileCoord]) -> Rect {
+        let mut bounds: Option<Rect> = None;
+        for tile in tiles {
+            let tile_bounds = self.tile_bounds(*tile);
+            bounds = Some(match bounds {
+                Some(existing) => existing.union(&tile_bounds),
+                None => tile_bounds,
+            });
+        }
+        bounds.unwrap_or(Rect::EMPTY)
+    }
+
     /// The tile containing a point on the content plane.
     pub fn containing(&self, point: [f32; 2]) -> TileCoord {
         TileCoord::new(
@@ -285,49 +299,101 @@ impl TileGrid {
     }
 
     /// Which layer a primitive with these bounds belongs in.
+    ///
+    /// A primitive no larger than a tile is **anchored** to the tile containing
+    /// its top-left corner, whether or not it overhangs into the neighbour.
+    /// Anything larger goes to the overlay. See [`TilePlacement`] for why that
+    /// is the rule, and [`TileGrid::overhang_is_covered`] for the one obligation
+    /// anchoring creates.
     pub fn placement(&self, bounds: Rect) -> TilePlacement {
-        match self.span(bounds) {
-            Some(span) if span.tile_count() == 1 => TilePlacement::Tile(span.min),
+        if bounds.is_empty() {
             // A degenerate primitive has no tile to be inside of, and putting it
             // on the overlay costs one never-visible instance rather than
             // needing a third case that means "nowhere".
-            _ => TilePlacement::Overlay,
+            return TilePlacement::Overlay;
         }
+        if bounds.width() > self.width || bounds.height() > self.height {
+            return TilePlacement::Overlay;
+        }
+        TilePlacement::Tile(self.containing([bounds.min_x, bounds.min_y]))
+    }
+
+    /// Whether a retain radius covers the overhang [`TileGrid::placement`]'s
+    /// anchoring can produce.
+    ///
+    /// **The correctness obligation anchoring creates, stated as a predicate
+    /// rather than as a comment.** An anchored primitive is at most one tile
+    /// wide, so it reaches at most one tile beyond the one it is anchored in. A
+    /// tile whose overhang is on screen must therefore still be resident, and a
+    /// retain radius of one or more guarantees exactly that: the tile behind the
+    /// visible edge is always in range. At radius zero it is not, and content
+    /// overhanging from the tile just off screen would go missing along that
+    /// edge.
+    ///
+    /// A caller that wants radius zero must have no anchored overhang, which in
+    /// practice means content strictly smaller than a tile *and* aligned to it —
+    /// so this returns `false` rather than trying to distinguish those.
+    pub const fn overhang_is_covered(retain_radius: u32) -> bool {
+        retain_radius >= 1
     }
 }
 
 /// Which of a tiled boundary's layers a primitive is emitted into.
 ///
-/// # The multi-tile content rule, chosen and stated once
+/// # The multi-tile content rule, chosen — and then corrected by measurement
 ///
-/// §4.3 offers two: clip a spanning primitive into each tile it crosses (what
-/// browser tiling does), or put it on an unbuffered overlay layer above the
-/// grid, "the same named pattern SFD §2 already proposes for hover-resolved
+/// §4.3 offers two options: clip a spanning primitive into each tile it crosses
+/// (what browser tiling does), or put it on an unbuffered overlay layer above
+/// the grid, "the same named pattern SFD §2 already proposes for hover-resolved
 /// content that can't cleanly live inside a buffer," with the instruction to
 /// "reuse that pattern rather than inventing a second one."
 ///
-/// **This picks the overlay**, for a reason that is about what exists rather
+/// **Clipping is not available here**, and that part is about what exists rather
 /// than about taste: per-tile clipping needs a per-primitive clip rectangle, and
-/// [`crate::patch::primitive::Quad`] does not have one — `docs/phase-1-results.md`
-/// §2 already recorded that absence. Clipping *geometrically* instead is not the
-/// same operation: shrinking a rounded, bordered quad's rectangle moves its
-/// corners and its border inward, so a node body straddling a tile edge would
-/// render as two differently-shaped halves. So clipping is not merely more work
-/// here, it is not yet expressible, and the version that is expressible is
-/// wrong.
+/// [`crate::patch::primitive::Quad`] does not have one —
+/// `docs/phase-1-results.md` §2 already recorded that absence. Clipping
+/// *geometrically* instead is a different operation: shrinking a rounded,
+/// bordered quad's rectangle moves its corners and its border inward, so a node
+/// body straddling a tile edge would render as two differently-shaped halves. So
+/// clipping is not merely more work, it is not yet expressible, and the version
+/// that is expressible is wrong.
 ///
-/// The overlay costs nothing new: it is [`crate::scene::layer::LayerKey::untiled`],
-/// the same layer an untiled boundary already uses, and it pans by `TRANSFORM`
-/// with the tiles. Its honest price is in `docs/phase-4.5-results.md`: overlay
-/// content is not tile-culled, so a graph whose wires are mostly long puts a
-/// growing always-resident layer above a well-bounded grid. Per-tile clipping
-/// becomes the better answer the moment `Quad` gains a content mask, and that is
-/// where the rule should be revisited.
+/// # Why "spanning ⇒ overlay" is not the rule, measured rather than reasoned
+///
+/// The obvious reading of the overlay option is "any primitive touching two
+/// tiles goes on the overlay." That was built first and it does not survive its
+/// own gate. On the node-graph workload — 130×70 nodes on a 256px grid — a node
+/// straddles a tile edge whenever its origin falls within 130px of one
+/// horizontally or 70px of one vertically, which is most of the tile: measured,
+/// **73% of the scene's primitives landed on the unbuffered layer**, and a tile
+/// crossing wrote 144 overlay primitives against 52 tile ones. The mechanism was
+/// technically working and buying almost nothing, because the layer that is not
+/// tile-culled held most of the content.
+///
+/// **So a primitive no larger than a tile is anchored to the tile holding its
+/// top-left corner, overhang and all**, and only genuinely oversized content —
+/// a wire spanning several columns, a group box around a whole subgraph —
+/// reaches the overlay. This is still the overlay pattern rather than a second
+/// one: the overlay exists, it holds what cannot be anchored, and it is
+/// [`crate::scene::layer::LayerKey::untiled`], the same layer an untiled
+/// boundary already has. What changed is only which content needs it.
+///
+/// Anchoring costs one obligation, and it is checkable rather than remembered:
+/// an anchored primitive reaches at most one tile past its own, so a tile must
+/// stay resident while its overhang is on screen. A retain radius of one or more
+/// guarantees that for free — see [`TileGrid::overhang_is_covered`].
+///
+/// The overlay's remaining price is in `docs/phase-4.5-results.md`: what sits
+/// there is not tile-culled, so a graph made mostly of very long wires still
+/// grows an always-resident layer. Per-tile clipping becomes the better answer
+/// the moment `Quad` gains a content mask, and that is where the rule should be
+/// revisited.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TilePlacement {
-    /// The primitive fits inside one tile and lives in that tile's layer.
+    /// The primitive is no larger than a tile and lives in the tile holding its
+    /// top-left corner, overhanging into the neighbour if it must.
     Tile(TileCoord),
-    /// The primitive spans more than one tile and lives on the boundary's
+    /// The primitive is larger than a tile and lives on the boundary's
     /// unbuffered overlay layer.
     Overlay,
 }
@@ -386,7 +452,7 @@ pub struct EvictedTile {
 /// next line of the frame is about to re-render would trade a memory bound for
 /// unbounded work. [`TileResidency::over_budget`] reports that state instead of
 /// hiding it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TileResidency {
     tiles: HashMap<TileCoord, TileResidencyState>,
     budget: usize,
@@ -505,6 +571,12 @@ impl TileResidency {
     /// The resident-tile cap.
     pub const fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// Change the cap. Takes effect at the next [`TileResidency::sweep`], so
+    /// lowering it never evicts anything the current frame is still using.
+    pub const fn set_budget(&mut self, budget: usize) {
+        self.budget = if budget > 1 { budget } else { 1 };
     }
 
     /// Whether this tile is resident.
@@ -815,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn a_primitive_inside_one_tile_goes_to_that_tile_and_a_spanning_one_to_the_overlay() {
+    fn a_primitive_no_larger_than_a_tile_anchors_and_an_oversized_one_goes_to_the_overlay() {
         let grid = grid();
         assert_eq!(
             grid.placement(rect(10.0, 10.0, 40.0, 40.0)),
@@ -826,17 +898,68 @@ mod tests {
             TilePlacement::Tile(TileCoord::new(-1, -1))
         );
         assert_eq!(
-            grid.placement(rect(200.0, 10.0, 400.0, 10.0)),
-            TilePlacement::Overlay,
-            "a wire crossing a tile edge cannot be clipped without a content \
-             mask Quad does not have"
-        );
-        assert_eq!(
             grid.placement(rect(0.0, 0.0, 256.0, 256.0)),
             TilePlacement::Tile(TileCoord::ORIGIN),
-            "a primitive filling a tile exactly is inside it, not spanning"
+            "a primitive filling a tile exactly still fits in one"
+        );
+        // The correction this rule exists because of: a node straddling a tile
+        // edge anchors rather than falling out of the grid entirely.
+        assert_eq!(
+            grid.placement(rect(200.0, 10.0, 130.0, 70.0)),
+            TilePlacement::Tile(TileCoord::ORIGIN),
+            "a node overhanging into the next tile is anchored, not exiled to \
+             the overlay — see TilePlacement's doc for the 73% this measured"
+        );
+        assert_eq!(
+            grid.placement(rect(200.0, 10.0, 400.0, 10.0)),
+            TilePlacement::Overlay,
+            "a wire wider than a tile cannot be anchored without unbounded \
+             overhang"
+        );
+        assert_eq!(
+            grid.placement(rect(10.0, 10.0, 10.0, 300.0)),
+            TilePlacement::Overlay,
+            "oversized on either axis is enough"
         );
         assert_eq!(grid.placement(Rect::EMPTY), TilePlacement::Overlay);
+    }
+
+    /// Anchoring's one correctness obligation, checked rather than asserted in
+    /// prose: a primitive anchored in a tile that has itself gone out of view
+    /// must still be resident while the part of it that overhangs is on screen.
+    #[test]
+    fn an_anchored_primitives_overhang_is_still_resident_when_it_is_on_screen() {
+        let grid = grid();
+        assert!(TileGrid::overhang_is_covered(1));
+        assert!(!TileGrid::overhang_is_covered(0));
+
+        // A node anchored in tile (0,0), overhanging into (1,0).
+        let node = rect(200.0, 100.0, 130.0, 70.0);
+        let anchor = match grid.placement(node) {
+            TilePlacement::Tile(coord) => coord,
+            TilePlacement::Overlay => panic!("a 130x70 node fits in a 256px tile"),
+        };
+        assert_eq!(anchor, TileCoord::ORIGIN);
+        assert!(node.max_x > grid.tile_bounds(anchor).max_x, "it does overhang");
+
+        // A viewport showing only tile (1,0) — the overhang is visible and the
+        // tile it belongs to is not.
+        let viewport = grid.tile_bounds(TileCoord::new(1, 0));
+        let span = grid
+            .visible_span(viewport, 1)
+            .expect("one tile plus a ring is usable");
+        assert!(
+            span.contains(anchor),
+            "the retain radius must keep the anchoring tile resident, or the \
+             overhang goes missing along that edge"
+        );
+
+        // And at radius zero it genuinely would not, which is what makes
+        // `overhang_is_covered` a real constraint rather than a formality.
+        let bare = grid
+            .visible_span(viewport, 0)
+            .expect("one tile is usable");
+        assert!(!bare.contains(anchor));
     }
 
     #[test]

@@ -65,6 +65,7 @@ use crate::invalidation::axes::Invalidation;
 use crate::invalidation::reason::Reason;
 use crate::occlusion::coverage::{MAX_OCCLUDERS, OccluderStyle, fully_covered, opaque_region};
 use crate::scene::layer::{BoundaryId, LayerId, LayerKey, LayerTransform};
+use crate::scene::tile::{EvictedTile, TileCoord, TileGrid, TileResidency};
 use std::collections::HashMap;
 
 /// What a boundary does with its content this frame.
@@ -99,7 +100,11 @@ impl Composite {
 }
 
 /// One boundary's retained compositing state.
-#[derive(Copy, Clone, Debug, PartialEq)]
+///
+/// No longer `Copy` as of Phase 4.5: a tiled boundary carries its own
+/// [`TileResidency`], which owns a map. Every accessor still hands out a copy of
+/// the field it names, so nothing that read this type had to change.
+#[derive(Clone, Debug, PartialEq)]
 pub struct BoundaryState {
     policy: BoundaryPolicy,
     layer: LayerId,
@@ -107,6 +112,7 @@ pub struct BoundaryState {
     retention: Retention,
     primitive_count: usize,
     last_visited_frame: u64,
+    tiles: Option<TileResidency>,
 }
 
 impl BoundaryState {
@@ -139,6 +145,12 @@ impl BoundaryState {
     /// The last frame this boundary appeared in the tree.
     pub const fn last_visited_frame(&self) -> u64 {
         self.last_visited_frame
+    }
+
+    /// Which tiles of this boundary's content plane are resident, or `None` for
+    /// a boundary that is not tiled.
+    pub const fn tiles(&self) -> Option<&TileResidency> {
+        self.tiles.as_ref()
     }
 }
 
@@ -362,6 +374,67 @@ impl BoundaryComposite {
     }
 }
 
+/// What one tiled boundary's frame resolved to (§4.3).
+///
+/// Every field is a list of tiles the caller turns into ordinary layer work.
+/// Nothing here is a layer, a slab, or an invalidation — see
+/// [`Compositor::visit_tiled`] for why that separation is the phase's whole
+/// claim rather than a stylistic choice.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TiledVisit {
+    /// The boundary these tiles belong to.
+    pub boundary: BoundaryId,
+    /// Its grid.
+    pub grid: TileGrid,
+    /// The content-plane rectangle under the viewport at this pan offset.
+    pub content_viewport: Rect,
+    /// Every tile in range this frame, row-major and ascending.
+    pub visible: Vec<TileCoord>,
+    /// The tiles that were not resident before this frame — the `DISPLAY`
+    /// targets, and the number §8's Phase 4.5 gate measures on a crossing.
+    pub revealed: Vec<TileCoord>,
+    /// The tiles that left residency, and under which rule.
+    pub evicted: Vec<EvictedTile>,
+    /// Resident tiles the budget could not account for, all of them in range.
+    pub over_budget: usize,
+    /// How many tiles are resident after this frame's sweep.
+    pub resident: usize,
+}
+
+impl TiledVisit {
+    /// The layer holding one tile of this boundary.
+    pub fn tile_layer(&self, tile: TileCoord) -> LayerId {
+        LayerId::from_key(LayerKey::tiled(self.boundary, tile))
+    }
+
+    /// The unbuffered overlay layer holding content that spans tiles — see
+    /// [`crate::scene::TilePlacement`] for why that content is not clipped into
+    /// each tile instead.
+    ///
+    /// It is the boundary's plain untiled layer, which is the point: the overlay
+    /// is not a new kind of layer, it is the layer an untiled boundary would
+    /// have had anyway.
+    pub fn overlay_layer(&self) -> LayerId {
+        LayerId::from_key(LayerKey::untiled(self.boundary))
+    }
+
+    /// Every visible tile's layer, in draw order.
+    pub fn visible_layers(&self) -> Vec<LayerId> {
+        self.visible
+            .iter()
+            .map(|tile| self.tile_layer(*tile))
+            .collect()
+    }
+
+    /// Which layer a primitive with these content-plane bounds belongs in.
+    pub fn placement_layer(&self, bounds: Rect) -> LayerId {
+        match self.grid.placement(bounds) {
+            crate::scene::tile::TilePlacement::Tile(tile) => self.tile_layer(tile),
+            crate::scene::tile::TilePlacement::Overlay => self.overlay_layer(),
+        }
+    }
+}
+
 /// Every live compositing boundary, across frames.
 #[derive(Debug, Default)]
 pub struct Compositor {
@@ -398,10 +471,81 @@ impl Compositor {
                 retention: Retention::Primitives,
                 primitive_count: 0,
                 last_visited_frame: frame,
+                tiles: None,
             });
         state.policy = policy;
         state.last_visited_frame = frame;
         state.layer
+    }
+
+    /// Declare a [`crate::boundary::policy::Buffering::Tiled`] boundary and
+    /// resolve its live tile set for this frame.
+    ///
+    /// `viewport` is the boundary's visible rectangle in its own parent space;
+    /// the content-plane rectangle under it is derived from the transform the
+    /// boundary already has, so a caller pans by [`Compositor::set_transform`]
+    /// and this reports what that pan revealed.
+    ///
+    /// Returns `None` when the policy is not tiled, or when its tile size cannot
+    /// address the viewport at all — see [`crate::scene::TileSpan::MAX_TILES`].
+    /// Both mean the same thing to a caller: buffer this boundary the untiled
+    /// way, which [`Compositor::visit`] already did for it.
+    ///
+    /// # More than one `Layer` per boundary, and nothing else new
+    ///
+    /// §4.3's whole claim is that tiling "needs almost no new machinery," and
+    /// this method is where that is either true or not. What it does is call
+    /// [`crate::scene::TileGrid::visible_span`], hand the result to
+    /// [`TileResidency`], and name a [`LayerKey::tiled`] per surviving tile. It
+    /// creates no layer, allocates no slab, and raises no invalidation — every
+    /// one of those is the caller's ordinary machinery, applied to the layer
+    /// keys this returns:
+    ///
+    /// - A **revealed** tile becomes a layer nobody declared before, and
+    ///   [`crate::scene::layer::LayerTable::insert`] starts a new layer at
+    ///   `Invalidation::all()` on its own rule. That is §4.3's "crossing into a
+    ///   new tile triggers `DISPLAY` for *that tile alone*", and it needed no
+    ///   tile-specific code to happen.
+    /// - A **still-visible** tile is a layer that already exists, so declaring
+    ///   it again is idempotent and the pan reaches it as one
+    ///   [`crate::scene::layer::LayerTable::set_transform`] — `TRANSFORM` and
+    ///   nothing else, which is §5.4's path, live since Phase 2.
+    /// - An **evicted** tile is a layer the caller removes, releasing its slab
+    ///   through [`crate::scene::Scene::remove_layer`] like any other.
+    pub fn visit_tiled(
+        &mut self,
+        boundary: BoundaryId,
+        policy: BoundaryPolicy,
+        frame: u64,
+        viewport: Rect,
+    ) -> Option<TiledVisit> {
+        self.visit(boundary, policy, frame);
+        let grid = policy.buffering.tile_grid()?;
+        let state = self.boundaries.get_mut(&boundary)?;
+
+        let content_viewport = TileGrid::content_viewport(viewport, state.transform);
+        let span = grid.visible_span(content_viewport, policy.buffering.retain_radius())?;
+
+        let residency = state
+            .tiles
+            .get_or_insert_with(|| TileResidency::new(policy.resident_tile_budget));
+        // Re-applied every frame for the same reason `state.policy = policy`
+        // above is: a re-declared boundary's policy is the one it was declared
+        // with this frame, not the one it happened to be created with.
+        residency.set_budget(policy.resident_tile_budget);
+        let revealed = residency.mark(span, frame);
+        let evicted = residency.sweep(frame, policy.evict_after_frames);
+
+        Some(TiledVisit {
+            boundary,
+            grid,
+            content_viewport,
+            visible: span.tiles(),
+            revealed,
+            evicted,
+            over_budget: residency.over_budget(),
+            resident: residency.len(),
+        })
     }
 
     /// Move a boundary's content to `transform`, reporting whether that is a
