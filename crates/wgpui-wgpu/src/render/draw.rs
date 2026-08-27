@@ -226,9 +226,26 @@ impl ResolvedArgs {
     /// Read the records back if `mode` needs them, and otherwise do nothing.
     ///
     /// Called before the render pass begins, because a readback submits its own
-    /// encoder and blocks. That ordering is the fallback's real cost and it is
-    /// visible here rather than buried: an indirect path issues its draws
-    /// without ever waiting on the device.
+    /// encoder and blocks.
+    ///
+    /// # What that costs, measured
+    ///
+    /// `examples/phase4_draw_issuance_bench.rs` prices this column beside the
+    /// draw-issuing one, and the gap is not small. On an RTX 4060 (Vulkan,
+    /// 561.03) the fallback's readback ran **187µs at 8 slots and 1.71ms at 128
+    /// slots**, against 0.3–8µs of actual draw issuing. Three digits of
+    /// difference, and it is not the 2KB of argument records that costs it:
+    /// `Device::poll(wait_indefinitely)` waits for *everything already
+    /// submitted*, so reading the arguments back also waits for the compute
+    /// dispatch that wrote them and for the previous frame's rendering to
+    /// drain. The fallback does not merely add a copy; it serializes the CPU
+    /// against the GPU once per frame.
+    ///
+    /// That is worth stating plainly rather than leaving as a footnote, because
+    /// §5.3 describes this path as the WASM path and the macOS best-effort
+    /// path without pricing it. It is a correct path and a slow one, and a
+    /// device that has `draw_indirect` at all — which is every WebGPU device —
+    /// should be taking [`DrawMode::PerSlotIndirect`] instead.
     pub fn resolve(
         mode: DrawMode,
         device: &wgpu::Device,
