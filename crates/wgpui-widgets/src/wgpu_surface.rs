@@ -369,13 +369,18 @@ mod tests {
     #[test]
     fn each_of_the_three_fields_is_the_only_thing_that_rebuilds_the_surface()
     -> Result<(), ReconcileError> {
+        // Each case changes exactly one of the fingerprint's three fields away
+        // from `base()` and leaves the other two alone, so the reported axes
+        // are attributable to that field and to nothing else.
         let cases: [(&str, WgpuSurface, Invalidation); 3] = [
             (
                 "a different surface handle",
-                base().style(SurfaceStyle {
-                    corner_radius: 0.0,
-                    opacity: 1.0,
-                }),
+                WgpuSurface::new(SurfaceId::from_raw(2))
+                    .bounds(viewport(640.0, 480.0))
+                    .style(SurfaceStyle {
+                        corner_radius: 0.0,
+                        opacity: 1.0,
+                    }),
                 Invalidation::DISPLAY,
             ),
             (
@@ -393,19 +398,12 @@ mod tests {
             ),
         ];
 
-        for (index, (what, changed, expected)) in cases.into_iter().enumerate() {
-            let changed = if index == 0 {
-                // Built here rather than in the array so the surface id is the
-                // one thing that differs in this case.
-                WgpuSurface::new(SurfaceId::from_raw(2))
-                    .bounds(viewport(640.0, 480.0))
-                    .style(SurfaceStyle {
-                        corner_radius: 0.0,
-                        opacity: 1.0,
-                    })
-            } else {
-                changed
-            };
+        for (what, changed, expected) in cases {
+            assert_ne!(
+                changed.diff_key(),
+                base().diff_key(),
+                "{what} must actually differ from the control"
+            );
 
             let mut reconciler = Reconciler::new();
             let mut layout = LayoutTree::new();

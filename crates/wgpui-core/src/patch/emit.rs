@@ -358,6 +358,15 @@ impl<P: Primitive> KindOperations<P> {
 pub struct Emitter {
     compositor: Compositor,
     emitted: HashMap<InstanceKey, EmittedNode>,
+    /// Layers whose boundary was evicted, released at the *start* of the next
+    /// frame rather than at the end of the one that evicted them.
+    ///
+    /// The delay is what makes the release safe: [`Emitter::emit`] produces a
+    /// patch and its caller applies it afterwards, so a layer dropped in the
+    /// same call could still be named by ops in the patch just returned.
+    /// Deferring one frame means the caller has applied that patch before the
+    /// layer's reservations are handed back.
+    pending_layer_removals: Vec<LayerId>,
     frame: u64,
 }
 
@@ -398,6 +407,9 @@ impl Emitter {
     ) -> Result<FrameEmission, EmitError> {
         self.frame += 1;
         let frame = self.frame;
+        for layer in std::mem::take(&mut self.pending_layer_removals) {
+            scene.remove_layer(layer);
+        }
 
         let mut stats = EmissionStats::default();
         let mut quads: KindOperations<Quad> = KindOperations::default();
@@ -591,7 +603,8 @@ impl Emitter {
         composites.sort_by_key(|composite| composite.layer);
         stats.boundaries = composites.len();
 
-        self.compositor.sweep(frame);
+        self.pending_layer_removals
+            .extend(self.compositor.sweep(frame));
         Ok(FrameEmission {
             patch,
             composites,
@@ -1275,6 +1288,63 @@ mod tests {
         let shrunk = window.draw(describe(1), &FrameSignals::new())?;
         assert_eq!(window.scene.quads.len(root_layer), 1);
         assert_eq!(shrunk.emission.stats.records_removed, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn an_evicted_boundary_stops_costing_the_scene_a_layer() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let boundary = boundary_of(&window);
+        let layer = LayerId::from_key(LayerKey::untiled(boundary));
+        let root_layer = LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT));
+        let policy = BoundaryPolicy {
+            evict_after_frames: 2,
+            ..BoundaryPolicy::default()
+        };
+        let describe = move |present: bool| {
+            let root = Description::new::<Panel>()
+                .diff_key(Fingerprint(present as u32))
+                .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT));
+            if !present {
+                return root;
+            }
+            root.child(
+                Description::new::<Panel>()
+                    .diff_key(Fingerprint(0))
+                    .style(column(100.0, 100.0))
+                    .boundary_with_policy(policy)
+                    .child(
+                        Description::new::<Panel>()
+                            .diff_key(Fingerprint(0))
+                            .style(fixed(10.0, 10.0))
+                            .emit(fill(0.5)),
+                    ),
+            )
+        };
+
+        window.draw(describe(true), &FrameSignals::new())?;
+        assert!(window.scene.layers.contains(layer));
+        assert_eq!(window.scene.quads.len(layer), 1);
+
+        // Residency goes with the elements, immediately.
+        window.draw(describe(false), &FrameSignals::new())?;
+        assert_eq!(window.scene.quads.len(layer), 0);
+        assert!(
+            window.scene.layers.contains(layer),
+            "the layer record outlives the elements by the eviction interval, \
+             so a panel that comes straight back keeps where it was"
+        );
+
+        // The layer record goes with the boundary, after it.
+        for _ in 0..4 {
+            window.draw(describe(false), &FrameSignals::new())?;
+        }
+        assert!(window.emitter.compositor().state(boundary).is_none());
+        assert!(
+            !window.scene.layers.contains(layer),
+            "an evicted boundary must not leave a layer behind for the scene to carry forever"
+        );
+        assert!(window.scene.layers.contains(root_layer));
         Ok(())
     }
 

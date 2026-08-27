@@ -253,7 +253,7 @@ impl Compositor {
     }
 
     /// Drop the state of every boundary unvisited for longer than its own
-    /// `evict_after_frames`, returning how many were dropped.
+    /// `evict_after_frames`, returning the layers those boundaries owned.
     ///
     /// R-N §3.4's mark-and-sweep, with its deliberate delay: a panel scrolled
     /// out of the tree and back within the interval re-materialises at the
@@ -261,13 +261,22 @@ impl Compositor {
     /// retains over that interval is this record only — a boundary's *records*
     /// leave residency as soon as it leaves the tree, because pooling their
     /// storage is the texture-pool work §8 puts in Phase 4.
-    pub fn sweep(&mut self, frame: u64) -> usize {
-        let before = self.boundaries.len();
+    ///
+    /// The evicted layers are returned rather than counted because a boundary's
+    /// layer outlives its records: the records go when the elements leave the
+    /// tree, but the `Layer` entry itself is the compositor's to release, and
+    /// nothing else knows when the interval has elapsed.
+    pub fn sweep(&mut self, frame: u64) -> Vec<LayerId> {
+        let mut evicted = Vec::new();
         self.boundaries.retain(|_, state| {
             let elapsed = frame.saturating_sub(state.last_visited_frame);
-            elapsed <= u64::from(state.policy.evict_after_frames)
+            if elapsed <= u64::from(state.policy.evict_after_frames) {
+                return true;
+            }
+            evicted.push(state.layer);
+            false
         });
-        before - self.boundaries.len()
+        evicted
     }
 
     /// How many boundaries are live.
@@ -411,9 +420,13 @@ mod tests {
     fn an_unvisited_boundary_survives_its_eviction_interval_and_then_does_not() {
         let mut compositor = compositor_with_panel();
         let interval = u64::from(BoundaryPolicy::DEFAULT_EVICT_AFTER_FRAMES);
-        assert_eq!(compositor.sweep(1 + interval), 0);
+        assert!(compositor.sweep(1 + interval).is_empty());
         assert_eq!(compositor.len(), 1);
-        assert_eq!(compositor.sweep(2 + interval), 1);
+        assert_eq!(
+            compositor.sweep(2 + interval),
+            vec![LayerId::from_key(LayerKey::untiled(PANEL))],
+            "an evicted boundary must name the layer it owned, so its caller can release it"
+        );
         assert!(compositor.is_empty());
     }
 
