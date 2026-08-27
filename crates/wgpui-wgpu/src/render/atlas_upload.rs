@@ -280,11 +280,9 @@ mod tests {
         // other rather than against a comment.
         for kind in [AtlasKind::Monochrome, AtlasKind::Polychrome] {
             assert_eq!(
-                u32::from(
-                    texture_format(kind)
-                        .block_copy_size(None)
-                        .expect("an uncompressed colour format has a block size")
-                ),
+                texture_format(kind)
+                    .block_copy_size(None)
+                    .expect("an uncompressed colour format has a block size"),
                 kind.bytes_per_pixel()
             );
         }

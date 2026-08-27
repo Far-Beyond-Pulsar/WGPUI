@@ -252,38 +252,32 @@ fn ours(rasterizer: &mut GlyphRasterizer, shaper: &mut TextShaper, key: GlyphRas
     }
 }
 
-/// One row of the differential: both sides, for one request.
-fn compare(
-    rasterizer: &mut GlyphRasterizer,
-    shaper: &mut TextShaper,
-    reference: &mut legacy::TextSystem,
-    reference_index: usize,
+/// One glyph, at one size, scale, sub-pixel variant and atlas kind.
+///
+/// A struct rather than five positional arguments: the two sides spell the same
+/// request differently (this crate folds the scale into the font size before it
+/// builds a key; the legacy multiplies at the call), and a differential whose
+/// two arms are fed by two argument lists is a differential that can compare two
+/// different requests and call it agreement.
+#[derive(Copy, Clone, Debug)]
+struct Request {
     glyph: u32,
     font_size: f32,
     scale_factor: f32,
     variant: u8,
     kind: AtlasKind,
-) -> (Raster, Raster) {
-    let key = GlyphRasterKey {
-        font: 0,
-        glyph,
-        // `crate::patch` scales before it builds the key; the legacy scales at
-        // the call. Same product, and this is where the two conventions meet.
-        font_size_bits: (font_size * scale_factor).to_bits(),
-        subpixel: [variant, 0],
-        scale_factor_bits: scale_factor.to_bits(),
-        kind,
-    };
-    let mine = ours(rasterizer, shaper, key);
-    let theirs = reference.rasterize_glyph(&legacy::RenderGlyphParams {
-        font_index: reference_index,
-        glyph_id: glyph,
-        font_size,
-        subpixel_variant: [variant, 0],
-        scale_factor,
-        is_emoji: kind == AtlasKind::Polychrome,
-    });
-    (mine, theirs)
+}
+
+impl Request {
+    fn monochrome(glyph: u32, font_size: f32, scale_factor: f32, variant: u8) -> Self {
+        Self {
+            glyph,
+            font_size,
+            scale_factor,
+            variant,
+            kind: AtlasKind::Monochrome,
+        }
+    }
 }
 
 struct Sides {
@@ -292,6 +286,30 @@ struct Sides {
     reference: legacy::TextSystem,
     reference_index: usize,
     glyphs: Vec<u32>,
+}
+
+impl Sides {
+    /// One row of the differential: both arms, for one request.
+    fn compare(&mut self, request: Request) -> (Raster, Raster) {
+        let key = GlyphRasterKey {
+            font: 0,
+            glyph: request.glyph,
+            font_size_bits: (request.font_size * request.scale_factor).to_bits(),
+            subpixel: [request.variant, 0],
+            scale_factor_bits: request.scale_factor.to_bits(),
+            kind: request.kind,
+        };
+        let mine = ours(&mut self.rasterizer, &mut self.shaper, key);
+        let theirs = self.reference.rasterize_glyph(&legacy::RenderGlyphParams {
+            font_index: self.reference_index,
+            glyph_id: request.glyph,
+            font_size: request.font_size,
+            subpixel_variant: [request.variant, 0],
+            scale_factor: request.scale_factor,
+            is_emoji: request.kind == AtlasKind::Polychrome,
+        });
+        (mine, theirs)
+    }
 }
 
 fn both_sides() -> Sides {
@@ -341,21 +359,17 @@ fn every_rasterised_glyph_matches_the_legacy_path_byte_for_byte() {
     let mut blank = 0usize;
     let mut disagreements = Vec::new();
 
-    for &glyph in &sides.glyphs {
+    let glyphs = sides.glyphs.clone();
+    for glyph in glyphs {
         for &font_size in &FONT_SIZES {
             for &scale_factor in &SCALE_FACTORS {
                 for variant in 0..4u8 {
-                    let (mine, theirs) = compare(
-                        &mut sides.rasterizer,
-                        &mut sides.shaper,
-                        &mut sides.reference,
-                        sides.reference_index,
+                    let (mine, theirs) = sides.compare(Request::monochrome(
                         glyph,
                         font_size,
                         scale_factor,
                         variant,
-                        AtlasKind::Monochrome,
-                    );
+                    ));
                     compared += 1;
                     match &theirs {
                         Raster::Bitmap { .. } => with_ink += 1,
@@ -411,19 +425,16 @@ fn the_colour_arm_matches_the_legacy_emoji_path() {
     let mut compared = 0usize;
     let mut disagreements = 0usize;
 
-    for &glyph in &sides.glyphs {
+    let glyphs = sides.glyphs.clone();
+    for glyph in glyphs {
         for &font_size in &FONT_SIZES {
-            let (mine, theirs) = compare(
-                &mut sides.rasterizer,
-                &mut sides.shaper,
-                &mut sides.reference,
-                sides.reference_index,
+            let (mine, theirs) = sides.compare(Request {
                 glyph,
                 font_size,
-                1.0,
-                0,
-                AtlasKind::Polychrome,
-            );
+                scale_factor: 1.0,
+                variant: 0,
+                kind: AtlasKind::Polychrome,
+            });
             compared += 1;
             if mine != theirs {
                 disagreements += 1;
@@ -456,20 +467,12 @@ fn dropping_the_scale_factor_from_the_sub_pixel_shift_breaks_the_agreement() {
     let mut differed = 0usize;
     let mut checked = 0usize;
 
-    for &glyph in &sides.glyphs {
+    let glyphs = sides.glyphs.clone();
+    for glyph in glyphs {
         for variant in 1..4u8 {
             // The correct request: 16px logical content at 2x.
-            let (correct, reference) = compare(
-                &mut sides.rasterizer,
-                &mut sides.shaper,
-                &mut sides.reference,
-                sides.reference_index,
-                glyph,
-                16.0,
-                2.0,
-                variant,
-                AtlasKind::Monochrome,
-            );
+            let (correct, reference) =
+                sides.compare(Request::monochrome(glyph, 16.0, 2.0, variant));
             assert_eq!(correct, reference, "the correct arm must still agree");
 
             // The mistake: same device size, same variant, scale factor claimed
@@ -508,17 +511,7 @@ fn dropping_the_scale_factor_from_the_sub_pixel_shift_breaks_the_agreement() {
 fn perturbing_a_single_texel_is_caught() {
     let mut sides = both_sides();
     let glyph = *sides.glyphs.last().expect("the sample has glyphs");
-    let (mine, theirs) = compare(
-        &mut sides.rasterizer,
-        &mut sides.shaper,
-        &mut sides.reference,
-        sides.reference_index,
-        glyph,
-        24.0,
-        1.0,
-        0,
-        AtlasKind::Monochrome,
-    );
+    let (mine, theirs) = sides.compare(Request::monochrome(glyph, 24.0, 1.0, 0));
     assert_eq!(mine, theirs);
     let Raster::Bitmap {
         size,
