@@ -121,6 +121,25 @@ impl ElementInstance {
     }
 }
 
+/// What one frame retains about an element, handed to [`InstanceTable::store`]
+/// as a single value.
+///
+/// Grouped rather than passed as six positional parameters because every field
+/// is a different type of "thing about this element" and a caller that
+/// transposed two of them would still compile.
+pub struct RetainedElement {
+    /// The element's Rust type.
+    pub type_id: TypeId,
+    /// This frame's fingerprint, if the element supplied one.
+    pub diff_key: Option<Box<dyn ReconcileKey>>,
+    /// The layout node the element settled on.
+    pub layout_node: LayoutNodeId,
+    /// The layout nodes of the element's children, in order.
+    pub child_nodes: Vec<LayoutNodeId>,
+    /// The instances of the element's children, in order.
+    pub children: Vec<InstanceKey>,
+}
+
 /// Every retained element instance in the window, addressed by
 /// [`InstanceKey`].
 #[derive(Debug, Default)]
@@ -156,16 +175,14 @@ impl InstanceTable {
     }
 
     /// Insert or replace the record for `key`.
-    pub fn store(
-        &mut self,
-        key: InstanceKey,
-        type_id: TypeId,
-        diff_key: Option<Box<dyn ReconcileKey>>,
-        layout_node: LayoutNodeId,
-        child_nodes: Vec<LayoutNodeId>,
-        children: Vec<InstanceKey>,
-        frame: u64,
-    ) {
+    pub fn store(&mut self, key: InstanceKey, element: RetainedElement, frame: u64) {
+        let RetainedElement {
+            type_id,
+            diff_key,
+            layout_node,
+            child_nodes,
+            children,
+        } = element;
         self.instances.insert(
             key,
             ElementInstance {
@@ -252,16 +269,18 @@ mod tests {
         LayoutNodeId::from_raw(raw)
     }
 
+    fn record(children: Vec<InstanceKey>) -> RetainedElement {
+        RetainedElement {
+            type_id: TypeId::of::<Panel>(),
+            diff_key: Some(Box::new(AlwaysDirty)),
+            layout_node: node(0),
+            child_nodes: Vec::new(),
+            children,
+        }
+    }
+
     fn store_leaf(table: &mut InstanceTable, key: InstanceKey, frame: u64) {
-        table.store(
-            key,
-            TypeId::of::<Panel>(),
-            Some(Box::new(AlwaysDirty)),
-            node(0),
-            Vec::new(),
-            Vec::new(),
-            frame,
-        );
+        table.store(key, record(Vec::new()), frame);
     }
 
     #[test]
@@ -310,24 +329,8 @@ mod tests {
         let child = InstanceKey::from_raw(3);
         let grandchild = InstanceKey::from_raw(5);
         store_leaf(&mut table, grandchild, 0);
-        table.store(
-            child,
-            TypeId::of::<Panel>(),
-            None,
-            node(0),
-            Vec::new(),
-            vec![grandchild],
-            0,
-        );
-        table.store(
-            root,
-            TypeId::of::<Panel>(),
-            None,
-            node(0),
-            Vec::new(),
-            vec![child],
-            0,
-        );
+        table.store(child, record(vec![grandchild]), 0);
+        table.store(root, record(vec![child]), 0);
         assert_eq!(table.len(), 3);
         assert_eq!(table.remove_subtree(root), 3);
         assert!(table.is_empty());

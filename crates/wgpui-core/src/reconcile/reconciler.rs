@@ -38,7 +38,7 @@
 
 use crate::invalidation::axes::Invalidation;
 use crate::reconcile::description::{Description, ElementId};
-use crate::reconcile::instance::{InstanceKey, InstanceTable};
+use crate::reconcile::instance::{InstanceKey, InstanceTable, RetainedElement};
 use crate::reconcile::plan::{FramePlan, NodeOutcome, PlannedNode, RebuildReason};
 use crate::reconcile::state::StateScope;
 use crate::reconcile::uncached::UncachedScope;
@@ -348,11 +348,13 @@ impl Reconciler {
         } else {
             self.instances.store(
                 instance_key,
-                type_id,
-                diff_key,
-                layout_node,
-                child_nodes,
-                child_instances,
+                RetainedElement {
+                    type_id,
+                    diff_key,
+                    layout_node,
+                    child_nodes,
+                    children: child_instances,
+                },
                 self.frame,
             );
         }

@@ -128,7 +128,7 @@ impl Arena {
     /// Advance the frontier to a multiple of `class_units`, banking the skipped
     /// span as aligned free blocks rather than losing it.
     fn align_frontier_to(&mut self, class_units: u32) -> Option<()> {
-        while self.frontier_units % class_units != 0 {
+        while !self.frontier_units.is_multiple_of(class_units) {
             // The frontier's own alignment is its lowest set bit; a block of
             // that size starting there is self-aligned, which is what keeps
             // buddy coalescing exact.

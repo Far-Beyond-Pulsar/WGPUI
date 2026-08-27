@@ -356,21 +356,71 @@ mod tests {
         (scene, layers)
     }
 
-    /// Rebuild a reference scene from nothing, holding exactly `quads` and
-    /// `runs` per layer in the given order.
-    fn rebuild(
-        layers: &[(LayerId, Vec<(RecordKey, Quad)>, Vec<(RecordKey, GlyphRun)>)],
-    ) -> Result<Scene, PatchError> {
+    /// One layer's intended content, maintained by the test independently of
+    /// the scene so gate #1's reference is not derived from the thing under
+    /// test.
+    #[derive(Clone, Debug, Default)]
+    struct LayerOracle {
+        quads: Vec<(RecordKey, Quad)>,
+        runs: Vec<(RecordKey, GlyphRun)>,
+    }
+
+    impl LayerOracle {
+        fn insert_quad(&mut self, index: usize, record: RecordKey, value: Quad) {
+            self.quads.insert(index, (record, value));
+        }
+
+        fn update_quad(&mut self, record: RecordKey, value: Quad) {
+            for entry in self.quads.iter_mut() {
+                if entry.0 == record {
+                    entry.1 = value;
+                }
+            }
+        }
+
+        fn remove_quad(&mut self, record: RecordKey) {
+            self.quads.retain(|entry| entry.0 != record);
+        }
+
+        fn insert_run(&mut self, index: usize, record: RecordKey, value: GlyphRun) {
+            self.runs.insert(index, (record, value));
+        }
+
+        fn update_run(&mut self, record: RecordKey, value: GlyphRun) {
+            for entry in self.runs.iter_mut() {
+                if entry.0 == record {
+                    entry.1 = value.clone();
+                }
+            }
+        }
+
+        /// Confirm the scene actually holds what the oracle says it should,
+        /// record for record, before any byte comparison happens.
+        fn assert_matches(&self, scene: &Scene, layer: LayerId) {
+            let quad_keys: Vec<RecordKey> = self.quads.iter().map(|entry| entry.0).collect();
+            assert_eq!(scene.quads.keys(layer), quad_keys);
+            for (record, value) in &self.quads {
+                assert_eq!(scene.quads.get(layer, *record), Some(value));
+            }
+            let run_keys: Vec<RecordKey> = self.runs.iter().map(|entry| entry.0).collect();
+            assert_eq!(scene.glyph_runs.keys(layer), run_keys);
+            for (record, value) in &self.runs {
+                assert_eq!(scene.glyph_runs.get(layer, *record), Some(value));
+            }
+        }
+    }
+
+    /// Rebuild a reference scene from nothing, holding exactly what each
+    /// oracle describes, in the order it describes.
+    fn rebuild(oracles: &[LayerOracle]) -> Result<Scene, PatchError> {
         let mut scene = Scene::new();
         let mut patch = ScenePatch::new();
-        for (index, (_, quads, runs)) in layers.iter().enumerate() {
+        for (index, oracle) in oracles.iter().enumerate() {
             let layer = scene.layer(LayerKey::untiled(BoundaryId::from_raw(index as u64)));
-            for (position, (record, value)) in quads.iter().enumerate() {
-                patch
-                    .quads
-                    .insert(layer, *record, position as u32, *value);
+            for (position, (record, value)) in oracle.quads.iter().enumerate() {
+                patch.quads.insert(layer, *record, position as u32, *value);
             }
-            for (position, (record, value)) in runs.iter().enumerate() {
+            for (position, (record, value)) in oracle.runs.iter().enumerate() {
                 patch
                     .glyph_runs
                     .insert(layer, *record, position as u32, value.clone());
@@ -391,88 +441,89 @@ mod tests {
     /// update that changes slot count, interior removals, and enough growth to
     /// cross a size class and force a relocation — across two layers and both
     /// primitive kinds.
+    ///
+    /// [`LayerOracle`] tracks the intended final content independently, so the
+    /// reference is built from what the patch sequence *meant*, not from what
+    /// the scene ended up holding. Deriving the reference from the scene would
+    /// make the gate self-fulfilling: it would prove the encoder deterministic
+    /// and nothing else.
     #[test]
     fn gate_1_a_patch_sequence_round_trips_to_a_full_rebuild() -> Result<(), PatchError> {
         let (mut scene, layers) = scene_with_layers(2);
         let (first, second) = (layers[0], layers[1]);
+        let mut first_oracle = LayerOracle::default();
+        let mut second_oracle = LayerOracle::default();
 
         let mut frame = ScenePatch::new();
         for index in 0..70u32 {
             frame
                 .quads
                 .append(first, key(index as u64 + 1), index, quad(index as f32));
+            first_oracle.insert_quad(index as usize, key(index as u64 + 1), quad(index as f32));
         }
         frame.glyph_runs.insert(first, key(9001), 0, run(4, 1.0));
+        first_oracle.insert_run(0, key(9001), run(4, 1.0));
         frame.glyph_runs.insert(first, key(9002), 1, run(6, 2.0));
+        first_oracle.insert_run(1, key(9002), run(6, 2.0));
         frame.quads.insert(second, key(5001), 0, quad(100.0));
+        second_oracle.insert_quad(0, key(5001), quad(100.0));
         apply(&mut scene, &frame)?;
+        first_oracle.assert_matches(&scene, first);
 
         // Frame 2: interior insert, in-place update, and a run that grows.
         let mut frame = ScenePatch::new();
         frame.quads.insert(first, key(500), 10, quad(-1.0));
+        first_oracle.insert_quad(10, key(500), quad(-1.0));
         frame.quads.update(first, key(3), quad(-2.0));
+        first_oracle.update_quad(key(3), quad(-2.0));
         frame.glyph_runs.update(first, key(9001), run(11, 3.0));
+        first_oracle.update_run(key(9001), run(11, 3.0));
         apply(&mut scene, &frame)?;
+        first_oracle.assert_matches(&scene, first);
 
-        // Frame 3: removals, including one that shrinks below a size class,
+        // Frame 3: removals, including enough to shrink below a size class,
         // plus an append onto the second layer.
         let mut frame = ScenePatch::new();
         for index in 0..40u32 {
             frame.quads.remove(first, key(index as u64 + 1));
+            first_oracle.remove_quad(key(index as u64 + 1));
         }
         frame.quads.append(second, key(5002), 1, quad(101.0));
+        second_oracle.insert_quad(1, key(5002), quad(101.0));
         apply(&mut scene, &frame)?;
+        first_oracle.assert_matches(&scene, first);
+        second_oracle.assert_matches(&scene, second);
 
         // Frame 4: grow the first layer back across a size class, which
-        // relocates it now that the second layer sits behind it.
+        // relocates it now that the second layer sits behind it in the arena.
+        let base_before = scene.quads.slab(first).base;
         let mut frame = ScenePatch::new();
         for index in 0..200u32 {
+            let position = 31 + index;
             frame.quads.append(
                 first,
                 key(20_000 + index as u64),
-                31 + index,
+                position,
+                quad(index as f32 + 0.5),
+            );
+            first_oracle.insert_quad(
+                position as usize,
+                key(20_000 + index as u64),
                 quad(index as f32 + 0.5),
             );
         }
         apply(&mut scene, &frame)?;
+        first_oracle.assert_matches(&scene, first);
+        assert_ne!(
+            scene.quads.slab(first).base,
+            base_before,
+            "the sequence must actually force a relocation, or it does not test one"
+        );
 
-        let expected_first_quads: Vec<(RecordKey, Quad)> = scene
-            .quads
-            .keys(first)
-            .into_iter()
-            .filter_map(|record| scene.quads.get(first, record).map(|value| (record, *value)))
-            .collect();
-        let expected_first_runs: Vec<(RecordKey, GlyphRun)> = scene
-            .glyph_runs
-            .keys(first)
-            .into_iter()
-            .filter_map(|record| {
-                scene
-                    .glyph_runs
-                    .get(first, record)
-                    .map(|value| (record, value.clone()))
-            })
-            .collect();
-        let expected_second_quads: Vec<(RecordKey, Quad)> = scene
-            .quads
-            .keys(second)
-            .into_iter()
-            .filter_map(|record| {
-                scene
-                    .quads
-                    .get(second, record)
-                    .map(|value| (record, *value))
-            })
-            .collect();
+        assert_eq!(first_oracle.quads.len(), 231);
+        assert_eq!(second_oracle.quads.len(), 2);
 
-        assert_eq!(expected_first_quads.len(), 231);
-        assert_eq!(expected_second_quads.len(), 2);
-
-        let reference = rebuild(&[
-            (first, expected_first_quads, expected_first_runs),
-            (second, expected_second_quads, Vec::new()),
-        ])?;
-
+        let reference = rebuild(&[first_oracle, second_oracle])?;
         assert_eq!(
             compare_to_rebuild(&scene, &reference),
             None,
@@ -490,27 +541,31 @@ mod tests {
         frame.quads.insert(layer, key(2), 1, quad(2.0));
         apply(&mut scene, &frame)?;
 
-        let reference = rebuild(&[(
-            layer,
-            vec![(key(1), quad(1.0)), (key(2), quad(9.0))],
-            Vec::new(),
-        )])?;
+        let wrong_value = LayerOracle {
+            quads: vec![(key(1), quad(1.0)), (key(2), quad(9.0))],
+            runs: Vec::new(),
+        };
         assert!(
             matches!(
-                compare_to_rebuild(&scene, &reference),
+                compare_to_rebuild(&scene, &rebuild(&[wrong_value])?),
                 Some(ResidencyMismatch::Bytes { .. })
             ),
             "the comparison must be capable of failing, or gate #1 proves nothing"
         );
 
-        let reordered = rebuild(&[(
-            layer,
-            vec![(key(2), quad(2.0)), (key(1), quad(1.0))],
-            Vec::new(),
-        )])?;
+        let wrong_order = LayerOracle {
+            quads: vec![(key(2), quad(2.0)), (key(1), quad(1.0))],
+            runs: Vec::new(),
+        };
         assert!(matches!(
-            compare_to_rebuild(&scene, &reordered),
+            compare_to_rebuild(&scene, &rebuild(&[wrong_order])?),
             Some(ResidencyMismatch::RecordOrder { .. })
+        ));
+
+        let extra_layer = compare_to_rebuild(&scene, &Scene::new());
+        assert!(matches!(
+            extra_layer,
+            Some(ResidencyMismatch::LayerSet { .. })
         ));
         Ok(())
     }
