@@ -609,7 +609,18 @@ impl Emitter {
         boundaries: &mut HashMap<BoundaryId, BoundaryFrame>,
     ) -> LayerId {
         let layer = self.compositor.visit(boundary, policy, frame);
-        scene.layer(LayerKey::untiled(boundary));
+        let key = LayerKey::untiled(boundary);
+        // A frame's invalidation is what *this* frame made stale, so a layer
+        // that already existed starts the frame clean and accumulates only what
+        // this frame raises: `LayerTable::set_transform` below, and
+        // `patch::apply`'s own axis derivation once the patch lands. A layer
+        // seen for the first time keeps the fully-invalid state it was created
+        // in, because nothing about it is resident yet.
+        let existing = scene.layers.contains(LayerId::from_key(key));
+        scene.layer(key);
+        if existing {
+            scene.layers.mark_clean(layer);
+        }
         let moved = self.compositor.set_transform(boundary, transform);
         let entry = boundaries.entry(boundary).or_insert(BoundaryFrame {
             layer,
@@ -731,5 +742,684 @@ impl Emitter {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::boundary::policy::Retention;
+    use crate::invalidation::axes::Invalidation;
+    use crate::patch::apply::apply;
+    use crate::patch::{PatchError, PatchOp};
+    use crate::reconcile::description::Description;
+    use crate::reconcile::diff_key::{ReconcileKey, compare_by_equality};
+    use crate::reconcile::plan::PlannedNode;
+    use crate::reconcile::reconciler::{ReconcileError, Reconciler};
+    use std::any::Any;
+    use wgpui_layout::taffy_tree::{Dimension, FlexDirection, LayoutSize, LayoutStyle, definite};
+
+    struct Panel;
+
+    const VIEWPORT_WIDTH: f32 = 400.0;
+    const VIEWPORT_HEIGHT: f32 = 300.0;
+    const ROW_HEIGHT: f32 = 20.0;
+    /// Enough rows that the boundary is over `rasterize_above` and therefore
+    /// texture-retained, so gate #1 exercises the "independent GPU texture
+    /// retention" half of §8's Phase 2 row rather than only the transform half.
+    const ROW_COUNT: u32 = 300;
+
+    #[derive(PartialEq, Debug)]
+    struct Fingerprint(u32);
+
+    impl ReconcileKey for Fingerprint {
+        fn compare(&self, previous: &dyn ReconcileKey) -> Invalidation {
+            compare_by_equality(self, previous, Invalidation::DISPLAY)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn column(width: f32, height: f32) -> LayoutStyle {
+        LayoutStyle {
+            flex_direction: FlexDirection::Column,
+            size: LayoutSize {
+                width: Dimension::length(width),
+                height: Dimension::length(height),
+            },
+            ..LayoutStyle::default()
+        }
+    }
+
+    fn fixed(width: f32, height: f32) -> LayoutStyle {
+        LayoutStyle {
+            size: LayoutSize {
+                width: Dimension::length(width),
+                height: Dimension::length(height),
+            },
+            flex_shrink: 0.0,
+            ..LayoutStyle::default()
+        }
+    }
+
+    /// A quad the size of the element that emitted it, so a test can read an
+    /// element's resolved position straight out of the scene.
+    fn fill(tint: f32) -> impl Emit {
+        move |context: &EmitContext, emission: &mut Emission| {
+            emission.quad(Quad {
+                origin: [context.bounds.x, context.bounds.y],
+                size: [context.bounds.width, context.bounds.height],
+                background: [tint, tint, tint, 1.0],
+                ..Quad::ZERO
+            });
+        }
+    }
+
+    /// One scroll container holding [`ROW_COUNT`] rows, with `.boundary()`
+    /// applied or not and nothing else different between the two.
+    ///
+    /// Nothing here names an element, keys a layer, tunes a policy, or declares
+    /// an invalidation — SFD §0.1's five-call opt-in reduced to one call or
+    /// zero, which is what §8's Phase 2 gate means by "no other API touched."
+    fn scroller(boundaried: bool, offset: f32, revision: u32) -> Description {
+        let rows = (0..ROW_COUNT).map(|row| {
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(revision))
+                .style(fixed(VIEWPORT_WIDTH, ROW_HEIGHT))
+                .emit(fill(row as f32 / ROW_COUNT as f32))
+        });
+        let container = Description::new::<Panel>()
+            .diff_key(Fingerprint(revision))
+            .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+            .scroll_offset([0.0, offset])
+            .emit(fill(0.0))
+            .children(rows);
+        let container = if boundaried {
+            container.boundary()
+        } else {
+            container
+        };
+        Description::new::<Panel>()
+            .diff_key(Fingerprint(revision))
+            .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+            .child(container)
+    }
+
+    /// Everything one window holds across frames, so a test drives real frames
+    /// rather than asserting on intermediate values.
+    struct Window {
+        reconciler: Reconciler,
+        layout: LayoutTree,
+        emitter: Emitter,
+        scene: Scene,
+    }
+
+    #[derive(Debug)]
+    enum FrameError {
+        Reconcile(ReconcileError),
+        Emit(EmitError),
+        Patch(PatchError),
+    }
+
+    impl From<ReconcileError> for FrameError {
+        fn from(error: ReconcileError) -> Self {
+            FrameError::Reconcile(error)
+        }
+    }
+
+    impl From<EmitError> for FrameError {
+        fn from(error: EmitError) -> Self {
+            FrameError::Emit(error)
+        }
+    }
+
+    impl From<PatchError> for FrameError {
+        fn from(error: PatchError) -> Self {
+            FrameError::Patch(error)
+        }
+    }
+
+    /// What one driven frame produced, kept together so a gate can assert on
+    /// the reconciliation and the compositing halves side by side — which is
+    /// the entire point of gate #2.
+    struct Frame {
+        reconciled: crate::reconcile::plan::FrameStats,
+        layout_nodes: Vec<wgpui_layout::taffy_tree::LayoutNodeId>,
+        fully_reused: bool,
+        emission: FrameEmission,
+        uploaded_bytes: u64,
+        upload_calls: usize,
+    }
+
+    impl Window {
+        fn new() -> Self {
+            Self {
+                reconciler: Reconciler::new(),
+                layout: LayoutTree::new(),
+                emitter: Emitter::new(),
+                scene: Scene::new(),
+            }
+        }
+
+        fn draw(
+            &mut self,
+            description: Description,
+            signals: &FrameSignals,
+        ) -> Result<Frame, FrameError> {
+            let plan = self.reconciler.reconcile(description, &mut self.layout)?;
+            let root = plan
+                .root()
+                .map(|node| node.layout_node)
+                .ok_or(EmitError::MalformedPlan { index: 0, depth: 0 })?;
+            self.layout
+                .compute_layout(root, definite(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+                .map_err(EmitError::from)?;
+            let emission =
+                self.emitter
+                    .emit(&plan, &self.layout, signals, &mut self.scene)?;
+            let uploads = apply(&mut self.scene, &emission.patch)?;
+            Ok(Frame {
+                reconciled: plan.stats(),
+                layout_nodes: plan.nodes().iter().map(|node| node.layout_node).collect(),
+                fully_reused: plan.fully_reused(),
+                emission,
+                uploaded_bytes: uploads.byte_count(),
+                upload_calls: uploads.len(),
+            })
+        }
+    }
+
+    fn boundary_of(window: &Window) -> BoundaryId {
+        // The scroll container is the root's first child, and neither names
+        // itself, so its identity is `[Slot(0), Slot(0)]` — SFD §1.0's
+        // positional fallback, resolved the same way a test outside the crate
+        // would have to resolve it.
+        use crate::boundary::identity::BoundaryIdentity;
+        use crate::reconcile::description::ElementId;
+        let _ = window;
+        BoundaryIdentity::from_path(&[ElementId::Slot(0), ElementId::Slot(0)])
+    }
+
+    /// Recursively confirm nothing in the tree names itself, keys a layer, or
+    /// opts out of anything — the "with no other API touched" clause of §8's
+    /// Phase 2 gate, checked mechanically rather than by reading the helper.
+    fn assert_only_boundary_is_touched(description: &Description, boundaried: bool) {
+        assert!(
+            description.element_id().is_none(),
+            "the gate requires a tree with no explicit id anywhere"
+        );
+        assert!(!description.is_uncached());
+        if let Some(policy) = description.boundary_policy() {
+            assert!(boundaried, "no boundary may appear in the unboundaried tree");
+            assert_eq!(
+                policy,
+                BoundaryPolicy::default(),
+                "`.boundary()` must be reachable with zero policy arguments"
+            );
+        }
+        for child in description.child_descriptions() {
+            assert_only_boundary_is_touched(child, boundaried);
+        }
+    }
+
+    /// **Phase 2 gate #1** (§4.1, §5.4, §8): `.boundary()` with zero policy
+    /// arguments reaches the fast path — a plain scroll container recomposites
+    /// transform-only on a scroll-reason notification, with no other API
+    /// touched.
+    #[test]
+    fn gate_1_a_bare_boundary_recomposites_a_scroll_transform_only() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let boundary = boundary_of(&window);
+        let layer = LayerId::from_key(LayerKey::untiled(boundary));
+
+        let first = scroller(true, 0.0, 0);
+        assert_only_boundary_is_touched(&first, true);
+        let built = window.draw(first, &FrameSignals::new())?;
+        assert_eq!(
+            built.emission.stats.records_inserted,
+            ROW_COUNT as usize + 1,
+            "one quad per row, plus the container's own background"
+        );
+
+        // A settled frame: nothing changed, nothing was signalled.
+        let idle = window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+        assert!(idle.fully_reused);
+        assert!(idle.emission.patch.is_empty());
+        assert_eq!(idle.uploaded_bytes, 0);
+        assert_eq!(
+            idle.emission.composite_for(boundary).map(|c| c.composite),
+            Some(Composite::Clean)
+        );
+        assert_eq!(
+            window.scene.layers.get(layer).map(|layer| layer.invalidation()),
+            Some(Invalidation::empty()),
+            "a settled frame leaves nothing stale — R-N §3.2's clean layer"
+        );
+
+        // The scroll tick itself: one tagged notification, one changed offset.
+        let mut signals = FrameSignals::new();
+        signals.scrolled(layer);
+        let scrolled = window.draw(scroller(true, -ROW_HEIGHT * 3.0, 0), &signals)?;
+
+        assert!(
+            scrolled.fully_reused,
+            "ambient reconciliation must still find the whole tree clean"
+        );
+        let composite = scrolled
+            .emission
+            .composite_for(boundary)
+            .ok_or(EmitError::MalformedPlan { index: 0, depth: 0 })?;
+        assert_eq!(
+            composite.composite,
+            Composite::TransformOnly,
+            "a bare `.boundary()` must reach R-N's fast path with no tuning"
+        );
+        assert_eq!(composite.invalidation, Invalidation::TRANSFORM);
+        assert_eq!(
+            composite.transform,
+            LayerTransform::translated(0.0, -ROW_HEIGHT * 3.0),
+            "the whole cost of the tick is one changed transform"
+        );
+        assert_eq!(
+            composite.retention,
+            Retention::Texture,
+            "a 300-row boundary is over `rasterize_above`, so it retains independently"
+        );
+
+        // The observable consequence, which is what makes this a gate rather
+        // than an assertion about the decision that produced it.
+        assert!(
+            scrolled.emission.patch.is_empty(),
+            "transform-only means no content patch at all, not a small one"
+        );
+        assert_eq!(scrolled.uploaded_bytes, 0);
+        assert_eq!(scrolled.upload_calls, 0);
+        assert_eq!(scrolled.emission.stats.nodes_emitted, 0);
+        assert_eq!(
+            scrolled.emission.stats.nodes_skipped,
+            ROW_COUNT as usize + 1,
+            "every element that emits anything skipped emitting"
+        );
+        assert_eq!(scrolled.emission.stats.transform_only, 1);
+
+        // And the scene agrees: the layer moved, its residency did not.
+        assert_eq!(
+            window.scene.layers.get(layer).map(|layer| layer.transform()),
+            Some(LayerTransform::translated(0.0, -ROW_HEIGHT * 3.0))
+        );
+        assert_eq!(
+            window.scene.layers.get(layer).map(|layer| layer.invalidation()),
+            Some(Invalidation::TRANSFORM)
+        );
+        assert_eq!(window.scene.quads.len(layer), ROW_COUNT);
+        Ok(())
+    }
+
+    /// **Phase 2 gate #2** (§4.0, §4.1, §8): removing `.boundary()` from gate
+    /// #1's case degrades the scroll to a per-tick recomposite but does **not**
+    /// reintroduce a full rebuild.
+    ///
+    /// This is the load-bearing one. Phase 1's whole claim was that
+    /// reconciliation is ambient and owes nothing to any boundary; this is
+    /// where that gets proved *under* a boundary, by taking the boundary away
+    /// and showing the reconciler's answer is bit-for-bit the same one.
+    #[test]
+    fn gate_2_removing_the_boundary_costs_a_recomposite_and_not_a_rebuild()
+    -> Result<(), FrameError> {
+        let mut boundaried = Window::new();
+        let mut plain = Window::new();
+        let boundary = boundary_of(&boundaried);
+        let boundary_layer = LayerId::from_key(LayerKey::untiled(boundary));
+        let root_layer = LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT));
+
+        let plain_description = scroller(false, 0.0, 0);
+        assert_only_boundary_is_touched(&plain_description, false);
+        boundaried.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+        plain.draw(plain_description, &FrameSignals::new())?;
+
+        let mut boundaried_signals = FrameSignals::new();
+        boundaried_signals.scrolled(boundary_layer);
+        let mut plain_signals = FrameSignals::new();
+        plain_signals.scrolled(root_layer);
+
+        let offset = -ROW_HEIGHT * 3.0;
+        let with = boundaried.draw(scroller(true, offset, 0), &boundaried_signals)?;
+        let without = plain.draw(scroller(false, offset, 0), &plain_signals)?;
+
+        // 1. Reconciliation is identical. Not "similar", not "also fast" —
+        //    the same numbers and the same retained layout-node identities.
+        assert_eq!(
+            with.reconciled, without.reconciled,
+            "reconciliation must not be able to tell whether a boundary exists"
+        );
+        assert_eq!(with.layout_nodes, without.layout_nodes);
+        assert!(with.fully_reused && without.fully_reused);
+        assert_eq!(without.reconciled.rebuilt, 0, "no element rebuilt");
+        assert_eq!(without.reconciled.layout_nodes_created, 0, "no node recreated");
+        assert_eq!(without.reconciled.layout_nodes_swept, 0);
+        assert_eq!(without.reconciled.instances_swept, 0);
+        assert_eq!(
+            plain.reconciler.instances().len(),
+            boundaried.reconciler.instances().len()
+        );
+
+        // 2. Compositing is not. The unboundaried container folds its offset
+        //    into its children, so every visible row moves and re-emits.
+        assert!(
+            with.emission.patch.is_empty(),
+            "the boundaried case is the control: it emits nothing"
+        );
+        assert!(!without.emission.patch.is_empty());
+        assert_eq!(without.emission.stats.nodes_emitted, ROW_COUNT as usize);
+        assert!(without.uploaded_bytes > 0);
+        assert_eq!(
+            without.emission.composite_for(BoundaryId::ROOT).map(|c| c.composite),
+            Some(Composite::Redisplay)
+        );
+
+        // 3. It is a recomposite and *not* a rebuild: every operation is a
+        //    value update in place. No record was inserted, removed, or
+        //    relocated, so §5.0's O(1) path carried the whole tick.
+        assert_eq!(without.emission.stats.records_updated, ROW_COUNT as usize);
+        assert_eq!(without.emission.stats.records_inserted, 0);
+        assert_eq!(without.emission.stats.records_removed, 0);
+        assert!(
+            without
+                .emission
+                .patch
+                .quads
+                .patches()
+                .iter()
+                .all(|patch| matches!(patch.op, PatchOp::Update { .. })),
+            "a degraded scroll must stay a value update, never an insert/remove churn"
+        );
+        assert_eq!(
+            without.uploaded_bytes,
+            ROW_COUNT as u64 * Quad::SLOT_STRIDE as u64,
+            "exactly the moved rows' bytes, and nothing wider"
+        );
+
+        // 4. The container's own background did not move in either case: a
+        //    scroll container's own paint does not scroll with its contents.
+        assert_eq!(plain.scene.quads.len(root_layer), ROW_COUNT + 1);
+        assert_eq!(boundaried.scene.quads.len(root_layer), 1);
+        assert_eq!(boundaried.scene.quads.len(boundary_layer), ROW_COUNT);
+        Ok(())
+    }
+
+    #[test]
+    fn a_boundary_that_was_not_told_this_was_a_scroll_folds_the_offset_in()
+    -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let boundary = boundary_of(&window);
+        window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+
+        let mut signals = FrameSignals::new();
+        signals.data_changed(LayerId::from_key(LayerKey::untiled(boundary)));
+        let frame = window.draw(scroller(true, -ROW_HEIGHT, 0), &signals)?;
+
+        assert!(frame.fully_reused, "the content itself is still clean");
+        assert_eq!(
+            frame.emission.composite_for(boundary).map(|c| c.composite),
+            Some(Composite::Redisplay),
+            "the fast path needs the signal as well as the measurement"
+        );
+        assert_eq!(
+            frame.emission.composite_for(boundary).map(|c| c.transform),
+            Some(LayerTransform::IDENTITY),
+            "a boundary refused the fast path must not leave a stale transform behind"
+        );
+        assert!(frame.uploaded_bytes > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_content_change_inside_a_scrolling_boundary_redisplays_it()
+    -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let boundary = boundary_of(&window);
+        let layer = LayerId::from_key(LayerKey::untiled(boundary));
+        window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+
+        let mut signals = FrameSignals::new();
+        signals.scrolled(layer);
+        let frame = window.draw(scroller(true, -ROW_HEIGHT, 1), &signals)?;
+
+        assert!(!frame.fully_reused);
+        assert_eq!(
+            frame.emission.composite_for(boundary).map(|c| c.composite),
+            Some(Composite::Redisplay),
+            "a scroll signal must never override a measured-dirty subtree"
+        );
+        assert_eq!(
+            frame.emission.composite_for(boundary).map(|c| c.invalidation),
+            Some(Invalidation::DISPLAY)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_boundary_holding_little_stays_primitive_retained() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let leaf = || {
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(0))
+                .style(fixed(10.0, 10.0))
+                .emit(fill(0.5))
+        };
+        let description = Description::new::<Panel>()
+            .diff_key(Fingerprint(0))
+            .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+            .child(
+                Description::new::<Panel>()
+                    .diff_key(Fingerprint(0))
+                    .style(column(100.0, 100.0))
+                    .boundary()
+                    .child(leaf())
+                    .child(leaf()),
+            );
+        let frame = window.draw(description, &FrameSignals::new())?;
+        let boundary = boundary_of(&window);
+        assert_eq!(
+            frame.emission.composite_for(boundary).map(|c| c.retention),
+            Some(Retention::Primitives),
+            "R-N §3.3: a boundary holding two quads is cheaper to re-emit than to composite"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_element_that_stops_emitting_takes_its_records_with_it() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let root_layer = LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT));
+        let describe = |emits: bool| {
+            let leaf = Description::new::<Panel>()
+                .diff_key(Fingerprint(emits as u32))
+                .style(fixed(10.0, 10.0));
+            let leaf = if emits { leaf.emit(fill(0.25)) } else { leaf };
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(0))
+                .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+                .child(leaf)
+        };
+        window.draw(describe(true), &FrameSignals::new())?;
+        assert_eq!(window.scene.quads.len(root_layer), 1);
+        assert_eq!(window.emitter.emitting_element_count(), 1);
+
+        window.draw(describe(false), &FrameSignals::new())?;
+        assert_eq!(window.scene.quads.len(root_layer), 0);
+        assert_eq!(window.emitter.emitting_element_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn an_element_that_leaves_the_tree_takes_its_records_with_it() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let root_layer = LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT));
+        let describe = |leaves: u32| {
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(leaves))
+                .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+                .children((0..leaves).map(|index| {
+                    Description::new::<Panel>()
+                        .diff_key(Fingerprint(index))
+                        .style(fixed(10.0, 10.0))
+                        .emit(fill(0.5))
+                }))
+        };
+        window.draw(describe(4), &FrameSignals::new())?;
+        assert_eq!(window.scene.quads.len(root_layer), 4);
+
+        let shrunk = window.draw(describe(1), &FrameSignals::new())?;
+        assert_eq!(window.scene.quads.len(root_layer), 1);
+        assert_eq!(shrunk.emission.stats.records_removed, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn an_uncached_subtree_still_emits_every_frame() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let root_layer = LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT));
+        let describe = || {
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(0))
+                .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+                .child(
+                    Description::new::<Panel>()
+                        .uncached()
+                        .style(column(100.0, 100.0))
+                        .child(
+                            Description::new::<Panel>()
+                                .style(fixed(10.0, 10.0))
+                                .emit(fill(0.75)),
+                        ),
+                )
+        };
+        window.draw(describe(), &FrameSignals::new())?;
+        assert_eq!(window.scene.quads.len(root_layer), 1);
+
+        // §4.2: "an `.uncached()` subtree still emits ordinary patches every
+        // frame (always a full replace, never a delta)" — and its residency is
+        // bounded by the emitter's own sweep, since it has no instance record
+        // for the reconciler's sweep to reach.
+        let second = window.draw(describe(), &FrameSignals::new())?;
+        assert_eq!(second.emission.stats.nodes_emitted, 1);
+        assert_eq!(second.emission.stats.records_updated, 1);
+        assert_eq!(window.scene.quads.len(root_layer), 1);
+        assert_eq!(window.emitter.emitting_element_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_element_emitting_several_primitives_keeps_each_ones_address()
+    -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let root_layer = LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT));
+        let describe = |tint: f32, revision: u32| {
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(revision))
+                .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+                .child(
+                    Description::new::<Panel>()
+                        .diff_key(Fingerprint(revision))
+                        .style(fixed(10.0, 10.0))
+                        .emit(move |context: &EmitContext, emission: &mut Emission| {
+                            emission
+                                .quad(Quad {
+                                    background: [tint, 0.0, 0.0, 1.0],
+                                    size: [context.bounds.width, context.bounds.height],
+                                    ..Quad::ZERO
+                                })
+                                .quad(Quad {
+                                    border_color: [0.0, tint, 0.0, 1.0],
+                                    ..Quad::ZERO
+                                })
+                                .glyph_run(GlyphRun::empty([tint, tint, tint, 1.0]));
+                        }),
+                )
+        };
+        window.draw(describe(0.25, 0), &FrameSignals::new())?;
+        let keys = window.scene.quads.keys(root_layer);
+        assert_eq!(keys.len(), 2);
+
+        let second = window.draw(describe(0.5, 1), &FrameSignals::new())?;
+        assert_eq!(
+            second.emission.stats.records_updated,
+            3,
+            "two quads and one glyph run, each addressed by its own ordinal"
+        );
+        assert_eq!(second.emission.stats.records_inserted, 0);
+        assert_eq!(second.emission.patch.glyph_runs.len(), 1);
+        assert_eq!(
+            window.scene.quads.keys(root_layer),
+            keys,
+            "a stable emission order means stable per-primitive addresses (§5.0)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_emitter_is_never_run_for_an_element_that_did_not_move_or_change()
+    -> Result<(), FrameError> {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut window = Window::new();
+        let calls = Rc::new(Cell::new(0u32));
+        let describe = |revision: u32, calls: Rc<Cell<u32>>| {
+            Description::new::<Panel>()
+                .diff_key(Fingerprint(0))
+                .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+                .child(
+                    Description::new::<Panel>()
+                        .diff_key(Fingerprint(revision))
+                        .style(fixed(10.0, 10.0))
+                        .emit(move |context: &EmitContext, emission: &mut Emission| {
+                            calls.set(calls.get() + 1);
+                            emission.quad(Quad {
+                                size: [context.bounds.width, context.bounds.height],
+                                ..Quad::ZERO
+                            });
+                        }),
+                )
+        };
+        window.draw(describe(0, Rc::clone(&calls)), &FrameSignals::new())?;
+        assert_eq!(calls.get(), 1);
+        window.draw(describe(0, Rc::clone(&calls)), &FrameSignals::new())?;
+        assert_eq!(calls.get(), 1, "a clean, unmoved element must not be asked again");
+        window.draw(describe(1, Rc::clone(&calls)), &FrameSignals::new())?;
+        assert_eq!(calls.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_plan_is_reported_rather_than_walked() {
+        let mut plan = FramePlan::new();
+        let mut node = PlannedNode {
+            address: InstanceKey::from_raw(1),
+            instance: None,
+            boundary: BoundaryId::ROOT,
+            declared_boundary: None,
+            boundary_policy: None,
+            scroll_offset: [0.0, 0.0],
+            state: crate::reconcile::state::StateScope::from_path(&[]),
+            layout_node: wgpui_layout::taffy_tree::LayoutNodeId::from_raw(0),
+            depth: 0,
+            outcome: crate::reconcile::plan::NodeOutcome::Uncached,
+            invalidation: Invalidation::all(),
+        };
+        plan.push(node);
+        node.depth = 4;
+        plan.push(node);
+
+        let mut emitter = Emitter::new();
+        let mut scene = Scene::new();
+        let layout = LayoutTree::new();
+        assert!(matches!(
+            emitter.emit(&plan, &layout, &FrameSignals::new(), &mut scene),
+            Err(EmitError::MalformedPlan { index: 0, .. }) | Err(EmitError::Layout(_))
+        ));
     }
 }
