@@ -216,10 +216,13 @@ impl StagingReader {
 
 /// The one place a dropped readback result is acknowledged.
 ///
-/// `wgpui-wgpu` has no logging dependency yet and `AGENTS.md` forbids
-/// discarding a fallible result silently, so this is the visible acknowledgement
-/// until the crate gains one. It is reachable only if the device is destroyed
-/// while a map is in flight.
+/// `AGENTS.md` forbids discarding a fallible result silently, so the dropped
+/// send is acknowledged rather than swallowed. It is reachable only if the
+/// device is destroyed while a map is in flight.
+///
+/// Phase 4 gave the crate a `log` dependency (for `surface_registry.rs`'s
+/// mechanical move), so this goes through it rather than to stderr — the
+/// earlier note here that the crate had no logger is no longer true.
 fn log_dropped_readback() {
-    eprintln!("wgpui-wgpu: buffer map completed after its receiver was dropped");
+    log::warn!("wgpui-wgpu: buffer map completed after its receiver was dropped");
 }

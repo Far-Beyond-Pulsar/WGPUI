@@ -233,14 +233,21 @@ impl ResolvedArgs {
     ///
     /// `examples/phase4_draw_issuance_bench.rs` prices this column beside the
     /// draw-issuing one, and the gap is not small. On an RTX 4060 (Vulkan,
-    /// 561.03) the fallback's readback ran **187µs at 8 slots and 1.71ms at 128
-    /// slots**, against 0.3–8µs of actual draw issuing. Three digits of
-    /// difference, and it is not the 2KB of argument records that costs it:
-    /// `Device::poll(wait_indefinitely)` waits for *everything already
-    /// submitted*, so reading the arguments back also waits for the compute
-    /// dispatch that wrote them and for the previous frame's rendering to
-    /// drain. The fallback does not merely add a copy; it serializes the CPU
-    /// against the GPU once per frame.
+    /// 561.03) the fallback's readback ran **446µs to 6.40ms**, against
+    /// 0.3–18µs of actual draw issuing — three to four digits of difference.
+    ///
+    /// It is not the 2KB of argument records that costs it, and — the part
+    /// worth stating precisely, because the obvious reading is wrong — it is
+    /// not a function of the slot count either. Both benchmark sweeps make
+    /// that visible: at a *fixed* 8 slots the readback still climbs 446µs →
+    /// 1.72ms as the scene's primitive count rises, and at a fixed primitive
+    /// count it climbs 853µs → 6.40ms as the layer count (and so the dispatch
+    /// count) rises. `Device::poll(wait_indefinitely)` waits for *everything
+    /// already submitted*, so reading the arguments back also waits for the
+    /// compute dispatches that wrote them and for the previous frame's
+    /// rendering to drain. The fallback does not merely add a copy; it
+    /// serializes the CPU against the whole frame's GPU work, once per frame,
+    /// and therefore costs whatever that frame's GPU work costs.
     ///
     /// That is worth stating plainly rather than leaving as a footnote, because
     /// §5.3 describes this path as the WASM path and the macOS best-effort

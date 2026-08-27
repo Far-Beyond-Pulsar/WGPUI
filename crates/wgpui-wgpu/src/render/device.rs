@@ -17,10 +17,12 @@
 //! works today fail to open for no benefit."
 //!
 //! **Phase 4 is where the indirect-draw features earn their keep**, so this
-//! file now negotiates the three `render_context.rs:104-176` already asks for —
-//! `INDIRECT_FIRST_INSTANCE`, `MULTI_DRAW_INDIRECT`, and
-//! `MULTI_DRAW_INDIRECT_COUNT` — and reports what it got as
-//! [`IndirectSupport`]. It negotiates them **best-effort on every platform**,
+//! file now negotiates the two indirect-draw features
+//! `render_context.rs:104-176` already asks for —
+//! `INDIRECT_FIRST_INSTANCE` and `MULTI_DRAW_INDIRECT_COUNT` — and reports what
+//! it got as [`IndirectSupport`]. (There is no third: `MULTI_DRAW_INDIRECT` is
+//! not a feature in wgpu 30 at all, which [`IndirectSupport`]'s own doc
+//! explains.) It negotiates them **best-effort on every platform**,
 //! which is deliberately weaker than what the legacy path does (hard-required
 //! on native outside macOS) and is not an oversight:
 //!

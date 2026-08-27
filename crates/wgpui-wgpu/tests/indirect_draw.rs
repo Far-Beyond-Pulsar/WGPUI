@@ -392,6 +392,7 @@ fn the_fallback_path_is_the_one_that_learns_the_counts() {
     // allocates GPU memory every frame in the one path that exists because the
     // device is already the weak one.
     let allocations_after_first = renderer.readback_allocations();
+    let plan_builds_after_first = renderer.draw_plan_builds();
     for _ in 0..20 {
         renderer
             .render(&context.device, &context.queue, &input, &target)
@@ -402,6 +403,15 @@ fn the_fallback_path_is_the_one_that_learns_the_counts() {
         allocations_after_first,
         "the readback staging buffer must not be reallocated in steady state"
     );
+    assert_eq!(
+        renderer.draw_plan_builds(),
+        plan_builds_after_first,
+        "the per-slot bases and their bind group are a function of residency, \
+         so a frame loop that changes no layer's reservation must not rebuild \
+         them — `QuadDrawPlan`'s own doc says \"per slot-table change rather \
+         than per frame\", and this is what makes that checkable"
+    );
+    assert_eq!(plan_builds_after_first, 1);
 }
 
 /// **Gate 2**: a viewport panel fully covered by a modal issues zero draws for

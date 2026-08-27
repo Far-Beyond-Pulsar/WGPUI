@@ -284,7 +284,7 @@ impl OffscreenTarget {
         let (sender, receiver) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             if sender.send(result).is_err() {
-                eprintln!("wgpui-wgpu: frame readback completed after its receiver was dropped");
+                log::warn!("wgpui-wgpu: frame readback completed after its receiver was dropped");
             }
         });
         device
@@ -327,6 +327,11 @@ pub struct FrameRenderer {
     globals: wgpu::Buffer,
     quad_args: IndirectArgsBuffers,
     composite_args: IndirectArgsBuffers,
+    /// The per-slot bases and their bind group, kept until the slot table
+    /// itself changes — see [`QuadDrawPlan`], which is only true of it if
+    /// something holds it across frames.
+    quad_plan: Option<QuadDrawPlan>,
+    quad_plan_builds: u64,
     reader: StagingReader,
     uploaded_generation: Option<u64>,
 }
@@ -350,6 +355,8 @@ impl FrameRenderer {
             }),
             quad_args: IndirectArgsBuffers::new(device, 1, 1),
             composite_args: IndirectArgsBuffers::new(device, 1, 1),
+            quad_plan: None,
+            quad_plan_builds: 0,
             reader: StagingReader::new(),
             uploaded_generation: None,
         }
@@ -358,6 +365,16 @@ impl FrameRenderer {
     /// How many times the readback staging buffer has been allocated.
     pub fn readback_allocations(&self) -> u64 {
         self.reader.allocations()
+    }
+
+    /// How many times the quad draw plan has been built.
+    ///
+    /// A frame loop whose residency does not change must not keep raising this
+    /// — that is what [`QuadDrawPlan`]'s "per slot-table change rather than per
+    /// frame" means, and a counter is what makes it checkable rather than
+    /// intended.
+    pub fn draw_plan_builds(&self) -> u64 {
+        self.quad_plan_builds
     }
 
     /// Render one frame into `target`.
@@ -540,7 +557,19 @@ impl FrameRenderer {
         timing.readback = started.elapsed();
 
         // --- 4. Issue.
-        let quad_plan = QuadDrawPlan::new(device, queue, &self.quads, &quad_slots);
+        // Rebuilt only when the slot table changes, which is what makes
+        // `QuadDrawPlan`'s "per slot-table change rather than per frame" true:
+        // the bases it holds are each layer's `SlabRange`, so a frame that
+        // changed contents but not residency reuses the buffer and the bind
+        // group untouched. The clean frame the gate measures is exactly that
+        // frame.
+        let quad_plan = match self.quad_plan.take() {
+            Some(plan) if plan.slots() == quad_slots.as_slice() => plan,
+            _ => {
+                self.quad_plan_builds += 1;
+                QuadDrawPlan::new(device, queue, &self.quads, &quad_slots)
+            }
+        };
         let quad_frame_group = self.quads.frame_bind_group(
             device,
             &self.globals,
@@ -592,6 +621,7 @@ impl FrameRenderer {
             timing.draw_issue = started.elapsed();
         }
         queue.submit(Some(encoder.finish()));
+        self.quad_plan = Some(quad_plan);
 
         Ok(FrameOutput {
             stats,

@@ -6764,6 +6764,7 @@ name = "wgpui-wgpu"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "log",
  "pollster 0.4.0",
  "rand 0.10.0",
  "wgpu",
