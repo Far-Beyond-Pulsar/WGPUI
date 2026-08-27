@@ -42,7 +42,7 @@ use crate::patch::apply::{ScenePatch, UploadPlan, apply};
 use crate::patch::primitive::Quad;
 use crate::patch::{PatchError, RecordKey};
 use crate::scene::layer::{Layer, LayerTransform};
-use crate::scene::{BoundaryId, LayerId, LayerKey, Scene, TileCoord, TileGrid};
+use crate::scene::{BoundaryId, LayerId, LayerKey, Scene, TileCoord};
 use std::collections::HashMap;
 
 /// What one frame of the walk looks like.
@@ -1170,6 +1170,7 @@ impl TiledCanvasDriver {
 mod tests {
     use super::*;
     use crate::occlusion::keep_mask;
+    use crate::scene::TileGrid;
 
     #[test]
     fn the_estimate_bounds_a_frame_without_wildly_overshooting_it() {

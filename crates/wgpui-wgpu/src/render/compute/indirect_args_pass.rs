@@ -315,12 +315,100 @@ impl IndirectArgsPass {
             queue.write_buffer(&slot_buffer, 0, slots);
         }
 
+        self.dispatch_with_slots(
+            device,
+            queue,
+            buffers,
+            &slot_buffer,
+            slot_count,
+            vertex_count,
+            first_instance,
+        );
+        Ok(IndirectArgsOutput {
+            slot_count,
+            first_instance,
+            vertex_count,
+        })
+    }
+
+    /// Generate arguments from a slot table **the GPU wrote**, rather than one
+    /// the CPU uploaded.
+    ///
+    /// This is the seam §4.3's tile-visibility pass plugs into, and the reason
+    /// tiling needed no draw path of its own. `slot_buffer` holds one
+    /// `[base, count, 0, 0]` record per slot in exactly
+    /// [`wgpui_core::indirect::encode_slots`]' layout — which is what
+    /// `tile_visibility.wgsl` writes, with an out-of-range tile's count zeroed.
+    /// Everything downstream is unchanged: `compact` turns a zero count into a
+    /// zero-instance record and `pack` drops it, so a tile that is out of range
+    /// simply has nothing to draw.
+    ///
+    /// **The caller validates, because the CPU no longer can.** [`Self::run`]
+    /// checks each slot's reservation against the arena before dispatching; a
+    /// GPU-written table cannot be read without a readback, which is the whole
+    /// thing this path exists to avoid. The caller knows each tile's base and
+    /// count — it wrote the tile descriptors — so it validates those instead.
+    /// [`crate::render::compute::tile_visibility_pass::TileVisibilityPass::run`]
+    /// does exactly that.
+    pub fn run_with_slots(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffers: &IndirectArgsBuffers,
+        slot_buffer: &wgpu::Buffer,
+        slot_count: u32,
+        vertex_count: u32,
+        first_instance: FirstInstance,
+    ) -> IndirectArgsOutput {
+        self.dispatch_with_slots(
+            device,
+            queue,
+            buffers,
+            slot_buffer,
+            slot_count,
+            vertex_count,
+            first_instance,
+        );
+        IndirectArgsOutput {
+            slot_count,
+            first_instance,
+            vertex_count,
+        }
+    }
+
+    fn dispatch_with_slots(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffers: &IndirectArgsBuffers,
+        slot_buffer: &wgpu::Buffer,
+        slot_count: u32,
+        vertex_count: u32,
+        first_instance: FirstInstance,
+    ) {
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("indirect args params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut params_bytes = Vec::with_capacity(16);
+        for value in [
+            slot_count,
+            first_instance.as_u32(),
+            vertex_count,
+            buffers.arena_slots,
+        ] {
+            params_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        queue.write_buffer(&params, 0, &params_bytes);
+
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("indirect args"),
             layout: &self.layout,
             entries: &[
                 binding(0, &params),
-                binding(1, &slot_buffer),
+                binding(1, slot_buffer),
                 binding(2, &buffers.draw_order),
                 binding(3, &buffers.culled),
                 binding(4, &buffers.visible),
@@ -345,12 +433,6 @@ impl IndirectArgsPass {
         // compaction has to stay order-preserving across the whole table.
         dispatch(&mut encoder, &self.pack, &group, 1);
         queue.submit(Some(encoder.finish()));
-
-        Ok(IndirectArgsOutput {
-            slot_count,
-            first_instance,
-            vertex_count,
-        })
     }
 
     /// Read the argument records back — the differential harness's use, and the
