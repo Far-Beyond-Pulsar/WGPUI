@@ -26,9 +26,15 @@ struct Globals {
     padding: vec2<f32>,
 };
 
+// Four scalars rather than `base: u32` plus a `vec3<u32>`: WGSL aligns a
+// `vec3<u32>` to 16 bytes, so the obvious spelling is a 32-byte struct and the
+// binding's `min_binding_size` then has to be 32 for a block that carries one
+// useful word. Caught by wgpu's own pipeline validation, not by reading.
 struct SlotBase {
     base: u32,
-    padding: vec3<u32>,
+    padding_0: u32,
+    padding_1: u32,
+    padding_2: u32,
 };
 
 // 64 bytes, matching `wgpui_core::patch::primitive::Quad::SLOT_STRIDE` and the

@@ -173,6 +173,10 @@ pub struct DrawStats {
     /// Composite entries the layer tier dropped, which cost no bind group, no
     /// texture fetch, and no draw call.
     pub composite_entries_culled: u32,
+    /// Composite entries whose producer had nothing ready. Not an error: an
+    /// external surface that has never presented, or a boundary swept out of
+    /// the texture pool.
+    pub composite_entries_unavailable: u32,
     /// Composite draw calls issued.
     pub composite_draws_issued: u32,
 }
@@ -187,6 +191,7 @@ impl DrawStats {
         self.readback_words += other.readback_words;
         self.composite_entries_visited += other.composite_entries_visited;
         self.composite_entries_culled += other.composite_entries_culled;
+        self.composite_entries_unavailable += other.composite_entries_unavailable;
         self.composite_draws_issued += other.composite_draws_issued;
         self.instances_known_to_cpu = match (self.instances_known_to_cpu, other.instances_known_to_cpu)
         {
@@ -412,7 +417,9 @@ pub struct PreparedComposite {
 /// (`wgpui_core::boundary::compositor::visible_composites`): a culled entry
 /// never reaches here, so it costs no bind group, no texture fetch, and — for
 /// an external surface — no interaction with `SurfaceRegistry` whatsoever.
-/// `culled` is how many were dropped, carried in only so the stats can say so.
+/// `culled` and `unavailable` are how many entries did not make it this far,
+/// carried in only so the stats can account for every entry the frame was
+/// given.
 pub fn issue_composites(
     pass: &mut wgpu::RenderPass<'_>,
     pipeline: &CompositePipeline,
@@ -420,12 +427,16 @@ pub fn issue_composites(
     args: &IndirectArgsBuffers,
     entries: &[PreparedComposite],
     culled: u32,
+    unavailable: u32,
     mode: DrawMode,
     resolved: &ResolvedArgs,
 ) -> DrawStats {
     let mut stats = DrawStats {
-        composite_entries_visited: u32::try_from(entries.len()).unwrap_or(u32::MAX) + culled,
+        composite_entries_visited: u32::try_from(entries.len()).unwrap_or(u32::MAX)
+            + culled
+            + unavailable,
         composite_entries_culled: culled,
+        composite_entries_unavailable: unavailable,
         readback_words: resolved.words_read(),
         instances_known_to_cpu: if mode.reads_back() { Some(0) } else { None },
         ..DrawStats::default()

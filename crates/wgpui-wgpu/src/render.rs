@@ -7,6 +7,7 @@ pub mod buffers;
 pub mod compute;
 pub mod device;
 pub mod draw;
+pub mod frame;
 pub mod pipelines;
 pub mod readback;
 pub mod shaders;
