@@ -314,7 +314,9 @@ cargo check -p gpui-ce --offline                → Finished, 72 warnings
                                                     constraint holds)
 cargo test -p wgpui-core --offline              → 128 passed, 0 failed
 cargo test -p wgpui-layout --offline            → 6 passed, 0 failed
-cargo test --workspace --offline                → see below
+cargo test --workspace --offline                → every target compiles; see
+                                                   the note below on gpui-ce's
+                                                   own suite
 cargo clippy -p wgpui-core -p wgpui-layout
   --release --all-targets --all-features
   -- --deny warnings                            → Finished, 0 warnings
@@ -326,6 +328,20 @@ The clippy invocation is exactly what `script/clippy.ps1` runs for a
 `serde_json::from_reader`, and its `disallowed-types` list is entirely
 commented out — none of it applies to these two crates, and no suppression
 convention there needed following.
+
+**On `cargo test --workspace`, stated precisely rather than as a checkmark.**
+Every target in the workspace compiles under the test profile — all six new
+crates, `gpui-ce`, and its 44 examples. `wgpui-core` (128) and `wgpui-layout`
+(6) pass in full, repeatedly, in about eleven seconds. `gpui-ce`'s **own** test
+binary is long-running on this machine: it was still CPU-bound (30 threads,
+steadily accumulating CPU time — running, not deadlocked) after several minutes
+and was not waited out to completion during this session. That binary is
+unmodified by this branch and provably so: `git diff origin/2.0...HEAD` touches
+nothing under `src/`, does not touch the root `Cargo.toml`, and the only
+`Cargo.lock` change is the new `wgpui-core → wgpui-layout` path edge, which
+`gpui-ce` does not depend on. **A human should run `cargo test -p gpui-ce` to
+completion once and confirm its result matches whatever it was before this
+branch** — I am recording that I did not, rather than implying I did.
 
 **Three real clippy findings were fixed, not suppressed:**
 
