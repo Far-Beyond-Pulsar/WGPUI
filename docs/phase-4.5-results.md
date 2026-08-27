@@ -9,10 +9,22 @@ broken and fixed, and what a human should still treat as open. It follows
 branch `wgpui-2.0/phase-4.5-tiled-buffering`, pushed to origin, not merged, no
 PR.
 
-**Nothing under `src/` changed.** `git diff origin/2.0..HEAD -- src/` is empty,
-checked by running it. The whole branch diff touches 11 files, all under
+**Nothing under `src/` changed, and `docs/gpu-native-architecture.md` was not
+edited.** `git diff 057487cc7d..HEAD -- src/ docs/gpu-native-architecture.md` is
+empty, checked by running it. The whole branch diff is 12 files: 11 under
 `crates/`, plus this one. No dependency was added, so `cargo metadata --locked`
 exits 0 — Phase 4's lockfile trap was checked for rather than assumed absent.
+
+**Read those diffs against `057487cc7d`, not against `origin/2.0`.** This branch
+was cut from `057487cc7d` (Phase 4's merge), and `2.0` has since advanced by one
+unrelated commit — `d41f2e8a79`, "docs: name path tessellation as a deliberate,
+disclosed CPU-side item", which adds a paragraph to §10 of the spec. A
+`git diff origin/2.0..HEAD` therefore *appears* to show this branch deleting 18
+lines of the architecture document. It does not: that paragraph was never in this
+branch's base. This is recorded because the appearance is alarming and the check
+that resolves it is not obvious — the branch is one commit behind `2.0` and
+should be rebased onto it before any merge, at which point the spec diff is empty
+by inspection as well as by merge-base.
 
 **Contents:** §1 What shipped, and where · §2 §4.3's claim, tested · §3 The
 tile-visibility design · §4 The multi-tile content rule, and the measurement that
