@@ -20,5 +20,14 @@ cosmic-text = "0.18.2"
 # edge runs one way: `wgpui-core` names nothing here.
 wgpui-core = { path = "../wgpui-core" }
 
+[dev-dependencies]
+# `tests/legacy_raster_differential.rs` transcribes the legacy rasteriser and
+# runs it against its own `FontSystem`/`SwashCache`, so the oracle needs the same
+# crate the port does. An integration test does not inherit `[dependencies]`, and
+# the legacy path itself is unreachable (`RenderGlyphParams` is `pub(crate)` in
+# `gpui-ce`), so this is what a differential against it costs. Same version — no
+# new package in the lockfile.
+cosmic-text = "0.18.2"
+
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
