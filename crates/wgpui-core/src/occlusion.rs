@@ -164,20 +164,94 @@ pub struct OcclusionStats {
     pub poisoned: usize,
 }
 
+/// A two-level AABB hierarchy over a layer's items, in paint order.
+///
+/// Identical in shape and constants to the one `shaders/occlusion.wgsl` builds
+/// — `blocks[b]` unions items `[b*64, b*64+64)` and `superblocks[s]` unions
+/// blocks `[s*64, s*64+64)` — because both sides have the same problem:
+/// finding the qualifying occluders above one item without scanning every item
+/// above it.
+///
+/// Rejecting a node whose union does not intersect the query is exact, so this
+/// is a pruning structure and not an approximation; [`keep_mask`] and
+/// [`keep_mask_exhaustive`] return the same answer and a test asserts it.
+///
+/// It degrades the same way the shader's does: a layer whose primitives are
+/// spatially scattered relative to paint order gets loose unions and
+/// approaches the exhaustive scan. It stays correct; it stops being fast.
+#[derive(Clone, Debug, Default)]
+pub struct CoverageHierarchy {
+    blocks: Vec<Rect>,
+    superblocks: Vec<Rect>,
+}
+
+/// A node covering no area, so it rejects every query. Its min edges sit above
+/// its max edges, matching `never_overlaps()` in the shader.
+const EMPTY_NODE: Rect = Rect {
+    min_x: 1.0,
+    min_y: 1.0,
+    max_x: -1.0,
+    max_y: -1.0,
+};
+
+impl CoverageHierarchy {
+    /// Build the hierarchy for one layer's items.
+    pub fn build(items: &[CoverageItem]) -> CoverageHierarchy {
+        let block_size = crate::ordering::BLOCK_SIZE as usize;
+        let superblock_size = crate::ordering::SUPERBLOCK_SIZE as usize;
+        let blocks: Vec<Rect> = items
+            .chunks(block_size)
+            .map(|chunk| union_of(chunk.iter().map(|item| item.visible)))
+            .collect();
+        let superblocks: Vec<Rect> = blocks
+            .chunks(superblock_size)
+            .map(|chunk| union_of(chunk.iter().copied()))
+            .collect();
+        CoverageHierarchy {
+            blocks,
+            superblocks,
+        }
+    }
+}
+
+fn union_of(mut regions: impl Iterator<Item = Rect>) -> Rect {
+    match regions.next() {
+        None => EMPTY_NODE,
+        Some(first) => regions.fold(first, |accumulated, region| accumulated.union(&region)),
+    }
+}
+
 /// Which primitives of one layer must still be emitted, in paint order.
 ///
 /// `items` is the layer's whole primitive stream in paint order — index order
 /// *is* paint order, so `items[j]` for `j > i` is painted above `items[i]`.
 /// Returns one flag per item: `true` to emit, `false` to cull.
 ///
-/// This is the CPU reference `shaders/occlusion.wgsl` transcribes. Every
-/// decision is a function of one item and the items above it, with no state
-/// carried between items, so the compute path can run all of them at once and
-/// get the same answer.
+/// This is the CPU reference `shaders/occlusion.wgsl` transcribes, down to the
+/// [`CoverageHierarchy`] it walks to find candidates. Every decision is a
+/// function of one item and the items above it, with no state carried between
+/// items, so the compute path can run all of them at once and get the same
+/// answer.
 pub fn keep_mask(items: &[CoverageItem], poison: &[PoisonRegion]) -> Vec<bool> {
+    let hierarchy = CoverageHierarchy::build(items);
     let mut keep = vec![true; items.len()];
     for index in 0..items.len() {
-        keep[index] = keep_item(items, poison, index);
+        keep[index] = keep_item(items, poison, Some(&hierarchy), index);
+    }
+    keep
+}
+
+/// [`keep_mask`] with the hierarchy removed: every item scans every item above
+/// it. `O(n²)`, and the definition the accelerated form is checked against.
+///
+/// The same relationship [`crate::ordering::painter_orders`] has to
+/// [`crate::ordering::painter_orders_via_tree`], and kept for the same reason:
+/// a pruning bug that makes the fast path miss a candidate is invisible against
+/// itself.
+pub fn keep_mask_exhaustive(items: &[CoverageItem], poison: &[PoisonRegion]) -> Vec<bool> {
+    let mut keep = vec![true; items.len()];
+    for index in 0..items.len() {
+        keep[index] = keep_item(items, poison, None, index);
     }
     keep
 }
@@ -207,7 +281,12 @@ pub fn keep_mask_with_stats(
 }
 
 /// The single-item decision, written exactly as the shader's one invocation.
-fn keep_item(items: &[CoverageItem], poison: &[PoisonRegion], index: usize) -> bool {
+fn keep_item(
+    items: &[CoverageItem],
+    poison: &[PoisonRegion],
+    hierarchy: Option<&CoverageHierarchy>,
+    index: usize,
+) -> bool {
     let Some(item) = items.get(index) else {
         return true;
     };
@@ -219,7 +298,8 @@ fn keep_item(items: &[CoverageItem], poison: &[PoisonRegion], index: usize) -> b
     }
 
     let mut occluders = [Rect::EMPTY; MAX_OCCLUDERS];
-    let occluder_count = gather_occluders(items, poison, index, &item.visible, &mut occluders);
+    let occluder_count =
+        gather_occluders(items, poison, hierarchy, index, &item.visible, &mut occluders);
     !fully_covered(item.visible, &occluders[..occluder_count])
 }
 
@@ -228,36 +308,82 @@ fn keep_item(items: &[CoverageItem], poison: &[PoisonRegion], index: usize) -> b
 ///
 /// "Qualifying" is exactly the legacy sweep's rule: it has an opaque region, it
 /// is not itself protected or poisoned (a quad inside a filter group never
-/// collects), and its region actually overlaps the target. Note that an
-/// occluder is collected whatever its *own* keep decision — an occluder that is
-/// itself covered still hides what lies beneath it, and the legacy sweep says
-/// so in as many words.
+/// collects), and its region actually overlaps the query. Note that an occluder
+/// is collected whatever its *own* keep decision — an occluder that is itself
+/// covered still hides what lies beneath it, and the legacy sweep says so in as
+/// many words.
+///
+/// Ascending order is what makes the [`MAX_OCCLUDERS`] cap deterministic, and
+/// therefore what makes the CPU and compute paths comparable rather than merely
+/// similar. The hierarchy prunes which ranges are visited; it never changes the
+/// order in which the survivors are collected.
 fn gather_occluders(
     items: &[CoverageItem],
     poison: &[PoisonRegion],
+    hierarchy: Option<&CoverageHierarchy>,
     index: usize,
-    target: &Rect,
+    query: &Rect,
     occluders: &mut [Rect; MAX_OCCLUDERS],
 ) -> usize {
     let mut count = 0usize;
-    let mut probe = index + 1;
-    while probe < items.len() && count < MAX_OCCLUDERS {
-        let candidate = probe;
-        probe += 1;
+    let mut consider = |candidate: usize, count: &mut usize| {
+        if *count >= MAX_OCCLUDERS {
+            return;
+        }
         let Some(above) = items.get(candidate) else {
-            continue;
+            return;
         };
         let Some(region) = above.opaque else {
-            continue;
+            return;
         };
         if above.protected || is_poisoned(poison, candidate, &above.visible) {
+            return;
+        }
+        if region.intersect(query).is_empty() {
+            return;
+        }
+        occluders[*count] = region;
+        *count += 1;
+    };
+
+    let Some(hierarchy) = hierarchy else {
+        for candidate in index + 1..items.len() {
+            if count >= MAX_OCCLUDERS {
+                break;
+            }
+            consider(candidate, &mut count);
+        }
+        return count;
+    };
+
+    let block_size = crate::ordering::BLOCK_SIZE as usize;
+    let superblock_size = crate::ordering::SUPERBLOCK_SIZE as usize;
+    let first_superblock = index / (block_size * superblock_size);
+    'outer: for superblock in first_superblock..hierarchy.superblocks.len() {
+        let Some(node) = hierarchy.superblocks.get(superblock) else {
+            continue;
+        };
+        if !node.intersects(query) {
             continue;
         }
-        if region.intersect(target).is_empty() {
-            continue;
+        let block_start = superblock * superblock_size;
+        let block_end = (block_start + superblock_size).min(hierarchy.blocks.len());
+        for block in block_start..block_end {
+            let Some(node) = hierarchy.blocks.get(block) else {
+                continue;
+            };
+            if !node.intersects(query) {
+                continue;
+            }
+            let first = (block * block_size).max(index + 1);
+            let last = (block * block_size + block_size).min(items.len());
+            for candidate in first..last {
+                if count >= MAX_OCCLUDERS {
+                    break 'outer;
+                }
+                consider(candidate, &mut count);
+            }
         }
-        occluders[count] = region;
-        count += 1;
     }
     count
 }
@@ -645,6 +771,56 @@ mod tests {
     #[test]
     fn an_empty_stream_decides_nothing() {
         assert!(keep_mask(&[], &[]).is_empty());
+        assert!(keep_mask_exhaustive(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn the_hierarchy_never_changes_the_answer_over_the_scripted_walk() {
+        use crate::test_support::ui_walk::{UiSceneSpec, scripted_walk};
+
+        // Enough primitives to cross the 64-item block boundary many times, so
+        // the pruning is actually exercised rather than short-circuited by a
+        // single-block layer.
+        let spec = UiSceneSpec::small();
+        for frame in scripted_walk(&spec) {
+            let items = frame.coverage_items();
+            assert!(items.len() > crate::ordering::BLOCK_SIZE as usize * 2);
+            assert_eq!(
+                keep_mask(&items, &frame.poison),
+                keep_mask_exhaustive(&items, &frame.poison),
+                "frame {}: the hierarchy pruned a real candidate",
+                frame.label
+            );
+        }
+    }
+
+    #[test]
+    fn the_hierarchy_never_changes_the_answer_on_scattered_content() {
+        // Paint order deliberately uncorrelated with position — the shape both
+        // this and the shader's hierarchy degrade on. Correctness must not.
+        let mut items = Vec::new();
+        for index in 0..400u32 {
+            let scattered = (index.wrapping_mul(97) % 400) as f32;
+            let bounds = rect(scattered * 3.0, (index % 40) as f32 * 7.0, 30.0, 30.0);
+            items.push(if index % 3 == 0 {
+                opaque_at(bounds)
+            } else {
+                CoverageItem::cullee(bounds)
+            });
+        }
+        assert_eq!(keep_mask(&items, &[]), keep_mask_exhaustive(&items, &[]));
+    }
+
+    #[test]
+    fn the_hierarchy_respects_the_occluder_cap_the_same_way() {
+        // Many overlapping occluders above one cullee, spread across several
+        // blocks: the capped set must be the same first MAX_OCCLUDERS either
+        // way, or the two paths would disagree only under load.
+        let mut items = vec![CoverageItem::cullee(rect(0.0, 0.0, 400.0, 40.0))];
+        for index in 0..300u32 {
+            items.push(opaque_at(rect(index as f32, 0.0, 40.0, 40.0)));
+        }
+        assert_eq!(keep_mask(&items, &[]), keep_mask_exhaustive(&items, &[]));
     }
 
     #[test]

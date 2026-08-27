@@ -60,6 +60,18 @@ pub struct UiSceneSpec {
     pub inspector_open: bool,
     /// Whether a modal dialog is up.
     pub modal_open: bool,
+    /// Uniform scale on row height and node size, i.e. how zoomed-out the
+    /// content is.
+    ///
+    /// At `1.0` the scene is a normal editor and a large `list_rows`/`nodes`
+    /// puts most of the content *below* the window — which is a real and
+    /// important shape (a retained layer holds its whole content, §5.0), but
+    /// one where most primitives clip away to nothing and the occlusion pass
+    /// early-outs on them. Scaling down packs the same primitive count into the
+    /// visible area instead, which is the shape where occlusion has real work
+    /// to do. The benchmark measures both, because either alone would be a
+    /// partial answer.
+    pub content_scale: f32,
 }
 
 impl UiSceneSpec {
@@ -75,11 +87,15 @@ impl UiSceneSpec {
             selected_row: 3,
             inspector_open: true,
             modal_open: false,
+            content_scale: 1.0,
         }
     }
 
-    /// A large scene, sized for the performance gate. `list_rows` and `nodes`
-    /// are what scale it; see [`quad_count_estimate`].
+    /// A large scene at normal zoom, sized for the performance gate.
+    ///
+    /// Most of its content sits below the window: a retained layer holds its
+    /// whole list and its whole graph, not only the visible part. See
+    /// [`UiSceneSpec::content_scale`] for the other half of that story.
     pub fn large(list_rows: u32, nodes: u32) -> UiSceneSpec {
         UiSceneSpec {
             width: 2560.0,
@@ -90,6 +106,16 @@ impl UiSceneSpec {
             selected_row: 17,
             inspector_open: true,
             modal_open: true,
+            content_scale: 1.0,
+        }
+    }
+
+    /// The same scene zoomed out until the content fills the window, so the
+    /// primitives the passes see are overwhelmingly *visible* ones.
+    pub fn large_dense(list_rows: u32, nodes: u32, content_scale: f32) -> UiSceneSpec {
+        UiSceneSpec {
+            content_scale,
+            ..UiSceneSpec::large(list_rows, nodes)
         }
     }
 }
@@ -150,8 +176,12 @@ const STATUS_BAR_HEIGHT: f32 = 24.0;
 const ROW_HEIGHT: f32 = 22.0;
 const NODE_WIDTH: f32 = 120.0;
 const NODE_HEIGHT: f32 = 64.0;
-const NODE_ROW_PITCH: f32 = NODE_HEIGHT + 28.0;
-const NODE_COLUMNS: u32 = 6;
+/// Column pitch as a fraction of a node's width. Below one, so horizontal
+/// neighbours overlap and genuinely step each other's painter order.
+const NODE_CELL_FRACTION: f32 = 0.55;
+/// Row pitch as a fraction of a node's height. Above one, so vertical
+/// neighbours only touch when the jitter pushes them together.
+const NODE_ROW_PITCH_FRACTION: f32 = 1.45;
 const INSPECTOR_FIELDS: u32 = 20;
 
 fn solid(red: f32, green: f32, blue: f32) -> [f32; 4] {
@@ -214,13 +244,15 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
         ),
         solid(0.13, 0.13, 0.16),
     ));
+    let scale = spec.content_scale.clamp(0.02, 4.0);
+    let row_height = (ROW_HEIGHT * scale).max(1.0);
     for row in 0..spec.list_rows {
-        let top = content_top + row as f32 * ROW_HEIGHT - spec.list_scroll;
+        let top = content_top + row as f32 * row_height - spec.list_scroll;
         // Rows scrolled past the panel's top edge are not emitted, which is
         // what a real virtualised list does. Rows below the window's bottom
         // *are* emitted: a list's slab holds its whole content, and that is the
         // residency §5.0 cares about.
-        if top + ROW_HEIGHT <= content_top {
+        if top + row_height <= content_top {
             continue;
         }
         let selected = row == spec.selected_row;
@@ -231,22 +263,26 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
         } else {
             translucent(0.20, 0.20, 0.24, 0.35)
         };
-        quads.push(plain(
-            rect(0.0, top, panel_width, ROW_HEIGHT),
-            background,
-        ));
+        quads.push(plain(rect(0.0, top, panel_width, row_height), background));
         // An icon: opaque but rounded, so its opaque region is inset.
+        let icon = (14.0 * scale).max(1.0);
         quads.push(Quad {
-            origin: [6.0, top + 4.0],
-            size: [14.0, 14.0],
+            origin: [6.0 * scale, top + (row_height - icon) * 0.5],
+            size: [icon, icon],
             background: solid(0.55, 0.62, 0.35),
             border_color: [0.0, 0.0, 0.0, 0.0],
-            corner_radius: 4.0,
+            corner_radius: (4.0 * scale).max(0.0),
             border_width: 0.0,
         });
         // A label bar standing in for shaped text: translucent, never occludes.
+        let label_left = 26.0 * scale;
         quads.push(plain(
-            rect(26.0, top + 7.0, panel_width - 34.0, 8.0),
+            rect(
+                label_left,
+                top + row_height * 0.35,
+                (panel_width - label_left - 8.0 * scale).max(1.0),
+                (8.0 * scale).max(1.0),
+            ),
             translucent(0.85, 0.86, 0.90, 0.75),
         ));
     }
@@ -268,41 +304,59 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
     // grid runs the full viewport width — including under the inspector — and
     // extends downward past the window, so the layer's residency is the whole
     // graph rather than only its visible part.
-    let cell_width = (viewport.width() / NODE_COLUMNS as f32).max(1.0);
+    let node_width = (NODE_WIDTH * scale).max(2.0);
+    let node_height = (NODE_HEIGHT * scale).max(2.0);
+    let cell_width = (node_width * NODE_CELL_FRACTION).max(1.0);
+    let row_pitch = (node_height * NODE_ROW_PITCH_FRACTION).max(1.0);
+    let columns = ((viewport.width() / cell_width) as u32).max(1);
     for node in 0..spec.nodes {
-        let column = node % NODE_COLUMNS;
-        let row = node / NODE_COLUMNS;
+        let column = node % columns;
+        let row = node / columns;
         let x = viewport.min_x
             + column as f32 * cell_width
             + jitter(node.wrapping_mul(3) + 1, cell_width * 0.3);
-        let y = viewport.min_y + 16.0 + row as f32 * NODE_ROW_PITCH
-            + jitter(node.wrapping_mul(7) + 2, 20.0);
+        let y = viewport.min_y + 16.0 * scale + row as f32 * row_pitch
+            + jitter(node.wrapping_mul(7) + 2, row_pitch * 0.2);
         // Drop shadow: translucent, so it can be culled but never occludes.
         quads.push(plain(
-            rect(x + 3.0, y + 3.0, NODE_WIDTH, NODE_HEIGHT),
+            rect(
+                x + 3.0 * scale,
+                y + 3.0 * scale,
+                node_width,
+                node_height,
+            ),
             translucent(0.0, 0.0, 0.0, 0.35),
         ));
         // Body: opaque, rounded, with a translucent hairline border — so its
         // opaque region is inset by the larger of the two.
         quads.push(Quad {
             origin: [x, y],
-            size: [NODE_WIDTH, NODE_HEIGHT],
+            size: [node_width, node_height],
             background: solid(0.19, 0.20, 0.24),
             border_color: translucent(0.55, 0.58, 0.66, 0.5),
-            corner_radius: 6.0,
-            border_width: 1.0,
+            corner_radius: 6.0 * scale,
+            border_width: 1.0 * scale,
         });
         quads.push(plain(
-            rect(x + 6.0, y + 6.0, NODE_WIDTH - 12.0, 14.0),
+            rect(
+                x + node_width * 0.05,
+                y + node_height * 0.09,
+                node_width * 0.9,
+                (node_height * 0.22).max(1.0),
+            ),
             solid(0.28, 0.32, 0.42),
         ));
-        for port in 0..3u32 {
+        let port = (8.0 * scale).max(1.0);
+        for index in 0..3u32 {
             quads.push(Quad {
-                origin: [x - 4.0, y + 26.0 + port as f32 * 12.0],
-                size: [8.0, 8.0],
+                origin: [
+                    x - port * 0.5,
+                    y + node_height * 0.4 + index as f32 * port * 1.5,
+                ],
+                size: [port, port],
                 background: solid(0.72, 0.66, 0.30),
                 border_color: [0.0, 0.0, 0.0, 0.0],
-                corner_radius: 4.0,
+                corner_radius: port * 0.5,
                 border_width: 0.0,
             });
         }
@@ -444,7 +498,7 @@ pub fn scripted_walk(base: &UiSceneSpec) -> Vec<UiFrame> {
     push("initial", &spec);
 
     for step in 1..=4u32 {
-        spec.list_scroll = step as f32 * ROW_HEIGHT * 1.5;
+        spec.list_scroll = step as f32 * ROW_HEIGHT * base.content_scale * 1.5;
         push(&format!("scrolled {step}"), &spec);
     }
 
@@ -454,7 +508,7 @@ pub fn scripted_walk(base: &UiSceneSpec) -> Vec<UiFrame> {
     spec.modal_open = !spec.modal_open;
     push("modal toggled", &spec);
 
-    spec.list_scroll += ROW_HEIGHT * 3.0;
+    spec.list_scroll += ROW_HEIGHT * base.content_scale * 3.0;
     push("scrolled under the modal", &spec);
 
     spec.modal_open = !spec.modal_open;

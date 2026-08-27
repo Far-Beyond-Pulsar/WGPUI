@@ -163,9 +163,9 @@ impl OrderingPass {
                 uniform_entry(0, 16),
                 storage_entry(1, true),
                 storage_entry(2, false),
-                storage_entry(3, false),
-                storage_entry(4, true),
-                storage_entry(5, false),
+                storage_entry(3, true),
+                storage_entry(4, false),
+                storage_entry(5, true),
                 storage_entry(6, false),
                 storage_entry(7, false),
                 storage_entry(8, false),
@@ -260,38 +260,70 @@ impl OrderingPass {
 
         let bounds_buffer = storage_buffer(device, "ordering bounds", bounds.len() as u64);
         queue.write_buffer(&bounds_buffer, 0, bounds);
-        let block_buffer = storage_buffer(device, "ordering blocks", blocks as u64 * 16);
-        let superblock_buffer =
-            storage_buffer(device, "ordering superblocks", superblocks as u64 * 16);
+        // Blocks then superblocks in one buffer — see `ordering.wgsl`'s note on
+        // staying inside WebGPU's downlevel storage-binding ceiling.
+        let hierarchy = storage_buffer(
+            device,
+            "ordering hierarchy",
+            (blocks as u64 + superblocks as u64) * 16,
+        );
 
         let order_bytes = count as u64 * 4;
         let order_a = storage_buffer(device, "ordering order a", order_bytes);
         let order_b = storage_buffer(device, "ordering order b", order_bytes);
         // Both sides start at the recurrence's floor so the first iteration
         // reads a defined value whichever way the ping-pong points.
-        let initial = vec![1u32; count as usize];
-        let initial_bytes: Vec<u8> = initial.iter().flat_map(|v| v.to_le_bytes()).collect();
-        queue.write_buffer(&order_a, 0, &initial_bytes);
-        queue.write_buffer(&order_b, 0, &initial_bytes);
+        let initial: Vec<u8> = (0..count).flat_map(|_| 1u32.to_le_bytes()).collect();
+        queue.write_buffer(&order_a, 0, &initial);
+        queue.write_buffer(&order_b, 0, &initial);
 
-        let changed = storage_buffer(device, "ordering changed", 4);
+        // One word of global counter plus one flag per block and per
+        // superblock. The buffer the first iteration *reads* starts all-ones so
+        // that iteration scans everything; every later iteration reads the
+        // flags its predecessor wrote.
+        let flag_count = 1 + blocks as u64 + superblocks as u64;
+        let changed_a = storage_buffer(device, "ordering changed a", flag_count * 4);
+        let changed_b = storage_buffer(device, "ordering changed b", flag_count * 4);
+        let all_changed: Vec<u8> = (0..flag_count).flat_map(|_| 1u32.to_le_bytes()).collect();
+        queue.write_buffer(&changed_a, 0, &all_changed);
+
         let sort_key = storage_buffer(device, "ordering sort keys", padded_count as u64 * 4);
         let sort_value = storage_buffer(device, "ordering sort values", padded_count as u64 * 4);
 
-        // Two bind groups differing only in which order buffer is the input.
-        // `data_groups[k]` reads `[order_a, order_b][k]`, so after using group
-        // `k` the freshly written buffer is the other one.
+        // Two bind groups differing only in which order and change buffers are
+        // the input. `data_groups[k]` reads `[a, b][k]`, so after using group
+        // `k` the freshly written buffers are the other pair.
         let data_groups = [
-            self.data_group(device, &params, &bounds_buffer, &block_buffer, &superblock_buffer, &order_a, &order_b, &changed, &sort_key, &sort_value),
-            self.data_group(device, &params, &bounds_buffer, &block_buffer, &superblock_buffer, &order_b, &order_a, &changed, &sort_key, &sort_value),
+            self.data_group(
+                device,
+                &params,
+                &bounds_buffer,
+                &hierarchy,
+                (&order_a, &order_b),
+                (&changed_a, &changed_b),
+                (&sort_key, &sort_value),
+            ),
+            self.data_group(
+                device,
+                &params,
+                &bounds_buffer,
+                &hierarchy,
+                (&order_b, &order_a),
+                (&changed_b, &changed_a),
+                (&sort_key, &sort_value),
+            ),
         ];
+        let changed_buffers = [&changed_a, &changed_b];
 
         let stages = bitonic_stages(padded_count);
         let (stage_buffer, stage_group) = self.stage_resources(device, queue, &stages);
 
         let block_groups = blocks.div_ceil(BLOCK_SIZE).max(1);
         let superblock_groups = superblocks.div_ceil(BLOCK_SIZE).max(1);
-        let item_groups = count.div_ceil(BLOCK_SIZE);
+        // The relaxation kernel is one invocation per *block*, not per
+        // primitive — see `ordering.wgsl`'s note on collapsing a block's
+        // internal overlap chain inside one invocation.
+        let relax_groups = block_groups;
         let sort_groups = padded_count.div_ceil(BLOCK_SIZE);
 
         let mut parity = 0usize;
@@ -309,7 +341,7 @@ impl OrderingPass {
             &mut encoder,
             &data_groups,
             &stage_group,
-            &changed,
+            &changed_buffers,
             parity,
             RELAX_FIRST_BATCH,
             item_groups,
@@ -325,7 +357,7 @@ impl OrderingPass {
         queue.submit(Some(encoder.finish()));
         submissions += 1;
 
-        let mut still_changing = self.read_changed(device, queue, &changed)?;
+        let mut still_changing = self.read_changed(device, queue, changed_buffers[parity])?;
         while still_changing != 0 {
             if iterations >= RELAX_ITERATION_LIMIT {
                 return Err(OrderingError::NotConverged {
@@ -340,7 +372,7 @@ impl OrderingPass {
                 &mut encoder,
                 &data_groups,
                 &stage_group,
-                &changed,
+                &changed_buffers,
                 parity,
                 RELAX_BATCH,
                 item_groups,
@@ -348,7 +380,7 @@ impl OrderingPass {
             iterations += RELAX_BATCH;
             queue.submit(Some(encoder.finish()));
             submissions += 1;
-            still_changing = self.read_changed(device, queue, &changed)?;
+            still_changing = self.read_changed(device, queue, changed_buffers[parity])?;
         }
 
         // The sort issued in the first submission is only valid if that
@@ -416,19 +448,15 @@ impl OrderingPass {
         Ok(values)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn data_group(
         &self,
         device: &wgpu::Device,
         params: &wgpu::Buffer,
         bounds: &wgpu::Buffer,
-        blocks: &wgpu::Buffer,
-        superblocks: &wgpu::Buffer,
-        order_in: &wgpu::Buffer,
-        order_out: &wgpu::Buffer,
-        changed: &wgpu::Buffer,
-        sort_key: &wgpu::Buffer,
-        sort_value: &wgpu::Buffer,
+        hierarchy: &wgpu::Buffer,
+        order: (&wgpu::Buffer, &wgpu::Buffer),
+        changed: (&wgpu::Buffer, &wgpu::Buffer),
+        sort: (&wgpu::Buffer, &wgpu::Buffer),
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ordering data"),
@@ -436,13 +464,13 @@ impl OrderingPass {
             entries: &[
                 binding(0, params),
                 binding(1, bounds),
-                binding(2, blocks),
-                binding(3, superblocks),
-                binding(4, order_in),
-                binding(5, order_out),
-                binding(6, changed),
-                binding(7, sort_key),
-                binding(8, sort_value),
+                binding(2, hierarchy),
+                binding(3, order.0),
+                binding(4, order.1),
+                binding(5, changed.0),
+                binding(6, changed.1),
+                binding(7, sort.0),
+                binding(8, sort.1),
             ],
         })
     }
@@ -487,26 +515,25 @@ impl OrderingPass {
 
     /// Encode `count` relaxation iterations, returning the new parity.
     ///
-    /// The change counter is cleared immediately before the *last* iteration of
-    /// the batch, inside the same encoder, so the value read afterwards reports
-    /// only that iteration's residual. A `queue.write_buffer` here would be
-    /// ordered before the whole encoder rather than between two of its passes —
-    /// the same trap Spike A's own comment records.
+    /// Each iteration clears the change buffer it is about to write, inside the
+    /// same encoder, so the flags a later iteration reads describe exactly its
+    /// predecessor and the counter read afterwards reports only the last
+    /// iteration's residual. A `queue.write_buffer` here would be ordered
+    /// before the whole encoder rather than between two of its passes — the
+    /// same trap Spike A's own comment records.
     fn encode_relaxation(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         data_groups: &[wgpu::BindGroup; 2],
         stage_group: &wgpu::BindGroup,
-        changed: &wgpu::Buffer,
+        changed: &[&wgpu::Buffer; 2],
         parity: usize,
         count: u32,
         workgroups: u32,
     ) -> usize {
         let mut parity = parity;
-        for iteration in 0..count {
-            if iteration + 1 == count {
-                encoder.clear_buffer(changed, 0, None);
-            }
+        for _ in 0..count {
+            encoder.clear_buffer(changed[parity ^ 1], 0, None);
             dispatch(
                 encoder,
                 &self.relax,
