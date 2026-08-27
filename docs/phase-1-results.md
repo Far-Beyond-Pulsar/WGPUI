@@ -307,11 +307,14 @@ so in a comment rather than asserting a number that reads like a guarantee.
 
 ```
 cargo check --workspace --offline               → Finished, 0 errors
-cargo check -p gpui-ce --offline                → Finished, 72 warnings
-                                                   (identical count to the
-                                                    Phase 0 baseline — §8's
-                                                    "legacy backend is frozen"
-                                                    constraint holds)
+  ↳ within it, `gpui-ce` (lib)                  → 72 warnings, the identical
+                                                   count Phase 0 recorded as
+                                                   its pre-workspace baseline
+                                                   — §8's "legacy backend is
+                                                   frozen" constraint holds
+                                                   (observed as part of the
+                                                    workspace check above,
+                                                    not as a separate run)
 cargo test -p wgpui-core --offline              → 128 passed, 0 failed
 cargo test -p wgpui-layout --offline            → 6 passed, 0 failed
 cargo test --workspace --offline                → every target compiles; see
