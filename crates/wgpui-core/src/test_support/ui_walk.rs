@@ -1356,6 +1356,17 @@ mod tests {
                 "every layer this frame touched carries TRANSFORM and nothing else"
             );
             assert!(stats.is_transform_only());
+            if step == 1 {
+                println!(
+                    "gate (within grid): {} visible tiles, {} TRANSFORM updates, \
+                     {} primitives written, {} upload bytes, {} layers displayed",
+                    stats.visible_tiles,
+                    stats.transform_updates,
+                    stats.primitives_written,
+                    stats.upload_bytes,
+                    stats.display_layers.len(),
+                );
+            }
             canvas.settle();
         }
         Ok(())
@@ -1447,6 +1458,16 @@ mod tests {
             canvas.resident_primitives() > resident_after_first,
             "the newly-revealed tiles added residency"
         );
+        println!(
+            "gate (crossing): {} of {} tiles revealed, {} primitives written \
+             ({} in tiles, {} on the overlay), against {} resident before",
+            stats.revealed.len(),
+            stats.visible_tiles,
+            stats.primitives_written,
+            tile_written,
+            stats.overlay_primitives_written,
+            resident_after_first,
+        );
         Ok(())
     }
 
@@ -1510,6 +1531,52 @@ mod tests {
              doc discloses",
             with_wires.overlay_primitives(),
             with_wires.resident_primitives()
+        );
+        Ok(())
+    }
+
+    /// What the overlay actually costs while panning, across many crossings
+    /// rather than the one the crossing gate happens to sample.
+    ///
+    /// The single crossing that gate measures wrote nothing to the overlay,
+    /// which would be a misleading number to report on its own — it means no
+    /// oversized wire entered the visible region on *that* frame, not that the
+    /// overlay is free. This walks twenty crossings and reports the totals, so
+    /// the claim in `docs/phase-4.5-results.md` is about the distribution rather
+    /// than about one lucky frame.
+    #[test]
+    fn the_overlays_share_of_a_long_pans_work_is_small_but_not_zero()
+    -> Result<(), PatchError> {
+        let mut canvas = canvas();
+        canvas.pan_to([-8.0, -8.0])?;
+        canvas.settle();
+
+        let mut tile_written = 0usize;
+        let mut overlay_written = 0usize;
+        let mut frames_touching_the_overlay = 0usize;
+        for step in 1..=20u32 {
+            let stats = canvas.pan_to([-8.0 - step as f32 * TileGrid::DEFAULT_EDGE, -8.0])?;
+            tile_written += stats.primitives_written - stats.overlay_primitives_written;
+            overlay_written += stats.overlay_primitives_written;
+            if stats.overlay_primitives_written > 0 {
+                frames_touching_the_overlay += 1;
+            }
+            canvas.settle();
+        }
+        println!(
+            "overlay over 20 crossings: {overlay_written} primitives on {frames_touching_the_overlay} \
+             frames, against {tile_written} written into tiles"
+        );
+        assert!(
+            overlay_written > 0,
+            "twenty tile crossings never touched the overlay, so the oversized-\
+             content path is not being exercised at all"
+        );
+        assert!(
+            overlay_written * 2 < tile_written,
+            "the overlay wrote {overlay_written} against the tiles' {tile_written} \
+             across a long pan — spanning content is dominating, which is the \
+             failure mode TilePlacement's doc discloses"
         );
         Ok(())
     }
