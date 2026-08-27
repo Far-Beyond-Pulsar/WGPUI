@@ -26,6 +26,11 @@ wgpu = { version = "30", default-features = false, features = [
 ] }
 pollster = "0.4.0"
 bytemuck = { version = "1.24", features = ["derive"] }
+# `render/surface_registry.rs` is a mechanical move of the legacy file (§5.5,
+# §9: "moved, not rebuilt"), and that file logs. Taking the dependency is what
+# keeps the move mechanical — deleting the one `log::trace!` would be a change
+# to code §9's risk table specifically asks this phase not to change.
+log = "0.4.16"
 
 [dev-dependencies]
 rand = "0.10"

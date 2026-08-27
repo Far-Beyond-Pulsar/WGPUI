@@ -36,12 +36,34 @@
 //!
 //! Nothing in this file allocates, pools, or draws a texture.
 //! [`Retention::Texture`] is a *decision* about a boundary, recorded and
-//! observable; §3.1 puts every live `wgpu::Device` in `wgpui-wgpu` and §8 puts
-//! the compositing entry that would consume this decision in Phase 4.
+//! observable; §3.1 puts every live `wgpu::Device` in `wgpui-wgpu`, and
+//! Phase 4's `render/textures/layer_texture.rs` is what consumes the decision
+//! into an actual texture.
+//!
+//! # What Phase 4 added: the composite entry, and the layer tier
+//!
+//! §5.5's Gap 2 asks that an externally-produced texture (`WgpuSurface`) and a
+//! boundary's own baked texture reach the framebuffer through *one* mechanism
+//! rather than two parallel ones. The half of that which belongs in a
+//! device-free crate is the description: [`CompositeEntry`] says where a
+//! texture lands, what clips it, how it is drawn, and — the part that makes
+//! §5.5's promised win real — whether anything painted above it covers it
+//! completely.
+//!
+//! That last question is R-N §8.1's **layer tier**, and it is deliberately CPU
+//! work. `crate::occlusion`'s own module doc says why: the layer tier "runs
+//! over layers, not primitives — tens of items, not tens of thousands — so it
+//! is not a compute problem", and it names
+//! [`crate::occlusion::coverage::fully_covered`] as "the routine it will reuse
+//! when the compositor grows a per-layer opaque region to feed it."
+//! [`visible_composites`] is that compositor growing it, and it calls exactly
+//! that routine rather than a second copy of the rule.
 
 use crate::boundary::policy::{BoundaryPolicy, Retention};
+use crate::geometry::Rect;
 use crate::invalidation::axes::Invalidation;
 use crate::invalidation::reason::Reason;
+use crate::occlusion::coverage::{MAX_OCCLUDERS, OccluderStyle, fully_covered, opaque_region};
 use crate::scene::layer::{BoundaryId, LayerId, LayerKey, LayerTransform};
 use std::collections::HashMap;
 
@@ -135,6 +157,162 @@ pub struct BoundaryComposite {
     pub transform: LayerTransform,
     /// The axes this decision raised on its layer.
     pub invalidation: Invalidation,
+}
+
+/// An externally-produced surface's identity, as the compositor sees it.
+///
+/// Opaque on purpose. The real handle is `WgpuSurfaceHandle`, which owns a
+/// triple-buffered texture and a cross-thread producer protocol that §9's risk
+/// table forbids this work from touching; all the compositor needs is something
+/// equal to itself and unequal to a different surface. `wgpui-widgets`'
+/// `SurfaceId` and `wgpui-wgpu`'s registry id both map onto this.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExternalSurfaceId(u64);
+
+impl ExternalSurfaceId {
+    /// Wrap a raw handle.
+    pub const fn from_raw(raw: u64) -> Self {
+        ExternalSurfaceId(raw)
+    }
+
+    /// The raw handle.
+    pub const fn as_raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Which of the two producers a composite entry's pixels come from.
+///
+/// §5.5's Gap 2 in one type: "a `WgpuSurface` becomes the degenerate case of a
+/// compositing boundary — here is a texture, produced externally instead of
+/// baked by the rasterizer, composite it exactly like a boundary's baked
+/// texture." Everything below this enum treats the two identically; the only
+/// place the difference survives is where the texture is *fetched from*, which
+/// is `wgpui-wgpu`'s business and not the compositor's.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CompositeSource {
+    /// A boundary that reached [`Retention::Texture`] and baked its own.
+    BoundaryTexture(BoundaryId),
+    /// A texture someone else's render loop produced.
+    External(ExternalSurfaceId),
+}
+
+/// One already-rendered texture's place in the ordered scene.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct CompositeEntry {
+    /// Where the pixels come from.
+    pub source: CompositeSource,
+    /// Where the texture lands, in the window's coordinate space.
+    pub bounds: Rect,
+    /// What clips it.
+    pub content_mask: Rect,
+    /// Straight alpha the entry composites at.
+    pub opacity: f32,
+    /// Uniform corner radius it is clipped to.
+    pub corner_radius: f32,
+    /// Whether the source fills its own bounds with no transparency.
+    ///
+    /// Never inferred. A boundary's baked texture is transparent wherever its
+    /// content is, and an external producer's contents are not the framework's
+    /// to know at all (§5.5: "its pixel *content* is never part of the CPU
+    /// description"), so an entry occludes only when its producer says it
+    /// does. The conservative default ([`CompositeEntry::sampled`]) is `false`.
+    pub source_is_opaque: bool,
+    /// The producer's content generation, so a texture pool can tell a stale
+    /// bake from a current one without comparing pixels.
+    pub content_token: u64,
+}
+
+impl CompositeEntry {
+    /// A translucent, square-cornered entry that never occludes — the safe
+    /// shape for any source whose contents are unknown.
+    pub fn sampled(source: CompositeSource, bounds: Rect, content_mask: Rect) -> CompositeEntry {
+        CompositeEntry {
+            source,
+            bounds,
+            content_mask,
+            opacity: 1.0,
+            corner_radius: 0.0,
+            source_is_opaque: false,
+            content_token: 0,
+        }
+    }
+
+    /// What this entry can actually paint.
+    pub fn visible(&self) -> Rect {
+        self.bounds.intersect(&self.content_mask)
+    }
+
+    /// Its conservative opaque region, or `None` when it does not qualify.
+    ///
+    /// Goes through [`opaque_region`] rather than restating the rule: an entry
+    /// is a rectangle with a fill alpha, a corner radius, and no border, which
+    /// is a strict special case of the primitive test, and keeping one
+    /// implementation is what stops the two tiers from disagreeing about what
+    /// "opaque" means.
+    pub fn opaque_region(&self) -> Option<Rect> {
+        if !self.source_is_opaque {
+            return None;
+        }
+        opaque_region(
+            self.bounds,
+            self.content_mask,
+            &OccluderStyle {
+                background_is_solid: true,
+                background_alpha: 1.0,
+                element_opacity: self.opacity,
+                max_corner_radius: self.corner_radius,
+                border_is_opaque: true,
+                max_border_width: 0.0,
+                has_backdrop_filter: false,
+            },
+        )
+    }
+}
+
+/// R-N §8.1's **layer tier**: which composite entries still have to be drawn.
+///
+/// `entries` is in draw order, so `entries[j]` for `j > i` paints above
+/// `entries[i]`. Returns one flag per entry, `true` to draw.
+///
+/// This is what makes §5.5's promise concrete — "a 3D viewport fully covered by
+/// a modal stops being drawn at all, which it cannot today". An entry this
+/// returns `false` for is dropped from the draw plan entirely: no bind group,
+/// no texture fetch, no draw call, and for an external surface no interaction
+/// with `SurfaceRegistry` at all.
+///
+/// Conservative in the same two ways the instance tier is: an entry with an
+/// empty visible rectangle is kept (it paints nothing, but saying so is the
+/// caller's business), and only the first [`MAX_OCCLUDERS`] qualifying
+/// occluders are considered, which can only ever *miss* a cull.
+pub fn visible_composites(entries: &[CompositeEntry]) -> Vec<bool> {
+    (0..entries.len())
+        .map(|index| {
+            let Some(entry) = entries.get(index) else {
+                return true;
+            };
+            let target = entry.visible();
+            if target.is_empty() {
+                return true;
+            }
+            let mut occluders = [Rect::EMPTY; MAX_OCCLUDERS];
+            let mut count = 0usize;
+            for above in entries.iter().skip(index + 1) {
+                if count >= MAX_OCCLUDERS {
+                    break;
+                }
+                let Some(region) = above.opaque_region() else {
+                    continue;
+                };
+                if !region.intersects(&target) {
+                    continue;
+                }
+                occluders[count] = region;
+                count += 1;
+            }
+            !fully_covered(target, &occluders[..count])
+        })
+        .collect()
 }
 
 /// Every live compositing boundary, across frames.
@@ -428,6 +606,134 @@ mod tests {
             "an evicted boundary must name the layer it owned, so its caller can release it"
         );
         assert!(compositor.is_empty());
+    }
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Rect {
+        Rect::from_origin_size([x, y], [width, height])
+    }
+
+    fn window() -> Rect {
+        rect(0.0, 0.0, 1000.0, 800.0)
+    }
+
+    /// An external viewport, then an opaque modal painted over it.
+    fn viewport_under_modal(modal: Rect) -> [CompositeEntry; 2] {
+        let viewport = CompositeEntry::sampled(
+            CompositeSource::External(ExternalSurfaceId::from_raw(1)),
+            rect(200.0, 150.0, 400.0, 300.0),
+            window(),
+        );
+        let modal = CompositeEntry {
+            source_is_opaque: true,
+            ..CompositeEntry::sampled(
+                CompositeSource::BoundaryTexture(BoundaryId::from_raw(2)),
+                modal,
+                window(),
+            )
+        };
+        [viewport, modal]
+    }
+
+    #[test]
+    fn a_composite_entry_fully_covered_by_an_opaque_one_above_it_is_dropped() {
+        let entries = viewport_under_modal(rect(100.0, 100.0, 700.0, 500.0));
+        assert_eq!(
+            visible_composites(&entries),
+            vec![false, true],
+            "§5.5: a viewport fully covered by a modal must stop being drawn"
+        );
+    }
+
+    #[test]
+    fn a_partially_covered_entry_is_kept() {
+        // The modal covers all but a strip of the viewport's left edge.
+        let entries = viewport_under_modal(rect(250.0, 100.0, 700.0, 500.0));
+        assert_eq!(visible_composites(&entries), vec![true, true]);
+    }
+
+    #[test]
+    fn an_entry_whose_source_is_not_declared_opaque_never_occludes() {
+        // The same geometry as the covering case, with the one flag flipped.
+        // An external producer's pixels are not the framework's to know
+        // (§5.5), so nothing may be culled under it by default.
+        let mut entries = viewport_under_modal(rect(100.0, 100.0, 700.0, 500.0));
+        entries[1].source_is_opaque = false;
+        assert_eq!(visible_composites(&entries), vec![true, true]);
+        assert_eq!(entries[1].opaque_region(), None);
+    }
+
+    #[test]
+    fn a_translucent_or_rounded_cover_insets_or_disqualifies_itself() {
+        let mut entries = viewport_under_modal(rect(100.0, 100.0, 700.0, 500.0));
+        entries[1].opacity = 0.9;
+        assert_eq!(
+            visible_composites(&entries),
+            vec![true, true],
+            "a translucent cover lets its contents show through"
+        );
+
+        let mut rounded = viewport_under_modal(rect(100.0, 100.0, 700.0, 500.0));
+        rounded[1].corner_radius = 400.0;
+        assert_eq!(
+            visible_composites(&rounded),
+            vec![true, true],
+            "a radius wide enough to eat the overlap must inset the region, \
+             not be ignored"
+        );
+    }
+
+    #[test]
+    fn a_cover_painted_below_does_not_occlude() {
+        // Draw order is paint order: index 0 paints first, so entry 0 covering
+        // entry 1's geometry hides nothing.
+        let [viewport, modal] = viewport_under_modal(rect(100.0, 100.0, 700.0, 500.0));
+        assert_eq!(
+            visible_composites(&[modal, viewport]),
+            vec![true, true],
+            "the tier must never look forward in paint order"
+        );
+    }
+
+    #[test]
+    fn an_entry_clipped_to_nothing_is_kept_rather_than_culled() {
+        let mut entries = viewport_under_modal(rect(100.0, 100.0, 700.0, 500.0));
+        entries[0].content_mask = rect(0.0, 0.0, 0.0, 0.0);
+        assert!(entries[0].visible().is_empty());
+        assert_eq!(
+            visible_composites(&entries).first().copied(),
+            Some(true),
+            "conservative, exactly as the instance tier is for an empty item"
+        );
+    }
+
+    #[test]
+    fn both_producers_are_the_same_kind_of_entry() {
+        // §5.5's Gap 2: the tier must not care which producer made the pixels.
+        let external = CompositeEntry {
+            source_is_opaque: true,
+            ..CompositeEntry::sampled(
+                CompositeSource::External(ExternalSurfaceId::from_raw(9)),
+                rect(0.0, 0.0, 1000.0, 800.0),
+                window(),
+            )
+        };
+        let baked = CompositeEntry {
+            source: CompositeSource::BoundaryTexture(BoundaryId::from_raw(9)),
+            ..external
+        };
+        let target = CompositeEntry::sampled(
+            CompositeSource::BoundaryTexture(BoundaryId::from_raw(1)),
+            rect(10.0, 10.0, 100.0, 100.0),
+            window(),
+        );
+        assert_eq!(
+            visible_composites(&[target, external]),
+            visible_composites(&[target, baked])
+        );
+        assert_eq!(
+            visible_composites(&[target, external]).first().copied(),
+            Some(false)
+        );
     }
 
     #[test]
