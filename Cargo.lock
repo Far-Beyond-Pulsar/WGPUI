@@ -6758,6 +6758,10 @@ dependencies = [
 [[package]]
 name = "wgpui-text"
 version = "0.1.0"
+dependencies = [
+ "cosmic-text",
+ "wgpui-core",
+]
 
 [[package]]
 name = "wgpui-wgpu"
