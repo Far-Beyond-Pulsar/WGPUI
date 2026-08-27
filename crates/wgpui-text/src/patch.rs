@@ -156,6 +156,7 @@ fn glyph_run(
             glyph: shaped.id.0,
             font_size_bits: (font_size * placement.scale_factor).to_bits(),
             subpixel: subpixel_variant(device),
+            scale_factor_bits: placement.scale_factor.to_bits(),
             kind: if shaped.is_emoji {
                 AtlasKind::Polychrome
             } else {

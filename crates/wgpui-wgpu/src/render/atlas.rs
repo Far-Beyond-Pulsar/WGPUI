@@ -546,6 +546,7 @@ mod tests {
             glyph,
             font_size_bits: 16.0f32.to_bits(),
             subpixel: [0, 0],
+            scale_factor_bits: 1.0f32.to_bits(),
             kind: AtlasKind::Monochrome,
         }
     }
@@ -591,6 +592,10 @@ mod tests {
             },
             GlyphRasterKey {
                 subpixel: [1, 0],
+                ..base
+            },
+            GlyphRasterKey {
+                scale_factor_bits: 2.0f32.to_bits(),
                 ..base
             },
             GlyphRasterKey {

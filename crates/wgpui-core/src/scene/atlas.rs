@@ -66,6 +66,23 @@ pub enum AtlasKind {
     Polychrome,
 }
 
+impl AtlasKind {
+    /// Bytes one texel of this kind occupies, in a CPU-side page buffer and in
+    /// the GPU texture it is uploaded to.
+    ///
+    /// One for a coverage mask (`R8Unorm`) and four for colour (`Rgba8Unorm`) —
+    /// the same two formats the legacy `WgpuAtlas::push_texture` maps its two
+    /// `AtlasTextureKind`s onto. It lives here rather than in `wgpui-wgpu`
+    /// because the crate that *rasterises* has to produce bytes of this width
+    /// and cannot see a `wgpu::TextureFormat` (§3.3, §3.5).
+    pub const fn bytes_per_pixel(self) -> u32 {
+        match self {
+            AtlasKind::Monochrome => 1,
+            AtlasKind::Polychrome => 4,
+        }
+    }
+}
+
 /// The exact identity of one rasterised glyph.
 ///
 /// # Why the fields rather than a hash
@@ -85,16 +102,29 @@ pub enum AtlasKind {
 ///   variants is what makes text look right without a raster per position.
 /// - `kind` because a colour emoji and a coverage mask are not interchangeable
 ///   even when everything else matches.
+/// - `scale_factor_bits` because the rasteriser turns a sub-pixel *variant* back
+///   into a sub-pixel *offset* by dividing by the device-pixel ratio (the legacy
+///   `CosmicTextSystemState::rasterize_glyph` does exactly this), so two
+///   requests agreeing on every other field but not on the scale factor produce
+///   two different bitmaps. Added in Phase 5.5, when building the rasteriser
+///   made the dependency real: Phase 5 folded the scale into `font_size_bits`,
+///   which is right for the *size* and silently wrong for the *offset* — a
+///   16px glyph at 2× and a 32px glyph at 1× are the same device size and
+///   different rasters, and the legacy `RenderGlyphParams` hashes the two
+///   fields separately for the same reason.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GlyphRasterKey {
     /// The face the outline comes from, as the shaper numbers its faces.
     pub font: u32,
     /// The font-local glyph index.
     pub glyph: u32,
-    /// Bit pattern of the pixel size the glyph is rasterised at.
+    /// Bit pattern of the pixel size the glyph is rasterised at — already
+    /// multiplied by the scale factor, so this is a device-pixel size.
     pub font_size_bits: u32,
     /// Quantised sub-pixel position, `[x, y]`.
     pub subpixel: [u8; 2],
+    /// Bit pattern of the device-pixel ratio the raster was requested at.
+    pub scale_factor_bits: u32,
     /// Which atlas the raster belongs in.
     pub kind: AtlasKind,
 }
