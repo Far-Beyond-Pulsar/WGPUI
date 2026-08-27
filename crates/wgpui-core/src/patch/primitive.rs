@@ -269,6 +269,87 @@ impl Primitive for Quad {
     }
 }
 
+/// Which atlas allocation a glyph's raster lives in.
+///
+/// # Why one packed `u32` rather than a `(page, slot)` pair
+///
+/// Phase 1 left [`Glyph`] with exactly four bytes of tail padding (44 bytes of
+/// payload in a 48-byte slot), and this is what Phase 5 puts in it — so giving
+/// glyphs a real atlas identity costs zero extra bytes per glyph and leaves
+/// [`GlyphRun::SLOT_STRIDE`] unchanged. A `(u32, u32)` pair would have pushed
+/// the slot to 64 bytes for information that comfortably fits in 32 bits.
+///
+/// The split is 8 bits of page and 24 bits of slot: 255 live atlas pages
+/// (`u8::MAX`, since `0xFF` is reserved by [`AtlasTileId::NONE`]) against
+/// 16,777,215 tiles per page. A 4096×4096 page holds ~65,000 typical glyph
+/// rasters, so the slot field has three orders of magnitude of headroom and the
+/// page field has more pages than any atlas this framework will open.
+///
+/// Both halves matter to different consumers, which is why neither can be
+/// dropped: the page tells the sprite pipeline which texture to sample, and the
+/// slot is what an eviction names when the allocator frees one tile out of a
+/// page that is otherwise still live (R-N §4.3).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AtlasTileId(u32);
+
+impl AtlasTileId {
+    /// Bits of [`AtlasTileId`] given to the slot; the rest are the page.
+    const SLOT_BITS: u32 = 24;
+    const SLOT_MASK: u32 = (1 << Self::SLOT_BITS) - 1;
+    /// The page index [`AtlasTileId::NONE`] occupies, and so the one no real
+    /// page may use.
+    const RESERVED_PAGE: u32 = 0xFF;
+
+    /// No tile: a glyph with no raster at all.
+    ///
+    /// Whitespace shapes to a positioned glyph with a real advance and no
+    /// coverage, and a run that carries it is more useful than one that silently
+    /// drops it — index-to-position mapping in `line_layout` depends on the
+    /// glyph being there. Such a glyph draws nothing and, importantly, is not a
+    /// tile reference: it must never make its layer subscribe to an eviction.
+    pub const NONE: AtlasTileId = AtlasTileId(u32::MAX);
+
+    /// A tile in `page` at `slot`, or `None` if either exceeds its field.
+    ///
+    /// Fallible rather than masking, because a silently truncated page index
+    /// would make one page's eviction poison a different page's layers — the
+    /// exact failure R-N §4.3's hazard is about.
+    pub const fn new(page: u32, slot: u32) -> Option<AtlasTileId> {
+        if page >= Self::RESERVED_PAGE || slot > Self::SLOT_MASK {
+            return None;
+        }
+        Some(AtlasTileId((page << Self::SLOT_BITS) | slot))
+    }
+
+    /// The atlas page this tile lives in, or `None` for [`AtlasTileId::NONE`].
+    pub const fn page(self) -> Option<u32> {
+        if self.is_none() {
+            None
+        } else {
+            Some(self.0 >> Self::SLOT_BITS)
+        }
+    }
+
+    /// The tile's slot within its page, or `None` for [`AtlasTileId::NONE`].
+    pub const fn slot(self) -> Option<u32> {
+        if self.is_none() {
+            None
+        } else {
+            Some(self.0 & Self::SLOT_MASK)
+        }
+    }
+
+    /// Whether this is [`AtlasTileId::NONE`].
+    pub const fn is_none(self) -> bool {
+        self.0 == u32::MAX
+    }
+
+    /// The packed representation, which is what reaches the GPU.
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
+}
+
 /// One positioned glyph inside a [`GlyphRun`]. Occupies exactly one slab slot.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Glyph {
@@ -278,18 +359,26 @@ pub struct Glyph {
     pub atlas_origin: [f32; 2],
     /// Size of this glyph's raster in the atlas, in texels.
     pub atlas_size: [f32; 2],
-    /// Font-specific glyph index, carried through for debugging and for the
-    /// atlas-eviction subscription Phase 5 adds (R-N §4.3).
+    /// Font-specific glyph index, carried through for debugging and for
+    /// re-rastering this glyph after its tile is evicted.
     pub glyph_id: u32,
+    /// Which atlas allocation holds this glyph's raster.
+    ///
+    /// This is the reference R-N §4.3 warns about — "a retained slab holds tile
+    /// references that the atlas may evict" — made addressable. Before Phase 5
+    /// a resident glyph named its texels by coordinate only, so nothing could
+    /// answer "which layers reference the page I am about to drop."
+    pub atlas_tile: AtlasTileId,
 }
 
 impl Glyph {
-    /// A glyph with every field zeroed.
+    /// A glyph with every field zeroed and no atlas tile.
     pub const ZERO: Glyph = Glyph {
         position: [0.0, 0.0],
         atlas_origin: [0.0, 0.0],
         atlas_size: [0.0, 0.0],
         glyph_id: 0,
+        atlas_tile: AtlasTileId::NONE,
     };
 }
 
@@ -315,13 +404,28 @@ impl GlyphRun {
             glyphs: Vec::new(),
         }
     }
+
+    /// Every real atlas tile this run references, [`AtlasTileId::NONE`]
+    /// excluded.
+    ///
+    /// Duplicates are not removed: a run of repeated characters legitimately
+    /// references one tile many times, and the callers that matter
+    /// ([`crate::scene::atlas`]) are asking a membership question, not counting.
+    pub fn atlas_tiles(&self) -> impl Iterator<Item = AtlasTileId> + '_ {
+        self.glyphs
+            .iter()
+            .map(|glyph| glyph.atlas_tile)
+            .filter(|tile| !tile.is_none())
+    }
 }
 
 impl Primitive for GlyphRun {
     const KIND: PrimitiveKind = PrimitiveKind::GlyphRun;
 
-    // 44 bytes of payload per glyph, padded to 48 for the same std430 reason
-    // as `Quad::SLOT_STRIDE`.
+    // 48 bytes of payload per glyph, which is already a 16-byte std430
+    // boundary. Phase 1 wrote 44 and padded 4; Phase 5 spent exactly that
+    // padding on `Glyph::atlas_tile`, so the stride is unchanged and no
+    // resident layout moved.
     const SLOT_STRIDE: usize = 48;
 
     fn slot_count(&self) -> u32 {
@@ -340,7 +444,7 @@ impl Primitive for GlyphRun {
             writer.write_f32_array(glyph.atlas_size)?;
             writer.write_u32(glyph.glyph_id)?;
             writer.write_f32_array(self.color)?;
-            writer.write_padding(4)?;
+            writer.write_u32(glyph.atlas_tile.as_raw())?;
         }
         writer.finish()
     }
@@ -408,6 +512,80 @@ mod tests {
         let second = &bytes[GlyphRun::SLOT_STRIDE + 28..GlyphRun::SLOT_STRIDE + 44];
         assert_eq!(first, second);
         assert_eq!(&first[0..4], &0.25f32.to_le_bytes());
+    }
+
+    #[test]
+    fn an_atlas_tile_round_trips_its_page_and_slot() {
+        let tile = AtlasTileId::new(3, 1_234).expect("3 and 1234 are both in range");
+        assert_eq!(tile.page(), Some(3));
+        assert_eq!(tile.slot(), Some(1_234));
+        assert!(!tile.is_none());
+
+        let widest = AtlasTileId::new(0xFE, 0x00FF_FFFF).expect("the widest legal tile");
+        assert_eq!(widest.page(), Some(0xFE));
+        assert_eq!(widest.slot(), Some(0x00FF_FFFF));
+    }
+
+    #[test]
+    fn an_out_of_range_page_or_slot_is_refused_rather_than_truncated() {
+        // Truncation here would make one page's eviction poison another page's
+        // layers, which is exactly the hazard the tile id exists to close.
+        assert_eq!(AtlasTileId::new(0xFF, 0), None);
+        assert_eq!(AtlasTileId::new(0x100, 0), None);
+        assert_eq!(AtlasTileId::new(0, 0x0100_0000), None);
+    }
+
+    #[test]
+    fn no_real_tile_can_collide_with_none() {
+        assert!(AtlasTileId::NONE.is_none());
+        assert_eq!(AtlasTileId::NONE.page(), None);
+        assert_eq!(AtlasTileId::NONE.slot(), None);
+        for page in 0..0xFF {
+            let tile = AtlasTileId::new(page, 0x00FF_FFFF).expect("in range");
+            assert_ne!(tile, AtlasTileId::NONE);
+        }
+    }
+
+    #[test]
+    fn a_runs_tile_references_skip_glyphs_that_have_no_raster() {
+        let tile = AtlasTileId::new(1, 7).expect("in range");
+        let run = GlyphRun {
+            color: [1.0; 4],
+            glyphs: vec![
+                Glyph {
+                    atlas_tile: tile,
+                    ..Glyph::ZERO
+                },
+                // A space: positioned, advancing, and not a tile reference.
+                Glyph::ZERO,
+                Glyph {
+                    atlas_tile: tile,
+                    ..Glyph::ZERO
+                },
+            ],
+        };
+        assert_eq!(run.atlas_tiles().collect::<Vec<_>>(), vec![tile, tile]);
+    }
+
+    #[test]
+    fn the_atlas_tile_lands_in_the_padding_phase_1_left_and_moves_nothing() {
+        let tile = AtlasTileId::new(2, 9).expect("in range");
+        let run = GlyphRun {
+            color: [0.25, 0.5, 0.75, 1.0],
+            glyphs: vec![Glyph {
+                glyph_id: 42,
+                atlas_tile: tile,
+                ..Glyph::ZERO
+            }],
+        };
+        let mut bytes = vec![0u8; GlyphRun::SLOT_STRIDE];
+        assert!(run.encode(&mut bytes).is_ok());
+        assert_eq!(GlyphRun::SLOT_STRIDE, 48, "the stride must not have grown");
+        // Everything Phase 1 wrote is where Phase 1 wrote it.
+        assert_eq!(&bytes[24..28], &42u32.to_le_bytes());
+        assert_eq!(&bytes[28..32], &0.25f32.to_le_bytes());
+        // And the tile occupies exactly the four bytes that used to be padding.
+        assert_eq!(&bytes[44..48], &tile.as_raw().to_le_bytes());
     }
 
     #[test]

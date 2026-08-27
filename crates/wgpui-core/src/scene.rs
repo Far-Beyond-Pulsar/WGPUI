@@ -8,6 +8,7 @@
 //! lives in the module that owns it; this file exists so `patch::apply` has a
 //! single thing to apply a frame's patches *to*.
 
+pub mod atlas;
 pub mod layer;
 pub mod primitive_store;
 pub mod record;
@@ -15,6 +16,7 @@ pub mod slab;
 pub mod slab_range;
 pub mod tile;
 
+pub use atlas::AtlasEviction;
 pub use layer::{BoundaryId, Layer, LayerId, LayerKey, LayerTable};
 pub use primitive_store::{DrawRange, PrimitiveStore};
 pub use record::{DispatchNode, Hitbox, LayoutInput, RecordStore};
