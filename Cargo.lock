@@ -6774,6 +6774,7 @@ dependencies = [
  "rand 0.10.0",
  "wgpu",
  "wgpui-core",
+ "wgpui-text",
 ]
 
 [[package]]

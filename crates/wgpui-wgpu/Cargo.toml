@@ -39,6 +39,13 @@ log = "0.4.16"
 
 [dev-dependencies]
 rand = "0.10"
+# Dev-only, and the production edge still runs one way: nothing under `src/`
+# names `wgpui-text`, and `AtlasTileSource` takes its rasteriser as a closure
+# precisely so it does not have to. `tests/glyph_atlas_upload.rs` needs both
+# halves of the path in one process — shape and rasterise on one side, pack and
+# upload on the other — and neither crate can host that test alone. It lives
+# here because this is where the device is.
+wgpui-text = { path = "../wgpui-text" }
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }

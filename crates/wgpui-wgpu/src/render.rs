@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod atlas;
+pub mod atlas_upload;
 pub mod buffers;
 pub mod compute;
 pub mod device;
