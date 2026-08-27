@@ -6782,6 +6782,7 @@ version = "0.1.0"
 dependencies = [
  "wgpui-core",
  "wgpui-layout",
+ "wgpui-text",
 ]
 
 [[package]]

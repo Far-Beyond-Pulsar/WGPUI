@@ -15,6 +15,10 @@ doctest = false
 # one way: neither core crate names anything in `wgpui-widgets`.
 wgpui-core = { path = "../wgpui-core" }
 wgpui-layout = { path = "../wgpui-layout" }
+# `styled_text` shapes through `wgpui-text` and converts the result to patch
+# payloads with it (§3.3, §3.4). One-way, like the others: `wgpui-text` knows
+# nothing about elements.
+wgpui-text = { path = "../wgpui-text" }
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
