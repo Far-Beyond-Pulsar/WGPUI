@@ -40,12 +40,22 @@ Both Phase 0 placeholders named in §3's file map are now real:
 `shaders/tile_visibility.wgsl` was a one-line comment and
 `render/compute/tile_visibility_pass.rs` was three lines of module doc.
 
-**No deviation from §3's file map this phase**, which is the first time across
-six phases — Phase 1 recorded six, Phase 2 two, Phase 3 four, Phase 4 two. §3
-gives `tile.rs` to "`TileCoord`, `(boundary, TileCoord)` addressing (§4.3)" and
-everything built here is that module growing into its own remit. `TiledVisit`
-went into `boundary/compositor.rs` because it is the per-frame compositing
-decision that file already owns.
+**No *new* file outside §3's map this phase** — the first time across six
+phases, where Phase 1 recorded six deviations, Phase 2 two, Phase 3 four, and
+Phase 4 two. Every file above is one §3 already names, and both compute-pass
+files landed exactly where §3 put them.
+
+**One stretch, stated rather than counted as zero.** §3 describes `tile.rs` as
+"`TileCoord`, `(boundary, TileCoord)` addressing (§4.3)", and what is in it now
+is more than addressing: the grid geometry, the visibility predicate, and the
+residency budget with its two eviction rules. That is the tile module growing
+into the whole of §4.3's mechanism rather than a new concern smuggled into an
+existing file — the alternative was three files of a few hundred lines each,
+which `AGENTS.md` explicitly steers away from — but a reader comparing this
+against §3's one-line description should expect a bigger file than that line
+suggests. `TiledVisit` went into `boundary/compositor.rs`, which is itself
+already a documented Phase 2 deviation, because it is the per-frame compositing
+decision that file exists to own.
 
 ---
 
