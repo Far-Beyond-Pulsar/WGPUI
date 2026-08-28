@@ -314,11 +314,21 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
     );
     assert_eq!(
         large_output.stats.slots_visited as usize,
-        LAYERS,
-        "one entry per layer for the one kind that has a pipeline — the slot \
-         table also names every layer's GlyphRun slot, and nothing draws those \
-         because Phase 4 built one instanced pipeline (see `render/frame.rs`)"
+        LAYERS * PrimitiveKind::COUNT,
+        "one entry per (layer, kind) slot. Phase 4 asserted `LAYERS` here and \
+         explained that nothing drew the GlyphRun half because only one \
+         instanced pipeline existed; Phase 5.6 built the second, so both halves \
+         of the table are now walked. The gate itself is untouched — the \
+         equalities above still say the work does not grow with the primitive \
+         count — and what changed is the premise, not the claim"
     );
+    assert_eq!(
+        large_output.stats.glyph_slots_unavailable as usize,
+        LAYERS,
+        "this scene has no atlas, so its glyph slots are walked and found to \
+         have no texture to bind — see `DrawStats::glyph_slots_unavailable`"
+    );
+    assert_eq!(large_output.stats.glyph_draws_issued, 0);
     assert_eq!(
         scene_slot_table_len(&large),
         LAYERS * PrimitiveKind::COUNT,
@@ -381,9 +391,13 @@ fn the_fallback_path_is_the_one_that_learns_the_counts() {
     assert!(known > 0);
     assert!(first.stats.readback_words > 0);
     assert_eq!(
-        first.stats.slots_skipped + first.stats.draw_calls_issued,
+        first.stats.slots_skipped
+            + first.stats.draw_calls_issued
+            + first.stats.glyph_slots_unavailable,
         first.stats.slots_visited,
-        "every slot is either drawn or knowingly skipped"
+        "every slot is either drawn, knowingly skipped, or — since Phase 5.6 — \
+         found to have no atlas page to bind at all, which is a third outcome \
+         and not a fourth name for skipping"
     );
     assert_eq!(
         first.stats.slots_skipped, 1,

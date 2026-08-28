@@ -200,6 +200,16 @@ pub struct DrawStats {
     pub atlas_pages_bound: u32,
     /// Glyph draw calls issued.
     pub glyph_draws_issued: u32,
+    /// Glyph slots that could not be issued at all, because no atlas page was
+    /// available to bind.
+    ///
+    /// The same idea as [`DrawStats::composite_entries_unavailable`] and not an
+    /// error: a window whose text has not been rasterised yet has glyph slots
+    /// and no texture to sample them from, and there is no such thing as a draw
+    /// call without a bound texture. Counted rather than silently dropped so
+    /// that `slots_skipped + draw_calls_issued + glyph_slots_unavailable` still
+    /// accounts for every slot the frame's fixed sequence named.
+    pub glyph_slots_unavailable: u32,
 }
 
 impl DrawStats {
@@ -216,6 +226,7 @@ impl DrawStats {
         self.composite_draws_issued += other.composite_draws_issued;
         self.atlas_pages_bound += other.atlas_pages_bound;
         self.glyph_draws_issued += other.glyph_draws_issued;
+        self.glyph_slots_unavailable += other.glyph_slots_unavailable;
         self.instances_known_to_cpu = match (self.instances_known_to_cpu, other.instances_known_to_cpu)
         {
             // Unknown is contagious on purpose: a frame that took one indirect
@@ -535,9 +546,12 @@ pub fn issue_glyphs(
     if plan.slots.is_empty() || draw.pages.is_empty() {
         // No page means no texture to sample, which is a scene with no
         // rasterised text in it rather than an error. The slots are still
-        // reported as visited: §5.3's sequence is fixed, and a frame that drew
-        // no text still walked it.
+        // reported as visited — §5.3's sequence is fixed — and reported as
+        // *unavailable*, because there is no such thing as a draw call without a
+        // bound texture and pretending they were skipped would say the CPU
+        // decided something it did not.
         stats.atlas_pages_bound = 0;
+        stats.glyph_slots_unavailable = stats.slots_visited;
         return stats;
     }
 
