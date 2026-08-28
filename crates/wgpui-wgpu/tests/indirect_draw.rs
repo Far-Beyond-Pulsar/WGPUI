@@ -126,6 +126,7 @@ fn every_draw_mode_renders_the_same_picture() {
             uploads: &[],
             composites: &[],
             registry: None,
+            atlas: None,
             viewport: [spec.width, spec.height],
             mode,
         };
@@ -206,6 +207,7 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
             uploads: &[],
             composites: &[],
             registry: None,
+            atlas: None,
             viewport: [spec.width, spec.height],
             mode,
         };
@@ -367,6 +369,7 @@ fn the_fallback_path_is_the_one_that_learns_the_counts() {
         uploads: &[],
         composites: &[],
         registry: None,
+        atlas: None,
         viewport: [spec.width, spec.height],
         mode: DrawMode::CpuReadback,
     };
@@ -484,6 +487,7 @@ fn gate_2_a_covered_viewport_issues_no_draws_and_consumes_no_produced_frame() {
             uploads: &[],
             composites,
             registry: Some(registry),
+            atlas: None,
             viewport: [spec.width, spec.height],
             mode,
         }
@@ -616,6 +620,7 @@ fn an_uncovered_composite_entry_actually_paints() {
         uploads: &[],
         composites: std::slice::from_ref(&entry),
         registry: None,
+        atlas: None,
         viewport: [spec.width, spec.height],
         mode: DrawMode::best_available(context.indirect),
     };

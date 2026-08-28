@@ -8,11 +8,21 @@
 //!
 //! Every function below is written so that claim is *structurally* true rather
 //! than true by measurement luck: nothing here reads a primitive, a record, an
-//! upload, or a count. [`QuadDrawPlan`] is built from a
+//! upload, or a count. [`SlotBasePlan`] is built from a
 //! `wgpui_core::indirect::SlotTable`, which is built from each layer's
 //! `SlabRange`, and issuing is a loop over slots whose body is a constant
 //! number of calls. [`DrawStats`] then makes it *measurable* rather than
 //! asserted, in the style `render_stats` established in the legacy backend.
+//!
+//! # The one place the claim is not O(layer slots) flat
+//!
+//! [`issue_glyphs`] multiplies the sequence by the number of live monochrome
+//! atlas pages, because a bind group cannot change inside a draw call and a
+//! glyph's page decides its texture. That is the same reason
+//! [`issue_composites`] is per entry even where multi-draw is available, and it
+//! is a property of sampling textures rather than a shortcoming of the mode.
+//! [`DrawStats::atlas_pages_bound`] reports the multiplier rather than leaving
+//! it to be inferred from a draw count.
 //!
 //! The counter that carries the claim is [`DrawStats::instances_known_to_cpu`].
 //! On every indirect path it is `None` — not zero, not unknown-but-guessable:
@@ -46,7 +56,9 @@ use wgpui_core::indirect::{DRAW_INDIRECT_ARGS_STRIDE, DrawIndirectArgs, DrawSlot
 
 use crate::render::compute::indirect_args_pass::IndirectArgsBuffers;
 use crate::render::device::IndirectSupport;
-use crate::render::pipelines::{CompositePipeline, QuadPipeline};
+use crate::render::pipelines::{
+    CompositePipeline, MonoSpritePipeline, QuadPipeline, slot_base_bind_group,
+};
 use crate::render::readback::{ReadbackError, StagingReader};
 use crate::render::textures::external_surface::CompositePlan;
 
@@ -180,6 +192,14 @@ pub struct DrawStats {
     pub composite_entries_unavailable: u32,
     /// Composite draw calls issued.
     pub composite_draws_issued: u32,
+    /// Atlas pages the glyph pass bound, one bind group each.
+    ///
+    /// The number `issue_glyphs` multiplies its slot sequence by, and therefore
+    /// the honest form of "this pipeline's CPU cost is O(layer slots × live
+    /// monochrome pages)" rather than O(layer slots) flat.
+    pub atlas_pages_bound: u32,
+    /// Glyph draw calls issued.
+    pub glyph_draws_issued: u32,
 }
 
 impl DrawStats {
@@ -194,6 +214,8 @@ impl DrawStats {
         self.composite_entries_culled += other.composite_entries_culled;
         self.composite_entries_unavailable += other.composite_entries_unavailable;
         self.composite_draws_issued += other.composite_draws_issued;
+        self.atlas_pages_bound += other.atlas_pages_bound;
+        self.glyph_draws_issued += other.glyph_draws_issued;
         self.instances_known_to_cpu = match (self.instances_known_to_cpu, other.instances_known_to_cpu)
         {
             // Unknown is contagious on purpose: a frame that took one indirect
@@ -287,7 +309,13 @@ impl ResolvedArgs {
 /// function of which layers exist and what they reserved, so it survives every
 /// frame in which content changes but residency does not — which is most of
 /// them.
-pub struct QuadDrawPlan {
+///
+/// Phase 4 called this `QuadDrawPlan`; Phase 5.6 renamed it when the glyph
+/// pipeline needed exactly the same thing over a different arena. Nothing about
+/// it was ever quad-specific — the slot base is `wgpui_core::indirect`'s notion,
+/// not a shader's — and the two pipelines now share one implementation rather
+/// than two copies that could drift.
+pub struct SlotBasePlan {
     slots: Vec<DrawSlot>,
     bind_group: wgpu::BindGroup,
     stride: u32,
@@ -296,21 +324,22 @@ pub struct QuadDrawPlan {
     zero_offset: u32,
 }
 
-impl QuadDrawPlan {
-    /// Build the plan for one kind's slots.
+impl SlotBasePlan {
+    /// Build the plan for one kind's slots against `layout`, which must be a
+    /// pipeline's slot-base bind group layout.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        pipeline: &QuadPipeline,
+        layout: &wgpu::BindGroupLayout,
+        stride: u32,
         slots: &[DrawSlot],
-    ) -> QuadDrawPlan {
-        let stride = pipeline.slot_stride;
+    ) -> SlotBasePlan {
         // One entry per slot, plus a trailing zero entry for the multi-draw
         // modes.
         let entries = slots.len() + 1;
         let size = u64::from(stride) * entries as u64;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("quad slot bases"),
+            label: Some("slot bases"),
             size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -323,13 +352,45 @@ impl QuadDrawPlan {
             }
         }
         queue.write_buffer(&buffer, 0, &bytes);
-        let bind_group = pipeline.slot_bind_group(device, &buffer);
-        QuadDrawPlan {
+        let bind_group = slot_base_bind_group(device, layout, &buffer);
+        SlotBasePlan {
             slots: slots.to_vec(),
             bind_group,
             stride,
             zero_offset: u32::try_from(slots.len()).unwrap_or(0) * stride,
         }
+    }
+
+    /// Build the plan for the quad pipeline's slots.
+    pub fn for_quads(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &QuadPipeline,
+        slots: &[DrawSlot],
+    ) -> SlotBasePlan {
+        SlotBasePlan::new(
+            device,
+            queue,
+            &pipeline.slot_layout,
+            pipeline.slot_stride,
+            slots,
+        )
+    }
+
+    /// Build the plan for the mono-sprite pipeline's slots.
+    pub fn for_glyphs(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &MonoSpritePipeline,
+        slots: &[DrawSlot],
+    ) -> SlotBasePlan {
+        SlotBasePlan::new(
+            device,
+            queue,
+            &pipeline.slot_layout,
+            pipeline.slot_stride,
+            slots,
+        )
     }
 
     /// Entries in the fixed sequence.
@@ -352,7 +413,7 @@ impl QuadDrawPlan {
 pub fn issue_quads(
     pass: &mut wgpu::RenderPass<'_>,
     pipeline: &QuadPipeline,
-    plan: &QuadDrawPlan,
+    plan: &SlotBasePlan,
     frame_group: &wgpu::BindGroup,
     args: &IndirectArgsBuffers,
     mode: DrawMode,
@@ -417,6 +478,132 @@ pub fn issue_quads(
             }
             stats.instances_known_to_cpu = Some(known);
         }
+    }
+    stats
+}
+
+/// The atlas pages one glyph pass will bind, in ascending page order.
+///
+/// Built per frame rather than per slot-table change, because the atlas is what
+/// changes: a frame that rasterised a glyph into a new page has a new page to
+/// bind, and a frame that evicted one has a bind group referencing a texture
+/// that no longer exists. Paired with the [`SlotBasePlan`] rather than folded
+/// into it for exactly that reason — the two have different lifetimes, and
+/// merging them would rebuild the slot bases every time a glyph was rasterised.
+pub struct GlyphDraw<'a> {
+    /// The per-slot bases, held across frames.
+    pub plan: &'a SlotBasePlan,
+    /// One bind group per live monochrome page: its index and its texture.
+    pub pages: &'a [wgpu::BindGroup],
+}
+
+/// Issue the glyph kind's fixed draw sequence, once per bound atlas page.
+///
+/// The sequence within a page is byte-for-byte [`issue_quads`]': the same
+/// argument buffer, the same dynamic slot-base offsets, the same four modes. The
+/// outer loop over `draw.pages` is the whole of the difference, and it exists
+/// because `mono_sprites.wgsl` filters glyphs by the bound page rather than
+/// looking a texture up per glyph — see that shader's header for why a lookup is
+/// not available on a device without binding arrays.
+///
+/// A glyph whose page is not the bound one collapses to a degenerate triangle
+/// strip, so drawing the same slot once per page is correct and not merely
+/// harmless: each glyph is rasterised into the framebuffer exactly once, by the
+/// pass that bound its own page.
+///
+/// **The CPU still never learns an instance count.** It issues the same record
+/// `pages.len()` times and does not read it, which is why
+/// [`DrawStats::instances_known_to_cpu`] is `None` on every indirect path here
+/// too.
+pub fn issue_glyphs(
+    pass: &mut wgpu::RenderPass<'_>,
+    pipeline: &MonoSpritePipeline,
+    draw: GlyphDraw<'_>,
+    frame_group: &wgpu::BindGroup,
+    args: &IndirectArgsBuffers,
+    mode: DrawMode,
+    resolved: &ResolvedArgs,
+) -> DrawStats {
+    let plan = draw.plan;
+    let mut stats = DrawStats {
+        slots_visited: plan.slot_count(),
+        readback_words: resolved.words_read(),
+        instances_known_to_cpu: if mode.reads_back() { Some(0) } else { None },
+        atlas_pages_bound: u32::try_from(draw.pages.len()).unwrap_or(u32::MAX),
+        ..DrawStats::default()
+    };
+    if plan.slots.is_empty() || draw.pages.is_empty() {
+        // No page means no texture to sample, which is a scene with no
+        // rasterised text in it rather than an error. The slots are still
+        // reported as visited: §5.3's sequence is fixed, and a frame that drew
+        // no text still walked it.
+        stats.atlas_pages_bound = 0;
+        return stats;
+    }
+
+    pass.set_pipeline(&pipeline.pipeline);
+    pass.set_bind_group(0, frame_group, &[]);
+    stats.bind_group_binds += 1;
+
+    let mut known = 0u32;
+    for (page_index, page) in draw.pages.iter().enumerate() {
+        // `slots_visited` is the length of the *fixed sequence*, which the page
+        // loop repeats rather than lengthens — so a skip is counted once, on the
+        // first page, and `slots_skipped + (glyph_draws_issued / pages)` still
+        // equals it. `atlas_pages_bound` carries the multiplier separately.
+        let count_skips = page_index == 0;
+        pass.set_bind_group(2, page, &[]);
+        stats.bind_group_binds += 1;
+        match mode {
+            DrawMode::MultiDrawIndirectCount => {
+                pass.set_bind_group(1, &plan.bind_group, &[plan.zero_offset]);
+                stats.bind_group_binds += 1;
+                pass.multi_draw_indirect_count(
+                    &args.packed_args,
+                    0,
+                    &args.draw_count,
+                    0,
+                    plan.slot_count(),
+                );
+                stats.draw_calls_issued += 1;
+                stats.glyph_draws_issued += 1;
+            }
+            DrawMode::MultiDrawIndirect => {
+                pass.set_bind_group(1, &plan.bind_group, &[plan.zero_offset]);
+                stats.bind_group_binds += 1;
+                pass.multi_draw_indirect(&args.args, 0, plan.slot_count());
+                stats.draw_calls_issued += 1;
+                stats.glyph_draws_issued += 1;
+            }
+            DrawMode::PerSlotIndirect => {
+                for index in 0..plan.slots.len() {
+                    pass.set_bind_group(1, &plan.bind_group, &[index as u32 * plan.stride]);
+                    stats.bind_group_binds += 1;
+                    pass.draw_indirect(&args.args, index as u64 * DRAW_INDIRECT_ARGS_STRIDE as u64);
+                    stats.draw_calls_issued += 1;
+                    stats.glyph_draws_issued += 1;
+                }
+            }
+            DrawMode::CpuReadback => {
+                for (index, record) in resolved.records().iter().enumerate() {
+                    if record.is_empty() {
+                        if count_skips {
+                            stats.slots_skipped += 1;
+                        }
+                        continue;
+                    }
+                    pass.set_bind_group(1, &plan.bind_group, &[index as u32 * plan.stride]);
+                    stats.bind_group_binds += 1;
+                    pass.draw(0..record.vertex_count, 0..record.instance_count);
+                    stats.draw_calls_issued += 1;
+                    stats.glyph_draws_issued += 1;
+                    known += record.instance_count;
+                }
+            }
+        }
+    }
+    if mode.reads_back() {
+        stats.instances_known_to_cpu = Some(known);
     }
     stats
 }

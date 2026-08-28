@@ -112,6 +112,31 @@ impl AtlasTextures {
         self.pages.len()
     }
 
+    /// Which atlas kind `page`'s texture holds.
+    ///
+    /// The sprite pipelines are per format — a coverage mask and a colour
+    /// bitmap are not the same shader — so a draw path has to be able to ask,
+    /// rather than binding every page it finds and sampling the red channel of
+    /// an emoji.
+    pub fn page_kind(&self, page: u32) -> Option<AtlasKind> {
+        self.pages.get(&page).map(|page| page.kind)
+    }
+
+    /// Every page with a texture whose kind is `kind`, in ascending page order.
+    ///
+    /// Sorted rather than in hash order so a frame's page sequence — and
+    /// therefore its draw sequence — is the same from one frame to the next.
+    pub fn pages_of_kind(&self, kind: AtlasKind) -> Vec<u32> {
+        let mut pages: Vec<u32> = self
+            .pages
+            .iter()
+            .filter(|(_, page)| page.kind == kind)
+            .map(|(index, _)| *index)
+            .collect();
+        pages.sort_unstable();
+        pages
+    }
+
     /// Create textures for new pages, drop them for destroyed ones, and copy
     /// every rectangle the atlas has queued.
     ///

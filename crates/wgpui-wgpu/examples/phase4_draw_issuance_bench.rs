@@ -148,6 +148,7 @@ fn run_case(context: &ComputeContext, layers: usize, per_layer: u32, mode: DrawM
         uploads: &[],
         composites: &[],
         registry: None,
+        atlas: None,
         viewport: [WIDTH, HEIGHT],
         mode,
     };
