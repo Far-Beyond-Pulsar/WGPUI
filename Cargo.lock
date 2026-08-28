@@ -6769,6 +6769,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "etagere",
+ "image",
  "log",
  "pollster 0.4.0",
  "rand 0.10.0",
@@ -6776,6 +6777,7 @@ dependencies = [
  "wgpui-core",
  "wgpui-layout",
  "wgpui-text",
+ "wgpui-widgets",
  "winit",
 ]
 

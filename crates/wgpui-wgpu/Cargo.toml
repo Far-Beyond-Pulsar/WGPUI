@@ -48,6 +48,28 @@ log = "0.4.16"
 winit = "0.30.12"
 
 [dev-dependencies]
+# `tests/legacy_image_differential.rs` drives Phase 6.2's gate end to end: a real
+# file on disk, decoded by `wgpui-widgets`, drawn by this crate, compared against
+# the legacy decoder's own bytes. That needs all three in one test binary.
+#
+# A dev-dependency and not a dependency, deliberately. §3.5 makes this "the only
+# crate touching a live device" and §3.4 puts elements the other side of that
+# line; an ordinary edge here would invert the split. A test binary is not the
+# library, and the graph stays acyclic either way (`wgpui-widgets` does not
+# depend on this crate).
+wgpui-widgets = { path = "../wgpui-widgets" }
+wgpui-layout = { path = "../wgpui-layout" }
+# The oracle. Same version the root crate pins, so the differential compares
+# against the decoder legacy actually calls rather than a different one.
+image = { version = "0.25.1", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
 rand = "0.10"
 # Dev-only, and the production edge still runs one way: nothing under `src/`
 # names `wgpui-text`, and `AtlasTileSource` takes its rasteriser as a closure
