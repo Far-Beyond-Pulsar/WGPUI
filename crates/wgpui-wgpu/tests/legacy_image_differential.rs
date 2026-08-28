@@ -30,15 +30,28 @@
 //! ones the legacy decoder produced" a checked claim rather than two separate
 //! half-claims.
 //!
-//! # Where it is exact and where it is within one unit, stated up front
+//! # The bar, and the tolerance that was designed in and then not needed
 //!
-//! An **opaque** texel is exact: `src.rgb * 1 + dst.rgb * 0` is the texel, and
-//! `Rgba8Unorm` writes it back unchanged. A **translucent** texel composites to
-//! `round(rgb * a / 255)`, which the GPU computes in `f32` and the CPU here
-//! computes in `f64`, and the two are permitted to disagree by one unit at a
-//! rounding boundary. So the assertion is equality on the opaque pixels — which
-//! is most of a real icon — and ±1 on the rest, with both counts printed so a
-//! regression that moves work from the first bucket to the second is visible.
+//! An **opaque** texel is exact by construction: `src.rgb * 1 + dst.rgb * 0` is
+//! the texel and `Rgba8Unorm` writes it back unchanged. A **translucent** texel
+//! composites to `round(rgb * a / 255)`, which the GPU computes in `f32` and the
+//! CPU here computes in `f64`, so the two *could* disagree by one unit at a
+//! rounding boundary — a real difference from Phase 5.6's pure-coverage case,
+//! where no such multiply existed.
+//!
+//! That tolerance is computed and reported, but it is **not** what the gate
+//! passes on. Measured on the reference adapter (RTX 4060, Vulkan, 561.03),
+//! every pixel of both assets agreed byte-for-byte, translucent ones included,
+//! and both tests assert exactly that. The ±1 classification survives as a
+//! diagnostic: a one-unit divergence dies with "this is the byte-exact bar"
+//! rather than with a raw mismatch, so it can be read and judged instead of
+//! being silently absorbed by a looser assertion.
+//!
+//! Because "byte-exact on an asset that is entirely opaque" would be a much
+//! weaker sentence than it sounds, the source texels are classified as opaque /
+//! translucent / transparent and printed, and the PNG gate asserts its asset
+//! actually contains translucent texels — otherwise the blend this is all about
+//! is never exercised at all.
 //!
 //! # If there is no adapter
 //!
@@ -254,13 +267,33 @@ fn expected_over_black(texel: [u8; 4]) -> [u8; 4] {
     ]
 }
 
+/// What one comparison found.
+///
+/// The alpha classes are carried, not just the agreement counts, because
+/// "byte-exact" over an asset that happens to be entirely opaque is a weaker
+/// claim than the same sentence over one that is not, and a report that cannot
+/// tell the two apart is not a report. `translucent` is the population the ±1
+/// tolerance is even *allowed* to apply to; if it is zero, the tolerance was
+/// never under test and this says so rather than letting a clean number imply
+/// otherwise.
+struct Agreement {
+    exact: usize,
+    within_one: usize,
+    opaque: usize,
+    translucent: usize,
+    transparent: usize,
+}
+
 /// Compare a rendered frame against an oracle bitmap, pixel by pixel.
 ///
-/// Returns `(exact, within_one)`. Panics with the first real divergence rather
-/// than with a count, because "1,400 pixels differ" is not a bug report.
-fn compare(rendered: &Rendered, oracle_size: [u32; 2], oracle: &[u8], label: &str) -> (usize, usize) {
+/// Panics with the first real divergence rather than with a count, because
+/// "1,400 pixels differ" is not a bug report.
+fn compare(rendered: &Rendered, oracle_size: [u32; 2], oracle: &[u8], label: &str) -> Agreement {
     let mut exact = 0usize;
     let mut within_one = 0usize;
+    let mut opaque = 0usize;
+    let mut translucent = 0usize;
+    let mut transparent = 0usize;
     for y in 0..oracle_size[1] {
         for x in 0..oracle_size[0] {
             let source = ((y * oracle_size[0] + x) * 4) as usize;
@@ -270,6 +303,11 @@ fn compare(rendered: &Rendered, oracle_size: [u32; 2], oracle: &[u8], label: &st
                 .try_into()
                 .expect("four bytes");
             let expected = expected_over_black(texel);
+            match texel[3] {
+                0x00 => transparent += 1,
+                0xFF => opaque += 1,
+                _ => translucent += 1,
+            }
 
             let index = ((y * rendered.width + x) * 4) as usize;
             let drawn: [u8; 4] = rendered
@@ -299,7 +337,13 @@ fn compare(rendered: &Rendered, oracle_size: [u32; 2], oracle: &[u8], label: &st
             within_one += 1;
         }
     }
-    (exact, within_one)
+    Agreement {
+        exact,
+        within_one,
+        opaque,
+        translucent,
+        transparent,
+    }
 }
 
 /// **The gate**, on a real PNG.
@@ -337,17 +381,24 @@ fn a_real_png_loads_decodes_uploads_and_renders_as_the_legacy_decoder_produced_i
     assert_eq!(rendered.sprites_resident, 1, "one sprite, from one element");
     assert_eq!(rendered.atlas_pages, 1, "one colour page");
 
-    let (exact, within_one) = compare(&rendered, legacy_size, &legacy_texels, "app-icon.png");
+    let found = compare(&rendered, legacy_size, &legacy_texels, "app-icon.png");
+    let total = (legacy_size[0] * legacy_size[1]) as usize;
     println!(
-        "phase_6_2_png_gate: {exact} pixels byte-exact, {within_one} within one unit \
-         (translucent texels only), of {} compared",
-        legacy_size[0] * legacy_size[1]
+        "phase_6_2_png_gate: {} of {total} pixels byte-exact, {} within one unit; \
+         source texels: {} opaque, {} translucent, {} transparent",
+        found.exact, found.within_one, found.opaque, found.translucent, found.transparent
     );
     assert!(
-        exact > (legacy_size[0] * legacy_size[1] / 2) as usize,
-        "most of a real icon is opaque, so most of the comparison must be exact — \
-         {exact} of {} is not a gate",
-        legacy_size[0] * legacy_size[1]
+        found.translucent > 0,
+        "this asset must contain translucent texels, or the blend the gate is \
+         about is never exercised and 'byte-exact' means only 'exact where alpha \
+         does nothing'"
+    );
+    assert_eq!(
+        found.exact, total,
+        "every pixel of this asset agreed byte-for-byte on the run that set this \
+         bar, translucent ones included; a run that needs the ±1 tolerance is a \
+         change in behaviour and must be read, not absorbed"
     );
 }
 
@@ -386,14 +437,24 @@ fn a_real_gifs_first_frame_renders_as_the_legacy_decoder_produced_it() {
         });
     let rendered = render_element(&context, &atlas, image, legacy_size);
 
-    let (exact, within_one) = compare(&rendered, legacy_size, &legacy_texels, "black-cat-typing.gif");
+    let found = compare(&rendered, legacy_size, &legacy_texels, "black-cat-typing.gif");
+    let total = (legacy_size[0] * legacy_size[1]) as usize;
     println!(
-        "phase_6_2_gif_gate: {exact} pixels byte-exact, {within_one} within one unit, \
-         of {} compared across {} decoded frames",
-        legacy_size[0] * legacy_size[1],
+        "phase_6_2_gif_gate: {} of {total} pixels byte-exact, {} within one unit; \
+         source texels: {} opaque, {} translucent, {} transparent; \
+         {} frames decoded, frame 0 drawn",
+        found.exact,
+        found.within_one,
+        found.opaque,
+        found.translucent,
+        found.transparent,
         ours.frame_count()
     );
-    assert!(exact > 0, "nothing matched exactly, which is not a gate");
+    assert_eq!(
+        found.exact, total,
+        "the GIF arm is held to the same bar as the PNG one; a differential that \
+         asserts only 'something matched' proves only that something matched"
+    );
 }
 
 /// The differential can fail.
@@ -433,7 +494,7 @@ fn the_comparison_actually_detects_a_wrong_pixel() {
     texels[index] = texels[index].wrapping_add(64);
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compare(&rendered, size, &texels, "corrupted");
+        let _ = compare(&rendered, size, &texels, "corrupted");
     }));
     assert!(
         outcome.is_err(),
