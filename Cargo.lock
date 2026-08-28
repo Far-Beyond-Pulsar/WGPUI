@@ -6775,6 +6775,7 @@ dependencies = [
  "wgpu",
  "wgpui-core",
  "wgpui-text",
+ "winit",
 ]
 
 [[package]]
