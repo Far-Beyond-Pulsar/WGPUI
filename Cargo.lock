@@ -6783,6 +6783,9 @@ dependencies = [
 name = "wgpui-widgets"
 version = "0.1.0"
 dependencies = [
+ "image",
+ "resvg",
+ "usvg",
  "wgpui-core",
  "wgpui-layout",
  "wgpui-text",

@@ -860,61 +860,110 @@ where
     }
 }
 
-/// An [`ImageTileSource`] built from an atlas and a decoder.
+/// Place one decoded frame in `atlas`, decoding it only if it is not resident.
 ///
-/// [`AtlasTileSource`]'s image counterpart, and it is a separate type for the
-/// dependency reason that one records: `wgpui-wgpu` cannot name
-/// `wgpui_widgets::image_cache::ImageCache` without depending on the crate that
-/// owns every element, which would invert §3.4/§3.5's edge. The closure is how
-/// the two meet and [`RasterizedImage`] is the vocabulary they meet in.
-///
-/// # Why the decoder is only asked about keys the atlas does not already hold
-///
-/// The same reason [`AtlasTileSource`] guards its rasteriser, one order of
-/// magnitude louder. A glyph raster is a few hundred bytes and decoding one
-/// again is wasteful; an image frame is megabytes and decoding one again inside
-/// a frame loop is a visible stall. So residency is checked first and the
-/// closure is a fallback, not a lookup.
-pub struct ImageAtlasSource<'atlas, Decode> {
-    atlas: &'atlas mut GlyphAtlas,
-    decode: Decode,
+/// The body of [`ImageTileSource`] for this crate, factored out so the borrowing
+/// and the shared adapters below cannot drift: they differ in how they reach a
+/// [`GlyphAtlas`] and in nothing else.
+fn image_tile_in(
+    atlas: &mut GlyphAtlas,
+    key: ImageRasterKey,
+    decode: &mut dyn FnMut(ImageRasterKey) -> Option<RasterizedImage>,
+) -> Option<ImageTile> {
+    let placement = match atlas.get(key) {
+        Some(placement) => {
+            atlas.stats.cache_hits += 1;
+            placement
+        }
+        None => {
+            let image = decode(key)?;
+            // A refused allocation is `None`, not an error the caller has to
+            // handle: one image failing to find atlas space degrades to a sprite
+            // that draws nothing rather than failing the frame — the same rule a
+            // glyph follows, and the one that keeps a 4000px photograph from
+            // taking a window down with it.
+            atlas.get_or_insert_image(key, &image).ok()?
+        }
+    };
+    Some(ImageTile {
+        tile: placement.tile,
+        atlas_origin: placement.origin,
+        atlas_size: placement.size,
+    })
 }
 
-impl<'atlas, Decode> ImageAtlasSource<'atlas, Decode>
-where
-    Decode: FnMut(ImageRasterKey) -> Option<RasterizedImage>,
-{
-    /// A tile source over `atlas`, decoding with `decode`.
-    pub fn new(atlas: &'atlas mut GlyphAtlas, decode: Decode) -> Self {
-        Self { atlas, decode }
+/// An [`ImageTileSource`] over a borrowed atlas.
+///
+/// [`AtlasTileSource`]'s image counterpart for a caller that already has the
+/// atlas in hand — a test, or a frame that borrows it for one call. It cannot be
+/// boxed into anything outliving the borrow, which is what [`SharedImageAtlas`]
+/// is for.
+///
+/// Unlike [`AtlasTileSource`] it holds no closure: the decoder arrives per call,
+/// because §3.4 puts the decode cache in `wgpui-widgets` and this crate may not
+/// name it. See [`ImageTileSource`]'s own doc, which records why the two seams
+/// differ in exactly this way.
+pub struct ImageAtlasSource<'atlas> {
+    atlas: &'atlas mut GlyphAtlas,
+}
+
+impl<'atlas> ImageAtlasSource<'atlas> {
+    /// A tile source over `atlas`.
+    pub fn new(atlas: &'atlas mut GlyphAtlas) -> Self {
+        Self { atlas }
     }
 }
 
-impl<Decode> ImageTileSource for ImageAtlasSource<'_, Decode>
-where
-    Decode: FnMut(ImageRasterKey) -> Option<RasterizedImage>,
-{
-    fn tile_for(&mut self, key: ImageRasterKey) -> Option<ImageTile> {
-        let placement = match self.atlas.get(key) {
-            Some(placement) => {
-                self.atlas.stats.cache_hits += 1;
-                placement
-            }
-            None => {
-                let image = (self.decode)(key)?;
-                // A refused allocation is `None`, not an error the caller has to
-                // handle: one image failing to find atlas space degrades to a
-                // sprite that draws nothing rather than failing the frame — the
-                // same rule a glyph follows, and the one that keeps a 4000px
-                // photograph from taking a window down with it.
-                self.atlas.get_or_insert_image(key, &image).ok()?
-            }
-        };
-        Some(ImageTile {
-            tile: placement.tile,
-            atlas_origin: placement.origin,
-            atlas_size: placement.size,
-        })
+impl ImageTileSource for ImageAtlasSource<'_> {
+    fn tile_for(
+        &mut self,
+        key: ImageRasterKey,
+        decode: &mut dyn FnMut(ImageRasterKey) -> Option<RasterizedImage>,
+    ) -> Option<ImageTile> {
+        image_tile_in(self.atlas, key, decode)
+    }
+}
+
+/// An [`ImageTileSource`] over an atlas shared with the frame renderer.
+///
+/// The form an element can actually hold: `wgpui_widgets::img::ImageEngine`
+/// keeps a `Box<dyn ImageTileSource>` for the lifetime of a window, and a
+/// borrowing source cannot be boxed that long. The renderer takes
+/// `atlas.borrow_mut()` when it uploads pages and this takes it when it
+/// allocates a tile; the two never overlap, because uploading happens between
+/// frames and allocating happens during emission.
+///
+/// `Rc<RefCell<_>>` and not a lock, for the reason
+/// `wgpui_widgets::styled_text::SharedTextEngine` gives: everything that reaches
+/// it runs on the frame's thread.
+#[derive(Clone)]
+pub struct SharedImageAtlas {
+    atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
+}
+
+impl SharedImageAtlas {
+    /// A tile source over `atlas`.
+    pub fn new(atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>) -> Self {
+        Self { atlas }
+    }
+
+    /// The atlas itself, for uploading its pages or draining its evictions.
+    pub fn atlas(&self) -> &std::rc::Rc<std::cell::RefCell<GlyphAtlas>> {
+        &self.atlas
+    }
+}
+
+impl ImageTileSource for SharedImageAtlas {
+    fn tile_for(
+        &mut self,
+        key: ImageRasterKey,
+        decode: &mut dyn FnMut(ImageRasterKey) -> Option<RasterizedImage>,
+    ) -> Option<ImageTile> {
+        // `try_borrow_mut` rather than `borrow_mut`: a re-entrant borrow would
+        // be a bug in the caller's frame structure, and a sprite that draws
+        // nothing is a better report of it than a panic inside a paint walk.
+        let mut atlas = self.atlas.try_borrow_mut().ok()?;
+        image_tile_in(&mut atlas, key, decode)
     }
 }
 
@@ -1520,12 +1569,17 @@ mod tests {
         let mut atlas = GlyphAtlas::new(64);
         let mut decodes = 0usize;
         {
-            let mut source = ImageAtlasSource::new(&mut atlas, |_key| {
+            let mut decode = |_key| {
                 decodes += 1;
                 Some(image(8, 12))
-            });
-            let first = source.tile_for(image_key(1, 0)).expect("a decoded frame");
-            let second = source.tile_for(image_key(1, 0)).expect("resident");
+            };
+            let mut source = ImageAtlasSource::new(&mut atlas);
+            let first = source
+                .tile_for(image_key(1, 0), &mut decode)
+                .expect("a decoded frame");
+            let second = source
+                .tile_for(image_key(1, 0), &mut decode)
+                .expect("resident");
             assert_eq!(first, second);
             assert_eq!(first.atlas_size, [8.0, 12.0]);
         }
@@ -1544,15 +1598,48 @@ mod tests {
 
         let mut atlas = GlyphAtlas::new(16);
         assert_eq!(
-            ImageAtlasSource::new(&mut atlas, |_key| None).tile_for(image_key(1, 0)),
+            ImageAtlasSource::new(&mut atlas).tile_for(image_key(1, 0), &mut |_key| None),
             None,
             "an image that has not loaded yet is ordinary, not an error"
         );
         assert_eq!(
-            ImageAtlasSource::new(&mut atlas, |_key| Some(image(64, 64)))
-                .tile_for(image_key(2, 0)),
+            ImageAtlasSource::new(&mut atlas)
+                .tile_for(image_key(2, 0), &mut |_key| Some(image(64, 64))),
             None,
             "one oversized photograph must not take the frame down with it"
+        );
+    }
+
+    #[test]
+    fn a_shared_atlas_source_places_tiles_in_the_atlas_the_renderer_uploads() {
+        use wgpui_core::scene::atlas::ImageTileSource;
+
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(GlyphAtlas::new(64)));
+        let mut source = SharedImageAtlas::new(std::rc::Rc::clone(&shared));
+        let tile = source
+            .tile_for(image_key(1, 0), &mut |_key| Some(image(8, 8)))
+            .expect("a decoded frame");
+
+        // The point of the shared form: the renderer's own handle sees the tile
+        // and the upload it queued, without the element having handed anything
+        // over.
+        let atlas = shared.borrow();
+        assert_eq!(atlas.get(image_key(1, 0)).map(|p| p.tile), Some(tile.tile));
+        assert!(atlas.has_pending_uploads());
+    }
+
+    #[test]
+    fn a_shared_atlas_already_borrowed_yields_a_blank_rather_than_panicking() {
+        use wgpui_core::scene::atlas::ImageTileSource;
+
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(GlyphAtlas::new(64)));
+        let mut source = SharedImageAtlas::new(std::rc::Rc::clone(&shared));
+        let _held = shared.borrow_mut();
+        assert_eq!(
+            source.tile_for(image_key(1, 0), &mut |_key| Some(image(8, 8))),
+            None,
+            "a re-entrant borrow is a bug in the caller's frame structure, and a \
+             blank sprite reports it better than a panic inside a paint walk"
         );
     }
 

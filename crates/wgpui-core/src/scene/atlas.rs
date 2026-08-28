@@ -272,12 +272,33 @@ impl RasterizedImage {
 /// implements both: `wgpui-text` calls the glyph one, `wgpui-widgets` calls this,
 /// and `wgpui-wgpu` implements both over one allocator.
 ///
-/// An implementation is expected to upload on demand and cache, for the same
-/// reason: a list of forty rows showing one avatar asks for one key forty times
-/// and takes no steps to deduplicate, because the source is the thing that
-/// already holds the key-to-tile map.
+/// An implementation is expected to allocate on demand and cache, for the same
+/// reason the glyph one is: a list of forty rows showing one avatar asks for one
+/// key forty times and takes no steps to deduplicate, because the source is the
+/// thing that already holds the key-to-tile map.
+///
+/// # Why the pixels arrive as a call-time closure and not as a constructor
+/// argument
+///
+/// This is the one place the two seams genuinely differ, and it falls out of
+/// §3.3/§3.4/§3.5's own crate split rather than from a preference.
+///
+/// A glyph's raster is produced by a rasteriser that can live *inside* the tile
+/// source: `wgpui-wgpu` constructs one with a closure over `swash` and never
+/// needs anything else. An image's pixels cannot work that way — they come from
+/// the decode cache, which §3.4 puts in `wgpui-widgets`, while the tile source
+/// is in the crate that owns the device (§3.5). Neither crate may name the
+/// other, and neither can own the other's half, so the pull has to cross at the
+/// call. Passing the decoder per call is what lets `wgpui-wgpu` allocate tiles
+/// for images it has no way to decode and `wgpui-widgets` decode images it has
+/// no way to upload.
 pub trait ImageTileSource {
-    /// The tile holding `key`'s bitmap, decoding and allocating if needed.
+    /// The tile holding `key`'s bitmap, allocating and uploading it if needed.
+    ///
+    /// `decode` is called **only on a miss**, which is the whole reason it is a
+    /// closure rather than a value: decoding an image frame is megabytes of
+    /// work, and a resident key must never pay it. An implementation that calls
+    /// `decode` unconditionally is correct and unusably slow.
     ///
     /// `None` means "this sprite draws nothing" — the source has not decoded
     /// yet, the decode failed, or the atlas refused the bitmap. All three are
@@ -285,7 +306,11 @@ pub trait ImageTileSource {
     /// [`AtlasTileId::NONE`], never a dropped sprite: an image that is still
     /// loading occupies its layout box and its slab slot exactly as it will once
     /// it arrives.
-    fn tile_for(&mut self, key: ImageRasterKey) -> Option<ImageTile>;
+    fn tile_for(
+        &mut self,
+        key: ImageRasterKey,
+        decode: &mut dyn FnMut(ImageRasterKey) -> Option<RasterizedImage>,
+    ) -> Option<ImageTile>;
 }
 
 /// A resident glyph raster: where its texels are, and where they go relative to

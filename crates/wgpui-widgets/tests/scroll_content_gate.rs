@@ -41,11 +41,15 @@ use wgpui_core::reconcile::instance::InstanceKey;
 use wgpui_core::reconcile::plan::NodeOutcome;
 use wgpui_core::reconcile::reconciler::Reconciler;
 use wgpui_core::scene::Scene;
-use wgpui_core::scene::atlas::{GlyphRasterKey, GlyphTile, GlyphTileSource};
+use wgpui_core::scene::atlas::{
+    GlyphRasterKey, GlyphTile, GlyphTileSource, ImageRasterKey, ImageTile, ImageTileSource,
+    RasterizedImage,
+};
 use wgpui_layout::taffy_tree::{
     Dimension, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
 };
-use wgpui_widgets::img::{ImageSourceId, Img};
+use wgpui_widgets::image_cache::{DecodedFrame, DecodedImage, ImageCache};
+use wgpui_widgets::img::{ImageEngine, ImageSourceId, Img, SharedImageEngine};
 use wgpui_widgets::styled_text::{
     HighlightStyle, Highlights, SharedTextEngine, StyledText, TextEngine, TextStyle,
 };
@@ -145,7 +149,11 @@ fn style() -> TextStyle {
     }
 }
 
-fn row(content: &RowContent, engine: &SharedTextEngine) -> Description {
+fn row(
+    content: &RowContent,
+    engine: &SharedTextEngine,
+    images: &SharedImageEngine,
+) -> Description {
     Description::new::<Row>()
         .diff_key(RowKey(0))
         .style(LayoutStyle {
@@ -158,7 +166,7 @@ fn row(content: &RowContent, engine: &SharedTextEngine) -> Description {
             ..LayoutStyle::default()
         })
         .child(
-            Img::new(content.avatar)
+            Img::new(content.avatar, Rc::clone(images))
                 .size(40.0, 40.0)
                 .describe(),
         )
@@ -175,14 +183,18 @@ fn row(content: &RowContent, engine: &SharedTextEngine) -> Description {
         )
 }
 
-fn list(content: &[RowContent], engine: &SharedTextEngine) -> Description {
+fn list(
+    content: &[RowContent],
+    engine: &SharedTextEngine,
+    images: &SharedImageEngine,
+) -> Description {
     Description::new::<ListRoot>()
         .diff_key(RowKey(usize::MAX))
         .style(LayoutStyle {
             flex_direction: FlexDirection::Column,
             ..LayoutStyle::default()
         })
-        .children(content.iter().map(|row_content| row(row_content, engine)))
+        .children(content.iter().map(|row_content| row(row_content, engine, images)))
 }
 
 /// Assert no node in the tree is a compositing boundary.
@@ -216,8 +228,71 @@ struct FrameCost {
     upload_bytes: u64,
 }
 
+/// An image tile source that hands out one tile per distinct key.
+///
+/// [`GateTiles`]' image counterpart, and it exists for the same reason: the gate
+/// measures reconciliation, so the atlas is a substitute here and the real one
+/// is exercised in `wgpui-wgpu`'s own tests.
+#[derive(Default)]
+struct GateImageTiles {
+    tiles: std::collections::HashMap<ImageRasterKey, ImageTile>,
+}
+
+impl ImageTileSource for GateImageTiles {
+    fn tile_for(
+        &mut self,
+        key: ImageRasterKey,
+        decode: &mut dyn FnMut(ImageRasterKey) -> Option<RasterizedImage>,
+    ) -> Option<ImageTile> {
+        if let Some(tile) = self.tiles.get(&key) {
+            return Some(*tile);
+        }
+        let raster = decode(key)?;
+        let next = self.tiles.len() as u32;
+        let tile = ImageTile {
+            tile: AtlasTileId::new(1, next).expect("the gate stays well inside 24 bits"),
+            atlas_origin: [next as f32 * 48.0, 0.0],
+            atlas_size: [raster.size[0] as f32, raster.size[1] as f32],
+        };
+        self.tiles.insert(key, tile);
+        Some(tile)
+    }
+}
+
+/// An engine holding one decoded avatar per row.
+///
+/// Real decoded frames rather than bare ids, so the avatars in this gate go
+/// through the whole Phase 6.2 path — decode, tile, sprite — rather than being
+/// element-shaped placeholders. The returned ids are asserted against the ones
+/// [`content`] fabricates, because the cache mints them and the row data names
+/// them and nothing else would notice the two drifting apart.
+fn image_engine() -> SharedImageEngine {
+    let mut cache = ImageCache::new();
+    for index in 0..ROWS {
+        let frame = DecodedFrame {
+            size: [40, 40],
+            texels: vec![index as u8; 40 * 40 * 4],
+            delay: std::time::Duration::ZERO,
+        };
+        let source = cache
+            .hold(DecodedImage::from_frames(vec![frame]).expect("one frame is a valid image"))
+            .expect("holding a decoded avatar must succeed");
+        assert_eq!(
+            source,
+            ImageSourceId::from_raw(index as u64 + 1),
+            "the cache's minted ids must be the ones the row data names, or the \
+             avatars in this gate silently stop decoding"
+        );
+    }
+    Rc::new(RefCell::new(ImageEngine::new(
+        cache,
+        Box::new(GateImageTiles::default()),
+    )))
+}
+
 struct Harness {
     engine: SharedTextEngine,
+    images: SharedImageEngine,
     reconciler: Reconciler,
     layout: LayoutTree,
     emitter: Emitter,
@@ -232,6 +307,7 @@ impl Harness {
                 TextShaper::new(),
                 Box::new(GateTiles::default()),
             ))),
+            images: image_engine(),
             reconciler: Reconciler::new(),
             layout: LayoutTree::new(),
             emitter: Emitter::new(),
@@ -278,7 +354,7 @@ fn gate_unchanged_rows_cost_no_shaping_under_ambient_reconciliation()
     let content = content();
     let mut harness = Harness::new();
 
-    let first = harness.frame(list(&content, &harness.engine.clone()))?;
+    let first = harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
     // Two text elements per row, each shaped once. If this is not what the
     // first frame costs, the second frame's zero means nothing.
     assert_eq!(
@@ -289,7 +365,7 @@ fn gate_unchanged_rows_cost_no_shaping_under_ambient_reconciliation()
     assert_eq!(first.nodes_emitted, ROWS * 3, "one Img and two texts per row");
     assert!(first.upload_bytes > 0);
 
-    let second = harness.frame(list(&content, &harness.engine.clone()))?;
+    let second = harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
     assert_eq!(
         second.lines_shaped, 0,
         "an unchanged row must not reach cosmic-text at all"
@@ -308,7 +384,7 @@ fn gate_unchanged_rows_cost_no_shaping_under_ambient_reconciliation()
 
     // A third identical frame, because "costs nothing once" and "costs nothing
     // every frame" are different claims and only the second one is useful.
-    let third = harness.frame(list(&content, &harness.engine.clone()))?;
+    let third = harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
     assert_eq!(third, second);
     Ok(())
 }
@@ -319,13 +395,13 @@ fn gate_unchanged_rows_cost_no_shaping_under_ambient_reconciliation()
 fn one_changed_row_reshapes_exactly_one_line() -> Result<(), Box<dyn std::error::Error>> {
     let mut content = content();
     let mut harness = Harness::new();
-    harness.frame(list(&content, &harness.engine.clone()))?;
-    harness.frame(list(&content, &harness.engine.clone()))?;
+    harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
+    harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
 
     if let Some(row) = content.get_mut(7) {
         row.title = SharedString::from("Row 7 — edited in place");
     }
-    let after = harness.frame(list(&content, &harness.engine.clone()))?;
+    let after = harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
 
     assert_eq!(
         after.lines_shaped, 1,
@@ -347,6 +423,7 @@ fn recolouring_a_row_repaints_without_reshaping() -> Result<(), Box<dyn std::err
     let content = content();
     let mut harness = Harness::new();
     let engine = harness.engine.clone();
+    let images = harness.images.clone();
 
     let recoloured = |index: usize| -> Description {
         Description::new::<ListRoot>()
@@ -371,7 +448,11 @@ fn recolouring_a_row_repaints_without_reshaping() -> Result<(), Box<dyn std::err
                         flex_shrink: 0.0,
                         ..LayoutStyle::default()
                     })
-                    .child(Img::new(row_content.avatar).size(40.0, 40.0).describe())
+                    .child(
+                        Img::new(row_content.avatar, Rc::clone(&images))
+                            .size(40.0, 40.0)
+                            .describe(),
+                    )
                     .child(
                         StyledText::new(row_content.title.clone(), style.clone(), engine.clone())
                             .with_highlights(row_content.highlights.clone())
@@ -419,18 +500,18 @@ fn without_reconciliation_the_cache_alone_is_measurably_weaker()
 -> Result<(), Box<dyn std::error::Error>> {
     let content = content();
     let mut reconciled = Harness::new();
-    reconciled.frame(list(&content, &reconciled.engine.clone()))?;
-    let with_reconciliation = reconciled.frame(list(&content, &reconciled.engine.clone()))?;
+    reconciled.frame(list(&content, &reconciled.engine.clone(), &reconciled.images.clone()))?;
+    let with_reconciliation = reconciled.frame(list(&content, &reconciled.engine.clone(), &reconciled.images.clone()))?;
 
     let mut cache_only = Harness::new();
-    cache_only.frame(list(&content, &cache_only.engine.clone()))?;
+    cache_only.frame(list(&content, &cache_only.engine.clone(), &cache_only.images.clone()))?;
     // A fresh reconciler and scene: every element is a new instance, so nothing
     // is reused and the shaping cache is the only thing left standing.
     cache_only.reconciler = Reconciler::new();
     cache_only.layout = LayoutTree::new();
     cache_only.emitter = Emitter::new();
     cache_only.scene = Scene::new();
-    let without_reconciliation = cache_only.frame(list(&content, &cache_only.engine.clone()))?;
+    let without_reconciliation = cache_only.frame(list(&content, &cache_only.engine.clone(), &cache_only.images.clone()))?;
 
     assert_eq!(with_reconciliation.lines_shaped, 0);
     assert_eq!(without_reconciliation.lines_shaped, 0, "the cache holds");
@@ -500,7 +581,7 @@ fn no_row_is_ever_named() {
         TextShaper::new(),
         Box::new(GateTiles::default()),
     )));
-    let description = list(&content, &engine);
+    let description = list(&content, &engine, &image_engine());
 
     fn unnamed(description: &Description) {
         assert_eq!(

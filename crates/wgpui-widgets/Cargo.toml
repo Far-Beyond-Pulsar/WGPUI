@@ -20,5 +20,36 @@ wgpui-layout = { path = "../wgpui-layout" }
 # nothing about elements.
 wgpui-text = { path = "../wgpui-text" }
 
+# Image decoding lives here because §3.4 puts `image_cache.rs` here — "image
+# loading/decoding cache" — and because the thing that needs decoded pixels is
+# an element. The alternatives were both worse: `wgpui-wgpu` is "the only crate
+# touching a live device" (§3.5) and would gain a PNG parser for no reason, and
+# a new crate for one file would be a crate boundary drawn around a dependency
+# rather than around a responsibility.
+#
+# Same version and the same feature set as the root crate's, deliberately: the
+# two decoders have to agree byte for byte while both exist (that agreement is
+# this phase's gate), and pinning them together also means no new package enters
+# the lockfile.
+image = { version = "0.25.1", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
+# SVG rasterises to a bitmap on the CPU and is uploaded through the same
+# polychrome tile path as any other image (§8's Phase 6.2 row). Same crates, same
+# versions, and the same features as the root crate's `SvgRenderer`, for the same
+# reason as `image`.
+resvg = { version = "0.47.0", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "memmap-fonts",
+] }
+usvg = { version = "0.47.0", default-features = false }
+
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
