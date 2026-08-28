@@ -46,9 +46,12 @@
 //!   past its own rectangle, and is never culled); see [`ShadowPipeline`]'s own
 //!   doc, which names them rather than letting "cheap" stand unqualified.
 //!
-//! What is still genuinely absent is `underlines`, `backdrop_blur`, and
-//! `paths`' own vertex buffer, which needs tessellation machinery no phase has
-//! built (Phase 6.4).
+//! - **[`UnderlinePipeline`]** (Phase 6.3) is [`ShadowPipeline`]'s construction
+//!   over another arena and another shader, with no qualification anywhere: it
+//!   is the one kind for which "`QuadPipeline`-shaped" is true end to end.
+//!
+//! What is still genuinely absent is `backdrop_blur` and `paths`' own vertex
+//! buffer, which needs tessellation machinery no phase has built (Phase 6.4).
 //!
 //! **Colour glyphs are not drawn either, and that is not the same absence.**
 //! [`PolySpritePipeline`] samples exactly the page a colour emoji's raster
@@ -336,6 +339,120 @@ impl ShadowPipeline {
     /// a test rather than rendering garbage.
     pub const fn arena_slot_stride() -> usize {
         wgpui_core::patch::primitive::Shadow::SLOT_STRIDE
+    }
+}
+
+/// The instanced underline pipeline: a straight or wavy rule per instance.
+///
+/// [`ShadowPipeline`]'s construction exactly, over the `Underline` arena and
+/// `underlines.wgsl`. Unlike [`ShadowPipeline`] there is no qualification to
+/// attach: an underline paints inside its own rectangle and is an ordinary
+/// occlusion cullee, so §8's "`QuadPipeline`-shaped" claim holds for this kind
+/// end to end — pipeline, ordering, and occlusion alike. It is the cheapest
+/// primitive kind 2.0 has added, and saying so is only worth anything beside
+/// the shadow row that qualifies the same phrase.
+pub struct UnderlinePipeline {
+    /// The pipeline itself.
+    pub pipeline: wgpu::RenderPipeline,
+    /// Globals, arena, and indirection buffer.
+    pub frame_layout: wgpu::BindGroupLayout,
+    /// The per-slot base index, addressed by dynamic offset.
+    pub slot_layout: wgpu::BindGroupLayout,
+    /// Byte stride between two slots' entries in the slot-base buffer.
+    pub slot_stride: u32,
+}
+
+impl UnderlinePipeline {
+    /// Build the pipeline. Once per device, never per frame.
+    pub fn new(device: &wgpu::Device) -> UnderlinePipeline {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wgpui underlines"),
+            source: wgpu::ShaderSource::Wgsl(super::shaders::UNDERLINES_WGSL.into()),
+        });
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("underlines frame"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, false),
+                storage_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                storage_entry(2, wgpu::ShaderStages::VERTEX),
+            ],
+        });
+        let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("underlines slot base"),
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("underlines"),
+            bind_group_layouts: &[Some(&frame_layout), Some(&slot_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("underlines"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vertex_main"),
+                compilation_options: Default::default(),
+                // §1's rule, unchanged for this kind too.
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fragment_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: TARGET_FORMAT,
+                    blend: Some(ALPHA_OVER),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: Default::default(),
+            cache: None,
+        });
+        UnderlinePipeline {
+            pipeline,
+            frame_layout,
+            slot_layout,
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+        }
+    }
+
+    /// The bind group holding this frame's globals, underline arena, and
+    /// indirection buffer.
+    pub fn frame_bind_group(
+        &self,
+        device: &wgpu::Device,
+        globals: &wgpu::Buffer,
+        arena: &wgpu::Buffer,
+        visible: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("underlines frame"),
+            layout: &self.frame_layout,
+            entries: &[
+                buffer_entry(0, globals),
+                buffer_entry(1, arena),
+                buffer_entry(2, visible),
+            ],
+        })
+    }
+
+    /// The bind group over a slot-base buffer.
+    pub fn slot_bind_group(&self, device: &wgpu::Device, bases: &wgpu::Buffer) -> wgpu::BindGroup {
+        slot_base_bind_group(device, &self.slot_layout, bases)
+    }
+
+    /// Bytes one underline occupies in the arena, restated from `wgpui-core` so
+    /// a drift between the shader's `UnderlineSlot` and the protocol's
+    /// `Underline` fails a test rather than rendering garbage.
+    pub const fn arena_slot_stride() -> usize {
+        wgpui_core::patch::primitive::Underline::SLOT_STRIDE
     }
 }
 
@@ -918,6 +1035,24 @@ mod tests {
         assert!(
             super::super::shaders::SHADOWS_WGSL
                 .contains("const BLUR_MARGIN_SIGMAS: f32 = 3.0;")
+        );
+    }
+
+    #[test]
+    fn the_shader_agrees_with_the_protocol_about_an_underline_slot() {
+        assert_eq!(UnderlinePipeline::arena_slot_stride(), 48);
+        let shader = super::super::shaders::UNDERLINES_WGSL;
+        assert!(shader.contains("struct UnderlineSlot"));
+        for field in ["origin_size", "color", "thickness", "wavy"] {
+            assert!(shader.contains(field), "the shader dropped `{field}`");
+        }
+        // `wavy` must be a real `u32` member. Packed into a trailing
+        // `vec4<f32>` and bit-cast, the word `1` is a denormal `f32` and a GPU
+        // that flushes denormals on load would draw every wavy underline
+        // straight — a wrong picture with no error anywhere.
+        assert!(
+            shader.contains("wavy: u32,"),
+            "the wavy flag must be declared as a word, not bit-cast out of an f32"
         );
     }
 

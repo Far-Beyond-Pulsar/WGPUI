@@ -66,7 +66,7 @@ use crate::render::draw::{
 };
 use crate::render::pipelines::{
     CompositePipeline, Globals, MonoSpritePipeline, PolySpritePipeline, QuadPipeline,
-    ShadowPipeline, TARGET_FORMAT,
+    ShadowPipeline, TARGET_FORMAT, UnderlinePipeline,
 };
 use crate::render::readback::{ReadbackError, StagingReader, read_texture_rgba8};
 use crate::render::surface_registry::SurfaceRegistry;
@@ -314,6 +314,8 @@ pub struct FrameRenderer {
     pub shadows: ShadowPipeline,
     /// The instanced quad pipeline.
     pub quads: QuadPipeline,
+    /// The instanced underline pipeline (Phase 6.3).
+    pub underlines: UnderlinePipeline,
     /// The instanced monochrome-sprite pipeline (Phase 5.6).
     pub glyphs: MonoSpritePipeline,
     /// The instanced polychrome-sprite pipeline (Phase 6.2).
@@ -326,6 +328,10 @@ pub struct FrameRenderer {
     pub shadow_arena: SlabBuffer,
     /// The quad arena.
     pub arena: SlabBuffer,
+    /// The underline arena, its own buffer for `shadow_arena`'s reason — the
+    /// two kinds' 48-byte strides agreeing is a coincidence of two independent
+    /// field sets.
+    pub underline_arena: SlabBuffer,
     /// The glyph arena. A second buffer rather than a second range of the
     /// first: the two kinds have different slot strides, and §5.0's upload
     /// instructions are already addressed per kind.
@@ -341,6 +347,7 @@ pub struct FrameRenderer {
     globals: wgpu::Buffer,
     shadow_args: IndirectArgsBuffers,
     quad_args: IndirectArgsBuffers,
+    underline_args: IndirectArgsBuffers,
     glyph_args: IndirectArgsBuffers,
     sprite_args: IndirectArgsBuffers,
     composite_args: IndirectArgsBuffers,
@@ -349,10 +356,12 @@ pub struct FrameRenderer {
     /// something holds it across frames.
     shadow_plan: Option<SlotBasePlan>,
     quad_plan: Option<SlotBasePlan>,
+    underline_plan: Option<SlotBasePlan>,
     glyph_plan: Option<SlotBasePlan>,
     sprite_plan: Option<SlotBasePlan>,
     shadow_plan_builds: u64,
     quad_plan_builds: u64,
+    underline_plan_builds: u64,
     glyph_plan_builds: u64,
     sprite_plan_builds: u64,
     /// One 16-byte `AtlasPage` uniform per page index ever bound.
@@ -375,11 +384,13 @@ impl FrameRenderer {
             indirect: IndirectArgsPass::new(device),
             shadows: ShadowPipeline::new(device),
             quads: QuadPipeline::new(device),
+            underlines: UnderlinePipeline::new(device),
             glyphs: MonoSpritePipeline::new(device),
             sprites: PolySpritePipeline::new(device),
             composite: CompositePipeline::new(device),
             shadow_arena: SlabBuffer::new(device, "shadow arena"),
             arena: SlabBuffer::new(device, "quad arena"),
+            underline_arena: SlabBuffer::new(device, "underline arena"),
             glyph_arena: SlabBuffer::new(device, "glyph arena"),
             sprite_arena: SlabBuffer::new(device, "sprite arena"),
             textures: LayerTexturePool::default(),
@@ -391,15 +402,18 @@ impl FrameRenderer {
             }),
             shadow_args: IndirectArgsBuffers::new(device, 1, 1),
             quad_args: IndirectArgsBuffers::new(device, 1, 1),
+            underline_args: IndirectArgsBuffers::new(device, 1, 1),
             glyph_args: IndirectArgsBuffers::new(device, 1, 1),
             sprite_args: IndirectArgsBuffers::new(device, 1, 1),
             composite_args: IndirectArgsBuffers::new(device, 1, 1),
             shadow_plan: None,
             quad_plan: None,
+            underline_plan: None,
             glyph_plan: None,
             sprite_plan: None,
             shadow_plan_builds: 0,
             quad_plan_builds: 0,
+            underline_plan_builds: 0,
             glyph_plan_builds: 0,
             sprite_plan_builds: 0,
             page_params: HashMap::new(),
@@ -426,6 +440,11 @@ impl FrameRenderer {
     /// The same counter for the shadow pipeline's slot bases.
     pub fn shadow_plan_builds(&self) -> u64 {
         self.shadow_plan_builds
+    }
+
+    /// The same counter for the underline pipeline's slot bases.
+    pub fn underline_plan_builds(&self) -> u64 {
+        self.underline_plan_builds
     }
 
     /// The same counter for the glyph pipeline's slot bases.
@@ -489,10 +508,10 @@ impl FrameRenderer {
 
     /// Render one frame into `target`.
     ///
-    /// **All four instanced kinds are drawn.** Phase 4 drew only `Quad` and
+    /// **All five instanced kinds are drawn.** Phase 4 drew only `Quad` and
     /// said so here; Phase 5.6 added the `GlyphRun` half, Phase 6.2 the
-    /// `PolySprite` half, and Phase 6.3 the `Shadow` half, all taking the
-    /// identical route — upload, ordering, occlusion, indirect-argument
+    /// `PolySprite` half, and Phase 6.3 the `Shadow` and `Underline` halves,
+    /// all taking the identical route — upload, ordering, occlusion, indirect-argument
     /// generation, fixed draw sequence — over their own arenas. Two kinds add
     /// something to that route and each addition is one thing:
     ///
@@ -504,7 +523,11 @@ impl FrameRenderer {
     ///   primitive's own rectangle, and take [`CoverageItem::uncullable`] rather
     ///   than [`CoverageItem::cullee`]. Both are noted at the loop that does it.
     ///
-    /// What still has no pipeline: `underlines`, `paths`, `backdrop_blur`.
+    /// `Underline` adds nothing to the route at all, which is worth stating
+    /// beside `Shadow`: two kinds landed in the same phase and only one of them
+    /// needed a qualification.
+    ///
+    /// What still has no pipeline: `paths`, `backdrop_blur`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -534,15 +557,18 @@ impl FrameRenderer {
         let table = input.scene.draw_slots();
         let shadow_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Shadow).to_vec();
         let quad_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Quad).to_vec();
+        let underline_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Underline).to_vec();
         let glyph_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::GlyphRun).to_vec();
         let sprite_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::PolySprite).to_vec();
         let shadow_arena_slots = input.scene.arena_slots(PrimitiveKind::Shadow);
         let arena_slots = input.scene.arena_slots(PrimitiveKind::Quad);
+        let underline_arena_slots = input.scene.arena_slots(PrimitiveKind::Underline);
         let glyph_arena_slots = input.scene.arena_slots(PrimitiveKind::GlyphRun);
         let sprite_arena_slots = input.scene.arena_slots(PrimitiveKind::PolySprite);
         let primitives_resident: u32 = shadow_slots
             .iter()
             .chain(quad_slots.iter())
+            .chain(underline_slots.iter())
             .chain(glyph_slots.iter())
             .chain(sprite_slots.iter())
             .map(|slot| slot.count)
@@ -552,12 +578,16 @@ impl FrameRenderer {
         let started = Instant::now();
         let shadow_resident = input.scene.shadows.resident_bytes();
         let resident = input.scene.quads.resident_bytes();
+        let underline_resident = input.scene.underlines.resident_bytes();
         let glyph_resident = input.scene.glyph_runs.resident_bytes();
         let sprite_resident = input.scene.poly_sprites.resident_bytes();
         let shadows_grew = self
             .shadow_arena
             .reserve(device, shadow_resident.len() as u64);
         let grew = self.arena.reserve(device, resident.len() as u64);
+        let underlines_grew = self
+            .underline_arena
+            .reserve(device, underline_resident.len() as u64);
         let glyphs_grew = self
             .glyph_arena
             .reserve(device, glyph_resident.len() as u64);
@@ -566,6 +596,7 @@ impl FrameRenderer {
             .reserve(device, sprite_resident.len() as u64);
         if shadows_grew
             || grew
+            || underlines_grew
             || glyphs_grew
             || sprites_grew
             || self.uploaded_generation.is_none()
@@ -574,6 +605,8 @@ impl FrameRenderer {
             self.shadow_arena
                 .upload_all(device, queue, shadow_resident);
             self.arena.upload_all(device, queue, resident);
+            self.underline_arena
+                .upload_all(device, queue, underline_resident);
             self.glyph_arena.upload_all(device, queue, glyph_resident);
             self.sprite_arena.upload_all(device, queue, sprite_resident);
             self.uploaded_generation = Some(0);
@@ -592,6 +625,12 @@ impl FrameRenderer {
             );
             self.arena
                 .upload(device, queue, resident, &kind_uploads(input.uploads, PrimitiveKind::Quad));
+            self.underline_arena.upload(
+                device,
+                queue,
+                underline_resident,
+                &kind_uploads(input.uploads, PrimitiveKind::Underline),
+            );
             self.glyph_arena.upload(
                 device,
                 queue,
@@ -628,6 +667,16 @@ impl FrameRenderer {
         if !self.quad_args.fits(arena_slots, quad_slots.len() as u32) {
             self.quad_args =
                 IndirectArgsBuffers::new(device, arena_slots.max(1), quad_slots.len() as u32 + 1);
+        }
+        if !self
+            .underline_args
+            .fits(underline_arena_slots, underline_slots.len() as u32)
+        {
+            self.underline_args = IndirectArgsBuffers::new(
+                device,
+                underline_arena_slots.max(1),
+                underline_slots.len() as u32 + 1,
+            );
         }
         if !self
             .glyph_args
@@ -761,6 +810,50 @@ impl FrameRenderer {
                 layers_recomputed += 1;
             }
 
+            // The underline half. Nothing here is qualified the way the shadow
+            // loop above is: an underline paints inside its own rectangle and is
+            // an ordinary `cullee`, exactly as the legacy sweep classifies it
+            // (`src/occlusion.rs:262` lists `Underline` beside `Quad`). It is
+            // not an occluder — a wavy rule covers almost none of its own box,
+            // and a straight one is thinner than its box by construction.
+            for slot in &underline_slots {
+                if slot.count == 0 || !input.dirty.contains(slot.layer) {
+                    continue;
+                }
+                let bounds = layer_underline_bounds(input.scene, slot.layer);
+                let items: Vec<CoverageItem> = bounds
+                    .iter()
+                    .map(|underline| CoverageItem::cullee(underline.intersect(&input.clip)))
+                    .collect();
+
+                encode_ordering_items(&bounds, &mut bounds_bytes);
+                let ordered = self.ordering.run(device, queue, &bounds_bytes)?;
+                encode_coverage_items(&items, &mut item_bytes);
+                let culled = self
+                    .occlusion
+                    .run(device, queue, &item_bytes, &poison_bytes)?;
+
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("underline scatter"),
+                });
+                IndirectArgsPass::scatter(
+                    &mut encoder,
+                    &ordered.draw_order,
+                    &self.underline_args.draw_order,
+                    slot.base,
+                    slot.count,
+                );
+                IndirectArgsPass::scatter(
+                    &mut encoder,
+                    &culled.culled,
+                    &self.underline_args.culled,
+                    slot.base,
+                    slot.count,
+                );
+                queue.submit(Some(encoder.finish()));
+                layers_recomputed += 1;
+            }
+
             // The glyph half, through the identical passes. A glyph is a
             // `CoverageItem::cullee` and never an occluder — a coverage mask is
             // not an opaque rectangle — so this dispatch culls glyphs against
@@ -875,6 +968,16 @@ impl FrameRenderer {
             QUAD_VERTEX_COUNT,
             input.mode.first_instance(),
         )?;
+        let mut underline_slot_bytes = Vec::new();
+        encode_slots(&underline_slots, &mut underline_slot_bytes);
+        let underline_output = self.indirect.run(
+            device,
+            queue,
+            &self.underline_args,
+            &underline_slot_bytes,
+            QUAD_VERTEX_COUNT,
+            input.mode.first_instance(),
+        )?;
         let mut glyph_slot_bytes = Vec::new();
         encode_slots(&glyph_slots, &mut glyph_slot_bytes);
         // The same four-vertex triangle strip: a glyph's sprite is a quad, so
@@ -962,6 +1065,14 @@ impl FrameRenderer {
             quad_output.slot_count,
             &mut self.reader,
         )?;
+        let underline_resolved = ResolvedArgs::resolve(
+            input.mode,
+            device,
+            queue,
+            &self.underline_args,
+            underline_output.slot_count,
+            &mut self.reader,
+        )?;
         let glyph_resolved = ResolvedArgs::resolve(
             input.mode,
             device,
@@ -1009,6 +1120,13 @@ impl FrameRenderer {
                 SlotBasePlan::for_quads(device, queue, &self.quads, &quad_slots)
             }
         };
+        let underline_plan = match self.underline_plan.take() {
+            Some(plan) if plan.slots() == underline_slots.as_slice() => plan,
+            _ => {
+                self.underline_plan_builds += 1;
+                SlotBasePlan::for_underlines(device, queue, &self.underlines, &underline_slots)
+            }
+        };
         let glyph_plan = match self.glyph_plan.take() {
             Some(plan) if plan.slots() == glyph_slots.as_slice() => plan,
             _ => {
@@ -1034,6 +1152,12 @@ impl FrameRenderer {
             &self.globals,
             self.arena.buffer(),
             &self.quad_args.visible,
+        );
+        let underline_frame_group = self.underlines.frame_bind_group(
+            device,
+            &self.globals,
+            self.underline_arena.buffer(),
+            &self.underline_args.visible,
         );
         let glyph_frame_group = self.glyphs.frame_bind_group(
             device,
@@ -1100,6 +1224,18 @@ impl FrameRenderer {
                 input.mode,
                 &quad_resolved,
             ));
+            // Between the quads and the text, which is where the legacy
+            // discriminant puts `Underline`: a rule paints over the row
+            // background and under the glyphs it belongs to.
+            stats.merge(issue_instanced(
+                &mut pass,
+                &self.underlines.pipeline,
+                &underline_plan,
+                &underline_frame_group,
+                &self.underline_args,
+                input.mode,
+                &underline_resolved,
+            ));
             // After the quads and before the composites: text paints over the
             // chrome behind it and under a modal composited on top, which is the
             // painter order §5.3's kind grouping already puts the slots in.
@@ -1145,6 +1281,7 @@ impl FrameRenderer {
         queue.submit(Some(encoder.finish()));
         self.shadow_plan = Some(shadow_plan);
         self.quad_plan = Some(quad_plan);
+        self.underline_plan = Some(underline_plan);
         self.glyph_plan = Some(glyph_plan);
         self.sprite_plan = Some(sprite_plan);
 
@@ -1177,6 +1314,22 @@ fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
             let (origin, size) = shadow.drawn_bounds();
             Rect::from_origin_size(origin, size)
         })
+        .collect()
+}
+
+/// One layer's underlines as bounding rectangles, in arena slot order.
+///
+/// [`layer_glyph_bounds`]' argument about slot order applies unchanged, and
+/// there is nothing else to say: an underline's rectangle *is* its
+/// `origin`/`size`. That this function is the boring one is the finding — see
+/// [`layer_shadow_bounds`], which is the same function and is not.
+fn layer_underline_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    scene
+        .underlines
+        .keys(layer)
+        .into_iter()
+        .filter_map(|key| scene.underlines.get(layer, key))
+        .map(|underline| Rect::from_origin_size(underline.origin, underline.size))
         .collect()
 }
 

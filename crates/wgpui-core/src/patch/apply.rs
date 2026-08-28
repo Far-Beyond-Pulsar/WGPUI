@@ -31,7 +31,7 @@
 //! layer, read back out of the arena at that layer's own address.
 
 use crate::invalidation::axes::Invalidation;
-use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad, Shadow};
+use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad, Shadow, Underline};
 use crate::patch::{PatchError, PatchList};
 use crate::scene::layer::LayerId;
 use crate::scene::record::{DispatchNode, Hitbox, LayoutInput};
@@ -51,6 +51,8 @@ pub struct ScenePatch {
     pub shadows: PatchList<Shadow>,
     /// Fixed-size primitives.
     pub quads: PatchList<Quad>,
+    /// Underline and strikethrough rules, painted under their layer's text.
+    pub underlines: PatchList<Underline>,
     /// Variable-size primitives.
     pub glyph_runs: PatchList<GlyphRun>,
     /// Colour-atlas sprites — images and rasterised SVGs.
@@ -74,6 +76,7 @@ impl ScenePatch {
     pub fn is_empty(&self) -> bool {
         self.shadows.is_empty()
             && self.quads.is_empty()
+            && self.underlines.is_empty()
             && self.glyph_runs.is_empty()
             && self.poly_sprites.is_empty()
             && self.layout_inputs.is_empty()
@@ -85,6 +88,7 @@ impl ScenePatch {
     pub fn len(&self) -> usize {
         self.shadows.len()
             + self.quads.len()
+            + self.underlines.len()
             + self.glyph_runs.len()
             + self.poly_sprites.len()
             + self.layout_inputs.len()
@@ -96,6 +100,7 @@ impl ScenePatch {
     pub fn clear(&mut self) {
         self.shadows.clear();
         self.quads.clear();
+        self.underlines.clear();
         self.glyph_runs.clear();
         self.poly_sprites.clear();
         self.layout_inputs.clear();
@@ -115,6 +120,9 @@ impl ScenePatch {
             note(patch.layer);
         }
         for patch in self.quads.patches() {
+            note(patch.layer);
+        }
+        for patch in self.underlines.patches() {
             note(patch.layer);
         }
         for patch in self.glyph_runs.patches() {
@@ -199,6 +207,9 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
         .quads
         .apply(&patch.quads, &mut scene.allocator, &mut entries)?;
     scene
+        .underlines
+        .apply(&patch.underlines, &mut scene.allocator, &mut entries)?;
+    scene
         .glyph_runs
         .apply(&patch.glyph_runs, &mut scene.allocator, &mut entries)?;
     scene
@@ -215,6 +226,7 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
         let mut axes = Invalidation::empty();
         if names(&patch.shadows, layer)
             || names(&patch.quads, layer)
+            || names(&patch.underlines, layer)
             || names(&patch.glyph_runs, layer)
             || names(&patch.poly_sprites, layer)
         {
@@ -225,6 +237,9 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
             scene
                 .layers
                 .set_slab(layer, Quad::KIND, scene.quads.slab(layer));
+            scene
+                .layers
+                .set_slab(layer, Underline::KIND, scene.underlines.slab(layer));
             scene
                 .layers
                 .set_slab(layer, GlyphRun::KIND, scene.glyph_runs.slab(layer));
@@ -303,6 +318,9 @@ pub fn compare_to_rebuild(patched: &Scene, rebuilt: &Scene) -> Option<ResidencyM
         if let Some(mismatch) =
             compare_store(&patched.quads, &rebuilt.quads, layer)
         {
+            return Some(mismatch);
+        }
+        if let Some(mismatch) = compare_store(&patched.underlines, &rebuilt.underlines, layer) {
             return Some(mismatch);
         }
         if let Some(mismatch) =

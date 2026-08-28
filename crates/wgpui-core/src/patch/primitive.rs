@@ -70,6 +70,9 @@ pub enum PrimitiveKind {
     Shadow,
     /// Fixed-size, one slot per primitive. See [`Quad`].
     Quad,
+    /// Fixed-size, one slot per primitive, drawn under its layer's text.
+    /// See [`Underline`].
+    Underline,
     /// Variable-size, one slot per glyph. See [`GlyphRun`].
     GlyphRun,
     /// Fixed-size, one slot per sprite, referencing a colour atlas tile.
@@ -99,12 +102,13 @@ impl PrimitiveKind {
     pub const ALL: [PrimitiveKind; PrimitiveKind::COUNT] = [
         PrimitiveKind::Shadow,
         PrimitiveKind::Quad,
+        PrimitiveKind::Underline,
         PrimitiveKind::GlyphRun,
         PrimitiveKind::PolySprite,
     ];
 
     /// Number of kinds; the width of every per-kind array in this crate.
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 5;
 
     /// Dense index into a per-kind array.
     pub const fn index(self) -> usize {
@@ -116,6 +120,7 @@ impl PrimitiveKind {
         match self {
             PrimitiveKind::Shadow => Shadow::SLOT_STRIDE,
             PrimitiveKind::Quad => Quad::SLOT_STRIDE,
+            PrimitiveKind::Underline => Underline::SLOT_STRIDE,
             PrimitiveKind::GlyphRun => GlyphRun::SLOT_STRIDE,
             PrimitiveKind::PolySprite => PolySprite::SLOT_STRIDE,
         }
@@ -714,6 +719,75 @@ impl Primitive for Shadow {
     }
 }
 
+/// One underline or strikethrough rule: a straight or wavy band under a run of
+/// text.
+///
+/// The legacy `Underline` (`src/scene.rs:1457`), reduced the same way [`Shadow`]
+/// and [`PolySprite`] are — no `order`, no `content_mask`, and no `pad` word,
+/// since 2.0's encoder writes an explicit byte layout rather than inheriting
+/// Rust's field alignment.
+///
+/// Unlike [`Shadow`], this kind is [`Quad`]-shaped in *every* respect and not
+/// just at the pipeline: it paints inside its own rectangle, and it is an
+/// ordinary [`crate::occlusion::CoverageItem::cullee`] — which is the legacy
+/// sweep's own classification (`src/occlusion.rs:262` lists `Underline`
+/// alongside `Quad`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Underline {
+    /// Top-left of the band in the owning layer's coordinate space.
+    pub origin: [f32; 2],
+    /// Width and height of the band. `size[1]` is the band's *box*, not its
+    /// stroke: a wavy underline needs vertical room for the wave, and the
+    /// legacy shader derives the wave's frequency and amplitude from the ratio
+    /// of `thickness` to this height.
+    pub size: [f32; 2],
+    /// Straight-alpha RGBA.
+    pub color: [f32; 4],
+    /// Stroke thickness, in the same units as `size`.
+    pub thickness: f32,
+    /// Whether to draw a sine wave rather than a straight rule — the
+    /// squiggly-underline spelling-error decoration.
+    pub wavy: bool,
+}
+
+impl Underline {
+    /// A zero-sized, fully transparent, straight underline.
+    pub const ZERO: Underline = Underline {
+        origin: [0.0, 0.0],
+        size: [0.0, 0.0],
+        color: [0.0, 0.0, 0.0, 0.0],
+        thickness: 0.0,
+        wavy: false,
+    };
+}
+
+impl Primitive for Underline {
+    const KIND: PrimitiveKind = PrimitiveKind::Underline;
+
+    // 40 bytes of payload, padded to 48 — [`Shadow`]'s layout exactly, which is
+    // [`Quad`]'s reasoning. The two kinds sharing a stride is a coincidence of
+    // two independent field sets, not a shared decision, and `wgpui-wgpu` gives
+    // each its own arena for that reason.
+    const SLOT_STRIDE: usize = 48;
+
+    fn slot_count(&self) -> u32 {
+        1
+    }
+
+    fn encode(&self, destination: &mut [u8]) -> Result<(), EncodeError> {
+        let mut writer = SlotWriter::new(destination);
+        writer.write_f32_array(self.origin)?;
+        writer.write_f32_array(self.size)?;
+        writer.write_f32_array(self.color)?;
+        writer.write_f32(self.thickness)?;
+        // A whole word for one bit, for [`PolySprite::grayscale`]'s reason: a
+        // storage-buffer shader reads words.
+        writer.write_u32(u32::from(self.wavy))?;
+        writer.write_padding(8)?;
+        writer.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,21 +985,81 @@ mod tests {
     }
 
     #[test]
-    fn shadows_paint_under_quads_and_the_kind_order_is_the_legacy_one() {
-        // Legacy `src/scene.rs`'s `PrimitiveKind` breaks an equal draw order by
-        // discriminant: Shadow, Quad, Path, Underline, MonochromeSprite,
-        // PolychromeSprite. 2.0 groups its fixed draw sequence by kind in
-        // `ALL`'s order, so the two agree about relative paint order only if
-        // this holds.
+    fn an_underline_encodes_exactly_one_slot_at_the_offsets_the_shader_reads() {
+        let mut bytes = vec![0xAAu8; Underline::SLOT_STRIDE];
+        let underline = Underline {
+            origin: [12.0, 34.0],
+            size: [200.0, 5.0],
+            color: [1.0, 0.0, 0.0, 1.0],
+            thickness: 1.5,
+            wavy: true,
+        };
+        assert_eq!(underline.slot_count(), 1);
+        assert!(underline.encode(&mut bytes).is_ok());
+        assert_eq!(&bytes[0..4], &12.0f32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &34.0f32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &200.0f32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &5.0f32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &1.0f32.to_le_bytes());
+        assert_eq!(&bytes[28..32], &1.0f32.to_le_bytes());
+        assert_eq!(&bytes[32..36], &1.5f32.to_le_bytes());
+        assert_eq!(&bytes[36..40], &1u32.to_le_bytes());
+        assert_eq!(&bytes[40..48], &[0u8; 8]);
+
+        // The flag is a whole word and takes exactly two values.
+        let mut straight = vec![0xFFu8; Underline::SLOT_STRIDE];
+        assert!(
+            Underline {
+                wavy: false,
+                ..underline
+            }
+            .encode(&mut straight)
+            .is_ok()
+        );
+        assert_eq!(&straight[36..40], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn an_underline_rejects_a_mis_sized_destination_instead_of_panicking() {
+        let mut too_small = vec![0u8; Underline::SLOT_STRIDE - 1];
+        assert!(Underline::ZERO.encode(&mut too_small).is_err());
+        let mut too_large = vec![0u8; Underline::SLOT_STRIDE + 1];
+        assert!(Underline::ZERO.encode(&mut too_large).is_err());
+    }
+
+    #[test]
+    fn the_kind_order_is_the_legacy_renderers_own_tie_break() {
+        // Legacy `src/scene.rs:1015`'s `PrimitiveKind` breaks an equal draw
+        // order by discriminant: Shadow, Quad, Path, Underline,
+        // MonochromeSprite, PolychromeSprite. 2.0 groups its fixed draw
+        // sequence by kind in `ALL`'s order, so the two agree about relative
+        // paint order only if this holds. `Path` is Phase 6.4 and its absence
+        // does not disturb the rest of the sequence.
+        assert_eq!(
+            PrimitiveKind::ALL,
+            [
+                PrimitiveKind::Shadow,
+                PrimitiveKind::Quad,
+                PrimitiveKind::Underline,
+                PrimitiveKind::GlyphRun,
+                PrimitiveKind::PolySprite,
+            ]
+        );
+        // Spelled again as the four relations that actually matter, so a
+        // failure names which one moved rather than printing two arrays.
         assert!(PrimitiveKind::Shadow < PrimitiveKind::Quad);
-        assert!(PrimitiveKind::Quad < PrimitiveKind::GlyphRun);
+        assert!(PrimitiveKind::Quad < PrimitiveKind::Underline);
+        assert!(PrimitiveKind::Underline < PrimitiveKind::GlyphRun);
         assert!(PrimitiveKind::GlyphRun < PrimitiveKind::PolySprite);
-        assert_eq!(PrimitiveKind::Shadow.index(), 0);
     }
 
     #[test]
     fn kind_tags_agree_with_their_payload_types() {
         assert_eq!(PrimitiveKind::Shadow.slot_stride(), Shadow::SLOT_STRIDE);
+        assert_eq!(
+            PrimitiveKind::Underline.slot_stride(),
+            Underline::SLOT_STRIDE
+        );
         assert_eq!(PrimitiveKind::Quad.slot_stride(), Quad::SLOT_STRIDE);
         assert_eq!(PrimitiveKind::GlyphRun.slot_stride(), GlyphRun::SLOT_STRIDE);
         assert_eq!(

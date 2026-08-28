@@ -64,7 +64,7 @@ use crate::boundary::compositor::{BoundaryComposite, Composite, Compositor};
 use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::request::FrameSignals;
 use crate::patch::apply::ScenePatch;
-use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad, Shadow};
+use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad, Shadow, Underline};
 use crate::patch::{PatchList, RecordKey};
 use crate::reconcile::instance::InstanceKey;
 use crate::reconcile::plan::FramePlan;
@@ -98,6 +98,7 @@ pub struct EmitContext {
 pub struct Emission {
     shadows: Vec<Shadow>,
     quads: Vec<Quad>,
+    underlines: Vec<Underline>,
     glyph_runs: Vec<GlyphRun>,
     poly_sprites: Vec<PolySprite>,
 }
@@ -136,6 +137,17 @@ impl Emission {
         &self.quads
     }
 
+    /// Contribute an underline or strikethrough rule.
+    pub fn underline(&mut self, underline: Underline) -> &mut Self {
+        self.underlines.push(underline);
+        self
+    }
+
+    /// The underlines contributed, in emission order.
+    pub fn underlines(&self) -> &[Underline] {
+        &self.underlines
+    }
+
     /// Contribute an image sprite.
     pub fn poly_sprite(&mut self, sprite: PolySprite) -> &mut Self {
         self.poly_sprites.push(sprite);
@@ -154,13 +166,18 @@ impl Emission {
 
     /// Total primitives contributed.
     pub fn len(&self) -> usize {
-        self.shadows.len() + self.quads.len() + self.glyph_runs.len() + self.poly_sprites.len()
+        self.shadows.len()
+            + self.quads.len()
+            + self.underlines.len()
+            + self.glyph_runs.len()
+            + self.poly_sprites.len()
     }
 
     /// Whether the element contributed nothing.
     pub fn is_empty(&self) -> bool {
         self.shadows.is_empty()
             && self.quads.is_empty()
+            && self.underlines.is_empty()
             && self.glyph_runs.is_empty()
             && self.poly_sprites.is_empty()
     }
@@ -169,6 +186,7 @@ impl Emission {
     pub fn clear(&mut self) {
         self.shadows.clear();
         self.quads.clear();
+        self.underlines.clear();
         self.glyph_runs.clear();
         self.poly_sprites.clear();
     }
@@ -298,6 +316,7 @@ struct EmittedNode {
     bounds: LayoutRect,
     shadows: u32,
     quads: u32,
+    underlines: u32,
     glyph_runs: u32,
     poly_sprites: u32,
     last_visited_frame: u64,
@@ -308,6 +327,7 @@ impl EmittedNode {
     fn record_count(&self) -> usize {
         self.shadows as usize
             + self.quads as usize
+            + self.underlines as usize
             + self.glyph_runs as usize
             + self.poly_sprites as usize
     }
@@ -365,6 +385,7 @@ impl<P> Default for KindOperations<P> {
 struct PendingOperations {
     shadows: KindOperations<Shadow>,
     quads: KindOperations<Quad>,
+    underlines: KindOperations<Underline>,
     glyph_runs: KindOperations<GlyphRun>,
     poly_sprites: KindOperations<PolySprite>,
 }
@@ -601,6 +622,13 @@ impl Emitter {
                         Self::reconcile_records(
                             node.address,
                             layer,
+                            previous.map(|record| (record.layer, record.underlines)),
+                            emission.underlines(),
+                            &mut pending.underlines,
+                        );
+                        Self::reconcile_records(
+                            node.address,
+                            layer,
                             previous.map(|record| (record.layer, record.glyph_runs)),
                             emission.glyph_runs(),
                             &mut pending.glyph_runs,
@@ -617,6 +645,8 @@ impl Emitter {
                             bounds,
                             shadows: u32::try_from(emission.shadows().len()).unwrap_or(u32::MAX),
                             quads: u32::try_from(emission.quads().len()).unwrap_or(u32::MAX),
+                            underlines: u32::try_from(emission.underlines().len())
+                                .unwrap_or(u32::MAX),
                             glyph_runs: u32::try_from(emission.glyph_runs().len())
                                 .unwrap_or(u32::MAX),
                             poly_sprites: u32::try_from(emission.poly_sprites().len())
@@ -653,6 +683,9 @@ impl Emitter {
         let patch = ScenePatch {
             shadows: pending.shadows.into_patch_list(&scene.shadows, &mut stats),
             quads: pending.quads.into_patch_list(&scene.quads, &mut stats),
+            underlines: pending
+                .underlines
+                .into_patch_list(&scene.underlines, &mut stats),
             glyph_runs: pending
                 .glyph_runs
                 .into_patch_list(&scene.glyph_runs, &mut stats),
@@ -802,6 +835,12 @@ impl Emitter {
         for ordinal in 0..record.quads {
             pending
                 .quads
+                .removes
+                .push((record.layer, RecordKey::new(address, ordinal)));
+        }
+        for ordinal in 0..record.underlines {
+            pending
+                .underlines
                 .removes
                 .push((record.layer, RecordKey::new(address, ordinal)));
         }

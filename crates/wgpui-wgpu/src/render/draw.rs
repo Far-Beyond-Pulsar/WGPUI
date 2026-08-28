@@ -58,7 +58,7 @@ use crate::render::compute::indirect_args_pass::IndirectArgsBuffers;
 use crate::render::device::IndirectSupport;
 use crate::render::pipelines::{
     CompositePipeline, MonoSpritePipeline, PolySpritePipeline, QuadPipeline, ShadowPipeline,
-    slot_base_bind_group,
+    UnderlinePipeline, slot_base_bind_group,
 };
 use crate::render::readback::{ReadbackError, StagingReader};
 use crate::render::textures::external_surface::CompositePlan;
@@ -404,6 +404,22 @@ impl SlotBasePlan {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         pipeline: &QuadPipeline,
+        slots: &[DrawSlot],
+    ) -> SlotBasePlan {
+        SlotBasePlan::new(
+            device,
+            queue,
+            &pipeline.slot_layout,
+            pipeline.slot_stride,
+            slots,
+        )
+    }
+
+    /// Build the plan for the underline pipeline's slots.
+    pub fn for_underlines(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &UnderlinePipeline,
         slots: &[DrawSlot],
     ) -> SlotBasePlan {
         SlotBasePlan::new(

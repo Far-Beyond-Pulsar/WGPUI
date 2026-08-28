@@ -31,7 +31,7 @@ pub use tile::{
 };
 
 use crate::indirect::{DrawSlot, SlotTable};
-use crate::patch::primitive::{GlyphRun, PolySprite, PrimitiveKind, Quad, Shadow};
+use crate::patch::primitive::{GlyphRun, PolySprite, PrimitiveKind, Quad, Shadow, Underline};
 
 /// The persistent, patched-not-rebuilt scene (R-N Pillar III, §2's picture).
 ///
@@ -55,6 +55,9 @@ pub struct Scene {
     pub shadows: PrimitiveStore<Shadow>,
     /// Fixed-size primitives (§2's "primitives").
     pub quads: PrimitiveStore<Quad>,
+    /// Underline and strikethrough rules, painted under their layer's text
+    /// (Phase 6.3).
+    pub underlines: PrimitiveStore<Underline>,
     /// Variable-size primitives (§2's "primitives").
     pub glyph_runs: PrimitiveStore<GlyphRun>,
     /// Colour-atlas sprites — images and rasterised SVGs (Phase 6.2).
@@ -100,6 +103,9 @@ impl Scene {
             if let Some(range) = self.quads.draw_range(layer) {
                 ranges.push((layer, PrimitiveKind::Quad, range));
             }
+            if let Some(range) = self.underlines.draw_range(layer) {
+                ranges.push((layer, PrimitiveKind::Underline, range));
+            }
             if let Some(range) = self.glyph_runs.draw_range(layer) {
                 ranges.push((layer, PrimitiveKind::GlyphRun, range));
             }
@@ -139,6 +145,7 @@ impl Scene {
                 let range = match kind {
                     PrimitiveKind::Shadow => self.shadows.slab(*layer),
                     PrimitiveKind::Quad => self.quads.slab(*layer),
+                    PrimitiveKind::Underline => self.underlines.slab(*layer),
                     PrimitiveKind::GlyphRun => self.glyph_runs.slab(*layer),
                     PrimitiveKind::PolySprite => self.poly_sprites.slab(*layer),
                 };
@@ -171,6 +178,7 @@ impl Scene {
     pub fn remove_layer(&mut self, layer: LayerId) -> bool {
         self.shadows.remove_layer(layer, &mut self.allocator);
         self.quads.remove_layer(layer, &mut self.allocator);
+        self.underlines.remove_layer(layer, &mut self.allocator);
         self.glyph_runs.remove_layer(layer, &mut self.allocator);
         self.poly_sprites.remove_layer(layer, &mut self.allocator);
         self.layout_inputs.remove_layer(layer);
@@ -192,6 +200,7 @@ mod tests {
         assert!(scene.layers.is_empty());
         assert!(scene.shadows.resident_bytes().is_empty());
         assert!(scene.quads.resident_bytes().is_empty());
+        assert!(scene.underlines.resident_bytes().is_empty());
         assert!(scene.glyph_runs.resident_bytes().is_empty());
         assert!(scene.poly_sprites.resident_bytes().is_empty());
     }

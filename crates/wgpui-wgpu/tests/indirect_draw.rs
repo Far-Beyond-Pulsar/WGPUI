@@ -433,11 +433,11 @@ fn the_fallback_path_is_the_one_that_learns_the_counts() {
     );
     assert_eq!(
         first.stats.slots_skipped as usize,
-        LAYERS + 1,
+        LAYERS * (NON_ATLAS_KINDS - 1) + 1,
         "the fallback declines to issue exactly the slots it has read and found \
          empty — the one thing an indirect path cannot do, because it does not \
-         know. That is every one of this scene's shadow slots (it holds no \
-         shadows at all) plus the one quad layer emptied above."
+         know. That is every slot of every texture-free kind this scene holds \
+         none of (it holds only quads) plus the one quad layer emptied above."
     );
 
     // The staging buffer must be reused across frames, or the fallback
