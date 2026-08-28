@@ -23,6 +23,17 @@
 //! [`crate::scene::Scene`]. Nothing in `patch`, `scene::slab`, or the upload
 //! machinery is written per-kind.
 //!
+//! Phase 6.2 is the first phase to actually *do* that, with [`PolySprite`] —
+//! and the claim above held: the addition is a variant, a payload type, a
+//! `Scene` field, and the three `match` arms the compiler pointed at. Nothing
+//! in the slab allocator, the patch protocol, the upload planner, or the
+//! indirect-draw slot table needed a line of per-kind code.
+//!
+//! [`PolySprite`] is structurally [`Quad`]'s shape (fixed size, one slot) with
+//! [`Glyph`]'s atlas reference, which is why it is a third kind rather than a
+//! third *shape*: it needed no new protocol mechanism, only a new payload and
+//! a pipeline that samples a colour page.
+//!
 //! # Why a trait plus a small tag enum, rather than a trait object
 //!
 //! Payloads are plain data of differing shape and size, produced once per
@@ -48,15 +59,30 @@ pub enum PrimitiveKind {
     Quad,
     /// Variable-size, one slot per glyph. See [`GlyphRun`].
     GlyphRun,
+    /// Fixed-size, one slot per sprite, referencing a colour atlas tile.
+    /// See [`PolySprite`].
+    PolySprite,
 }
 
 impl PrimitiveKind {
     /// Every kind, in declaration order.
-    pub const ALL: [PrimitiveKind; PrimitiveKind::COUNT] =
-        [PrimitiveKind::Quad, PrimitiveKind::GlyphRun];
+    ///
+    /// Declaration order is also *paint* order within a frame, because
+    /// [`crate::indirect::SlotTable`] groups the fixed draw sequence by kind and
+    /// the render pass issues the groups in this order. `PolySprite` is declared
+    /// after `GlyphRun` for that reason and not alphabetically: an image drawn
+    /// over a label is the ordinary case (an avatar over a row background, a
+    /// thumbnail over a card), and cross-kind z-order within one layer is not
+    /// expressible while the ordering dispatch is per kind — see
+    /// docs/phase-5.6-results.md, which discloses the same limit for text.
+    pub const ALL: [PrimitiveKind; PrimitiveKind::COUNT] = [
+        PrimitiveKind::Quad,
+        PrimitiveKind::GlyphRun,
+        PrimitiveKind::PolySprite,
+    ];
 
     /// Number of kinds; the width of every per-kind array in this crate.
-    pub const COUNT: usize = 2;
+    pub const COUNT: usize = 3;
 
     /// Dense index into a per-kind array.
     pub const fn index(self) -> usize {
@@ -68,6 +94,7 @@ impl PrimitiveKind {
         match self {
             PrimitiveKind::Quad => Quad::SLOT_STRIDE,
             PrimitiveKind::GlyphRun => GlyphRun::SLOT_STRIDE,
+            PrimitiveKind::PolySprite => PolySprite::SLOT_STRIDE,
         }
     }
 }
@@ -450,6 +477,114 @@ impl Primitive for GlyphRun {
     }
 }
 
+/// One image sprite: a rectangle of screen filled from one colour atlas tile.
+///
+/// The legacy `PolychromeSprite` (`src/scene.rs`), reduced to what 2.0's
+/// protocol carries and no further. What is deliberately absent, with the
+/// reason in each case:
+///
+/// - `order` — §5.1's ordering pass computes draw order on the GPU from the
+///   primitive's bounds; a CPU-assigned order field is exactly what Phase 3
+///   replaced.
+/// - `content_mask` — the frame's clip rectangle reaches the occlusion pass as
+///   a [`crate::occlusion::CoverageItem`], not as a per-primitive field. This is
+///   the same choice [`Quad`] made in Phase 1 and it is not new here.
+/// - `AtlasTextureId { index, kind }` — [`AtlasTileId`] already packs page and
+///   slot into one word, and the kind is implied: a sprite of this kind is
+///   always in a [`crate::scene::atlas::AtlasKind::Polychrome`] page.
+/// - per-corner radii — [`Quad`] carries one uniform radius in 2.0 and this
+///   matches it rather than inventing a second convention. Four radii is a
+///   16-byte addition to both kinds, together, when something needs it.
+///
+/// # Why the tile's extent is carried as well as the screen rectangle
+///
+/// The two are not the same number and the difference is the whole of
+/// object-fit. `size` is where layout put the image; `atlas_size` is how big the
+/// decoded bitmap actually is. A sprite drawn at its natural size has them equal
+/// — which is the case the byte-exact proof uses, because a 1:1 blit is the only
+/// mapping under which "the pixel on screen *is* the texel in the atlas" is a
+/// statement about equality rather than about interpolation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PolySprite {
+    /// Top-left of the drawn rectangle in the owning layer's coordinate space.
+    pub origin: [f32; 2],
+    /// Width and height of the drawn rectangle, in the same space.
+    pub size: [f32; 2],
+    /// Top-left of this sprite's bitmap in the atlas, in texels.
+    pub atlas_origin: [f32; 2],
+    /// Size of this sprite's bitmap in the atlas, in texels.
+    pub atlas_size: [f32; 2],
+    /// Uniform corner radius the sprite is clipped to.
+    pub corner_radius: f32,
+    /// Straight alpha the sprite composites at.
+    pub opacity: f32,
+    /// Whether to desaturate — the legacy `PolychromeSprite::grayscale`, which
+    /// is a `u8` there and a flag here, encoded as a whole word because a
+    /// storage-buffer shader reads words.
+    pub grayscale: bool,
+    /// Which atlas allocation holds this sprite's bitmap.
+    ///
+    /// [`AtlasTileId::NONE`] for a sprite whose image has not been decoded or
+    /// whose tile the atlas refused. Such a sprite keeps its slab slot and draws
+    /// nothing, exactly as a whitespace [`Glyph`] does, and — importantly — is
+    /// not a tile reference, so it never subscribes its layer to an eviction.
+    pub atlas_tile: AtlasTileId,
+}
+
+impl PolySprite {
+    /// A zero-sized, fully transparent sprite referencing no tile.
+    pub const ZERO: PolySprite = PolySprite {
+        origin: [0.0, 0.0],
+        size: [0.0, 0.0],
+        atlas_origin: [0.0, 0.0],
+        atlas_size: [0.0, 0.0],
+        corner_radius: 0.0,
+        opacity: 0.0,
+        grayscale: false,
+        atlas_tile: AtlasTileId::NONE,
+    };
+
+    /// The atlas tile this sprite references, or `None` when it draws nothing.
+    ///
+    /// The [`GlyphRun::atlas_tiles`] of this kind, singular because a sprite has
+    /// exactly one tile. Both exist so [`crate::scene::Scene::layers_referencing`]
+    /// can ask the same question of every kind without knowing how many tiles a
+    /// kind holds.
+    pub fn atlas_tile(&self) -> Option<AtlasTileId> {
+        if self.atlas_tile.is_none() {
+            None
+        } else {
+            Some(self.atlas_tile)
+        }
+    }
+}
+
+impl Primitive for PolySprite {
+    const KIND: PrimitiveKind = PrimitiveKind::PolySprite;
+
+    // 48 bytes of payload, exactly filled: four `vec2<f32>` (32) plus two `f32`
+    // and two `u32` (16). Already a 16-byte std430 boundary with no padding, so
+    // unlike `Quad` this kind spends nothing on alignment.
+    const SLOT_STRIDE: usize = 48;
+
+    fn slot_count(&self) -> u32 {
+        1
+    }
+
+    fn encode(&self, destination: &mut [u8]) -> Result<(), EncodeError> {
+        let mut writer = SlotWriter::new(destination);
+        writer.write_f32_array(self.origin)?;
+        writer.write_f32_array(self.size)?;
+        writer.write_f32_array(self.atlas_origin)?;
+        writer.write_f32_array(self.atlas_size)?;
+        writer.write_f32(self.corner_radius)?;
+        writer.write_f32(self.opacity)?;
+        writer.write_u32(u32::from(self.grayscale))?;
+        writer.write_u32(self.atlas_tile.as_raw())?;
+        writer.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,8 +727,83 @@ mod tests {
     fn kind_tags_agree_with_their_payload_types() {
         assert_eq!(PrimitiveKind::Quad.slot_stride(), Quad::SLOT_STRIDE);
         assert_eq!(PrimitiveKind::GlyphRun.slot_stride(), GlyphRun::SLOT_STRIDE);
+        assert_eq!(
+            PrimitiveKind::PolySprite.slot_stride(),
+            PolySprite::SLOT_STRIDE
+        );
         for (index, kind) in PrimitiveKind::ALL.iter().enumerate() {
             assert_eq!(kind.index(), index);
         }
+        assert_eq!(PrimitiveKind::ALL.len(), PrimitiveKind::COUNT);
+    }
+
+    fn sprite(tile: AtlasTileId) -> PolySprite {
+        PolySprite {
+            origin: [10.0, 20.0],
+            size: [64.0, 48.0],
+            atlas_origin: [128.0, 256.0],
+            atlas_size: [64.0, 48.0],
+            corner_radius: 4.0,
+            opacity: 0.5,
+            grayscale: true,
+            atlas_tile: tile,
+        }
+    }
+
+    #[test]
+    fn a_poly_sprite_encodes_exactly_one_slot_with_no_padding() {
+        let tile = AtlasTileId::new(2, 9).expect("in range");
+        let mut bytes = vec![0xAAu8; PolySprite::SLOT_STRIDE];
+        let sprite = sprite(tile);
+        assert_eq!(sprite.slot_count(), 1);
+        assert!(sprite.encode(&mut bytes).is_ok());
+
+        // Every field, at the offset the shader's `SpriteSlot` reads it from.
+        // Asserted by offset rather than by round-trip because there is no
+        // decoder: the only reader is WGSL, where nothing checks the layout.
+        assert_eq!(&bytes[0..4], &10.0f32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &20.0f32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &64.0f32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &48.0f32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &128.0f32.to_le_bytes());
+        assert_eq!(&bytes[20..24], &256.0f32.to_le_bytes());
+        assert_eq!(&bytes[24..28], &64.0f32.to_le_bytes());
+        assert_eq!(&bytes[28..32], &48.0f32.to_le_bytes());
+        assert_eq!(&bytes[32..36], &4.0f32.to_le_bytes());
+        assert_eq!(&bytes[36..40], &0.5f32.to_le_bytes());
+        assert_eq!(&bytes[40..44], &1u32.to_le_bytes());
+        assert_eq!(&bytes[44..48], &tile.as_raw().to_le_bytes());
+    }
+
+    #[test]
+    fn a_poly_sprite_rejects_a_mis_sized_destination_instead_of_panicking() {
+        let mut too_small = vec![0u8; PolySprite::SLOT_STRIDE - 1];
+        assert!(PolySprite::ZERO.encode(&mut too_small).is_err());
+        let mut too_large = vec![0u8; PolySprite::SLOT_STRIDE + 1];
+        assert!(PolySprite::ZERO.encode(&mut too_large).is_err());
+    }
+
+    #[test]
+    fn a_sprite_with_no_tile_is_not_a_tile_reference() {
+        // The same rule a whitespace glyph follows: it holds its slot, draws
+        // nothing, and must never make its layer subscribe to an eviction.
+        assert_eq!(PolySprite::ZERO.atlas_tile(), None);
+        let tile = AtlasTileId::new(1, 3).expect("in range");
+        assert_eq!(sprite(tile).atlas_tile(), Some(tile));
+    }
+
+    #[test]
+    fn the_grayscale_flag_encodes_as_zero_or_one_and_nothing_else() {
+        let tile = AtlasTileId::new(0, 0).expect("in range");
+        let mut bytes = vec![0xFFu8; PolySprite::SLOT_STRIDE];
+        assert!(
+            PolySprite {
+                grayscale: false,
+                ..sprite(tile)
+            }
+            .encode(&mut bytes)
+            .is_ok()
+        );
+        assert_eq!(&bytes[40..44], &0u32.to_le_bytes());
     }
 }

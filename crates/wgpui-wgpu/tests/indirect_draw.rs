@@ -36,6 +36,18 @@ use wgpui_wgpu::render::surface_registry::SurfaceRegistry;
 
 const LAYERS: usize = 6;
 
+/// Primitive kinds the render pass actually walks a slot sequence for.
+///
+/// Kept separate from [`PrimitiveKind::COUNT`] so the two claims stay
+/// distinguishable: the *table* names every (layer, kind) pair that could be
+/// populated, while the *pass* walks the kinds that have a pipeline behind
+/// them. They were unequal through Phases 4–5.6 and are unequal again at the
+/// point in Phase 6.2 where `PolySprite` exists as a kind and its pipeline does
+/// not — and stating which of the two an assertion is about is the difference
+/// between the gate tracking the renderer and the gate tracking an enum's
+/// length.
+const DRAWN_KINDS: usize = 2;
+
 fn window(spec: &UiSceneSpec) -> Rect {
     Rect::from_origin_size([0.0, 0.0], [spec.width, spec.height])
 }
@@ -314,13 +326,13 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
     );
     assert_eq!(
         large_output.stats.slots_visited as usize,
-        LAYERS * PrimitiveKind::COUNT,
-        "one entry per (layer, kind) slot. Phase 4 asserted `LAYERS` here and \
-         explained that nothing drew the GlyphRun half because only one \
-         instanced pipeline existed; Phase 5.6 built the second, so both halves \
-         of the table are now walked. The gate itself is untouched — the \
-         equalities above still say the work does not grow with the primitive \
-         count — and what changed is the premise, not the claim"
+        LAYERS * DRAWN_KINDS,
+        "one entry per (layer, drawn-kind) slot. Phase 4 asserted `LAYERS` here \
+         and explained that nothing drew the GlyphRun half because only one \
+         instanced pipeline existed; Phase 5.6 built the second and Phase 6.2 \
+         the third, so every half of the table is now walked. The gate itself is \
+         untouched — the equalities above still say the work does not grow with \
+         the primitive count — and what changed is the premise, not the claim"
     );
     assert_eq!(
         large_output.stats.glyph_slots_unavailable as usize,

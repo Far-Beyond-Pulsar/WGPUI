@@ -30,7 +30,7 @@ pub use tile::{
 };
 
 use crate::indirect::{DrawSlot, SlotTable};
-use crate::patch::primitive::{GlyphRun, PrimitiveKind, Quad};
+use crate::patch::primitive::{GlyphRun, PolySprite, PrimitiveKind, Quad};
 
 /// The persistent, patched-not-rebuilt scene (R-N Pillar III, §2's picture).
 ///
@@ -53,6 +53,8 @@ pub struct Scene {
     pub quads: PrimitiveStore<Quad>,
     /// Variable-size primitives (§2's "primitives").
     pub glyph_runs: PrimitiveStore<GlyphRun>,
+    /// Colour-atlas sprites — images and rasterised SVGs (Phase 6.2).
+    pub poly_sprites: PrimitiveStore<PolySprite>,
     /// §2's "layout inputs".
     pub layout_inputs: RecordStore<LayoutInput>,
     /// §2's "hitboxes".
@@ -94,6 +96,9 @@ impl Scene {
             if let Some(range) = self.glyph_runs.draw_range(layer) {
                 ranges.push((layer, PrimitiveKind::GlyphRun, range));
             }
+            if let Some(range) = self.poly_sprites.draw_range(layer) {
+                ranges.push((layer, PrimitiveKind::PolySprite, range));
+            }
         }
         ranges
     }
@@ -127,6 +132,7 @@ impl Scene {
                 let range = match kind {
                     PrimitiveKind::Quad => self.quads.slab(*layer),
                     PrimitiveKind::GlyphRun => self.glyph_runs.slab(*layer),
+                    PrimitiveKind::PolySprite => self.poly_sprites.slab(*layer),
                 };
                 slots.push(DrawSlot {
                     layer: *layer,
@@ -157,6 +163,7 @@ impl Scene {
     pub fn remove_layer(&mut self, layer: LayerId) -> bool {
         self.quads.remove_layer(layer, &mut self.allocator);
         self.glyph_runs.remove_layer(layer, &mut self.allocator);
+        self.poly_sprites.remove_layer(layer, &mut self.allocator);
         self.layout_inputs.remove_layer(layer);
         self.hitboxes.remove_layer(layer);
         self.dispatch_nodes.remove_layer(layer);
@@ -176,6 +183,7 @@ mod tests {
         assert!(scene.layers.is_empty());
         assert!(scene.quads.resident_bytes().is_empty());
         assert!(scene.glyph_runs.resident_bytes().is_empty());
+        assert!(scene.poly_sprites.resident_bytes().is_empty());
     }
 
     #[test]

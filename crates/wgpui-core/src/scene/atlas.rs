@@ -250,22 +250,39 @@ impl AtlasEviction {
 }
 
 impl Scene {
-    /// Every live layer holding a glyph whose raster is in `evicted`, in
-    /// ascending layer order.
+    /// Every live layer holding a glyph or sprite whose raster is in `evicted`,
+    /// in ascending layer order.
     ///
     /// A pure query: it reports what would be affected without changing
     /// anything, so a caller can log or assert against it before acting.
+    ///
+    /// **Both tile-referencing kinds are scanned.** Phase 6.2 added
+    /// [`crate::patch::primitive::PolySprite`], which references a colour tile
+    /// exactly as a [`crate::patch::primitive::Glyph`] references a coverage
+    /// one, and an eviction it did not see is the same stale-texels bug this
+    /// module's doc is about — an image sprite left pointing at a freed
+    /// rectangle draws whatever was allocated over it, with nothing to notice.
+    /// The scan is what makes that hard to get wrong: adding a kind that holds
+    /// tiles and forgetting this function is a missing clause here, not a
+    /// missing update site scattered across the patch path.
     pub fn layers_referencing(&self, evicted: AtlasEviction) -> Vec<LayerId> {
         let mut affected = Vec::new();
         for layer in self.layers.ids() {
-            let references = self
+            let glyphs = self
                 .glyph_runs
                 .keys(layer)
                 .into_iter()
                 .filter_map(|key| self.glyph_runs.get(layer, key))
                 .flat_map(|run| run.atlas_tiles())
                 .any(|tile| evicted.covers(tile));
-            if references {
+            let sprites = self
+                .poly_sprites
+                .keys(layer)
+                .into_iter()
+                .filter_map(|key| self.poly_sprites.get(layer, key))
+                .filter_map(|sprite| sprite.atlas_tile())
+                .any(|tile| evicted.covers(tile));
+            if glyphs || sprites {
                 affected.push(layer);
             }
         }
@@ -459,6 +476,66 @@ mod tests {
         assert_eq!(
             scene.layers.get(page_zero).map(|l| l.invalidation()),
             Some(Invalidation::DISPLAY)
+        );
+        Ok(())
+    }
+
+    /// The Phase 6.2 half of the same subscription: an image sprite is a tile
+    /// reference too, and an eviction it did not see is the same bug.
+    #[test]
+    fn evicting_a_page_invalidates_the_layers_whose_sprites_reference_it()
+    -> Result<(), PatchError> {
+        use crate::patch::primitive::PolySprite;
+
+        let mut scene = Scene::new();
+        let with_image = scene.layer(LayerKey::untiled(BoundaryId::from_raw(1)));
+        let other_image = scene.layer(LayerKey::untiled(BoundaryId::from_raw(2)));
+        let no_tile = scene.layer(LayerKey::untiled(BoundaryId::from_raw(3)));
+
+        let mut patch = ScenePatch::new();
+        patch.poly_sprites.append(
+            with_image,
+            RecordKey::from_raw(1),
+            0,
+            PolySprite {
+                atlas_tile: tile(5, 1),
+                ..PolySprite::ZERO
+            },
+        );
+        patch.poly_sprites.append(
+            other_image,
+            RecordKey::from_raw(2),
+            0,
+            PolySprite {
+                atlas_tile: tile(6, 1),
+                ..PolySprite::ZERO
+            },
+        );
+        // A sprite whose image has not decoded yet: a slot, no tile reference.
+        patch
+            .poly_sprites
+            .append(no_tile, RecordKey::from_raw(3), 0, PolySprite::ZERO);
+        apply(&mut scene, &patch)?;
+        for layer in [with_image, other_image, no_tile] {
+            scene.layers.mark_clean(layer);
+        }
+
+        assert_eq!(scene.evict_atlas(AtlasEviction::Page(5)), vec![with_image]);
+        assert_eq!(
+            scene.layers.get(with_image).map(|l| l.invalidation()),
+            Some(Invalidation::DISPLAY)
+        );
+        assert!(scene.layers.get(other_image).is_some_and(|l| l.is_clean()));
+        assert!(scene.layers.get(no_tile).is_some_and(|l| l.is_clean()));
+
+        assert_eq!(
+            scene.evict_atlas(AtlasEviction::Tile(tile(6, 1))),
+            vec![other_image]
+        );
+        assert_eq!(
+            scene.evict_atlas(AtlasEviction::Tile(AtlasTileId::NONE)),
+            vec![],
+            "a sprite with no tile must never subscribe to an eviction"
         );
         Ok(())
     }

@@ -64,7 +64,7 @@ use crate::boundary::compositor::{BoundaryComposite, Composite, Compositor};
 use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::request::FrameSignals;
 use crate::patch::apply::ScenePatch;
-use crate::patch::primitive::{GlyphRun, Primitive, Quad};
+use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad};
 use crate::patch::{PatchList, RecordKey};
 use crate::reconcile::instance::InstanceKey;
 use crate::reconcile::plan::FramePlan;
@@ -98,6 +98,7 @@ pub struct EmitContext {
 pub struct Emission {
     quads: Vec<Quad>,
     glyph_runs: Vec<GlyphRun>,
+    poly_sprites: Vec<PolySprite>,
 }
 
 impl Emission {
@@ -123,25 +124,37 @@ impl Emission {
         &self.quads
     }
 
+    /// Contribute an image sprite.
+    pub fn poly_sprite(&mut self, sprite: PolySprite) -> &mut Self {
+        self.poly_sprites.push(sprite);
+        self
+    }
+
     /// The glyph runs contributed, in emission order.
     pub fn glyph_runs(&self) -> &[GlyphRun] {
         &self.glyph_runs
     }
 
+    /// The image sprites contributed, in emission order.
+    pub fn poly_sprites(&self) -> &[PolySprite] {
+        &self.poly_sprites
+    }
+
     /// Total primitives contributed.
     pub fn len(&self) -> usize {
-        self.quads.len() + self.glyph_runs.len()
+        self.quads.len() + self.glyph_runs.len() + self.poly_sprites.len()
     }
 
     /// Whether the element contributed nothing.
     pub fn is_empty(&self) -> bool {
-        self.quads.is_empty() && self.glyph_runs.is_empty()
+        self.quads.is_empty() && self.glyph_runs.is_empty() && self.poly_sprites.is_empty()
     }
 
     /// Drop everything, keeping the allocations for the next element.
     pub fn clear(&mut self) {
         self.quads.clear();
         self.glyph_runs.clear();
+        self.poly_sprites.clear();
     }
 }
 
@@ -269,6 +282,7 @@ struct EmittedNode {
     bounds: LayoutRect,
     quads: u32,
     glyph_runs: u32,
+    poly_sprites: u32,
     last_visited_frame: u64,
 }
 
@@ -414,6 +428,7 @@ impl Emitter {
         let mut stats = EmissionStats::default();
         let mut quads: KindOperations<Quad> = KindOperations::default();
         let mut glyph_runs: KindOperations<GlyphRun> = KindOperations::default();
+        let mut poly_sprites: KindOperations<PolySprite> = KindOperations::default();
         let mut boundaries: HashMap<BoundaryId, BoundaryFrame> = HashMap::new();
         let mut emission = Emission::new();
 
@@ -513,7 +528,9 @@ impl Emitter {
                                 &mut boundaries,
                                 node.boundary,
                                 false,
-                                record.quads as usize + record.glyph_runs as usize,
+                                record.quads as usize
+                                    + record.glyph_runs as usize
+                                    + record.poly_sprites as usize,
                             );
                         }
                     } else {
@@ -541,11 +558,20 @@ impl Emitter {
                             emission.glyph_runs(),
                             &mut glyph_runs,
                         );
+                        Self::reconcile_records(
+                            node.address,
+                            layer,
+                            previous.map(|record| (record.layer, record.poly_sprites)),
+                            emission.poly_sprites(),
+                            &mut poly_sprites,
+                        );
                         let emitted = EmittedNode {
                             layer,
                             bounds,
                             quads: u32::try_from(emission.quads().len()).unwrap_or(u32::MAX),
                             glyph_runs: u32::try_from(emission.glyph_runs().len())
+                                .unwrap_or(u32::MAX),
+                            poly_sprites: u32::try_from(emission.poly_sprites().len())
                                 .unwrap_or(u32::MAX),
                             last_visited_frame: frame,
                         };
@@ -558,7 +584,13 @@ impl Emitter {
                     // with it, not leave them resident under an address nothing
                     // will address again.
                     if let Some(record) = previous {
-                        Self::retire_records(node.address, record, &mut quads, &mut glyph_runs);
+                        Self::retire_records(
+                            node.address,
+                            record,
+                            &mut quads,
+                            &mut glyph_runs,
+                            &mut poly_sprites,
+                        );
                         self.emitted.remove(&node.address);
                         Self::account(&mut boundaries, node.boundary, true, 0);
                     }
@@ -574,11 +606,18 @@ impl Emitter {
             });
         }
 
-        self.sweep_departed(frame, &mut quads, &mut glyph_runs, &mut boundaries);
+        self.sweep_departed(
+            frame,
+            &mut quads,
+            &mut glyph_runs,
+            &mut poly_sprites,
+            &mut boundaries,
+        );
 
         let patch = ScenePatch {
             quads: quads.into_patch_list(&scene.quads, &mut stats),
             glyph_runs: glyph_runs.into_patch_list(&scene.glyph_runs, &mut stats),
+            poly_sprites: poly_sprites.into_patch_list(&scene.poly_sprites, &mut stats),
             ..ScenePatch::new()
         };
 
@@ -713,6 +752,7 @@ impl Emitter {
         record: EmittedNode,
         quads: &mut KindOperations<Quad>,
         glyph_runs: &mut KindOperations<GlyphRun>,
+        poly_sprites: &mut KindOperations<PolySprite>,
     ) {
         for ordinal in 0..record.quads {
             quads
@@ -721,6 +761,11 @@ impl Emitter {
         }
         for ordinal in 0..record.glyph_runs {
             glyph_runs
+                .removes
+                .push((record.layer, RecordKey::new(address, ordinal)));
+        }
+        for ordinal in 0..record.poly_sprites {
+            poly_sprites
                 .removes
                 .push((record.layer, RecordKey::new(address, ordinal)));
         }
@@ -738,6 +783,7 @@ impl Emitter {
         frame: u64,
         quads: &mut KindOperations<Quad>,
         glyph_runs: &mut KindOperations<GlyphRun>,
+        poly_sprites: &mut KindOperations<PolySprite>,
         boundaries: &mut HashMap<BoundaryId, BoundaryFrame>,
     ) {
         let departed: Vec<(InstanceKey, EmittedNode)> = self
@@ -747,7 +793,7 @@ impl Emitter {
             .map(|(address, record)| (*address, *record))
             .collect();
         for (address, record) in departed {
-            Self::retire_records(address, record, quads, glyph_runs);
+            Self::retire_records(address, record, quads, glyph_runs, poly_sprites);
             self.emitted.remove(&address);
             for entry in boundaries.values_mut() {
                 if entry.layer == record.layer {

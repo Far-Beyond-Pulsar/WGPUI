@@ -31,7 +31,7 @@
 //! layer, read back out of the arena at that layer's own address.
 
 use crate::invalidation::axes::Invalidation;
-use crate::patch::primitive::{GlyphRun, Primitive, Quad};
+use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad};
 use crate::patch::{PatchError, PatchList};
 use crate::scene::layer::LayerId;
 use crate::scene::record::{DispatchNode, Hitbox, LayoutInput};
@@ -51,6 +51,8 @@ pub struct ScenePatch {
     pub quads: PatchList<Quad>,
     /// Variable-size primitives.
     pub glyph_runs: PatchList<GlyphRun>,
+    /// Colour-atlas sprites — images and rasterised SVGs.
+    pub poly_sprites: PatchList<PolySprite>,
     /// Retained-layout-node placement.
     pub layout_inputs: PatchList<LayoutInput>,
     /// Registered hit regions.
@@ -70,6 +72,7 @@ impl ScenePatch {
     pub fn is_empty(&self) -> bool {
         self.quads.is_empty()
             && self.glyph_runs.is_empty()
+            && self.poly_sprites.is_empty()
             && self.layout_inputs.is_empty()
             && self.hitboxes.is_empty()
             && self.dispatch_nodes.is_empty()
@@ -79,6 +82,7 @@ impl ScenePatch {
     pub fn len(&self) -> usize {
         self.quads.len()
             + self.glyph_runs.len()
+            + self.poly_sprites.len()
             + self.layout_inputs.len()
             + self.hitboxes.len()
             + self.dispatch_nodes.len()
@@ -88,6 +92,7 @@ impl ScenePatch {
     pub fn clear(&mut self) {
         self.quads.clear();
         self.glyph_runs.clear();
+        self.poly_sprites.clear();
         self.layout_inputs.clear();
         self.hitboxes.clear();
         self.dispatch_nodes.clear();
@@ -105,6 +110,9 @@ impl ScenePatch {
             note(patch.layer);
         }
         for patch in self.glyph_runs.patches() {
+            note(patch.layer);
+        }
+        for patch in self.poly_sprites.patches() {
             note(patch.layer);
         }
         for patch in self.layout_inputs.patches() {
@@ -182,6 +190,9 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     scene
         .glyph_runs
         .apply(&patch.glyph_runs, &mut scene.allocator, &mut entries)?;
+    scene
+        .poly_sprites
+        .apply(&patch.poly_sprites, &mut scene.allocator, &mut entries)?;
     scene.layout_inputs.apply(&patch.layout_inputs)?;
     scene.hitboxes.apply(&patch.hitboxes)?;
     scene.dispatch_nodes.apply(&patch.dispatch_nodes)?;
@@ -191,7 +202,10 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     // standing rule, applied at the one place that knows what actually moved.
     for layer in touched {
         let mut axes = Invalidation::empty();
-        if names(&patch.quads, layer) || names(&patch.glyph_runs, layer) {
+        if names(&patch.quads, layer)
+            || names(&patch.glyph_runs, layer)
+            || names(&patch.poly_sprites, layer)
+        {
             axes |= Invalidation::DISPLAY;
             scene
                 .layers
@@ -199,6 +213,9 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
             scene
                 .layers
                 .set_slab(layer, GlyphRun::KIND, scene.glyph_runs.slab(layer));
+            scene
+                .layers
+                .set_slab(layer, PolySprite::KIND, scene.poly_sprites.slab(layer));
         }
         if names(&patch.layout_inputs, layer) {
             axes |= Invalidation::LAYOUT;
@@ -272,6 +289,11 @@ pub fn compare_to_rebuild(patched: &Scene, rebuilt: &Scene) -> Option<ResidencyM
         }
         if let Some(mismatch) =
             compare_store(&patched.glyph_runs, &rebuilt.glyph_runs, layer)
+        {
+            return Some(mismatch);
+        }
+        if let Some(mismatch) =
+            compare_store(&patched.poly_sprites, &rebuilt.poly_sprites, layer)
         {
             return Some(mismatch);
         }
