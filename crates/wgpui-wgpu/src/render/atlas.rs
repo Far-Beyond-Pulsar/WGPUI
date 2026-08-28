@@ -43,7 +43,10 @@
 
 use std::collections::HashMap;
 use wgpui_core::patch::primitive::AtlasTileId;
-use wgpui_core::scene::atlas::{AtlasEviction, AtlasKind, GlyphRasterKey, RasterizedGlyph};
+use wgpui_core::scene::atlas::{
+    AtlasEviction, AtlasKey, AtlasKind, GlyphRasterKey, ImageRasterKey, ImageTile, ImageTileSource,
+    RasterizedGlyph, RasterizedImage,
+};
 
 /// Side length of a page, in texels, when the atlas opens one.
 ///
@@ -299,8 +302,8 @@ pub struct GlyphAtlas {
     /// and a test caught this counter being missing rather than a review
     /// finding it.
     next_page_index: u32,
-    tiles_by_key: HashMap<GlyphRasterKey, TilePlacement>,
-    keys_by_tile: HashMap<AtlasTileId, GlyphRasterKey>,
+    tiles_by_key: HashMap<AtlasKey, TilePlacement>,
+    keys_by_tile: HashMap<AtlasTileId, AtlasKey>,
     pending_evictions: Vec<AtlasEviction>,
     pending_uploads: Vec<PendingUpload>,
     stats: AtlasStats,
@@ -345,8 +348,8 @@ impl GlyphAtlas {
     ///
     /// The read-only half of [`Self::get_or_insert`], for a caller that wants to
     /// know whether a request would allocate without making it do so.
-    pub fn get(&self, key: &GlyphRasterKey) -> Option<TilePlacement> {
-        self.tiles_by_key.get(key).copied()
+    pub fn get(&self, key: impl Into<AtlasKey>) -> Option<TilePlacement> {
+        self.tiles_by_key.get(&key.into()).copied()
     }
 
     /// Reserve space for `key`'s raster without supplying its texels.
@@ -359,9 +362,10 @@ impl GlyphAtlas {
     /// to use when the pixels exist.
     pub fn get_or_insert(
         &mut self,
-        key: GlyphRasterKey,
+        key: impl Into<AtlasKey>,
         metrics: RasterMetrics,
     ) -> Result<TilePlacement, AtlasError> {
+        let key = key.into();
         if let Some(placement) = self.tiles_by_key.get(&key) {
             self.stats.cache_hits += 1;
             return Ok(*placement);
@@ -382,16 +386,13 @@ impl GlyphAtlas {
     /// what it wants to avoid, which is exactly what [`AtlasTileSource`] does.
     pub fn get_or_insert_raster(
         &mut self,
-        key: GlyphRasterKey,
+        key: impl Into<AtlasKey>,
         raster: &RasterizedGlyph,
     ) -> Result<TilePlacement, AtlasError> {
-        if let Some(placement) = self.tiles_by_key.get(&key) {
-            self.stats.cache_hits += 1;
-            return Ok(*placement);
-        }
-        if raster.kind != key.kind {
+        let key = key.into();
+        if raster.kind != key.kind() {
             return Err(AtlasError::KindMismatch {
-                requested: key.kind,
+                requested: key.kind(),
                 rasterized: raster.kind,
             });
         }
@@ -401,21 +402,77 @@ impl GlyphAtlas {
                 actual: raster.texels.len(),
             });
         }
-
-        let placement = self.insert_new(
+        self.insert_texels(
             key,
             RasterMetrics {
                 size: raster.size,
                 bearing: raster.bearing,
             },
-        )?;
-        self.write_texels(placement, &raster.texels);
+            &raster.texels,
+        )
+    }
+
+    /// Where `key`'s decoded frame lives, uploading its texels into a fresh tile
+    /// if it is not already resident.
+    ///
+    /// The image half of [`Self::get_or_insert_raster`], over the same pages and
+    /// the same tile numbering. It is a separate entry point rather than a
+    /// second `Into<AtlasKey>` call because the two producers hand over
+    /// different value types — a glyph carries a bearing and a kind, an image
+    /// carries neither — and collapsing them would mean an image caller
+    /// constructing a `RasterizedGlyph` whose `bearing` is a lie and whose
+    /// `kind` is redundant with the key.
+    ///
+    /// A resident key is answered without looking at `image` at all, so a caller
+    /// that wants to avoid *decoding* checks [`Self::get`] first — which is
+    /// exactly what [`ImageAtlasSource`] does.
+    pub fn get_or_insert_image(
+        &mut self,
+        key: ImageRasterKey,
+        image: &RasterizedImage,
+    ) -> Result<TilePlacement, AtlasError> {
+        if !image.is_well_formed() {
+            return Err(AtlasError::MalformedBitmap {
+                expected: image.expected_texel_bytes(),
+                actual: image.texels.len(),
+            });
+        }
+        self.insert_texels(
+            AtlasKey::Image(key),
+            RasterMetrics {
+                size: image.size,
+                // An image has no pen and therefore no bearing. Zero here is not
+                // a placeholder: `ImageTile` deliberately does not carry the
+                // field, so nothing downstream can add it to a position.
+                bearing: [0.0, 0.0],
+            },
+            &image.texels,
+        )
+    }
+
+    /// Allocate `key` if it is not resident and write `texels` into its tile.
+    ///
+    /// The shared body of the two `get_or_insert_*` entry points, so that "a
+    /// resident key is a cache hit and is never rewritten" is one decision
+    /// rather than two that can drift.
+    fn insert_texels(
+        &mut self,
+        key: AtlasKey,
+        metrics: RasterMetrics,
+        texels: &[u8],
+    ) -> Result<TilePlacement, AtlasError> {
+        if let Some(placement) = self.tiles_by_key.get(&key) {
+            self.stats.cache_hits += 1;
+            return Ok(*placement);
+        }
+        let placement = self.insert_new(key, metrics)?;
+        self.write_texels(placement, texels);
         Ok(placement)
     }
 
     fn insert_new(
         &mut self,
-        key: GlyphRasterKey,
+        key: AtlasKey,
         metrics: RasterMetrics,
     ) -> Result<TilePlacement, AtlasError> {
         let size = metrics.size;
@@ -519,7 +576,7 @@ impl GlyphAtlas {
 
     fn allocate(
         &mut self,
-        key: GlyphRasterKey,
+        key: AtlasKey,
         metrics: RasterMetrics,
     ) -> Result<TilePlacement, AtlasError> {
         let size = metrics.size;
@@ -539,7 +596,7 @@ impl GlyphAtlas {
         // walking every full page on every allocation once an atlas has grown.
         for index in (0..self.pages.len()).rev() {
             let kind = self.pages[index].kind;
-            if kind != key.kind {
+            if kind != key.kind() {
                 continue;
             }
             if let Some(placement) = self.allocate_in(index, key, metrics, requested)? {
@@ -547,7 +604,7 @@ impl GlyphAtlas {
             }
         }
 
-        let index = self.open_page(key.kind)?;
+        let index = self.open_page(key.kind())?;
         self.allocate_in(index, key, metrics, requested)?
             .ok_or(AtlasError::TooLargeForAPage {
                 requested: size,
@@ -558,7 +615,7 @@ impl GlyphAtlas {
     fn allocate_in(
         &mut self,
         index: usize,
-        key: GlyphRasterKey,
+        key: AtlasKey,
         metrics: RasterMetrics,
         requested: etagere::Size,
     ) -> Result<Option<TilePlacement>, AtlasError> {
@@ -598,7 +655,7 @@ impl GlyphAtlas {
 
         Ok(Some(TilePlacement {
             tile,
-            kind: key.kind,
+            kind: key.kind(),
             origin: [
                 allocation.rectangle.min.x as f32,
                 allocation.rectangle.min.y as f32,
@@ -646,8 +703,8 @@ impl GlyphAtlas {
     /// the eviction has to be reported: a retained slab pointing at them draws
     /// a stale glyph and then, later, a *wrong* one, with nothing in between to
     /// notice.
-    pub fn evict(&mut self, key: &GlyphRasterKey) -> bool {
-        let Some(placement) = self.tiles_by_key.remove(key) else {
+    pub fn evict(&mut self, key: impl Into<AtlasKey>) -> bool {
+        let Some(placement) = self.tiles_by_key.remove(&key.into()) else {
             return false;
         };
         self.keys_by_tile.remove(&placement.tile);
@@ -667,7 +724,7 @@ impl GlyphAtlas {
         let Some(position) = self.pages.iter().position(|page| page.index == page_index) else {
             return false;
         };
-        let dropped: Vec<GlyphRasterKey> = self
+        let dropped: Vec<AtlasKey> = self
             .tiles_by_key
             .iter()
             .filter(|(_, placement)| placement.tile.page() == Some(page_index))
@@ -780,7 +837,7 @@ where
         // atlas holding a key map at all: a paragraph asks for the same 'e'
         // dozens of times per frame, and the caller deliberately does not
         // deduplicate (`wgpui-text`'s `patch` module says so).
-        let placement = match self.atlas.get(&key) {
+        let placement = match self.atlas.get(key) {
             Some(placement) => {
                 self.atlas.stats.cache_hits += 1;
                 placement
@@ -799,6 +856,64 @@ where
             atlas_origin: placement.origin,
             atlas_size: placement.size,
             bearing: placement.bearing,
+        })
+    }
+}
+
+/// An [`ImageTileSource`] built from an atlas and a decoder.
+///
+/// [`AtlasTileSource`]'s image counterpart, and it is a separate type for the
+/// dependency reason that one records: `wgpui-wgpu` cannot name
+/// `wgpui_widgets::image_cache::ImageCache` without depending on the crate that
+/// owns every element, which would invert §3.4/§3.5's edge. The closure is how
+/// the two meet and [`RasterizedImage`] is the vocabulary they meet in.
+///
+/// # Why the decoder is only asked about keys the atlas does not already hold
+///
+/// The same reason [`AtlasTileSource`] guards its rasteriser, one order of
+/// magnitude louder. A glyph raster is a few hundred bytes and decoding one
+/// again is wasteful; an image frame is megabytes and decoding one again inside
+/// a frame loop is a visible stall. So residency is checked first and the
+/// closure is a fallback, not a lookup.
+pub struct ImageAtlasSource<'atlas, Decode> {
+    atlas: &'atlas mut GlyphAtlas,
+    decode: Decode,
+}
+
+impl<'atlas, Decode> ImageAtlasSource<'atlas, Decode>
+where
+    Decode: FnMut(ImageRasterKey) -> Option<RasterizedImage>,
+{
+    /// A tile source over `atlas`, decoding with `decode`.
+    pub fn new(atlas: &'atlas mut GlyphAtlas, decode: Decode) -> Self {
+        Self { atlas, decode }
+    }
+}
+
+impl<Decode> ImageTileSource for ImageAtlasSource<'_, Decode>
+where
+    Decode: FnMut(ImageRasterKey) -> Option<RasterizedImage>,
+{
+    fn tile_for(&mut self, key: ImageRasterKey) -> Option<ImageTile> {
+        let placement = match self.atlas.get(key) {
+            Some(placement) => {
+                self.atlas.stats.cache_hits += 1;
+                placement
+            }
+            None => {
+                let image = (self.decode)(key)?;
+                // A refused allocation is `None`, not an error the caller has to
+                // handle: one image failing to find atlas space degrades to a
+                // sprite that draws nothing rather than failing the frame — the
+                // same rule a glyph follows, and the one that keeps a 4000px
+                // photograph from taking a window down with it.
+                self.atlas.get_or_insert_image(key, &image).ok()?
+            }
+        };
+        Some(ImageTile {
+            tile: placement.tile,
+            atlas_origin: placement.origin,
+            atlas_size: placement.size,
         })
     }
 }
@@ -965,22 +1080,22 @@ mod tests {
         let placement = atlas.get_or_insert(key(1), raster(32, 32)).expect("allocate");
         assert_eq!(atlas.live_tiles_in_page(0), Some(1));
 
-        assert!(atlas.evict(&key(1)));
-        assert!(!atlas.evict(&key(1)), "a second eviction is not an event");
+        assert!(atlas.evict(key(1)));
+        assert!(!atlas.evict(key(1)), "a second eviction is not an event");
         assert_eq!(
             atlas.drain_evictions(),
             vec![AtlasEviction::Tile(placement.tile)]
         );
         assert!(atlas.drain_evictions().is_empty(), "draining is destructive");
         assert_eq!(atlas.live_tiles_in_page(0), Some(0));
-        assert_eq!(atlas.get(&key(1)), None);
+        assert_eq!(atlas.get(key(1)), None);
     }
 
     #[test]
     fn a_freed_slot_is_reused_so_the_slot_field_bounds_live_tiles_not_lifetime_allocations() {
         let mut atlas = GlyphAtlas::new(64);
         let first = atlas.get_or_insert(key(1), raster(8, 8)).expect("allocate");
-        atlas.evict(&key(1));
+        atlas.evict(key(1));
         let second = atlas.get_or_insert(key(2), raster(8, 8)).expect("allocate");
         assert_eq!(
             first.tile.slot(),
@@ -1003,7 +1118,7 @@ mod tests {
         assert_eq!(atlas.stats().tiles, 0);
         assert_eq!(atlas.stats().pages, 0);
         for glyph in 0..4 {
-            assert_eq!(atlas.get(&key(glyph)), None);
+            assert_eq!(atlas.get(key(glyph)), None);
         }
     }
 
@@ -1250,13 +1365,210 @@ mod tests {
         atlas
             .get_or_insert_raster(key(1), &bitmap(16, 16, AtlasKind::Monochrome, 0xFF))
             .expect("allocate");
-        assert!(atlas.evict(&key(1)));
+        assert!(atlas.evict(key(1)));
         let reused = atlas.get_or_insert(key(2), raster(16, 16)).expect("allocate");
         assert_eq!(
             atlas.tile_texels(reused),
             Some(vec![0xFF; 256]),
             "the freed rectangle still holds the evicted glyph's texels"
         );
+    }
+
+    // ---- Phase 6.2: the polychrome tile producer -------------------------
+
+    fn image_key(source: u64, frame_index: u32) -> ImageRasterKey {
+        ImageRasterKey {
+            source,
+            frame_index,
+            scale_factor_bits: 1.0f32.to_bits(),
+        }
+    }
+
+    /// A `width x height` RGBA bitmap whose every texel is distinct, so a blit
+    /// that transposes rows or drops a channel cannot pass by accident.
+    fn image(width: u32, height: u32) -> RasterizedImage {
+        let mut texels = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                texels.extend_from_slice(&[x as u8, y as u8, (x ^ y) as u8, 0xFF]);
+            }
+        }
+        RasterizedImage {
+            size: [width, height],
+            texels,
+        }
+    }
+
+    #[test]
+    fn an_image_frame_lands_in_a_colour_page_and_reads_back_exactly() {
+        let mut atlas = GlyphAtlas::new(64);
+        let bitmap = image(8, 4);
+        let placement = atlas
+            .get_or_insert_image(image_key(1, 0), &bitmap)
+            .expect("allocate");
+
+        assert_eq!(placement.kind, AtlasKind::Polychrome);
+        assert_eq!(placement.size, [8.0, 4.0]);
+        assert_eq!(placement.bearing, [0.0, 0.0], "an image has no pen");
+        assert_eq!(
+            atlas.tile_texels(placement),
+            Some(bitmap.texels.clone()),
+            "the tile must read back exactly the decoded bytes"
+        );
+        assert_eq!(
+            atlas.page_kind(placement.tile.page().expect("a page")),
+            Some(AtlasKind::Polychrome)
+        );
+        assert_eq!(atlas.drain_uploads().len(), 1);
+    }
+
+    #[test]
+    fn each_frame_of_an_animated_source_gets_its_own_tile() {
+        // A GIF that has looped once holds every frame at the same time and
+        // cycles between tiles; if the frame index were not part of the key it
+        // would instead re-upload over frame 0 on every tick.
+        let mut atlas = GlyphAtlas::new(64);
+        let first = atlas
+            .get_or_insert_image(image_key(1, 0), &image(8, 8))
+            .expect("allocate");
+        let second = atlas
+            .get_or_insert_image(image_key(1, 1), &image(8, 8))
+            .expect("allocate");
+        let other_source = atlas
+            .get_or_insert_image(image_key(2, 0), &image(8, 8))
+            .expect("allocate");
+        assert_ne!(first.tile, second.tile);
+        assert_ne!(first.tile, other_source.tile);
+        assert_eq!(atlas.stats().tiles, 3);
+    }
+
+    #[test]
+    fn a_glyph_and_an_image_can_share_a_colour_page_without_sharing_a_tile() {
+        let mut atlas = GlyphAtlas::new(64);
+        let emoji = atlas
+            .get_or_insert_raster(
+                GlyphRasterKey {
+                    kind: AtlasKind::Polychrome,
+                    ..key(1)
+                },
+                &bitmap(8, 8, AtlasKind::Polychrome, 0x11),
+            )
+            .expect("allocate");
+        let picture = atlas
+            .get_or_insert_image(image_key(1, 0), &image(8, 8))
+            .expect("allocate");
+
+        assert_eq!(
+            emoji.tile.page(),
+            picture.tile.page(),
+            "one colour format, one set of pages — this is why the allocator was \
+             made kind-aware rather than glyph-aware"
+        );
+        assert_ne!(emoji.tile, picture.tile);
+        assert_eq!(atlas.stats().pages, 1);
+        assert_eq!(atlas.tile_texels(emoji), Some(vec![0x11; 8 * 8 * 4]));
+    }
+
+    #[test]
+    fn a_glyph_key_and_an_image_key_never_collide() {
+        // The two key spaces are disjoint by construction — a `u64` source id
+        // and a `u32` font id live in different variants — and this asserts the
+        // construction rather than trusting it, because a collision here draws
+        // one resource's pixels for another's request.
+        let mut atlas = GlyphAtlas::new(64);
+        let glyph = atlas.get_or_insert(key(1), raster(8, 8)).expect("allocate");
+        let picture = atlas
+            .get_or_insert_image(image_key(1, 0), &image(8, 8))
+            .expect("allocate");
+        assert_ne!(glyph.tile, picture.tile);
+        assert_eq!(atlas.get(image_key(1, 0)).map(|p| p.tile), Some(picture.tile));
+        assert_eq!(atlas.get(key(1)).map(|p| p.tile), Some(glyph.tile));
+    }
+
+    #[test]
+    fn an_image_whose_length_disagrees_with_its_size_is_refused_rather_than_blitted() {
+        let mut atlas = GlyphAtlas::new(64);
+        let mut short = image(8, 8);
+        short.texels.pop();
+        assert_eq!(
+            atlas.get_or_insert_image(image_key(1, 0), &short),
+            Err(AtlasError::MalformedBitmap {
+                expected: 8 * 8 * 4,
+                actual: 8 * 8 * 4 - 1,
+            })
+        );
+        assert_eq!(atlas.stats().pages, 0, "a refused image opens no page");
+        assert!(!atlas.has_pending_uploads());
+    }
+
+    #[test]
+    fn an_image_larger_than_a_page_is_reported_rather_than_growing_the_page() {
+        let mut atlas = GlyphAtlas::new(64);
+        assert_eq!(
+            atlas.get_or_insert_image(image_key(1, 0), &image(65, 8)),
+            Err(AtlasError::TooLargeForAPage {
+                requested: [65, 8],
+                page_size: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn an_image_source_decodes_once_and_answers_from_the_atlas_thereafter() {
+        use wgpui_core::scene::atlas::ImageTileSource;
+
+        let mut atlas = GlyphAtlas::new(64);
+        let mut decodes = 0usize;
+        {
+            let mut source = ImageAtlasSource::new(&mut atlas, |_key| {
+                decodes += 1;
+                Some(image(8, 12))
+            });
+            let first = source.tile_for(image_key(1, 0)).expect("a decoded frame");
+            let second = source.tile_for(image_key(1, 0)).expect("resident");
+            assert_eq!(first, second);
+            assert_eq!(first.atlas_size, [8.0, 12.0]);
+        }
+        assert_eq!(
+            decodes, 1,
+            "a resident frame must not be decoded again — an image frame is \
+             megabytes, and decoding one twice inside a frame loop is a stall"
+        );
+        assert_eq!(atlas.stats().allocations, 1);
+        assert_eq!(atlas.stats().cache_hits, 1);
+    }
+
+    #[test]
+    fn an_image_the_decoder_declines_or_the_atlas_refuses_becomes_a_blank_sprite() {
+        use wgpui_core::scene::atlas::ImageTileSource;
+
+        let mut atlas = GlyphAtlas::new(16);
+        assert_eq!(
+            ImageAtlasSource::new(&mut atlas, |_key| None).tile_for(image_key(1, 0)),
+            None,
+            "an image that has not loaded yet is ordinary, not an error"
+        );
+        assert_eq!(
+            ImageAtlasSource::new(&mut atlas, |_key| Some(image(64, 64)))
+                .tile_for(image_key(2, 0)),
+            None,
+            "one oversized photograph must not take the frame down with it"
+        );
+    }
+
+    #[test]
+    fn evicting_an_image_frees_its_space_and_reports_its_tile() {
+        let mut atlas = GlyphAtlas::new(64);
+        let placement = atlas
+            .get_or_insert_image(image_key(1, 0), &image(32, 32))
+            .expect("allocate");
+        assert!(atlas.evict(image_key(1, 0)));
+        assert!(!atlas.evict(image_key(1, 0)));
+        assert_eq!(
+            atlas.drain_evictions(),
+            vec![AtlasEviction::Tile(placement.tile)]
+        );
+        assert_eq!(atlas.get(image_key(1, 0)), None);
     }
 
     /// The whole subscription, end to end: the atlas frees a tile, the scene is
@@ -1307,7 +1619,7 @@ mod tests {
         scene.layers.mark_clean(with_text);
         scene.layers.mark_clean(other_text);
 
-        atlas.evict(&key(1));
+        atlas.evict(key(1));
         let affected = scene.evict_atlas_batch(atlas.drain_evictions());
 
         assert_eq!(affected, vec![with_text]);

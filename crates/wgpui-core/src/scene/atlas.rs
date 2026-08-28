@@ -129,6 +129,165 @@ pub struct GlyphRasterKey {
     pub kind: AtlasKind,
 }
 
+/// The exact identity of one decoded image frame, at one scale.
+///
+/// The image counterpart of [`GlyphRasterKey`], and the same reasoning about
+/// fields rather than a hash applies: an atlas keyed by a digest is one
+/// collision away from drawing the wrong picture. Three fields, each part of the
+/// identity for a reason:
+///
+/// - `source` names the resource. It is [`crate::patch::primitive::AtlasTileId`]-
+///   opaque on purpose — a path, a URI, an embedded asset, an in-memory
+///   registration — because how a source is named is the image cache's business
+///   and not the atlas's. A source that is reloaded is issued a new id rather
+///   than mutating in place, which is what makes comparing identity rather than
+///   content sound (the same argument `wgpui_widgets::img::ImageSourceId` makes
+///   for the reconciliation key, one level up).
+/// - `frame_index` because an animated source's frames are separate bitmaps that
+///   are legitimately resident at the same time — a GIF that has looped once has
+///   every frame in the atlas and cycles between tiles rather than re-uploading.
+/// - `scale_factor_bits` because a bitmap decoded for a 2× display is a
+///   different bitmap from the same source at 1×, exactly as a glyph raster is.
+///   Phase 6.2 decodes at 1× only and this field is what makes adding the second
+///   scale a decode-side change rather than an atlas-side one.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ImageRasterKey {
+    /// Which resource the bitmap came from.
+    pub source: u64,
+    /// Which frame of that resource. `0` for a still image.
+    pub frame_index: u32,
+    /// Bit pattern of the device-pixel ratio the bitmap was produced at.
+    pub scale_factor_bits: u32,
+}
+
+/// What a tile in the atlas holds: a glyph's raster, or an image's bitmap.
+///
+/// # Why the two share one map and one page numbering
+///
+/// They already share the pages. [`AtlasKind::Polychrome`] is the format a
+/// colour emoji and a PNG both need, and Phase 5.5 made the allocator kind-aware
+/// rather than glyph-aware precisely so a second producer would not need a
+/// second allocator. What was missing was a *name* a non-glyph tile could be
+/// looked up by, and this is it — the legacy atlas draws the same line, with an
+/// `AtlasKey::Image` variant beside its glyph one (`src/platform.rs`).
+///
+/// Sharing the numbering matters for eviction specifically: a page index has to
+/// identify a page globally, or an [`AtlasEviction::Page`] would be ambiguous
+/// and every subscriber would have to be told which producer it meant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AtlasKey {
+    /// One rasterised glyph.
+    Glyph(GlyphRasterKey),
+    /// One decoded image frame.
+    Image(ImageRasterKey),
+}
+
+impl AtlasKey {
+    /// Which atlas this key's texels belong in.
+    ///
+    /// An image is always [`AtlasKind::Polychrome`]: a decoded frame is RGBA
+    /// whether or not the source had colour in it, because the alpha channel is
+    /// not optional and a coverage page has no room for it.
+    pub const fn kind(self) -> AtlasKind {
+        match self {
+            AtlasKey::Glyph(glyph) => glyph.kind,
+            AtlasKey::Image(_) => AtlasKind::Polychrome,
+        }
+    }
+}
+
+impl From<GlyphRasterKey> for AtlasKey {
+    fn from(key: GlyphRasterKey) -> Self {
+        AtlasKey::Glyph(key)
+    }
+}
+
+impl From<ImageRasterKey> for AtlasKey {
+    fn from(key: ImageRasterKey) -> Self {
+        AtlasKey::Image(key)
+    }
+}
+
+/// A resident image bitmap: where its texels are and how big they are.
+///
+/// [`GlyphTile`] without the bearing, which is the one field that would be a
+/// lie: a glyph's ink sits at an offset from its pen position, and an image has
+/// no pen. Carrying a field that is always `[0.0, 0.0]` would invite a caller to
+/// add it to a position and get the right answer for the wrong reason.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ImageTile {
+    /// The tile's identity, which a resident
+    /// [`crate::patch::primitive::PolySprite`] carries and an eviction names.
+    pub tile: AtlasTileId,
+    /// Top-left of the bitmap within its atlas page, in texels.
+    pub atlas_origin: [f32; 2],
+    /// Size of the bitmap, in texels.
+    pub atlas_size: [f32; 2],
+}
+
+/// One decoded image frame's pixels: the bitmap an allocated tile is supposed to
+/// hold.
+///
+/// The image half of [`ImageTileSource`]'s vocabulary, and it lives here for the
+/// same reason [`RasterizedGlyph`] does: `wgpui-widgets` produces one (it is the
+/// crate that owns the decoder) and `wgpui-wgpu` consumes one (it is the crate
+/// that owns the atlas pages), and neither names the other.
+///
+/// # Straight alpha, stated because it is the field that gets this wrong
+///
+/// [`Self::texels`] is **straight** (non-premultiplied) RGBA8, which is what
+/// `image`'s `into_rgba8()` produces for every still format and what the sprite
+/// pipeline's `over` blend expects. A producer whose decoder emits premultiplied
+/// texels — `resvg`, via `tiny_skia::Pixmap` — has to un-premultiply before
+/// building one of these. That is a real difference from the legacy path, which
+/// uploads the pixmap as-is and relies on a `premultiplied_alpha` shader flag it
+/// only sets on surfaces whose composite alpha mode is `PreMultiplied`; see
+/// `wgpui_widgets::image_cache` and docs/phase-6.2-results.md.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RasterizedImage {
+    /// The bitmap's size in texels, `[width, height]`.
+    pub size: [u32; 2],
+    /// The texels, row-major, four bytes each, straight alpha, no row padding.
+    pub texels: Vec<u8>,
+}
+
+impl RasterizedImage {
+    /// How many bytes [`Self::texels`] must hold for [`Self::size`].
+    pub fn expected_texel_bytes(&self) -> usize {
+        self.size[0] as usize
+            * self.size[1] as usize
+            * AtlasKind::Polychrome.bytes_per_pixel() as usize
+    }
+
+    /// Whether the bitmap's length agrees with its declared size.
+    pub fn is_well_formed(&self) -> bool {
+        self.texels.len() == self.expected_texel_bytes()
+    }
+}
+
+/// Where a decoded image frame's tile comes from.
+///
+/// The image counterpart of [`GlyphTileSource`], separate rather than a second
+/// method on it because the two seams have different producers and neither crate
+/// implements both: `wgpui-text` calls the glyph one, `wgpui-widgets` calls this,
+/// and `wgpui-wgpu` implements both over one allocator.
+///
+/// An implementation is expected to upload on demand and cache, for the same
+/// reason: a list of forty rows showing one avatar asks for one key forty times
+/// and takes no steps to deduplicate, because the source is the thing that
+/// already holds the key-to-tile map.
+pub trait ImageTileSource {
+    /// The tile holding `key`'s bitmap, decoding and allocating if needed.
+    ///
+    /// `None` means "this sprite draws nothing" — the source has not decoded
+    /// yet, the decode failed, or the atlas refused the bitmap. All three are
+    /// ordinary and produce a positioned sprite carrying
+    /// [`AtlasTileId::NONE`], never a dropped sprite: an image that is still
+    /// loading occupies its layout box and its slab slot exactly as it will once
+    /// it arrives.
+    fn tile_for(&mut self, key: ImageRasterKey) -> Option<ImageTile>;
+}
+
 /// A resident glyph raster: where its texels are, and where they go relative to
 /// the pen.
 #[derive(Copy, Clone, Debug, PartialEq)]

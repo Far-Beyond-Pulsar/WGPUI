@@ -13,7 +13,9 @@
 //! missing adapter is reported plainly and never allowed to look like coverage
 //! that ran.
 
-use wgpui_core::scene::atlas::{AtlasKind, GlyphRasterKey, GlyphTileSource, RasterizedGlyph};
+use wgpui_core::scene::atlas::{
+    AtlasKind, GlyphRasterKey, GlyphTileSource, ImageRasterKey, RasterizedGlyph, RasterizedImage,
+};
 use wgpui_wgpu::render::atlas::{AtlasTileSource, GlyphAtlas};
 use wgpui_wgpu::render::atlas_upload::{AtlasTextures, texture_format};
 use wgpui_wgpu::render::device::context_or_report;
@@ -185,6 +187,78 @@ fn an_uploaded_page_reads_back_exactly_as_the_cpu_side_holds_it() {
         assert!(
             read_back.iter().any(|texel| *texel != 0),
             "page {page} read back entirely blank, which would make the comparison vacuous"
+        );
+    }
+}
+
+/// Phase 6.2's layer-2 proof, at the level this file works at: an image frame
+/// inserted through the *image* entry point reaches a real `Rgba8Unorm` texture
+/// with its bytes unchanged.
+///
+/// Deliberately in this file rather than a new one. The upload machinery is
+/// already kind-generic — `AtlasTextures::sync` was written against
+/// `AtlasKind`, not against glyphs — and the honest way to show that a second
+/// producer needed no upload-side work is to put its case beside the first
+/// producer's and use the same readback, not to write a parallel one that could
+/// diverge.
+#[test]
+fn an_image_frame_reaches_a_colour_texture_with_its_bytes_unchanged() {
+    let Some(context) = context_or_report("an_image_frame_reaches_a_colour_texture") else {
+        return;
+    };
+    let mut atlas = GlyphAtlas::new(128);
+    let mut textures = AtlasTextures::for_atlas(&atlas);
+
+    // 37 texels wide: 148 unpadded bytes per row, which is not a multiple of
+    // `COPY_BYTES_PER_ROW_ALIGNMENT`, so the copy has to pad and the readback
+    // has to unpad. A power-of-two width would let both bugs cancel.
+    let frame = RasterizedImage {
+        size: [37, 11],
+        texels: (0..37 * 11 * 4)
+            .map(|index: u32| (index % 251) as u8)
+            .collect(),
+    };
+    let placement = atlas
+        .get_or_insert_image(
+            ImageRasterKey {
+                source: 7,
+                frame_index: 0,
+                scale_factor_bits: 1.0f32.to_bits(),
+            },
+            &frame,
+        )
+        .expect("a 37x11 frame fits a 128px page");
+
+    let report = textures.sync(&context.device, &context.queue, &mut atlas);
+    assert_eq!(report.rectangles, 1);
+    assert_eq!(report.pages_created, 1);
+    assert_eq!(report.skipped, 0);
+
+    let page = placement.tile.page().expect("a live tile has a page");
+    assert_eq!(atlas.page_kind(page), Some(AtlasKind::Polychrome));
+    let texture = textures.texture(page).expect("the page has a texture");
+    assert_eq!(texture.format(), texture_format(AtlasKind::Polychrome));
+
+    let read_back = read_page_back(
+        &context.device,
+        &context.queue,
+        texture,
+        AtlasKind::Polychrome,
+    );
+    // The whole page matches the CPU side, and — the part that matters — the
+    // rectangle the tile occupies holds the decoded bytes in row order.
+    let expected_page = atlas.page_texels(page).expect("a live page has texels");
+    assert!(read_back == expected_page, "the colour page diverged from the CPU side");
+
+    let origin = [placement.origin[0] as usize, placement.origin[1] as usize];
+    let stride = 128 * 4;
+    for row in 0..11usize {
+        let start = (origin[1] + row) * stride + origin[0] * 4;
+        let source = row * 37 * 4;
+        assert_eq!(
+            read_back.get(start..start + 37 * 4),
+            frame.texels.get(source..source + 37 * 4),
+            "row {row} of the uploaded frame is not the row that was decoded"
         );
     }
 }

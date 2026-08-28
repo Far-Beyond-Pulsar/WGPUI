@@ -17,7 +17,8 @@ pub mod slab_range;
 pub mod tile;
 
 pub use atlas::{
-    AtlasEviction, AtlasKind, GlyphRasterKey, GlyphTile, GlyphTileSource, RasterizedGlyph,
+    AtlasEviction, AtlasKey, AtlasKind, GlyphRasterKey, GlyphTile, GlyphTileSource, ImageRasterKey,
+    ImageTile, ImageTileSource, RasterizedGlyph, RasterizedImage,
 };
 pub use layer::{BoundaryId, Layer, LayerId, LayerKey, LayerTable};
 pub use primitive_store::{DrawRange, PrimitiveStore};
