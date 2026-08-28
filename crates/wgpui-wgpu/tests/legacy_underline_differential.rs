@@ -709,6 +709,222 @@ fn the_legacy_alpha_really_is_squared() {
 
 /// The legacy file still has the shape this test's "no wrapper" argument rests
 /// on — `slab_shader_source`'s own two assertions, restated.
+/// **Milestone 4's gate.** The underlines a real `StyledText` emits from its
+/// highlight runs render byte-exact against the legacy underline shader.
+///
+/// The tests above prove the *pipeline* draws an arbitrary `Underline`
+/// byte-exactly; Phase 6.3 built them, and at that point nothing in `2.0`
+/// produced an `Underline` at all. This one closes the other half: a real
+/// element, with real highlight runs, shaped by real `cosmic-text`, produces
+/// primitives that render byte-exactly.
+///
+/// # What this deliberately does not claim
+///
+/// It does not claim 2.0's underline lands on the same *screen pixel* as the
+/// legacy element's. `StyledText` places a line's baseline at its element's
+/// `bounds.y`, where the legacy `paint_line` places the top of the line *box*
+/// there and derives the baseline from ascent and padding — a pre-existing
+/// disagreement `docs/phase-5.6-results.md` already disclosed for glyphs, which
+/// nothing about decorations is the right place to fix. What is checked here is
+/// that the decoration sits correctly relative to its own text (which is a
+/// decoration's whole job) and that the resulting primitive is drawn exactly.
+#[test]
+fn phase_6_6_styled_text_underline_gate() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use wgpui_core::patch::primitive::AtlasTileId;
+    use wgpui_core::scene::atlas::{GlyphRasterKey, GlyphTile, GlyphTileSource};
+    use wgpui_text::shaping::{TextShaper, font};
+    use wgpui_widgets::styled_text::{
+        HighlightStyle, StrikethroughStyle, StyledText, TextEngine, TextStyle, UnderlineStyle,
+    };
+
+    let Some(context) = context_or_report("phase_6_6_styled_text_underline_gate") else {
+        return;
+    };
+    let clear = measured_clear_pixel(&context);
+    let mode = DrawMode::best_available(context.indirect);
+
+    /// A tile source that never fails, so shaping's own behaviour is what the
+    /// test exercises rather than an atlas's. The glyphs are irrelevant here —
+    /// only their *positions* are, and those come from the shaper.
+    #[derive(Default)]
+    struct AnyTile;
+    impl GlyphTileSource for AnyTile {
+        fn tile_for(&mut self, _key: GlyphRasterKey) -> Option<GlyphTile> {
+            Some(GlyphTile {
+                tile: AtlasTileId::new(0, 0).expect("in range"),
+                atlas_origin: [0.0, 0.0],
+                atlas_size: [1.0, 1.0],
+                bearing: [0.0, 0.0],
+            })
+        }
+    }
+
+    let engine = Rc::new(RefCell::new(TextEngine::new(
+        TextShaper::new(),
+        Box::new(AnyTile),
+    )));
+    let style = TextStyle {
+        font: font("Segoe UI"),
+        font_size: 16.0,
+        line_height: 22.0,
+        color: [1.0, 1.0, 1.0, 1.0],
+    };
+    // Every colour is one the shared `hsla_to_rgba` reproduces exactly — the
+    // constraint every differential in this crate works under.
+    let red = ([0.0, 1.0, 0.5, 1.0], [1.0, 0.0, 0.0, 1.0]);
+    let cyan = ([0.5, 1.0, 0.5, 1.0], [0.0, 1.0, 1.0, 1.0]);
+    let white = ([0.0, 0.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+
+    let element = StyledText::new(
+        "a spelling mistake and a deletion",
+        style,
+        Rc::clone(&engine),
+    )
+    .size(240.0, 22.0)
+    .with_highlights(Arc::from(vec![
+        (
+            2..18,
+            HighlightStyle {
+                underline: Some(UnderlineStyle {
+                    thickness: 2.0,
+                    color: Some(red.1),
+                    wavy: true,
+                }),
+                ..HighlightStyle::default()
+            },
+        ),
+        (
+            23..33,
+            HighlightStyle {
+                color: Some(cyan.1),
+                underline: Some(UnderlineStyle {
+                    thickness: 2.0,
+                    color: Some(white.1),
+                    wavy: false,
+                }),
+                strikethrough: Some(StrikethroughStyle {
+                    thickness: 2.0,
+                    // Deliberately unnamed, so the fallback to the run's own
+                    // colour is part of what reaches the GPU.
+                    color: None,
+                }),
+                ..HighlightStyle::default()
+            },
+        ),
+    ]));
+
+    // Drive the whole element path rather than calling the emitter directly:
+    // reconcile, lay out with Taffy, emit, apply. The bands compared below are
+    // whatever came out the far end of that, positioned by layout, at a y that
+    // puts every one comfortably inside the viewport given `StyledText`'s
+    // baseline-at-`bounds.y` convention.
+    let underlines: Vec<Underline> = {
+        use wgpui_core::invalidation::request::FrameSignals;
+        use wgpui_core::patch::apply::apply;
+        use wgpui_core::patch::emit::Emitter;
+        use wgpui_core::reconcile::reconciler::Reconciler;
+        use wgpui_core::scene::Scene;
+        use wgpui_core::scene::layer::LayerId;
+        use wgpui_layout::taffy_tree::{LayoutTree, definite};
+        use wgpui_widgets::div::div;
+        use wgpui_widgets::styled::Styled;
+
+        let tree = div().w(WIDTH as f32).h(HEIGHT as f32).child(
+            div()
+                .absolute()
+                .left(12.0)
+                .top(44.0)
+                .child(element.describe()),
+        );
+
+        let mut reconciler = Reconciler::new();
+        let mut layout = LayoutTree::new();
+        let mut emitter = Emitter::new();
+        let mut scene = Scene::new();
+        let plan = reconciler
+            .reconcile(tree.describe(), &mut layout)
+            .expect("the tree must reconcile");
+        let node = plan.root().expect("a plan has a root").layout_node;
+        layout
+            .compute_layout(node, definite(WIDTH as f32, HEIGHT as f32))
+            .expect("the tree must lay out");
+        let emission = emitter
+            .emit(&plan, &layout, &FrameSignals::new(), &mut scene)
+            .expect("the tree must emit");
+        apply(&mut scene, &emission.patch).expect("the emission must apply");
+
+        let layer = LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT));
+        scene
+            .underlines
+            .keys(layer)
+            .into_iter()
+            .filter_map(|key| scene.underlines.get(layer, key).copied())
+            .collect()
+    };
+    assert_eq!(
+        underlines.len(),
+        3,
+        "a wavy underline, a straight one, and a strikethrough"
+    );
+    assert!(underlines[0].wavy, "the spelling squiggle");
+    assert!(!underlines[1].wavy);
+    assert_eq!(
+        underlines[2].color, cyan.1,
+        "the strikethrough named no colour, so it takes its run's"
+    );
+    for underline in &underlines {
+        assert!(
+            underline.size[0] > 1.0,
+            "every band must have real width, or agreeing proves nothing: {underline:?}"
+        );
+    }
+
+    // The HSLA the legacy arm is handed, one per band, checked rather than
+    // assumed to round-trip.
+    let hslas = [red.0, white.0, cyan.0];
+    let mut total = 0usize;
+    let mut exact = 0usize;
+    let mut painted = 0usize;
+    for (underline, hsla) in underlines.iter().zip(hslas) {
+        assert_eq!(hsla_to_rgba(hsla), underline.color);
+        let case = Case {
+            name: "styled text band",
+            underline: *underline,
+            hsla,
+        };
+        let legacy = render_legacy(&context, &case);
+        let ours = render_2_0(&context, Some(*underline), mode);
+        let result = compare(&legacy, &ours, clear);
+        println!(
+            "  {:?}: {} of {} pixels byte-exact ({} painted)",
+            underline, result.exact, result.total, result.painted
+        );
+        assert_eq!(
+            result.exact, result.total,
+            "byte-exact means byte-exact; first difference at {:?}",
+            result.first_difference
+        );
+        assert!(
+            result.painted > 100,
+            "a band that painted {} pixels is too thin for the agreement to \
+             mean anything",
+            result.painted
+        );
+        total += result.total;
+        exact += result.exact;
+        painted += result.painted;
+    }
+    println!(
+        "phase_6_6_styled_text_underline_gate: {exact} of {total} pixels byte-exact across \
+         {} bands, {painted} of them painted",
+        underlines.len()
+    );
+    assert_eq!(exact, total);
+}
+
 #[test]
 fn the_legacy_source_still_has_the_shape_this_test_relies_on() {
     assert_eq!(
