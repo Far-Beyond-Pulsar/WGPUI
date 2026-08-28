@@ -65,7 +65,7 @@
 use wgpui_core::geometry::Rect;
 use wgpui_core::patch::RecordKey;
 use wgpui_core::patch::apply::{ScenePatch, apply};
-use wgpui_core::patch::primitive::Shadow;
+use wgpui_core::patch::primitive::{Quad, Shadow};
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::{BoundaryId, LayerKey};
 use wgpui_wgpu::render::device::{ComputeContext, context_or_report};
@@ -742,6 +742,152 @@ fn every_draw_mode_produces_the_same_shadow() {
     }
     assert!(modes >= 2, "only {modes} draw modes were exercised");
     println!("every shadow drawn identically across {modes} draw modes");
+}
+
+/// A card's drop shadow still shows around the card — the behaviour
+/// `window_shadow` and the `shadow` bench are actually about.
+///
+/// # What this test proves, and the larger thing it does not
+///
+/// It was written to prove the two decisions `Shadow` makes that no earlier
+/// primitive kind did — [`Shadow::drawn_bounds`] reaching the ordering pass, and
+/// [`wgpui_core::occlusion::CoverageItem::uncullable`] instead of `cullee`. It
+/// does **not** prove either, and that was established by removing them rather
+/// than by reading the code:
+///
+/// - Replacing `uncullable` with `cullee`: this test still passes, and so does
+///   the whole gate above.
+/// - Feeding the ordering pass `origin`/`size` instead of `drawn_bounds`: same.
+/// - Both at once: same.
+///
+/// The reason is a limitation `frame.rs` already documents for glyphs and that
+/// applies with more force here: **occlusion dispatches per kind**, so the quad
+/// below is in a different dispatch and can never cull the shadow whatever its
+/// flag says. Nor can a shadow cull a shadow — a shadow is never an occluder.
+/// And `keep_item` keeps an item whose visible rectangle is empty rather than
+/// dropping it, so even a shadow entirely outside the clip survives.
+///
+/// So both adjustments are **correct, matching legacy, and currently inert**.
+/// They are kept because they are right — and because the moment cross-kind
+/// occlusion exists, a shadow culled against its unblurred rectangle would lose
+/// falloff that was never covered. Recorded here rather than left for a future
+/// phase to discover that a mechanism it depended on had never been exercised.
+///
+/// What the test *does* prove is worth keeping on its own terms: the composite
+/// a real drop shadow produces — shadow under card, falloff visible around it —
+/// comes out of the real frame path, with `Shadow` sorting below `Quad`.
+#[test]
+fn a_shadow_covered_by_an_opaque_quad_still_paints_its_falloff_outside_it() {
+    let Some(context) = context_or_report("shadow_survives_coverage") else {
+        return;
+    };
+    let clear = measured_clear_pixel(&context);
+    let mode = DrawMode::best_available(context.indirect);
+
+    let shadow = Shadow {
+        origin: [80.0, 60.0],
+        size: [64.0, 48.0],
+        color: [1.0, 1.0, 1.0, 1.0],
+        corner_radius: 4.0,
+        blur_radius: 16.0,
+    };
+    // Strictly larger than the shadow's own rectangle on every side. Written
+    // that way so a coverage test against that rectangle *would* succeed
+    // completely — see this test's doc for why no such test runs today.
+    let cover = Quad {
+        origin: [70.0, 50.0],
+        size: [84.0, 68.0],
+        background: [0.0, 0.0, 0.0, 1.0],
+        border_color: [0.0, 0.0, 0.0, 1.0],
+        corner_radius: 0.0,
+        border_width: 0.0,
+    };
+
+    let render = |with_shadow: bool| -> Vec<u8> {
+        let mut scene = Scene::new();
+        let layer = scene.layer(LayerKey::untiled(BoundaryId::from_raw(1)));
+        let mut patch = ScenePatch::new();
+        if with_shadow {
+            patch.shadows.append(layer, RecordKey::from_raw(1), 0, shadow);
+        }
+        patch.quads.append(layer, RecordKey::from_raw(2), 0, cover);
+        apply(&mut scene, &patch).expect("the patch must apply");
+
+        let mut renderer = FrameRenderer::new(&context.device);
+        let target = OffscreenTarget::new(&context.device, WIDTH, HEIGHT);
+        let input = FrameInput {
+            scene: &scene,
+            clip: Rect::from_origin_size([0.0, 0.0], [WIDTH as f32, HEIGHT as f32]),
+            poison: &[],
+            dirty: Dirty::All,
+            uploads: &[],
+            composites: &[],
+            registry: None,
+            atlas: None,
+            viewport: [WIDTH as f32, HEIGHT as f32],
+            mode,
+        };
+        renderer
+            .render_to(
+                &context.device,
+                &context.queue,
+                &input,
+                &RenderTarget {
+                    view: &target.view,
+                    width: target.width,
+                    height: target.height,
+                    clear: CLEAR_COLOR,
+                },
+            )
+            .expect("a frame must render");
+        target
+            .read_pixels(&context.device, &context.queue)
+            .expect("reading back must succeed")
+    };
+
+    let with_shadow = render(true);
+    let without_shadow = render(false);
+    let pixel = |bytes: &[u8], x: usize, y: usize| -> [u8; 4] {
+        let index = (y * WIDTH as usize + x) * 4;
+        [bytes[index], bytes[index + 1], bytes[index + 2], bytes[index + 3]]
+    };
+
+    // Four samples outside the quad on each side, inside the 3σ margin.
+    let samples = [
+        (60usize, 84usize),
+        (164, 84),
+        (112, 40),
+        (112, 128),
+    ];
+    let mut lit = 0;
+    for (x, y) in samples {
+        let covered = pixel(&without_shadow, x, y);
+        assert_eq!(
+            covered, clear,
+            "sample ({x}, {y}) must be outside the quad, or it proves nothing"
+        );
+        let shadowed = pixel(&with_shadow, x, y);
+        assert_ne!(
+            shadowed, clear,
+            "sample ({x}, {y}) is inside the shadow's blur margin and outside \
+             the covering quad, and it is blank — the shadow did not reach the \
+             framebuffer at all"
+        );
+        lit += 1;
+    }
+    assert_eq!(lit, samples.len());
+
+    // And the quad really does cover the shadow's own rectangle, so the
+    // assertion above is about the falloff rather than about a shadow that was
+    // never covered in the first place.
+    let centre = pixel(&with_shadow, 112, 84);
+    assert_eq!(
+        centre,
+        pixel(&without_shadow, 112, 84),
+        "the quad paints over the shadow's core in both renders — `Shadow` \
+         sorts below `Quad`"
+    );
+    println!("all {lit} out-of-quad samples carry shadow falloff; the core is covered");
 }
 
 /// The legacy file still has the shape this test's "no wrapper" argument rests

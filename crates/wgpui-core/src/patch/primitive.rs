@@ -643,6 +643,14 @@ impl Primitive for PolySprite {
 ///
 /// [`Shadow::drawn_bounds`] is the one place that arithmetic lives, so the two
 /// consumers and the shader cannot drift apart silently.
+///
+/// **Both of those are latent today, and Phase 6.3 measured that rather than
+/// assuming otherwise**: 2.0's occlusion dispatches per primitive kind, so
+/// nothing can cull a shadow whatever flag it carries, and reverting either
+/// choice leaves every shadow test passing. They are written this way because
+/// they are correct and because the day cross-kind occlusion exists a shadow
+/// culled against its unblurred rectangle would lose falloff that was never
+/// covered. `docs/phase-6.3-results.md` has the experiment.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shadow {
     /// Top-left of the *unblurred* rectangle in the owning layer's coordinate

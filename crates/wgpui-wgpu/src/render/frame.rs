@@ -730,6 +730,21 @@ impl FrameRenderer {
             // A shadow is never an occluder either, and for a stronger reason
             // than a sprite's: its own interior is a blurred gradient, so there
             // is no rectangle over which it is opaque at all.
+            //
+            // **Both adjustments are currently inert, and that is measured
+            // rather than assumed.** Reverting either or both leaves every
+            // shadow test — the byte-exact gate included — passing, because
+            // occlusion dispatches per kind: the quad that would cover a shadow
+            // is in a different dispatch, no shadow can occlude another, and
+            // `keep_item` keeps an empty-visible item rather than dropping it.
+            // So nothing in 2.0 can cull a shadow today whatever this says.
+            // They are written this way because they are *right*, and because
+            // the day cross-kind occlusion exists (the limit Phase 5.6 recorded
+            // for glyphs) a shadow culled against its unblurred rectangle would
+            // lose falloff that was never covered. See
+            // `tests/legacy_shadow_differential.rs`'s
+            // `a_shadow_covered_by_an_opaque_quad_still_paints_its_falloff_outside_it`,
+            // which records the experiment.
             for slot in &shadow_slots {
                 if slot.count == 0 || !input.dirty.contains(slot.layer) {
                     continue;
