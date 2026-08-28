@@ -31,7 +31,7 @@
 //! layer, read back out of the arena at that layer's own address.
 
 use crate::invalidation::axes::Invalidation;
-use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad};
+use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad, Shadow};
 use crate::patch::{PatchError, PatchList};
 use crate::scene::layer::LayerId;
 use crate::scene::record::{DispatchNode, Hitbox, LayoutInput};
@@ -47,6 +47,8 @@ use crate::scene::{PrimitiveStore, Scene};
 // `PartialEq` and stops there rather than inventing a total order for floats.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScenePatch {
+    /// Blurred rounded rectangles, painted under everything else in their layer.
+    pub shadows: PatchList<Shadow>,
     /// Fixed-size primitives.
     pub quads: PatchList<Quad>,
     /// Variable-size primitives.
@@ -70,7 +72,8 @@ impl ScenePatch {
 
     /// Whether every list is empty.
     pub fn is_empty(&self) -> bool {
-        self.quads.is_empty()
+        self.shadows.is_empty()
+            && self.quads.is_empty()
             && self.glyph_runs.is_empty()
             && self.poly_sprites.is_empty()
             && self.layout_inputs.is_empty()
@@ -80,7 +83,8 @@ impl ScenePatch {
 
     /// Total operations across every list.
     pub fn len(&self) -> usize {
-        self.quads.len()
+        self.shadows.len()
+            + self.quads.len()
             + self.glyph_runs.len()
             + self.poly_sprites.len()
             + self.layout_inputs.len()
@@ -90,6 +94,7 @@ impl ScenePatch {
 
     /// Drop every operation, keeping the allocations for the next frame.
     pub fn clear(&mut self) {
+        self.shadows.clear();
         self.quads.clear();
         self.glyph_runs.clear();
         self.poly_sprites.clear();
@@ -106,6 +111,9 @@ impl ScenePatch {
                 layers.push(layer);
             }
         };
+        for patch in self.shadows.patches() {
+            note(patch.layer);
+        }
         for patch in self.quads.patches() {
             note(patch.layer);
         }
@@ -185,6 +193,9 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
 
     let mut entries: Vec<UploadRange> = Vec::new();
     scene
+        .shadows
+        .apply(&patch.shadows, &mut scene.allocator, &mut entries)?;
+    scene
         .quads
         .apply(&patch.quads, &mut scene.allocator, &mut entries)?;
     scene
@@ -202,11 +213,15 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     // standing rule, applied at the one place that knows what actually moved.
     for layer in touched {
         let mut axes = Invalidation::empty();
-        if names(&patch.quads, layer)
+        if names(&patch.shadows, layer)
+            || names(&patch.quads, layer)
             || names(&patch.glyph_runs, layer)
             || names(&patch.poly_sprites, layer)
         {
             axes |= Invalidation::DISPLAY;
+            scene
+                .layers
+                .set_slab(layer, Shadow::KIND, scene.shadows.slab(layer));
             scene
                 .layers
                 .set_slab(layer, Quad::KIND, scene.quads.slab(layer));
@@ -282,6 +297,9 @@ pub fn compare_to_rebuild(patched: &Scene, rebuilt: &Scene) -> Option<ResidencyM
     }
 
     for layer in patched_layers {
+        if let Some(mismatch) = compare_store(&patched.shadows, &rebuilt.shadows, layer) {
+            return Some(mismatch);
+        }
         if let Some(mismatch) =
             compare_store(&patched.quads, &rebuilt.quads, layer)
         {
@@ -806,6 +824,64 @@ mod tests {
             Some(scene.glyph_runs.slab(layer))
         );
         assert_ne!(record.map(|layer| layer.slab(Quad::KIND)), Some(SlabRange::EMPTY));
+        Ok(())
+    }
+
+    /// Phase 6.3's structural claim, checked rather than asserted in prose: a
+    /// new fixed-size kind needs nothing from the patch protocol beyond its own
+    /// list. A shadow inserted, updated in place, and removed leaves the arena
+    /// byte-identical to a scene that never held it, and the update touches one
+    /// slot rather than the layer's range.
+    #[test]
+    fn a_shadow_rides_the_same_patch_protocol_as_every_other_kind() -> Result<(), PatchError> {
+        let (mut scene, layers) = scene_with_layers(1);
+        let layer = layers[0];
+
+        let first = Shadow {
+            origin: [1.0, 2.0],
+            size: [30.0, 40.0],
+            color: [0.0, 0.0, 0.0, 0.5],
+            corner_radius: 4.0,
+            blur_radius: 8.0,
+        };
+        let mut patch = ScenePatch::new();
+        patch.shadows.insert(layer, key(1), 0, first);
+        patch.shadows.insert(layer, key(2), 1, Shadow::ZERO);
+        patch.quads.insert(layer, key(3), 0, quad(1.0));
+        let plan = apply(&mut scene, &patch)?;
+        assert_eq!(scene.shadows.len(layer), 2);
+        assert_eq!(
+            scene.layers.get(layer).map(|layer| layer.slab(Shadow::KIND)),
+            Some(scene.shadows.slab(layer)),
+            "the layer table must learn a shadow reservation like any other"
+        );
+        assert!(!plan.is_empty());
+
+        // §5.0's O(1) case, for this kind: one changed field, one slot uploaded.
+        let mut update = ScenePatch::new();
+        update.shadows.update(
+            layer,
+            key(1),
+            Shadow {
+                blur_radius: 12.0,
+                ..first
+            },
+        );
+        let plan = apply(&mut scene, &update)?;
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.byte_count(), Shadow::SLOT_STRIDE as u64);
+        assert_eq!(
+            plan.entries().first().map(|entry| entry.kind),
+            Some(Shadow::KIND),
+            "an upload entry must be addressed to the shadow arena, or it \
+             overwrites an unrelated kind's bytes"
+        );
+
+        let mut removal = ScenePatch::new();
+        removal.shadows.remove(layer, key(1));
+        removal.shadows.remove(layer, key(2));
+        apply(&mut scene, &removal)?;
+        assert_eq!(scene.shadows.len(layer), 0);
         Ok(())
     }
 

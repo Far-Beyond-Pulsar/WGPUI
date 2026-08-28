@@ -31,7 +31,7 @@ pub use tile::{
 };
 
 use crate::indirect::{DrawSlot, SlotTable};
-use crate::patch::primitive::{GlyphRun, PolySprite, PrimitiveKind, Quad};
+use crate::patch::primitive::{GlyphRun, PolySprite, PrimitiveKind, Quad, Shadow};
 
 /// The persistent, patched-not-rebuilt scene (R-N Pillar III, §2's picture).
 ///
@@ -50,6 +50,9 @@ pub struct Scene {
     pub layers: LayerTable,
     /// Slot placement for every kind's arena.
     pub allocator: SlabAllocator,
+    /// Blurred rounded rectangles, painted under everything else in their layer
+    /// (Phase 6.3).
+    pub shadows: PrimitiveStore<Shadow>,
     /// Fixed-size primitives (§2's "primitives").
     pub quads: PrimitiveStore<Quad>,
     /// Variable-size primitives (§2's "primitives").
@@ -91,6 +94,9 @@ impl Scene {
     pub fn draw_ranges(&self) -> Vec<(LayerId, PrimitiveKind, DrawRange)> {
         let mut ranges = Vec::new();
         for layer in self.layers.ids() {
+            if let Some(range) = self.shadows.draw_range(layer) {
+                ranges.push((layer, PrimitiveKind::Shadow, range));
+            }
             if let Some(range) = self.quads.draw_range(layer) {
                 ranges.push((layer, PrimitiveKind::Quad, range));
             }
@@ -131,6 +137,7 @@ impl Scene {
         for kind in PrimitiveKind::ALL {
             for layer in &ids {
                 let range = match kind {
+                    PrimitiveKind::Shadow => self.shadows.slab(*layer),
                     PrimitiveKind::Quad => self.quads.slab(*layer),
                     PrimitiveKind::GlyphRun => self.glyph_runs.slab(*layer),
                     PrimitiveKind::PolySprite => self.poly_sprites.slab(*layer),
@@ -162,6 +169,7 @@ impl Scene {
     /// allocator's accounting exact: the record is only the caller's view of
     /// the reservation, never its owner.
     pub fn remove_layer(&mut self, layer: LayerId) -> bool {
+        self.shadows.remove_layer(layer, &mut self.allocator);
         self.quads.remove_layer(layer, &mut self.allocator);
         self.glyph_runs.remove_layer(layer, &mut self.allocator);
         self.poly_sprites.remove_layer(layer, &mut self.allocator);
@@ -182,6 +190,7 @@ mod tests {
     fn a_fresh_scene_holds_nothing() {
         let scene = Scene::new();
         assert!(scene.layers.is_empty());
+        assert!(scene.shadows.resident_bytes().is_empty());
         assert!(scene.quads.resident_bytes().is_empty());
         assert!(scene.glyph_runs.resident_bytes().is_empty());
         assert!(scene.poly_sprites.resident_bytes().is_empty());
@@ -307,7 +316,12 @@ mod tests {
         apply(&mut scene, &patch)?;
 
         let table = scene.draw_slots();
-        let slot = table.slots().first().copied();
+        // Addressed by kind rather than by `.first()`: the sequence is grouped
+        // in `PrimitiveKind::ALL` order, so a position-indexed assertion here
+        // silently becomes an assertion about *which kind sorts first* every
+        // time a kind is added. Phase 6.3 added one below `Quad` and this test
+        // failed for exactly that reason.
+        let slot = table.kind_slots(PrimitiveKind::Quad).first().copied();
         assert_eq!(
             slot,
             Some(DrawSlot {

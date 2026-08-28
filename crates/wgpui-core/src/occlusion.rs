@@ -120,6 +120,30 @@ impl CoverageItem {
         }
     }
 
+    /// A primitive that neither occludes nor may be dropped when covered.
+    ///
+    /// The shape [`CoverageItem::cullable`]'s doc has described since Phase 3
+    /// without anything constructing it, because none of the first three
+    /// primitive kinds needed it. [`crate::patch::primitive::Shadow`] is the
+    /// first that does, and it takes this rather than
+    /// [`CoverageItem::cullee`] for the reason the legacy sweep gives at
+    /// `src/occlusion.rs:255`: a shadow's Gaussian tail reaches past the
+    /// rectangle the scene knows about, so culling it against that rectangle
+    /// would erase falloff that was never covered.
+    ///
+    /// Note that this is *not* [`CoverageItem::protected`]. Protection is a
+    /// property of where a primitive sits (inside a filter group, inside an
+    /// overdraw margin); this is a property of the kind itself, and the two are
+    /// kept apart so a shadow does not silently acquire a filter's exemptions.
+    pub fn uncullable(visible: Rect) -> CoverageItem {
+        CoverageItem {
+            visible,
+            opaque: None,
+            cullable: false,
+            protected: false,
+        }
+    }
+
     /// A primitive that can be culled and occludes over `opaque`.
     pub fn occluder(visible: Rect, opaque: Rect) -> CoverageItem {
         CoverageItem {

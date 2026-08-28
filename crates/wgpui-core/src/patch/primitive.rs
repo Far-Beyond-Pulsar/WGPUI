@@ -34,6 +34,16 @@
 //! third *shape*: it needed no new protocol mechanism, only a new payload and
 //! a pipeline that samples a colour page.
 //!
+//! Phase 6.3 adds [`Shadow`] and [`Underline`], both [`Quad`]'s shape with no
+//! atlas reference at all — the cheapest additions so far, and the claim held a
+//! second and third time. [`Shadow`] is nonetheless the first kind whose
+//! *drawn* extent is larger than its own rectangle: the shader expands the
+//! bounds by [`Shadow::BLUR_MARGIN_SIGMAS`] times the blur radius so the
+//! Gaussian falloff has somewhere to land. That is a fact about geometry rather
+//! than about the protocol — nothing here changes — but it is why
+//! [`Shadow::drawn_bounds`] exists and why `wgpui-wgpu` feeds *that* rectangle
+//! to the ordering and occlusion passes.
+//!
 //! # Why a trait plus a small tag enum, rather than a trait object
 //!
 //! Payloads are plain data of differing shape and size, produced once per
@@ -55,6 +65,9 @@
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum PrimitiveKind {
+    /// Fixed-size, one slot per primitive, drawn under everything else in its
+    /// layer. See [`Shadow`].
+    Shadow,
     /// Fixed-size, one slot per primitive. See [`Quad`].
     Quad,
     /// Variable-size, one slot per glyph. See [`GlyphRun`].
@@ -75,14 +88,23 @@ impl PrimitiveKind {
     /// thumbnail over a card), and cross-kind z-order within one layer is not
     /// expressible while the ordering dispatch is per kind — see
     /// docs/phase-5.6-results.md, which discloses the same limit for text.
+    ///
+    /// Phase 6.3's two additions are placed by the legacy renderer's own
+    /// tie-break order rather than by preference: `src/scene.rs`'s
+    /// `PrimitiveKind` reads `Shadow, Quad, Path, Underline, MonochromeSprite,
+    /// PolychromeSprite`, and at equal draw order that discriminant is what
+    /// decides which of two primitives paints on top. Dropping `Path` (Phase
+    /// 6.4) leaves exactly the sequence below, so 2.0's kind grouping and the
+    /// legacy sorter agree about relative paint order by construction.
     pub const ALL: [PrimitiveKind; PrimitiveKind::COUNT] = [
+        PrimitiveKind::Shadow,
         PrimitiveKind::Quad,
         PrimitiveKind::GlyphRun,
         PrimitiveKind::PolySprite,
     ];
 
     /// Number of kinds; the width of every per-kind array in this crate.
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 4;
 
     /// Dense index into a per-kind array.
     pub const fn index(self) -> usize {
@@ -92,6 +114,7 @@ impl PrimitiveKind {
     /// Bytes one slab slot of this kind occupies in the resident buffer.
     pub const fn slot_stride(self) -> usize {
         match self {
+            PrimitiveKind::Shadow => Shadow::SLOT_STRIDE,
             PrimitiveKind::Quad => Quad::SLOT_STRIDE,
             PrimitiveKind::GlyphRun => GlyphRun::SLOT_STRIDE,
             PrimitiveKind::PolySprite => PolySprite::SLOT_STRIDE,
@@ -585,6 +608,112 @@ impl Primitive for PolySprite {
     }
 }
 
+/// One drop shadow: a blurred, rounded rectangle painted under its layer's
+/// other content.
+///
+/// The legacy `Shadow` (`src/scene.rs:1478`), reduced to what 2.0's protocol
+/// carries. What is deliberately absent is exactly what [`PolySprite`]'s doc
+/// lists and for the same reasons — `order` (§5.1 computes it on the GPU),
+/// `content_mask` (the clip reaches the occlusion pass as a
+/// [`crate::occlusion::CoverageItem`]), and per-corner radii ([`Quad`] carries
+/// one uniform radius in 2.0 and this matches it rather than inventing a second
+/// convention).
+///
+/// # The one thing that is genuinely new about this kind
+///
+/// A shadow paints *outside* its own rectangle. The legacy vertex shader
+/// (`src/platform/cross/shaders/shadows.wgsl:148`) expands the bounds by
+/// `3.0 * blur_radius` on every side before projecting them, because the
+/// Gaussian's tail has to have somewhere to land; the fragment shader then
+/// integrates the falloff over exactly that margin. Every other primitive kind
+/// in 2.0 paints within its own `origin`/`size`, and two consumers care about
+/// the difference:
+///
+/// - **Ordering** (§5.1) sorts by bounds, so a shadow's ordering rectangle is
+///   the expanded one — that is the area it actually covers.
+/// - **Occlusion** (§5.2) must not cull a shadow at all. That is not this
+///   phase's invention: [`crate::occlusion::CoverageItem::cullable`] has said
+///   so since Phase 3, naming shadows specifically, and the legacy sweep does
+///   the same (`src/occlusion.rs:266`).
+///
+/// [`Shadow::drawn_bounds`] is the one place that arithmetic lives, so the two
+/// consumers and the shader cannot drift apart silently.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shadow {
+    /// Top-left of the *unblurred* rectangle in the owning layer's coordinate
+    /// space. The drawn extent is larger — see [`Shadow::drawn_bounds`].
+    pub origin: [f32; 2],
+    /// Width and height of the unblurred rectangle.
+    pub size: [f32; 2],
+    /// Straight-alpha RGBA the shadow composites at full coverage.
+    pub color: [f32; 4],
+    /// Uniform corner radius of the unblurred rectangle.
+    pub corner_radius: f32,
+    /// Gaussian sigma, in the same units as `size`. Zero is a legitimate value
+    /// and draws a hard-edged rounded rectangle.
+    pub blur_radius: f32,
+}
+
+impl Shadow {
+    /// How many blur radii the drawn rectangle extends past the shadow's own on
+    /// each side.
+    ///
+    /// Three, transcribed from the legacy vertex shader's `3.0 * blur_radius`
+    /// margin, which is also the integration range its fragment shader clamps
+    /// to (`start`/`end` at `±3.0 * blur_radius`). A Gaussian carries 99.7% of
+    /// its mass inside three sigma, so the two agree that nothing meaningful is
+    /// being clipped — but the number is a transcription, not a derivation, and
+    /// it must match the shader's or the outermost band of the falloff is cut
+    /// off by a triangle edge.
+    pub const BLUR_MARGIN_SIGMAS: f32 = 3.0;
+
+    /// A zero-sized, fully transparent, unblurred shadow.
+    pub const ZERO: Shadow = Shadow {
+        origin: [0.0, 0.0],
+        size: [0.0, 0.0],
+        color: [0.0, 0.0, 0.0, 0.0],
+        corner_radius: 0.0,
+        blur_radius: 0.0,
+    };
+
+    /// The rectangle this shadow's fragments can actually land in: its own,
+    /// grown by [`Shadow::BLUR_MARGIN_SIGMAS`] blur radii on every side.
+    ///
+    /// Returned as `(origin, size)` rather than a `Rect` so `patch` keeps its
+    /// module boundary — `geometry` does not depend on `patch` and this does not
+    /// reverse that.
+    pub fn drawn_bounds(&self) -> ([f32; 2], [f32; 2]) {
+        let margin = Self::BLUR_MARGIN_SIGMAS * self.blur_radius;
+        (
+            [self.origin[0] - margin, self.origin[1] - margin],
+            [self.size[0] + 2.0 * margin, self.size[1] + 2.0 * margin],
+        )
+    }
+}
+
+impl Primitive for Shadow {
+    const KIND: PrimitiveKind = PrimitiveKind::Shadow;
+
+    // 40 bytes of payload, padded to 48 so a slot boundary is also a 16-byte
+    // std430 boundary — `Quad`'s reasoning, one field set over.
+    const SLOT_STRIDE: usize = 48;
+
+    fn slot_count(&self) -> u32 {
+        1
+    }
+
+    fn encode(&self, destination: &mut [u8]) -> Result<(), EncodeError> {
+        let mut writer = SlotWriter::new(destination);
+        writer.write_f32_array(self.origin)?;
+        writer.write_f32_array(self.size)?;
+        writer.write_f32_array(self.color)?;
+        writer.write_f32(self.corner_radius)?;
+        writer.write_f32(self.blur_radius)?;
+        writer.write_padding(8)?;
+        writer.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,7 +853,79 @@ mod tests {
     }
 
     #[test]
+    fn a_shadow_encodes_exactly_one_slot_at_the_offsets_the_shader_reads() {
+        let mut bytes = vec![0xAAu8; Shadow::SLOT_STRIDE];
+        let shadow = Shadow {
+            origin: [10.0, 20.0],
+            size: [64.0, 48.0],
+            color: [0.25, 0.5, 0.75, 1.0],
+            corner_radius: 6.0,
+            blur_radius: 4.0,
+        };
+        assert_eq!(shadow.slot_count(), 1);
+        assert!(shadow.encode(&mut bytes).is_ok());
+        // Asserted by offset rather than by round-trip, for `PolySprite`'s
+        // reason: the only reader is WGSL, where nothing checks the layout.
+        assert_eq!(&bytes[0..4], &10.0f32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &20.0f32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &64.0f32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &48.0f32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &0.25f32.to_le_bytes());
+        assert_eq!(&bytes[28..32], &1.0f32.to_le_bytes());
+        assert_eq!(&bytes[32..36], &6.0f32.to_le_bytes());
+        assert_eq!(&bytes[36..40], &4.0f32.to_le_bytes());
+        assert_eq!(&bytes[40..48], &[0u8; 8]);
+    }
+
+    #[test]
+    fn a_shadow_rejects_a_mis_sized_destination_instead_of_panicking() {
+        let mut too_small = vec![0u8; Shadow::SLOT_STRIDE - 1];
+        assert!(Shadow::ZERO.encode(&mut too_small).is_err());
+        let mut too_large = vec![0u8; Shadow::SLOT_STRIDE + 1];
+        assert!(Shadow::ZERO.encode(&mut too_large).is_err());
+    }
+
+    #[test]
+    fn a_shadows_drawn_rectangle_grows_by_three_sigma_on_every_side() {
+        // The number the vertex shader hard-codes. If these disagree the
+        // outermost band of the falloff is clipped by a triangle edge, which
+        // looks like a subtly wrong shadow rather than like an error.
+        let shadow = Shadow {
+            origin: [100.0, 200.0],
+            size: [40.0, 30.0],
+            blur_radius: 5.0,
+            ..Shadow::ZERO
+        };
+        assert_eq!(shadow.drawn_bounds(), ([85.0, 185.0], [70.0, 60.0]));
+
+        let unblurred = Shadow {
+            blur_radius: 0.0,
+            ..shadow
+        };
+        assert_eq!(
+            unblurred.drawn_bounds(),
+            (shadow.origin, shadow.size),
+            "a zero blur radius must draw exactly its own rectangle, not a \
+             degenerate one"
+        );
+    }
+
+    #[test]
+    fn shadows_paint_under_quads_and_the_kind_order_is_the_legacy_one() {
+        // Legacy `src/scene.rs`'s `PrimitiveKind` breaks an equal draw order by
+        // discriminant: Shadow, Quad, Path, Underline, MonochromeSprite,
+        // PolychromeSprite. 2.0 groups its fixed draw sequence by kind in
+        // `ALL`'s order, so the two agree about relative paint order only if
+        // this holds.
+        assert!(PrimitiveKind::Shadow < PrimitiveKind::Quad);
+        assert!(PrimitiveKind::Quad < PrimitiveKind::GlyphRun);
+        assert!(PrimitiveKind::GlyphRun < PrimitiveKind::PolySprite);
+        assert_eq!(PrimitiveKind::Shadow.index(), 0);
+    }
+
+    #[test]
     fn kind_tags_agree_with_their_payload_types() {
+        assert_eq!(PrimitiveKind::Shadow.slot_stride(), Shadow::SLOT_STRIDE);
         assert_eq!(PrimitiveKind::Quad.slot_stride(), Quad::SLOT_STRIDE);
         assert_eq!(PrimitiveKind::GlyphRun.slot_stride(), GlyphRun::SLOT_STRIDE);
         assert_eq!(
