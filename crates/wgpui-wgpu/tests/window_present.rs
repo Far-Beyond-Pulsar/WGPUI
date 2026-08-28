@@ -48,7 +48,7 @@ use wgpui_wgpu::render::draw::DrawMode;
 use wgpui_wgpu::render::frame::RenderTarget;
 use wgpui_wgpu::render::pipelines::TARGET_FORMAT;
 use wgpui_wgpu::render::readback::read_texture_rgba8;
-use wgpui_wgpu::window::frame_loop::{FrameLoop, ReferenceScene};
+use wgpui_wgpu::window::frame_loop::{FrameLoop, LoopInput, ReferenceScene};
 use wgpui_wgpu::window::{
     Acquired, PROOF_MAGENTA, PROOF_MAGENTA_BYTES, SurfaceFormatChoice, WindowSurface, clear_frame,
 };
@@ -388,11 +388,13 @@ impl Harness {
                 &context.device,
                 &context.queue,
                 reference.describe(),
-                Some(&textures),
-                &target,
-                mode,
-                &FrameSignals::new(),
-                &[],
+                &LoopInput {
+                    atlas: Some(&textures),
+                    target: &target,
+                    mode,
+                    signals: &FrameSignals::new(),
+                    composites: &[],
+                },
             ) {
                 Ok(frame) => {
                     if frame.was_idle() {

@@ -32,7 +32,7 @@ use wgpui_wgpu::render::device::ComputeContext;
 use wgpui_wgpu::render::draw::DrawMode;
 use wgpui_wgpu::render::frame::RenderTarget;
 use wgpui_wgpu::render::readback::read_texture_rgba8;
-use wgpui_wgpu::window::frame_loop::{FrameLoop, ReferenceScene};
+use wgpui_wgpu::window::frame_loop::{FrameLoop, LoopInput, ReferenceScene};
 use wgpui_wgpu::window::resize_detector::ResizeDetector;
 use wgpui_wgpu::window::{
     Acquired, PROOF_MAGENTA, PROOF_MAGENTA_BYTES, SurfaceStats, WindowSurface, clear_frame,
@@ -137,6 +137,10 @@ struct Observed {
     /// `--scene` only: frames where the patch was empty, no layer was dirty,
     /// and nothing was uploaded. A steady window's every frame after the first.
     idle_frames: u32,
+    /// `--scene` only: bytes the patches scheduled for GPU upload across the
+    /// whole run. The measurable half of the fingerprint finding — a settled
+    /// window should add nothing to this after its first frame.
+    uploaded_bytes: u64,
     last_frame: Option<String>,
     sizes_presented: Vec<(u32, u32)>,
     surface: SurfaceStats,
@@ -322,13 +326,16 @@ impl App {
                     &live.context.device,
                     &live.context.queue,
                     scene.reference.describe(),
-                    Some(&scene.atlas),
-                    &target,
-                    scene.mode,
-                    &FrameSignals::new(),
-                    &[],
+                    &LoopInput {
+                        atlas: Some(&scene.atlas),
+                        target: &target,
+                        mode: scene.mode,
+                        signals: &FrameSignals::new(),
+                        composites: &[],
+                    },
                 ) {
                     Ok(frame) => {
+                        self.observed.uploaded_bytes += frame.uploaded_bytes;
                         if frame.was_idle() {
                             idle_frames = 1;
                         }
@@ -711,6 +718,7 @@ fn main() -> std::process::ExitCode {
     println!("sizes presented:         {:?}", observed.sizes_presented);
     if options.scene {
         println!("idle frames:             {}", observed.idle_frames);
+        println!("bytes uploaded:          {}", observed.uploaded_bytes);
         println!(
             "last frame:              {}",
             observed.last_frame.as_deref().unwrap_or("none")

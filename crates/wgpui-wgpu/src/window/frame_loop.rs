@@ -137,6 +137,27 @@ impl LoopFrame {
     }
 }
 
+/// Everything one frame needs that is not the description itself.
+///
+/// Grouped rather than passed as eight parameters, which is `frame.rs`'s own
+/// [`FrameInput`] idiom one level up and is what a nine-argument `draw` was
+/// told to become. The grouping also reads better at the call site: a window's
+/// loop varies exactly one of these per frame — the target's view — and naming
+/// the rest in a struct makes that obvious.
+pub struct LoopInput<'a> {
+    /// The uploaded atlas pages a glyph draw samples, if this frame has text.
+    pub atlas: Option<&'a AtlasTextures>,
+    /// Where the colour goes, and what the pass clears with.
+    pub target: &'a RenderTarget<'a>,
+    /// How the fixed draw sequence reaches the device.
+    pub mode: DrawMode,
+    /// This frame's invalidation signals.
+    pub signals: &'a FrameSignals,
+    /// The composite entries, in draw order (§5.5). Empty for a scene with no
+    /// `.boundary()` in it, which is every scene Phase 6 draws.
+    pub composites: &'a [CompositeEntry],
+}
+
 /// Everything one window holds across frames.
 ///
 /// # The invariant that turned out to be load-bearing
@@ -269,38 +290,39 @@ impl FrameLoop {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         description: Description,
-        atlas: Option<&AtlasTextures>,
-        target: &RenderTarget<'_>,
-        mode: DrawMode,
-        signals: &FrameSignals,
-        composites: &[CompositeEntry],
+        input: &LoopInput<'_>,
     ) -> Result<LoopFrame, LoopError> {
         let plan = self.reconciler.reconcile(description, &mut self.layout)?;
-        let root = plan.root().map(|node| node.layout_node).ok_or(LoopError::NoRoot)?;
-        let width = target.width.max(1) as f32;
-        let height = target.height.max(1) as f32;
+        let root = plan
+            .root()
+            .map(|node| node.layout_node)
+            .ok_or(LoopError::NoRoot)?;
+        let width = input.target.width.max(1) as f32;
+        let height = input.target.height.max(1) as f32;
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
         let emission = self
             .emitter
-            .emit(&plan, &self.layout, signals, &mut self.scene)?;
+            .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
         let uploads = apply(&mut self.scene, &emission.patch)?;
         let dirty_layers = emission.patch.layers();
 
-        let input = FrameInput {
+        let frame_input = FrameInput {
             scene: &self.scene,
             clip: Rect::from_origin_size([0.0, 0.0], [width, height]),
             poison: &[],
             dirty: Dirty::Some(&dirty_layers),
             uploads: uploads.entries(),
-            composites,
+            composites: input.composites,
             registry: None,
-            atlas,
+            atlas: input.atlas,
             viewport: [width, height],
-            mode,
+            mode: input.mode,
         };
-        let frame = self.renderer.render_to(device, queue, &input, target)?;
+        let frame = self
+            .renderer
+            .render_to(device, queue, &frame_input, input.target)?;
         self.frames += 1;
 
         Ok(LoopFrame {
