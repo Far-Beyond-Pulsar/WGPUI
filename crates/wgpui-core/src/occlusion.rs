@@ -593,10 +593,24 @@ mod tests {
 
     #[test]
     fn a_non_cullable_item_survives_full_coverage() {
-        let mut shadow = CoverageItem::cullee(rect(10.0, 10.0, 20.0, 20.0));
-        shadow.cullable = false;
+        // Through the constructor Phase 6.3 added rather than by setting the
+        // field: `Shadow` is the first kind that actually reaches this path, and
+        // a test that hand-builds the value would keep passing if the
+        // constructor stopped producing it.
+        let shadow = CoverageItem::uncullable(rect(10.0, 10.0, 20.0, 20.0));
+        assert!(!shadow.cullable);
+        assert!(!shadow.protected, "uncullable is not the same as protected");
+        assert_eq!(shadow.opaque, None, "a blurred gradient occludes nothing");
         let items = [shadow, opaque_at(rect(0.0, 0.0, 100.0, 100.0))];
         assert_eq!(keep_mask(&items, &[]), vec![true, true]);
+
+        // And the same item made cullable *is* dropped, so the assertion above
+        // is about the flag rather than about the geometry.
+        let items = [
+            CoverageItem::cullee(rect(10.0, 10.0, 20.0, 20.0)),
+            opaque_at(rect(0.0, 0.0, 100.0, 100.0)),
+        ];
+        assert_eq!(keep_mask(&items, &[]), vec![false, true]);
     }
 
     #[test]

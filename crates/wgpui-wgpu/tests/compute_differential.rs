@@ -264,6 +264,55 @@ fn the_compute_passes_agree_with_a_hand_computed_answer() {
     );
 }
 
+/// The occlusion shader's `FLAG_CULLABLE` bit, differentially — the one flag
+/// this file has never exercised.
+///
+/// `CoverageItem::cullable` has existed since Phase 3 and every item every test
+/// here builds comes from `quad_coverage_item`, which always sets it. So the
+/// shader's `(item.flags & FLAG_CULLABLE) == 0u` branch was reachable in
+/// principle and unreached in practice for three phases. Phase 6.3's `Shadow`
+/// is the first primitive kind that takes it, on every frame, which makes the
+/// gap worth closing here rather than trusting the branch on inspection.
+///
+/// The scene is the strongest available shape: an item completely covered by an
+/// opaque square above it, built twice — once cullable, once not — so the
+/// comparison is against the *flag* and not against the geometry.
+#[test]
+fn the_shader_honours_the_uncullable_flag_exactly_as_the_cpu_does() {
+    let Some(context) = context_or_skip("uncullable_flag") else {
+        return;
+    };
+    let occlusion = OcclusionPass::new(&context.device);
+    let covered = Rect::from_origin_size([20.0, 20.0], [40.0, 40.0]);
+    let cover = Rect::from_origin_size([0.0, 0.0], [200.0, 200.0]);
+
+    for (label, hidden, expected_first) in [
+        ("cullable", CoverageItem::cullee(covered), false),
+        ("uncullable", CoverageItem::uncullable(covered), true),
+    ] {
+        let items = [hidden, CoverageItem::occluder(cover, cover)];
+        let mut item_bytes = Vec::new();
+        let mut poison_bytes = Vec::new();
+        encode_coverage_items(&items, &mut item_bytes);
+        encode_poison_regions(&[], &mut poison_bytes);
+        let culled = occlusion
+            .run(&context.device, &context.queue, &item_bytes, &poison_bytes)
+            .expect("the occlusion pass must dispatch");
+        let gpu = occlusion
+            .read_keep_mask(&context.device, &context.queue, &culled)
+            .expect("reading the keep mask back must succeed");
+        let cpu = keep_mask(&items, &[]);
+
+        assert_eq!(gpu, cpu, "[{label}] the two paths must agree");
+        assert_eq!(
+            gpu,
+            vec![expected_first, true],
+            "[{label}] and they must agree on the right answer, not merely with \
+             each other"
+        );
+    }
+}
+
 /// A single overlap chain, at two depths, is the sharpest test of the
 /// relaxation's iteration count as well as its exactness — the painter order is
 /// exactly `1..count` and nothing shallower reaches it.
