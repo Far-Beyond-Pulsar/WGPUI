@@ -22,10 +22,11 @@
 //! the on-screen frame.
 //!
 //! It does not need either. `Surface::get_capabilities` on this machine reports
-//! `[Bgra8UnormSrgb, Rgba8UnormSrgb, Bgra8Unorm, Rgba8Unorm, Rgba16Float,
-//! Rgb10a2Unorm]`, so [`SurfaceFormatChoice`] takes `TARGET_FORMAT` directly and
-//! the pixels a test reads back offscreen and the pixels the display scans out
-//! come from the same pipeline writing the same format. Where a surface cannot
+//! `[Bgra8UnormSrgb, Rgba8UnormSrgb, Bgra8Unorm, Rgba8Unorm, Rgb10a2Unorm]`
+//! (`examples/window_probe.rs` prints it), so [`SurfaceFormatChoice`] takes
+//! `TARGET_FORMAT` directly and the pixels a test reads back offscreen and the
+//! pixels the display scans out come from the same pipeline writing the same
+//! format. Where a surface cannot
 //! offer it, [`WindowSurface::new`] fails with [`WindowError::NoTargetFormat`]
 //! and says so, rather than quietly configuring a format the pipelines will
 //! refuse at draw time — see that variant's doc for why refusing is the honest
@@ -179,6 +180,34 @@ pub struct SurfaceStats {
     pub presents: u64,
 }
 
+/// The best present mode this surface actually offers, unpaced first.
+///
+/// `Immediate` presents without waiting for vsync, so a window can be resized at
+/// the full rate the OS delivers `WM_SIZE` events instead of being paced to the
+/// display refresh — which is why it is preferred, and it is what this crate's
+/// own resize evidence was measured on.
+///
+/// It is *chosen from the capability list* rather than named outright, because
+/// `Surface::configure` does not fall back for it. `wgpu` resolves only the
+/// `Auto*` modes against what a surface supports; a concrete mode the surface
+/// does not offer is a `ConfigureSurfaceError::UnsupportedPresentMode`
+/// validation error, which reaches the default handler and panics — inside
+/// [`WindowSurface::new`], where there is no `Result` left for a caller to do
+/// anything about it. `Immediate` is not universally available: WebGPU exposes
+/// only `Fifo`, and some Wayland/Mesa configurations offer `Mailbox` without it.
+///
+/// `Fifo` is the terminal fallback because WebGPU requires every surface to
+/// support it, so this cannot return a mode the surface will refuse — the same
+/// discipline the format and alpha-mode choices beside it already follow.
+fn present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
+    const PREFERENCE: [wgpu::PresentMode; 2] =
+        [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox];
+    PREFERENCE
+        .into_iter()
+        .find(|mode| capabilities.present_modes.contains(mode))
+        .unwrap_or(wgpu::PresentMode::Fifo)
+}
+
 /// A live OS window and the swapchain configured on it.
 ///
 /// Holds the `wgpu::Instance` the surface was created from. `wgpu`'s own
@@ -234,10 +263,7 @@ impl WindowSurface {
             format: TARGET_FORMAT,
             width: size.width.max(1),
             height: size.height.max(1),
-            // `Immediate` presents without waiting for vsync, so a window can be
-            // resized at the full rate the OS delivers WM_SIZE events instead of
-            // being paced to the display refresh.
-            present_mode: wgpu::PresentMode::Immediate,
+            present_mode: present_mode(&capabilities),
             alpha_mode: capabilities
                 .alpha_modes
                 .first()
@@ -283,6 +309,16 @@ impl WindowSurface {
     /// Whether the swapchain is the format the pipelines draw.
     pub fn format_choice(&self) -> SurfaceFormatChoice {
         self.format_choice
+    }
+
+    /// The present mode the swapchain was configured with.
+    ///
+    /// Reported rather than assumed, because [`present_mode`] picks it from what
+    /// the surface offers: a run's frame pacing is a property of the machine it
+    /// ran on, and a report that quotes frame counts should be able to say which
+    /// mode produced them.
+    pub fn present_mode(&self) -> wgpu::PresentMode {
+        self.configuration.present_mode
     }
 
     /// The configured size in physical pixels.

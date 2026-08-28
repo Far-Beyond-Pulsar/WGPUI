@@ -102,8 +102,7 @@ impl Options {
             match argument.as_str() {
                 "--frames" => {
                     let value = arguments.next().ok_or("--frames needs a count")?;
-                    options.frames =
-                        Some(value.parse::<u32>().map_err(|error| error.to_string())?);
+                    options.frames = Some(value.parse::<u32>().map_err(|error| error.to_string())?);
                 }
                 "--hold-ms" => {
                     let value = arguments.next().ok_or("--hold-ms needs a duration")?;
@@ -141,6 +140,11 @@ struct Observed {
     /// whole run. The measurable half of the fingerprint finding — a settled
     /// window should add nothing to this after its first frame.
     uploaded_bytes: u64,
+    /// `--scene` only: frames recomputed in full because the viewport moved
+    /// rather than because the patch named a layer. One per distinct size
+    /// presented, and never more — see `FrameLoop::draw`'s note on why the clip
+    /// is dirtiness the patch cannot report.
+    viewport_recomputes: u64,
     last_frame: Option<String>,
     sizes_presented: Vec<(u32, u32)>,
     surface: SurfaceStats,
@@ -201,9 +205,10 @@ impl winit::application::ApplicationHandler for App {
         };
         println!("device:  {}", context.describe());
         println!(
-            "surface: {:?} {:?} at {}x{}",
+            "surface: {:?} {:?} {:?} at {}x{}",
             surface.format(),
             surface.format_choice(),
+            surface.present_mode(),
             surface.size().0,
             surface.size().1,
         );
@@ -339,6 +344,7 @@ impl App {
                         if frame.was_idle() {
                             idle_frames = 1;
                         }
+                        self.observed.viewport_recomputes = scene.frame_loop.viewport_recomputes();
                         self.observed.last_frame = Some(format!(
                             "resident={} draws={} slots={} plan_builds={}/{}",
                             frame.frame.primitives_resident,
@@ -709,8 +715,14 @@ fn main() -> std::process::ExitCode {
     println!("frames verified:         {}", observed.frames_verified);
     println!("surface stats:           {:?}", observed.surface);
     println!("resize events seen:      {}", observed.resize_events_seen);
-    println!("reconfigurations:        {}", observed.resize_reconfigurations);
-    println!("resize steps dispatched: {}", observed.resize_steps_dispatched);
+    println!(
+        "reconfigurations:        {}",
+        observed.resize_reconfigurations
+    );
+    println!(
+        "resize steps dispatched: {}",
+        observed.resize_steps_dispatched
+    );
     println!(
         "resizes answered sync:   {}",
         observed.resizes_answered_synchronously
@@ -719,6 +731,7 @@ fn main() -> std::process::ExitCode {
     if options.scene {
         println!("idle frames:             {}", observed.idle_frames);
         println!("bytes uploaded:          {}", observed.uploaded_bytes);
+        println!("viewport recomputes:     {}", observed.viewport_recomputes);
         println!(
             "last frame:              {}",
             observed.last_frame.as_deref().unwrap_or("none")
@@ -741,6 +754,17 @@ fn main() -> std::process::ExitCode {
     }
     if options.verify && observed.frames_verified == 0 {
         eprintln!("FAILED: --verify was asked for and no frame was verified");
+        failed = true;
+    }
+    // One full recompute per distinct size presented, and not one more: the
+    // first claim is the resize fix doing its job, the second is that it did not
+    // turn every settled frame into a rebuild.
+    if options.scene && observed.viewport_recomputes != observed.sizes_presented.len() as u64 {
+        eprintln!(
+            "FAILED: {} viewport recomputes for {} sizes presented",
+            observed.viewport_recomputes,
+            observed.sizes_presented.len()
+        );
         failed = true;
     }
     if options.resize && observed.sizes_presented.len() < 2 {

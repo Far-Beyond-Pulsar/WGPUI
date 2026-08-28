@@ -122,18 +122,27 @@ pub struct LoopFrame {
     pub dirty_layers: Vec<LayerId>,
     /// Bytes the patch's application scheduled for upload.
     pub uploaded_bytes: u64,
+    /// Whether this frame's viewport differed from the previous frame's, and so
+    /// forced a full recompute regardless of what the patch said.
+    ///
+    /// See [`FrameLoop::draw`]'s note on why the clip is a second, independent
+    /// source of dirtiness.
+    pub viewport_changed: bool,
     /// The GPU half.
     pub frame: FrameOutput,
 }
 
 impl LoopFrame {
     /// Whether this frame changed nothing at all — no records touched, no
-    /// bytes uploaded, no layer dirty.
+    /// bytes uploaded, no layer dirty, and the same viewport as last frame.
     ///
     /// The shape a window sitting still has, and the one `frame.rs`'s
     /// clean-frame path is written for.
     pub fn was_idle(&self) -> bool {
-        self.emission.patch.is_empty() && self.dirty_layers.is_empty() && self.uploaded_bytes == 0
+        self.emission.patch.is_empty()
+            && self.dirty_layers.is_empty()
+            && self.uploaded_bytes == 0
+            && !self.viewport_changed
     }
 }
 
@@ -183,6 +192,8 @@ pub struct FrameLoop {
     scene: Scene,
     renderer: FrameRenderer,
     frames: u64,
+    last_viewport: Option<[f32; 2]>,
+    viewport_recomputes: u64,
 }
 
 impl FrameLoop {
@@ -195,6 +206,8 @@ impl FrameLoop {
             scene: Scene::new(),
             renderer: FrameRenderer::new(device),
             frames: 0,
+            last_viewport: None,
+            viewport_recomputes: 0,
         }
     }
 
@@ -219,6 +232,16 @@ impl FrameLoop {
     /// The same counter for the glyph pipeline.
     pub fn glyph_plan_builds(&self) -> u64 {
         self.renderer.glyph_plan_builds()
+    }
+
+    /// How many frames were recomputed in full because the viewport changed
+    /// rather than because the patch named a layer.
+    ///
+    /// Exists so the rule in [`Self::draw`]'s "the clip is dirtiness too" note
+    /// is observable rather than asserted: a resized window must raise this, and
+    /// a still one must not.
+    pub fn viewport_recomputes(&self) -> u64 {
+        self.viewport_recomputes
     }
 
     /// Every quad resident in the scene, in paint order, across every layer.
@@ -285,6 +308,29 @@ impl FrameLoop {
     /// `Dirty::Some(&[])` — the clean-frame path — rather than `Dirty::All`,
     /// which would recompute a settled window's whole scene every frame and
     /// make `frame.rs`'s clean-frame path unreachable from a real loop.
+    ///
+    /// # The clip is dirtiness too, and the patch cannot know it
+    ///
+    /// That rule is right about *scene content* and incomplete on its own, which
+    /// is a thing this loop is the first code in the project able to notice:
+    /// occlusion is computed against `FrameInput::clip`, and the clip is the
+    /// window's rectangle. Resize the window without changing a single
+    /// primitive and the patch is legitimately empty, so `frame.rs` skips step 2
+    /// (`//! A clean layer's results from a previous frame are still sitting
+    /// there`) and the *indirect arguments still describe the old rectangle*. A
+    /// window shrunk and then grown back would keep drawing the shrunk frame's
+    /// cull decisions, so content that left the small viewport never comes back.
+    ///
+    /// The viewport is therefore a second, independent source of dirtiness, and
+    /// a frame whose clip moved is `Dirty::All` whatever the patch says.
+    ///
+    /// Phase 6's own reference scene cannot exhibit the bug — its text element
+    /// is `width: 100%`, so every resize re-emits its runs and the patch is
+    /// never empty across one — which is exactly why this was found by reading
+    /// the rule against `frame.rs`'s contract rather than by a failing test.
+    /// [`Self::viewport_recomputes`] makes the fix observable in the direction
+    /// that *can* be checked: it must rise on a resized frame and never on a
+    /// still one.
     pub fn draw(
         &mut self,
         device: &wgpu::Device,
@@ -308,11 +354,22 @@ impl FrameLoop {
         let uploads = apply(&mut self.scene, &emission.patch)?;
         let dirty_layers = emission.patch.layers();
 
+        let viewport = [width, height];
+        let viewport_changed = self.last_viewport != Some(viewport);
+        if viewport_changed {
+            self.last_viewport = Some(viewport);
+            self.viewport_recomputes += 1;
+        }
+
         let frame_input = FrameInput {
             scene: &self.scene,
             clip: Rect::from_origin_size([0.0, 0.0], [width, height]),
             poison: &[],
-            dirty: Dirty::Some(&dirty_layers),
+            dirty: if viewport_changed {
+                Dirty::All
+            } else {
+                Dirty::Some(&dirty_layers)
+            },
             uploads: uploads.entries(),
             composites: input.composites,
             registry: None,
@@ -330,6 +387,7 @@ impl FrameLoop {
             emission,
             dirty_layers,
             uploaded_bytes: uploads.byte_count(),
+            viewport_changed,
             frame,
         })
     }

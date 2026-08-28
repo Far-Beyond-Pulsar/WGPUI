@@ -222,15 +222,16 @@ impl Harness {
                 width,
                 height,
             ) {
-                Ok(pixels) => match first_pixel_other_than(&pixels, width, height, |_, _| {
-                    PROOF_MAGENTA_BYTES
-                }) {
-                    Some(message) => self.report.fail(format!("clear frame: {message}")),
-                    None => {
-                        verified += 1;
-                        pixels_compared += (width * height) as usize;
+                Ok(pixels) => {
+                    match first_pixel_other_than(&pixels, width, height, |_, _| PROOF_MAGENTA_BYTES)
+                    {
+                        Some(message) => self.report.fail(format!("clear frame: {message}")),
+                        None => {
+                            verified += 1;
+                            pixels_compared += (width * height) as usize;
+                        }
                     }
-                },
+                }
                 Err(error) => self.report.fail(format!("clear readback failed: {error}")),
             }
             surface.present(&context.queue, texture);
@@ -250,6 +251,31 @@ impl Harness {
     /// Driven through [`WindowSurface::resize`] rather than a real
     /// `WindowEvent::Resized` — see this file's doc for why, and for where the
     /// real-event evidence lives.
+    ///
+    /// # What a surface-only resize costs, and why the count here is not the
+    /// example's
+    ///
+    /// This drives the surface *without* the window: the client area stays at
+    /// `EXACT_WIDTH`×`EXACT_HEIGHT` while the swapchain is configured to eight
+    /// other extents. On Vulkan an extent that disagrees with the window's is
+    /// exactly what `VK_ERROR_OUT_OF_DATE_KHR` reports, so the very next
+    /// `get_current_texture` is `Outdated` and [`WindowSurface::acquire`]'s
+    /// documented recovery — reconfigure once, ask once more — answers it. That
+    /// recovery is the mechanism working, not failing: every one of those frames
+    /// still presents, and `lost` stays zero.
+    ///
+    /// So "one configure per size" cannot be read off `configures` alone here,
+    /// and the first version of this check did exactly that and was wrong about
+    /// its own harness rather than about the code: it counted 15 configures for
+    /// 8 sizes and called it a failure, when 8 were the resizes and 7 were the
+    /// recoveries the deliberate size mismatch provokes. `SurfaceStats` already
+    /// separates the two, so the claim is made against the difference — and the
+    /// recoveries are bounded and named rather than absorbed.
+    ///
+    /// The unqualified `retries: 0` version of this claim is the *example's*,
+    /// where `request_inner_size` moves the window too and the extents agree:
+    /// `--scene --resize --verify` reports 10 configures for 9 real
+    /// `WindowEvent::Resized`, 0 retried, 0 lost. Both are in Phase 6's report.
     fn resizing_keeps_presenting_correctly(
         &mut self,
         surface: &mut WindowSurface,
@@ -257,7 +283,9 @@ impl Harness {
     ) {
         let before = surface.stats();
         let mut sizes_verified = Vec::new();
+        let mut sizes_recovered = Vec::new();
         for &(width, height) in RESIZE_SIZES {
+            let before_size = surface.stats();
             if !surface.resize(&context.device, width, height) {
                 self.report
                     .fail(format!("resize to {width}x{height} did not reconfigure"));
@@ -302,8 +330,13 @@ impl Harness {
             if good == 2 {
                 sizes_verified.push((width, height));
             }
+            if surface.stats().retries > before_size.retries {
+                sizes_recovered.push((width, height));
+            }
         }
         let after = surface.stats();
+        let configures = after.configures.saturating_sub(before.configures);
+        let retries = after.retries.saturating_sub(before.retries);
         self.check(
             sizes_verified.len() == RESIZE_SIZES.len(),
             format!(
@@ -312,10 +345,20 @@ impl Harness {
             ),
         );
         self.check(
-            after.configures - before.configures == RESIZE_SIZES.len() as u64,
+            configures.saturating_sub(retries) == RESIZE_SIZES.len() as u64,
             format!(
-                "one `Surface::configure` per size change, no more: {} for {} sizes",
-                after.configures - before.configures,
+                "`WindowSurface::resize` configured exactly once per size change: {configures} \
+                 configures less {retries} recovery reconfigures is {} for {} sizes",
+                configures.saturating_sub(retries),
+                RESIZE_SIZES.len()
+            ),
+        );
+        self.check(
+            retries <= RESIZE_SIZES.len() as u64,
+            format!(
+                "each stale swapchain cost at most one reconfigure-and-retry: {retries} across \
+                 {} sizes, at {sizes_recovered:?} — the extents this harness deliberately \
+                 disagrees with the window on",
                 RESIZE_SIZES.len()
             ),
         );
@@ -434,6 +477,19 @@ impl Harness {
             format!(
                 "a fingerprinted scene settles: {idle} of {FRAMES} frames changed nothing \
                  (the first builds it)"
+            ),
+        );
+        // The clip is a source of dirtiness the patch cannot report, so
+        // `FrameLoop` forces a full recompute when the viewport moves — see its
+        // `draw` doc. These six frames are all at one size, so exactly the first
+        // may claim it, and a loop that raised this every frame would be
+        // recomputing a settled window's whole scene forever.
+        self.check(
+            frame_loop.viewport_recomputes() == 1,
+            format!(
+                "the viewport forced exactly one full recompute across {FRAMES} frames at one \
+                 size: {}",
+                frame_loop.viewport_recomputes()
             ),
         );
         self.check(
@@ -613,11 +669,7 @@ fn glyph_coverage(glyphs: &[Glyph]) -> Vec<u8> {
     coverage
 }
 
-fn compare_glyph_texels(
-    glyphs: &[Glyph],
-    atlas: &GlyphAtlas,
-    pixels: &[u8],
-) -> TexelComparison {
+fn compare_glyph_texels(glyphs: &[Glyph], atlas: &GlyphAtlas, pixels: &[u8]) -> TexelComparison {
     let coverage = glyph_coverage(glyphs);
     let mut result = TexelComparison::default();
     for glyph in glyphs {
