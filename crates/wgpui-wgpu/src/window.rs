@@ -234,9 +234,10 @@ impl WindowSurface {
             format: TARGET_FORMAT,
             width: size.width.max(1),
             height: size.height.max(1),
-            // Fifo: WebGPU's guaranteed-present mode, the only one every
-            // backend must support, and the legacy backend's own default.
-            present_mode: wgpu::PresentMode::Fifo,
+            // `Immediate` presents without waiting for vsync, so a window can be
+            // resized at the full rate the OS delivers WM_SIZE events instead of
+            // being paced to the display refresh.
+            present_mode: wgpu::PresentMode::Immediate,
             alpha_mode: capabilities
                 .alpha_modes
                 .first()
