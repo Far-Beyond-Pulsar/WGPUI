@@ -170,7 +170,7 @@ pub struct BoxShadow {
 /// See this module's doc for why this is a resolved style rather than a
 /// refinement, and why the layout and paint halves sit side by side rather than
 /// merged.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DivStyle {
     /// The Taffy style this element's layout node is created with.
     pub layout: LayoutStyle,
@@ -188,19 +188,6 @@ pub struct DivStyle {
     pub corner_radii: Corners,
     /// `box-shadow` layers, painted in order, all *behind* the element.
     pub box_shadow: Vec<BoxShadow>,
-}
-
-impl Default for DivStyle {
-    fn default() -> Self {
-        Self {
-            layout: LayoutStyle::default(),
-            background: None,
-            border_color: None,
-            border_widths: Edges::default(),
-            corner_radii: Corners::default(),
-            box_shadow: Vec::new(),
-        }
-    }
 }
 
 impl DivStyle {

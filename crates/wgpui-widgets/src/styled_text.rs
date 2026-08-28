@@ -577,7 +577,7 @@ impl StyledText {
                 }
             }
         }
-        any.then(|| origin_x + line.width)
+        any.then_some(origin_x + line.width)
     }
 
     /// The underline and strikethrough bands this text's highlights describe,

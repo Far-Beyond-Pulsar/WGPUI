@@ -139,8 +139,17 @@ struct Painted {
     border: Option<([f32; 4], [f32; 4])>,
     corner_radii: [f32; 4],
     border_widths: [f32; 4],
-    /// `(color, offset, blur, spread)` per `box-shadow` layer.
-    shadows: Vec<(([f32; 4], [f32; 4]), [f32; 2], f32, f32)>,
+    shadows: Vec<ShadowLayer>,
+}
+
+/// One `box-shadow` layer as this file's oracle states it: the colour in both
+/// spaces, plus the three geometry numbers `Window::paint_shadows` reads.
+#[derive(Copy, Clone, Debug)]
+struct ShadowLayer {
+    color: ([f32; 4], [f32; 4]),
+    offset: [f32; 2],
+    blur_radius: f32,
+    spread_radius: f32,
 }
 
 impl Painted {
@@ -174,18 +183,21 @@ impl Painted {
         let radii = self.clamped_radii();
         self.shadows
             .iter()
-            .map(|((hsla, rgba), offset, blur, spread)| LegacyShadow {
+            .map(|layer| LegacyShadow {
                 shadow: Shadow {
                     origin: [
-                        self.origin[0] + offset[0] - spread,
-                        self.origin[1] + offset[1] - spread,
+                        self.origin[0] + layer.offset[0] - layer.spread_radius,
+                        self.origin[1] + layer.offset[1] - layer.spread_radius,
                     ],
-                    size: [self.size[0] + 2.0 * spread, self.size[1] + 2.0 * spread],
-                    color: *rgba,
+                    size: [
+                        self.size[0] + 2.0 * layer.spread_radius,
+                        self.size[1] + 2.0 * layer.spread_radius,
+                    ],
+                    color: layer.color.1,
                     corner_radii: radii,
-                    blur_radius: *blur,
+                    blur_radius: layer.blur_radius,
                 },
-                hsla: *hsla,
+                hsla: layer.color.0,
             })
             .collect()
     }
@@ -772,7 +784,12 @@ fn card_tree_oracle() -> Vec<Painted> {
         border: Some(WHITE),
         corner_radii: [CARD_RADIUS; 4],
         border_widths: [CARD_BORDER; 4],
-        shadows: vec![(BLACK_QUARTER, [0.0, 6.0], 10.0, -2.0)],
+        shadows: vec![ShadowLayer {
+            color: BLACK_QUARTER,
+            offset: [0.0, 6.0],
+            blur_radius: 10.0,
+            spread_radius: -2.0,
+        }],
     }];
 
     for index in 0..ROW_COUNT {
@@ -819,8 +836,8 @@ fn phase_6_6_div_tree_gate() {
                 element.name
             );
         }
-        for ((hsla, rgba), ..) in &element.shadows {
-            assert_eq!(hsla_to_rgba(*hsla), *rgba);
+        for layer in &element.shadows {
+            assert_eq!(hsla_to_rgba(layer.color.0), layer.color.1);
         }
     }
 
