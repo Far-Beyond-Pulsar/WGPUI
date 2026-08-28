@@ -19,6 +19,46 @@
 // `FirstInstance::SlotBase` the uniform is zero and `first_instance` carries
 // the base instead, which is what a `multi_draw_indirect` needs. The expression
 // below is the same either way, which is the point.
+//
+// # Phase 6.6: the fragment shader is now a port, not a simplification
+//
+// Phases 1–6.3 shipped a deliberately hard-edged rounded-rectangle SDF here,
+// with a comment saying antialiasing was declined on purpose because "every
+// comparison this shader takes part in is a bit-exact one between two draw
+// paths." That reasoning was sound for those comparisons and wrong for this
+// one: §8's Phase 6.6 gate is byte-exactness against the *legacy renderer*, and
+// the legacy renderer antialiases. A hard-edged shader can never match it at a
+// rounded corner, so the discard-based version could not have passed the gate
+// under any amount of care on the emitting side.
+//
+// So `fragment_main` below is a transcription of `fs_quad` from
+// `src/platform/cross/shaders/quads.wgsl`, expression for expression, for the
+// case 2.0's `Quad` can express. `tests/legacy_quad_differential.rs` compiles
+// that legacy file itself and compares pixel for pixel, so the transcription is
+// checked rather than asserted.
+//
+// **What is transcribed and what is deliberately not**, named here rather than
+// discovered later. Not transcribed, because `wgpui_core::patch::primitive::Quad`
+// has no field for any of it:
+//
+// - Gradient and pattern backgrounds (`Background.tag` 1/2/3). 2.0's
+//   `background` is one solid straight-alpha RGBA, so the port takes the
+//   `gradient_color` `default:` arm — `return solid_color` — and nothing else.
+// - Dashed borders (`border_style == 1`). The port takes the solid arm.
+// - The per-fragment content mask. §5.2 sends the frame's clip to the occlusion
+//   pass instead, so there is no `clip_distances` to test.
+// - `hsla_to_rgba`. The legacy struct carries HSLA and converts in its vertex
+//   shader; 2.0 carries straight RGBA and the conversion happens on the CPU,
+//   before a colour ever reaches a slot.
+// - `premultiplied_alpha`. 2.0 has no equivalent flag; `blend_color` here is
+//   the legacy expression with `multiplier` fixed at 1.0, which is what the
+//   legacy shader itself computes when the flag is 0.
+//
+// Transcribed in full: `pick_corner_radius`, `quad_sdf_impl`,
+// `quarter_ellipse_sdf`, `over`, the `reduced_border` trick for zero-width
+// sides, both background fast paths, and the final
+// `mix`/`saturate(antialias_threshold - …)` composite. Those are the parts a
+// rounded, bordered, antialiased box actually depends on.
 
 struct Globals {
     // Framebuffer size in pixels.
@@ -37,14 +77,17 @@ struct SlotBase {
     padding_2: u32,
 };
 
-// 64 bytes, matching `wgpui_core::patch::primitive::Quad::SLOT_STRIDE` and the
+// 80 bytes, matching `wgpui_core::patch::primitive::Quad::SLOT_STRIDE` and the
 // field order `Quad::encode` writes.
 struct QuadSlot {
     origin_size: vec4<f32>,
     background: vec4<f32>,
     border_color: vec4<f32>,
-    // corner_radius, border_width, and two words of padding.
-    radius_width: vec4<f32>,
+    // Corner radii in the legacy `Corners` order: top-left, top-right,
+    // bottom-right, bottom-left.
+    corner_radii: vec4<f32>,
+    // Border widths in the legacy `Edges` order: top, right, bottom, left.
+    border_widths: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -94,25 +137,160 @@ fn vertex_main(
     return out;
 }
 
+// `pick_corner_radius`, transcribed. The quadrant test is `< 0.0` on both axes
+// and the order of the four radii is the legacy `Corners` field order, so a
+// point above-left of the centre takes `corner_radii.x`.
+fn pick_corner_radius(center_to_point: vec2<f32>, radii: vec4<f32>) -> f32 {
+    if center_to_point.x < 0.0 {
+        if center_to_point.y < 0.0 {
+            return radii.x;
+        } else {
+            return radii.w;
+        }
+    } else {
+        if center_to_point.y < 0.0 {
+            return radii.y;
+        } else {
+            return radii.z;
+        }
+    }
+}
+
+// `quad_sdf_impl`, transcribed.
+fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32) -> f32 {
+    if corner_radius == 0.0 {
+        return max(corner_center_to_point.x, corner_center_to_point.y);
+    } else {
+        let signed_distance_to_inset_quad =
+            length(max(vec2<f32>(0.0), corner_center_to_point)) +
+            min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
+
+        return signed_distance_to_inset_quad - corner_radius;
+    }
+}
+
+// `quarter_ellipse_sdf`, transcribed.
+fn quarter_ellipse_sdf(point: vec2<f32>, radii: vec2<f32>) -> f32 {
+    let circle_vec = point / radii;
+    let unit_circle_sdf = length(circle_vec) - 1.0;
+    return unit_circle_sdf * (radii.x + radii.y) * -0.5;
+}
+
+// `over`, transcribed.
+fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
+    let alpha = above.a + below.a * (1.0 - above.a);
+    let color = (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
+    return vec4<f32>(color, alpha);
+}
+
+// `blend_color`, transcribed with `premultiplied_alpha` fixed at 0 — see this
+// file's header for why 2.0 has no such flag and why 0 is the right constant.
+fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
+    let alpha = color.a * alpha_factor;
+    return vec4<f32>(color.rgb, alpha);
+}
+
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let quad = quads[in.arena_index];
-    let size = quad.origin_size.zw;
-    let half_size = size * 0.5;
-    let radius = min(quad.radius_width.x, min(half_size.x, half_size.y));
-    let border = quad.radius_width.y;
 
-    // Rounded-rectangle signed distance, positive outside. Hard-edged rather
-    // than antialiased on purpose: every comparison this shader takes part in
-    // is a bit-exact one between two draw paths, and a coverage ramp would make
-    // "identical" depend on rasterization order.
-    let centred = abs(in.local - half_size) - (half_size - vec2<f32>(radius, radius));
-    let distance = length(max(centred, vec2<f32>(0.0, 0.0))) - radius;
-    if (distance > 0.0) {
-        discard;
+    // 2.0's background is always solid, so `gradient_color`'s `default:` arm.
+    let background_color = quad.background;
+
+    let unrounded = quad.corner_radii.x == 0.0 &&
+        quad.corner_radii.y == 0.0 &&
+        quad.corner_radii.z == 0.0 &&
+        quad.corner_radii.w == 0.0;
+
+    // Fast path when the quad is not rounded and doesn't have any border.
+    if quad.border_widths.x == 0.0 &&
+            quad.border_widths.y == 0.0 &&
+            quad.border_widths.z == 0.0 &&
+            quad.border_widths.w == 0.0 &&
+            unrounded {
+        return blend_color(background_color, 1.0);
     }
-    if (border > 0.0 && distance > -border) {
-        return quad.border_color;
+
+    let size = quad.origin_size.zw;
+    let half_size = size / 2.0;
+    // `input.position.xy - quad.bounds.origin`, the legacy expression, and
+    // deliberately **not** the interpolated `local` varying this shader still
+    // carries for the unrounded fast path. The two are equal in exact
+    // arithmetic and are not obliged to be equal in floating point: one is a
+    // subtraction of two window coordinates, the other is a barycentric
+    // interpolation of a per-vertex value. Byte-exactness against the legacy
+    // renderer is decided at the antialiased corner, where a one-ULP difference
+    // in `point` is a different coverage value and a different byte.
+    let point = in.position.xy - quad.origin_size.xy;
+    let center_to_point = point - half_size;
+
+    let antialias_threshold = 0.5;
+
+    let corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+
+    // Width of the nearest borders. `Edges` order is top, right, bottom, left.
+    let border = vec2<f32>(
+        select(
+            quad.border_widths.y,
+            quad.border_widths.w,
+            center_to_point.x < 0.0
+        ),
+        select(
+            quad.border_widths.z,
+            quad.border_widths.x,
+            center_to_point.y < 0.0
+        )
+    );
+
+    // 0-width borders are reduced so that `inner_sdf >= antialias_threshold`.
+    let reduced_border = vec2<f32>(select(border.x, -antialias_threshold, border.x == 0.0),
+        select(border.y, -antialias_threshold, border.y == 0.0));
+
+    let corner_to_point = abs(center_to_point) - half_size;
+    let corner_center_to_point = corner_to_point + corner_radius;
+
+    let is_near_rounded_corner = corner_center_to_point.x >= 0.0 &&
+            corner_center_to_point.y >= 0.0;
+
+    let straight_border_inner_corner_to_point = corner_to_point + reduced_border;
+
+    let is_beyond_inner_straight_border = straight_border_inner_corner_to_point.x > 0.0 ||
+            straight_border_inner_corner_to_point.y > 0.0;
+
+    let is_within_inner_straight_border = straight_border_inner_corner_to_point.x < -antialias_threshold &&
+        straight_border_inner_corner_to_point.y < -antialias_threshold;
+
+    // Fast path for points that must be part of the background.
+    if is_within_inner_straight_border && !is_near_rounded_corner {
+        return blend_color(background_color, 1.0);
     }
-    return quad.background;
+
+    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+
+    var inner_sdf = 0.0;
+    if corner_center_to_point.x <= 0.0 || corner_center_to_point.y <= 0.0 {
+        inner_sdf = -max(straight_border_inner_corner_to_point.x,
+            straight_border_inner_corner_to_point.y);
+    } else if is_beyond_inner_straight_border {
+        inner_sdf = -1.0;
+    } else if reduced_border.x == reduced_border.y {
+        inner_sdf = -(outer_sdf + reduced_border.x);
+    } else {
+        let ellipse_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
+        inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+    }
+
+    let border_sdf = max(inner_sdf, outer_sdf);
+
+    var color = background_color;
+    if border_sdf < antialias_threshold {
+        let border_color = quad.border_color;
+        // Blend the border on top of the background and then linearly
+        // interpolate between the two as we slide inside the background.
+        let blended_border = over(background_color, border_color);
+        color = mix(background_color, blended_border,
+            saturate(antialias_threshold - inner_sdf));
+    }
+
+    return blend_color(color, saturate(antialias_threshold - outer_sdf));
 }

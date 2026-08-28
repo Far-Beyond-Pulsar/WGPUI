@@ -799,8 +799,8 @@ fn a_shadow_covered_by_an_opaque_quad_still_paints_its_falloff_outside_it() {
         size: [84.0, 68.0],
         background: [0.0, 0.0, 0.0, 1.0],
         border_color: [0.0, 0.0, 0.0, 1.0],
-        corner_radius: 0.0,
-        border_width: 0.0,
+        corner_radii: [0.0; 4],
+        border_widths: [0.0; 4],
     };
 
     let render = |with_shadow: bool| -> Vec<u8> {

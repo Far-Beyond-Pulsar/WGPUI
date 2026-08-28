@@ -389,8 +389,8 @@ mod tests {
             size: [10.0, 20.0],
             background: [value / 255.0, 0.5, 0.25, 1.0],
             border_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 4.0,
-            border_width: 1.0,
+            corner_radii: [4.0; 4],
+            border_widths: [1.0; 4],
         }
     }
 
@@ -679,7 +679,12 @@ mod tests {
 
         let layer_bytes = scene.quads.slab(layer).used_byte_range(Quad::SLOT_STRIDE);
         let layer_byte_count = layer_bytes.end - layer_bytes.start;
-        assert_eq!(layer_byte_count, 640_000);
+        // Derived from the stride rather than written out, because what this
+        // gate measures is the *ratio* between one slot and the layer, and a
+        // literal here would have to be edited every time the field set grows —
+        // which is how a phase widening `Quad` discovers it broke an unrelated
+        // gate rather than that it changed a constant.
+        assert_eq!(layer_byte_count, 10_000 * Quad::SLOT_STRIDE as u64);
         assert!(
             plan.byte_count() * 10_000 == layer_byte_count,
             "the delta must be 1/10,000th of the layer, which is the whole point"

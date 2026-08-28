@@ -587,8 +587,8 @@ impl Emit for SolidFill {
             size: [context.bounds.width, context.bounds.height],
             background: self.color,
             border_color: [0.0, 0.0, 0.0, 0.0],
-            corner_radius: 0.0,
-            border_width: 0.0,
+            corner_radii: [0.0; 4],
+            border_widths: [0.0; 4],
         });
     }
 }

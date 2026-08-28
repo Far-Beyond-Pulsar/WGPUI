@@ -166,7 +166,7 @@ fn paint(framebuffer: &mut Framebuffer, quad: &Quad) {
     // makes the painted area *larger* than the conservative opaque region,
     // which is the direction that keeps the harness sound.
     let radius = quad
-        .corner_radius
+        .max_corner_radius()
         .min(bounds.width() / 2.0)
         .max(0.0)
         .min(bounds.height() / 2.0);
@@ -187,7 +187,7 @@ fn paint(framebuffer: &mut Framebuffer, quad: &Quad) {
                 .min(bounds.max_x - sample_x)
                 .min(sample_y - bounds.min_y)
                 .min(bounds.max_y - sample_y);
-            let source = if edge_distance < quad.border_width {
+            let source = if edge_distance < quad.max_border_width() {
                 quad.border_color
             } else {
                 quad.background
@@ -247,8 +247,8 @@ mod tests {
             size: [width, height],
             background: [0.25, 0.5, 0.75, alpha],
             border_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 0.0,
-            border_width: 0.0,
+            corner_radii: [0.0; 4],
+            border_widths: [0.0; 4],
         }
     }
 
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn a_rounded_quad_leaves_its_corners_unpainted() {
         let mut rounded = quad(0.0, 0.0, 8.0, 8.0, 1.0);
-        rounded.corner_radius = 4.0;
+        rounded.corner_radii = [4.0; 4];
         let framebuffer = rasterize(&[rounded], &[0], None, 8, 8);
         assert_eq!(framebuffer.pixels.first().copied(), Some([0.0; 4]));
         assert_eq!(framebuffer.pixels.get(3 * 8 + 4).copied().map(|p| p[3]), Some(1.0));
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn a_border_paints_over_the_edge_band() {
         let mut bordered = quad(0.0, 0.0, 6.0, 6.0, 1.0);
-        bordered.border_width = 2.0;
+        bordered.border_widths = [2.0; 4];
         bordered.border_color = [1.0, 0.0, 0.0, 1.0];
         let framebuffer = rasterize(&[bordered], &[0], None, 6, 6);
         assert_eq!(

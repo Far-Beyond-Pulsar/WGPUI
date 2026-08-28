@@ -39,7 +39,26 @@ pub type LayoutStyle = taffy::style::Style;
 /// A width/height pair, as Taffy spells one.
 pub type LayoutSize<T> = TaffySize<T>;
 
-pub use taffy::style::{Dimension, Display, FlexDirection};
+/// A top/right/bottom/left quadruple, as Taffy spells one.
+///
+/// Named `LayoutSides` rather than `LayoutRect` because that name is already
+/// taken by the *computed* rectangle below, and Taffy's own `Rect` is neither —
+/// it is the four-sided value `padding`, `margin`, `border` and `inset` are all
+/// expressed as.
+pub type LayoutSides<T> = taffy::geometry::Rect<T>;
+
+/// Every style enum and length type `wgpui-widgets`' Tailwind surface has to
+/// name in order to build a [`LayoutStyle`].
+///
+/// Re-exported for the reason the module doc already gives for `LayoutStyle`
+/// itself: §10 rules a new layout DSL out of scope and §3.2 does not intend the
+/// `taffy` dependency to leak past this crate, so anything a caller must spell
+/// is spelled here once. Phase 6.6 widened this list from three names to the
+/// set a real `div()` builder needs; nothing about the policy changed.
+pub use taffy::style::{
+    AlignContent, AlignItems, BoxSizing, Dimension, Display, FlexDirection, FlexWrap,
+    LengthPercentage, LengthPercentageAuto, Overflow, Position,
+};
 
 /// The available space for a subtree with a known width and height.
 ///

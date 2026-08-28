@@ -266,9 +266,25 @@ impl<'a> SlotWriter<'a> {
 /// A fixed-size, rounded, bordered rectangle — the representative
 /// **fixed-size** primitive kind (one slab slot, always).
 ///
-/// Field set is the subset of the legacy renderer's quad that matters for
-/// exercising the protocol; it is not a port of that struct, and Phase 1 does
-/// not draw it anywhere.
+/// # What Phase 6.6 widened, and why
+///
+/// Phase 1 gave this type one uniform corner radius and one uniform border
+/// width, on the stated grounds that the field set was "a subset ... that
+/// matters for exercising the protocol." Phase 6.6 is the phase where something
+/// real emits it, and the real thing is [`crate::patch::primitive::Quad`]'s
+/// legacy counterpart (`src/scene.rs`'s `Quad`), which carries four radii and
+/// four widths because the Tailwind surface `wgpui-widgets` presents
+/// (`rounded_t_md`, `border_b_1`) is per-corner and per-side. A uniform radius
+/// cannot express those, and the alternative — emitting extra plain quads to
+/// fake one rounded side — is not what the legacy renderer draws, so it could
+/// never be byte-exact against it.
+///
+/// What is still deliberately absent, and named rather than implied: a gradient
+/// or pattern background (2.0's `background` is one solid straight-alpha RGBA),
+/// a border style (the legacy dashed-border branch), a content mask (§5.2 sends
+/// the clip to the occlusion pass instead), and an element-opacity field
+/// (folded into the colours by whoever builds the quad, exactly as
+/// `quad_coverage_item` already documents).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quad {
     /// Top-left corner in the owning layer's coordinate space.
@@ -279,13 +295,37 @@ pub struct Quad {
     pub background: [f32; 4],
     /// Straight-alpha RGBA border.
     pub border_color: [f32; 4],
-    /// Uniform corner radius.
-    pub corner_radius: f32,
-    /// Uniform border width.
-    pub border_width: f32,
+    /// Corner radii, in the legacy `Corners` order: top-left, top-right,
+    /// bottom-right, bottom-left.
+    ///
+    /// The order matters and is not arbitrary — it is the order the legacy
+    /// `Corners<T>` struct declares its fields in, which is the order its WGSL
+    /// counterpart reads them in, so a quad built here and a quad built there
+    /// select the same radius in the same quadrant.
+    pub corner_radii: [f32; 4],
+    /// Border widths, in the legacy `Edges` order: top, right, bottom, left.
+    pub border_widths: [f32; 4],
 }
 
 impl Quad {
+    /// Index of the top-left radius in [`Quad::corner_radii`].
+    pub const TOP_LEFT: usize = 0;
+    /// Index of the top-right radius in [`Quad::corner_radii`].
+    pub const TOP_RIGHT: usize = 1;
+    /// Index of the bottom-right radius in [`Quad::corner_radii`].
+    pub const BOTTOM_RIGHT: usize = 2;
+    /// Index of the bottom-left radius in [`Quad::corner_radii`].
+    pub const BOTTOM_LEFT: usize = 3;
+
+    /// Index of the top width in [`Quad::border_widths`].
+    pub const TOP: usize = 0;
+    /// Index of the right width in [`Quad::border_widths`].
+    pub const RIGHT: usize = 1;
+    /// Index of the bottom width in [`Quad::border_widths`].
+    pub const BOTTOM: usize = 2;
+    /// Index of the left width in [`Quad::border_widths`].
+    pub const LEFT: usize = 3;
+
     /// A zero-sized, fully transparent quad — a convenient starting point for
     /// tests and for callers building a quad field by field.
     pub const ZERO: Quad = Quad {
@@ -293,19 +333,33 @@ impl Quad {
         size: [0.0, 0.0],
         background: [0.0, 0.0, 0.0, 0.0],
         border_color: [0.0, 0.0, 0.0, 0.0],
-        corner_radius: 0.0,
-        border_width: 0.0,
+        corner_radii: [0.0; 4],
+        border_widths: [0.0; 4],
     };
+
+    /// The largest of the four corner radii.
+    ///
+    /// What occlusion insets by (§5.2): a rounded corner is the one part of a
+    /// quad's rectangle that is not covered, so the inset has to assume the
+    /// worst corner rather than an average of them.
+    pub fn max_corner_radius(&self) -> f32 {
+        self.corner_radii.iter().copied().fold(0.0, f32::max)
+    }
+
+    /// The largest of the four border widths.
+    pub fn max_border_width(&self) -> f32 {
+        self.border_widths.iter().copied().fold(0.0, f32::max)
+    }
 }
 
 impl Primitive for Quad {
     const KIND: PrimitiveKind = PrimitiveKind::Quad;
 
-    // 56 bytes of payload, padded to 64 so a slot boundary is also a 16-byte
-    // std430 boundary — the layout a storage-buffer vertex-pulling shader
-    // (§1's finding: the renderer already pulls per-instance data this way)
-    // reads without a per-field alignment fixup.
-    const SLOT_STRIDE: usize = 64;
+    // 80 bytes of payload, which is already a multiple of 16 and so needs no
+    // tail padding — the reason Phase 1's 56-byte payload was padded to 64.
+    // Phase 6.6 grew it from 64 by replacing two scalars with two `vec4<f32>`s;
+    // the shader reads the same five 16-byte rows it always did, plus one more.
+    const SLOT_STRIDE: usize = 80;
 
     fn slot_count(&self) -> u32 {
         1
@@ -317,9 +371,8 @@ impl Primitive for Quad {
         writer.write_f32_array(self.size)?;
         writer.write_f32_array(self.background)?;
         writer.write_f32_array(self.border_color)?;
-        writer.write_f32(self.corner_radius)?;
-        writer.write_f32(self.border_width)?;
-        writer.write_padding(8)?;
+        writer.write_f32_array(self.corner_radii)?;
+        writer.write_f32_array(self.border_widths)?;
         writer.finish()
     }
 }
@@ -808,15 +861,24 @@ mod tests {
             size: [3.0, 4.0],
             background: [0.1, 0.2, 0.3, 1.0],
             border_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 5.0,
-            border_width: 1.5,
+            corner_radii: [5.0, 6.0, 7.0, 8.0],
+            border_widths: [1.5, 2.5, 3.5, 4.5],
         };
         assert_eq!(quad.slot_count(), 1);
         assert!(quad.encode(&mut bytes).is_ok());
         assert_eq!(&bytes[0..4], &1.0f32.to_le_bytes());
-        // Padding must be zeroed, not left as the caller's fill pattern, or
-        // two encodings of equal values would not produce equal bytes.
-        assert_eq!(&bytes[56..64], &[0u8; 8]);
+        // Each of the four radii and four widths must reach its own word, in
+        // declaration order: the shader's `pick_corner_radius` selects by
+        // quadrant, so a transposed pair rounds the wrong corner and nothing
+        // about the total byte count would notice.
+        assert_eq!(&bytes[48..52], &5.0f32.to_le_bytes());
+        assert_eq!(&bytes[52..56], &6.0f32.to_le_bytes());
+        assert_eq!(&bytes[56..60], &7.0f32.to_le_bytes());
+        assert_eq!(&bytes[60..64], &8.0f32.to_le_bytes());
+        assert_eq!(&bytes[64..68], &1.5f32.to_le_bytes());
+        assert_eq!(&bytes[76..80], &4.5f32.to_le_bytes());
+        assert_eq!(quad.max_corner_radius(), 8.0);
+        assert_eq!(quad.max_border_width(), 4.5);
     }
 
     #[test]

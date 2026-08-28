@@ -10,6 +10,7 @@ pub mod img;
 pub mod list;
 pub mod overlay;
 pub mod scroll;
+pub mod styled;
 pub mod styled_text;
 pub mod surface;
 pub mod svg;

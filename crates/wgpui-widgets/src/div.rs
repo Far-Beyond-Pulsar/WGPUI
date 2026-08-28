@@ -1,14 +1,511 @@
+//! `Div` — the element nearly every example in this repository is built out of.
+//! See docs/gpu-native-architecture.md §3.4 and §8's Phase 6.6 row.
+//!
+//! # What Phase 6.6 built here, and what it deliberately left for later
+//!
+//! Before this phase `div.rs` and its four submodules were 33 lines in total: a
+//! `pub struct Div;` with no fields, no builder, no emission and no layout. Five
+//! render pipelines could draw quads, glyph runs, sprites, shadows and
+//! underlines byte-exactly, and almost nothing in `2.0` produced any of them,
+//! because the element vocabulary that decides *what* to emit did not exist.
+//! This file is that vocabulary for the one element that matters most.
+//!
+//! What is real here: a Tailwind-style builder ([`crate::styled::Styled`]), a
+//! resolved paint style that turns into `Quad`/`Shadow` patches
+//! ([`interactivity::style::DivStyle`]), children, real Taffy layout through
+//! `Description`'s existing `.style()`/`.children()` mechanism, and a
+//! `ReconcileKey` split by what a change actually affects
+//! ([`diff::DivDiffKey`]).
+//!
+//! What is **not** here, named rather than implied, because §8's Phase 6.6 row
+//! scopes it out explicitly and a half-built version would be worse than an
+//! absent one:
+//!
+//! - `:hover` / `:active` / `:focus`. These need a cascade *above* `DivStyle`
+//!   and a hit-test to drive it, and the hit-test needs the input plumbing
+//!   §3.4's `div/interactivity/hitbox.rs` is a placeholder for.
+//! - Mouse and keyboard event binding (`InteractiveElement`, today's ~456-line
+//!   trait block). `div/events.rs` is still a placeholder.
+//! - Scroll containers. `Description::scroll_offset` already carries a
+//!   displacement and `.boundary()` already resolves one to a layer transform
+//!   (Phase 2), so the *mechanism* exists; what does not is a `ScrollHandle`
+//!   deciding what the offset should be, which is `div/scroll_state.rs`.
+//!
+//! # Why `describe` consumes `self`
+//!
+//! A `Description`'s children are `Description`s, and a `Description` is not
+//! `Clone` (it owns a `Box<dyn ReconcileKey>` and a `Box<dyn Emit>`). So a `Div`
+//! holding built children can only hand them over by move. That matches the
+//! legacy shape rather than departing from it: `RenderOnce::render` takes
+//! `self` for the same reason, and `AGENTS.md` describes elements as values
+//! constructed per frame and turned into a tree once.
+
 //! `Div`, `DivFrameState`/`DivPrepaintState` — the small remainder once
 //! `div.rs`'s four seams (event-binding, interactivity, the `Element` impl,
 //! scroll/click retained state) move to their own files.
 //! See docs/gpu-native-architecture.md §3.4.
-#![allow(dead_code)]
 
 pub mod diff;
 pub mod events;
 pub mod interactivity;
 pub mod scroll_state;
 
-/// Placeholder for `Div`'s own `Element` impl plus reconciliation
-/// fingerprint. Empty at Phase 0.
-pub struct Div;
+use crate::div::diff::DivDiffKey;
+use crate::div::interactivity::style::DivStyle;
+use crate::styled::Styled;
+use wgpui_core::patch::emit::{EmitContext, Emission};
+use wgpui_core::reconcile::description::{Description, ElementId};
+
+/// Anything that can become one node of a description tree.
+///
+/// The 2.0 counterpart of `IntoElement`, reduced to what `wgpui-core` actually
+/// consumes. It exists so `div().child(other_div)` reads the way the legacy API
+/// does instead of obliging every call site to write `.describe()`; the blanket
+/// `Description` impl means an element with its own `describe` still composes
+/// without implementing anything.
+pub trait IntoDescription {
+    /// This value as one description-tree node.
+    fn into_description(self) -> Description;
+}
+
+impl IntoDescription for Description {
+    fn into_description(self) -> Description {
+        self
+    }
+}
+
+/// A styled, laid-out box with children — `div()`.
+pub struct Div {
+    element_id: Option<ElementId>,
+    style: DivStyle,
+    children: Vec<Description>,
+    boundary: bool,
+    uncached: bool,
+    scroll_offset: [f32; 2],
+}
+
+/// A new, unstyled, childless `div`.
+///
+/// Free function rather than `Div::new`, matching the legacy API exactly: this
+/// name appears in every example in the repository and §7 freezes it.
+pub fn div() -> Div {
+    Div {
+        element_id: None,
+        style: DivStyle::default(),
+        children: Vec::new(),
+        boundary: false,
+        uncached: false,
+        scroll_offset: [0.0, 0.0],
+    }
+}
+
+impl Default for Div {
+    fn default() -> Self {
+        div()
+    }
+}
+
+impl Div {
+    /// Give this element an explicit identity, so it keeps its instance across a
+    /// sibling reorder.
+    ///
+    /// Optional, and that is the whole point of §4.0: identity is positional by
+    /// default (SFD §1.0), so a tree that never calls this still reconciles.
+    pub fn id(mut self, element_id: impl Into<ElementId>) -> Self {
+        self.element_id = Some(element_id.into());
+        self
+    }
+
+    /// Append one child.
+    pub fn child(mut self, child: impl IntoDescription) -> Self {
+        self.children.push(child.into_description());
+        self
+    }
+
+    /// Append several children.
+    pub fn children<C: IntoDescription>(mut self, children: impl IntoIterator<Item = C>) -> Self {
+        self.children
+            .extend(children.into_iter().map(IntoDescription::into_description));
+        self
+    }
+
+    /// Make this element a compositing boundary (§4.1).
+    pub fn boundary(mut self) -> Self {
+        self.boundary = true;
+        self
+    }
+
+    /// Opt this element and its subtree out of reconciliation (§4.2).
+    pub fn uncached(mut self) -> Self {
+        self.uncached = true;
+        self
+    }
+
+    /// Displace this element's children by `offset`.
+    ///
+    /// The raw mechanism, not a scroll container: nothing here decides what the
+    /// offset should be, subscribes to a wheel event, or clamps to a content
+    /// extent. That is `div/scroll_state.rs`'s job and it is out of scope for
+    /// this phase — see this module's doc. Exposed anyway because
+    /// `Description::scroll_offset` has carried it since Phase 1 and a `Div`
+    /// that could not reach it would make Phase 2's boundary gates unreachable
+    /// from a real element.
+    pub fn scroll_offset(mut self, offset: [f32; 2]) -> Self {
+        self.scroll_offset = offset;
+        self
+    }
+
+    /// This `div`'s resolved style, for tests and for an inspector.
+    pub fn div_style(&self) -> &DivStyle {
+        &self.style
+    }
+
+    /// How many children this `div` holds.
+    pub fn child_count(&self) -> usize {
+        self.children.len()
+    }
+
+    /// This frame's fingerprint.
+    pub fn diff_key(&self) -> DivDiffKey {
+        DivDiffKey::new(self.style.clone(), self.children.len())
+    }
+
+    /// The per-frame description of this `div` and its subtree.
+    pub fn describe(self) -> Description {
+        let Div {
+            element_id,
+            style,
+            children,
+            boundary,
+            uncached,
+            scroll_offset,
+        } = self;
+
+        let key = DivDiffKey::new(style.clone(), children.len());
+        let layout_style = style.layout.clone();
+        let paint = style;
+
+        let mut description = Description::new::<Div>()
+            .diff_key(key)
+            .style(layout_style)
+            .scroll_offset(scroll_offset)
+            .children(children);
+
+        if let Some(element_id) = element_id {
+            description = description.id(element_id);
+        }
+        if boundary {
+            description = description.boundary();
+        }
+        if uncached {
+            description = description.uncached();
+        }
+
+        // An element that paints nothing gets no emitter at all rather than one
+        // that writes an empty emission. The distinction is load-bearing:
+        // `Emitter::emit` counts an element with an emitter as visited-and-
+        // skipped and an element without one as not emitting, and a grouping
+        // `div` — most of a real tree — should be the second.
+        if paint.primitive_count() == 0 {
+            return description;
+        }
+        description.emit(move |context: &EmitContext, emission: &mut Emission| {
+            paint.paint(context.bounds, emission);
+        })
+    }
+}
+
+impl IntoDescription for Div {
+    fn into_description(self) -> Description {
+        self.describe()
+    }
+}
+
+impl Styled for Div {
+    fn style(&mut self) -> &mut DivStyle {
+        &mut self.style
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::div::interactivity::style::{Corners, Edges};
+    use wgpui_core::invalidation::request::FrameSignals;
+    use wgpui_core::patch::apply::apply;
+    use wgpui_core::patch::emit::{EmitError, Emitter};
+    use wgpui_core::reconcile::plan::NodeOutcome;
+    use wgpui_core::reconcile::instance::InstanceKey;
+    use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
+    use wgpui_core::scene::Scene;
+    use wgpui_core::scene::layer::{BoundaryId, LayerId, LayerKey};
+    use wgpui_layout::taffy_tree::{LayoutTree, definite};
+
+    const VIEWPORT: [f32; 2] = [400.0, 300.0];
+
+    #[derive(Debug)]
+    enum FrameError {
+        Reconcile(ReconcileError),
+        Emit(EmitError),
+        Patch(wgpui_core::patch::PatchError),
+    }
+
+    impl From<ReconcileError> for FrameError {
+        fn from(error: ReconcileError) -> Self {
+            FrameError::Reconcile(error)
+        }
+    }
+    impl From<EmitError> for FrameError {
+        fn from(error: EmitError) -> Self {
+            FrameError::Emit(error)
+        }
+    }
+    impl From<wgpui_core::patch::PatchError> for FrameError {
+        fn from(error: wgpui_core::patch::PatchError) -> Self {
+            FrameError::Patch(error)
+        }
+    }
+
+    /// Everything one window holds across frames, so these tests drive real
+    /// frames rather than asserting on intermediate values.
+    struct Window {
+        reconciler: Reconciler,
+        layout: LayoutTree,
+        emitter: Emitter,
+        scene: Scene,
+    }
+
+    impl Window {
+        fn new() -> Self {
+            Self {
+                reconciler: Reconciler::new(),
+                layout: LayoutTree::new(),
+                emitter: Emitter::new(),
+                scene: Scene::new(),
+            }
+        }
+
+        fn draw(&mut self, root: Div) -> Result<Frame, FrameError> {
+            let plan = self
+                .reconciler
+                .reconcile(root.describe(), &mut self.layout)?;
+            let node = plan
+                .root()
+                .map(|node| node.layout_node)
+                .ok_or(EmitError::MalformedPlan { index: 0, depth: 0 })?;
+            self.layout
+                .compute_layout(node, definite(VIEWPORT[0], VIEWPORT[1]))
+                .map_err(EmitError::from)?;
+            let emission =
+                self.emitter
+                    .emit(&plan, &self.layout, &FrameSignals::new(), &mut self.scene)?;
+            apply(&mut self.scene, &emission.patch)?;
+            Ok(Frame {
+                outcomes: plan
+                    .nodes()
+                    .iter()
+                    .map(|node| (node.address, node.outcome))
+                    .collect(),
+                emitted: emission.stats.nodes_emitted,
+                updated: emission.stats.records_updated,
+                inserted: emission.stats.records_inserted,
+                layout_created: self.layout.stats().nodes_created,
+                layout_reused: self.layout.stats().nodes_reused,
+            })
+        }
+    }
+
+    struct Frame {
+        outcomes: Vec<(InstanceKey, NodeOutcome)>,
+        emitted: usize,
+        updated: usize,
+        inserted: usize,
+        layout_created: usize,
+        layout_reused: usize,
+    }
+
+    impl Frame {
+        fn outcome_at(&self, path: &[ElementId]) -> Option<NodeOutcome> {
+            let address = InstanceKey::from_path(path);
+            self.outcomes
+                .iter()
+                .find(|(key, _)| *key == address)
+                .map(|(_, outcome)| *outcome)
+        }
+    }
+
+    fn root_layer() -> LayerId {
+        LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT))
+    }
+
+    /// The root layer's resident quads, in paint order.
+    fn quads(window: &Window) -> Vec<wgpui_core::patch::primitive::Quad> {
+        window
+            .scene
+            .quads
+            .keys(root_layer())
+            .into_iter()
+            .filter_map(|key| window.scene.quads.get(root_layer(), key).copied())
+            .collect()
+    }
+
+    fn card() -> Div {
+        div()
+            .w(200.0)
+            .h(120.0)
+            .bg([0.2, 0.3, 0.4, 1.0])
+            .border_color([1.0, 1.0, 1.0, 1.0])
+            .border_1()
+            .rounded_md()
+    }
+
+    #[test]
+    fn a_styled_childless_div_emits_its_background_and_border() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        window.draw(card())?;
+
+        assert_eq!(window.scene.quads.len(root_layer()), 2);
+        let quads = quads(&window);
+        assert_eq!(quads[0].background, [0.2, 0.3, 0.4, 1.0]);
+        assert_eq!(quads[0].size, [200.0, 120.0]);
+        assert_eq!(quads[0].corner_radii, [6.0; 4]);
+        assert_eq!(quads[1].border_widths, [1.0; 4]);
+        assert_eq!(quads[1].border_color, [1.0, 1.0, 1.0, 1.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unstyled_div_emits_nothing_and_still_lays_out() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let frame = window.draw(div().w(100.0).h(100.0).child(card()))?;
+        assert_eq!(
+            window.scene.quads.len(root_layer()),
+            2,
+            "the grouping div contributes no primitives of its own"
+        );
+        assert_eq!(frame.emitted, 1);
+        assert_eq!(
+            frame.layout_created, 2,
+            "it still gets a Taffy node, because its children hang off it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_identical_second_frame_reuses_everything_and_uploads_nothing()
+    -> Result<(), FrameError> {
+        let mut window = Window::new();
+        window.draw(card())?;
+        let settled = window.draw(card())?;
+        assert_eq!(settled.outcome_at(&[ElementId::Slot(0)]), Some(NodeOutcome::Reused));
+        assert_eq!(settled.emitted, 0, "a clean, unmoved div must not re-emit");
+        assert_eq!(settled.inserted, 0);
+        assert_eq!(settled.updated, 0);
+        assert_eq!(settled.layout_created, 0);
+        assert_eq!(settled.layout_reused, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_recolour_updates_the_same_records_in_place() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        window.draw(card())?;
+        let keys = window.scene.quads.keys(root_layer());
+
+        let recoloured = window.draw(card().bg([1.0, 0.0, 0.0, 1.0]))?;
+        assert_eq!(recoloured.updated, 2, "two quads, each at its own ordinal");
+        assert_eq!(recoloured.inserted, 0);
+        assert_eq!(
+            window.scene.quads.keys(root_layer()),
+            keys,
+            "a stable emission order means stable per-primitive addresses (§5.0)"
+        );
+        assert_eq!(
+            quads(&window)[0].background,
+            [1.0, 0.0, 0.0, 1.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adding_a_background_inserts_a_record_rather_than_updating_one()
+    -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let bare = || div().w(200.0).h(120.0).border_color([1.0; 4]).border_1();
+        window.draw(bare())?;
+        assert_eq!(window.scene.quads.len(root_layer()), 1);
+
+        // The background is emitted *before* the border, so gaining one shifts
+        // the border to ordinal 1 — an insert plus an update, not one insert.
+        let grown = window.draw(bare().bg([0.0, 1.0, 0.0, 1.0]))?;
+        assert_eq!(window.scene.quads.len(root_layer()), 2);
+        assert_eq!(grown.inserted, 1);
+        assert_eq!(grown.updated, 1);
+        let quads = quads(&window);
+        assert_eq!(quads[0].background, [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(quads[1].border_widths, [1.0; 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_builder_reaches_every_field_the_paint_path_reads() {
+        let styled = div()
+            .bg([0.1, 0.2, 0.3, 0.4])
+            .border_color([0.5, 0.6, 0.7, 0.8])
+            .border_b(3.0)
+            .rounded_t(9.0)
+            .shadow_sm();
+        let style = styled.div_style();
+        assert_eq!(style.background, Some([0.1, 0.2, 0.3, 0.4]));
+        assert_eq!(style.border_color, Some([0.5, 0.6, 0.7, 0.8]));
+        assert_eq!(
+            style.border_widths,
+            Edges {
+                bottom: 3.0,
+                ..Edges::default()
+            }
+        );
+        assert_eq!(
+            style.corner_radii,
+            Corners {
+                top_left: 9.0,
+                top_right: 9.0,
+                ..Corners::default()
+            }
+        );
+        assert_eq!(style.box_shadow.len(), 2);
+        assert_eq!(
+            style.primitive_count(),
+            4,
+            "two shadow layers, one background, one border"
+        );
+    }
+
+    #[test]
+    fn an_explicit_id_survives_a_sibling_reorder_and_a_positional_one_does_not()
+    -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let tree = |swapped: bool| {
+            let first = card().id("first");
+            let second = card().id("second").bg([1.0, 0.0, 0.0, 1.0]);
+            let row = div().w(400.0).h(300.0).flex_row();
+            if swapped {
+                row.child(second).child(first)
+            } else {
+                row.child(first).child(second)
+            }
+        };
+        window.draw(tree(false))?;
+        let swapped = window.draw(tree(true))?;
+        assert_eq!(
+            swapped.outcome_at(&[ElementId::Slot(0), ElementId::from("first")]),
+            Some(NodeOutcome::Reused),
+            "a named child must keep its instance across a reorder"
+        );
+        assert_eq!(
+            swapped.outcome_at(&[ElementId::Slot(0), ElementId::from("second")]),
+            Some(NodeOutcome::Reused)
+        );
+        Ok(())
+    }
+}

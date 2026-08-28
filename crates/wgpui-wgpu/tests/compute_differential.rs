@@ -214,8 +214,8 @@ fn the_compute_passes_agree_with_a_hand_computed_answer() {
             size: [100.0 + 2.0 * index as f32, 100.0 + 2.0 * index as f32],
             background: [0.2, 0.3, 0.4, 1.0],
             border_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 0.0,
-            border_width: 0.0,
+            corner_radii: [0.0; 4],
+            border_widths: [0.0; 4],
         })
         .collect();
 

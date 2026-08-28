@@ -203,8 +203,8 @@ fn plain(bounds: Rect, background: [f32; 4]) -> Quad {
         size: [bounds.width(), bounds.height()],
         background,
         border_color: [0.0, 0.0, 0.0, 0.0],
-        corner_radius: 0.0,
-        border_width: 0.0,
+        corner_radii: [0.0; 4],
+        border_widths: [0.0; 4],
     }
 }
 
@@ -276,8 +276,8 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
             size: [icon, icon],
             background: solid(0.55, 0.62, 0.35),
             border_color: [0.0, 0.0, 0.0, 0.0],
-            corner_radius: (4.0 * scale).max(0.0),
-            border_width: 0.0,
+            corner_radii: [(4.0 * scale).max(0.0); 4],
+            border_widths: [0.0; 4],
         });
         // A label bar standing in for shaped text: translucent, never occludes.
         let label_left = 26.0 * scale;
@@ -339,8 +339,8 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
             size: [node_width, node_height],
             background: solid(0.19, 0.20, 0.24),
             border_color: translucent(0.55, 0.58, 0.66, 0.5),
-            corner_radius: 6.0 * scale,
-            border_width: 1.0 * scale,
+            corner_radii: [6.0 * scale; 4],
+            border_widths: [1.0 * scale; 4],
         });
         quads.push(plain(
             rect(
@@ -361,8 +361,8 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
                 size: [port, port],
                 background: solid(0.72, 0.66, 0.30),
                 border_color: [0.0, 0.0, 0.0, 0.0],
-                corner_radius: port * 0.5,
-                border_width: 0.0,
+                corner_radii: [port * 0.5; 4],
+                border_widths: [0.0; 4],
             });
         }
     }
@@ -418,8 +418,8 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
             size: [dialog.width(), dialog.height()],
             background: solid(0.17, 0.17, 0.21),
             border_color: [0.0, 0.0, 0.0, 0.0],
-            corner_radius: 8.0,
-            border_width: 0.0,
+            corner_radii: [8.0; 4],
+            border_widths: [0.0; 4],
         });
         quads.push(plain(
             rect(dialog.min_x, dialog.min_y + 40.0, dialog.width(), 1.0),
@@ -895,8 +895,8 @@ impl NodeGraph {
                         size: [body.width(), body.height()],
                         background: solid(0.19, 0.20, 0.24),
                         border_color: translucent(0.55, 0.58, 0.66, 0.5),
-                        corner_radius: 6.0,
-                        border_width: 1.0,
+                        corner_radii: [6.0; 4],
+                        border_widths: [1.0; 4],
                     },
                 );
                 let header = rect(x + 6.0, y + 6.0, GRAPH_NODE_WIDTH - 12.0, 16.0);
@@ -910,8 +910,8 @@ impl NodeGraph {
                             size: [port.width(), port.height()],
                             background: solid(0.72, 0.66, 0.30),
                             border_color: [0.0, 0.0, 0.0, 0.0],
-                            corner_radius: 4.0,
-                            border_width: 0.0,
+                            corner_radii: [4.0; 4],
+                            border_widths: [0.0; 4],
                         },
                     );
                 }
@@ -1275,12 +1275,12 @@ mod tests {
             "no translucent primitive: the alpha rule is untested"
         );
         assert!(
-            frame.quads.iter().any(|quad| quad.corner_radius > 0.0
+            frame.quads.iter().any(|quad| quad.max_corner_radius() > 0.0
                 && quad.background[3] >= 1.0),
             "no rounded opaque primitive: the corner-radius inset is untested"
         );
         assert!(
-            frame.quads.iter().any(|quad| quad.border_width > 0.0
+            frame.quads.iter().any(|quad| quad.max_border_width() > 0.0
                 && quad.border_color[3] < 1.0
                 && quad.background[3] >= 1.0),
             "no translucent-bordered opaque primitive: the border inset is untested"
@@ -1620,7 +1620,7 @@ mod tests {
             .quads
             .iter()
             .zip(frame.coverage_items())
-            .find(|(quad, _)| quad.corner_radius == 4.0 && quad.size == [14.0, 14.0])
+            .find(|(quad, _)| quad.max_corner_radius() == 4.0 && quad.size == [14.0, 14.0])
             .and_then(|(_, item)| item.opaque);
         assert_eq!(
             inset.map(|region| (region.width(), region.height())),

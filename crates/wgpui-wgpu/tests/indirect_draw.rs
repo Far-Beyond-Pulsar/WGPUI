@@ -716,7 +716,7 @@ fn chrome_quad(spec: &UiSceneSpec) -> Quad {
         size: [spec.width, 24.0],
         background: [0.15, 0.16, 0.2, 1.0],
         border_color: [0.0, 0.0, 0.0, 0.0],
-        corner_radius: 0.0,
-        border_width: 0.0,
+        corner_radii: [0.0; 4],
+        border_widths: [0.0; 4],
     }
 }

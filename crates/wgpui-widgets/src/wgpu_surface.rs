@@ -211,7 +211,7 @@ impl WgpuSurface {
                     origin: [context.bounds.x, context.bounds.y],
                     size: [context.bounds.width, context.bounds.height],
                     background: [0.0, 0.0, 0.0, opacity],
-                    corner_radius,
+                    corner_radii: [corner_radius; 4],
                     ..Quad::ZERO
                 });
             })

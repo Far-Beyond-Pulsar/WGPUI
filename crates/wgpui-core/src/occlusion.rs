@@ -441,9 +441,9 @@ pub fn quad_coverage_item(quad: &Quad, clip: Rect, protected: bool) -> CoverageI
         background_is_solid: true,
         background_alpha: quad.background[3],
         element_opacity: 1.0,
-        max_corner_radius: quad.corner_radius,
+        max_corner_radius: quad.max_corner_radius(),
         border_is_opaque: quad.border_color[3] >= 1.0,
-        max_border_width: quad.border_width,
+        max_border_width: quad.max_border_width(),
         has_backdrop_filter: false,
     };
     CoverageItem {
@@ -699,8 +699,8 @@ mod tests {
             size: [100.0, 100.0],
             background: [0.0, 0.0, 0.0, 1.0],
             border_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 15.0,
-            border_width: 0.0,
+            corner_radii: [15.0; 4],
+            border_widths: [0.0; 4],
         };
         let items = [
             CoverageItem::cullee(rect(0.0, 0.0, 100.0, 100.0)),
@@ -720,8 +720,8 @@ mod tests {
             size: [100.0, 100.0],
             background: [0.2, 0.2, 0.2, 1.0],
             border_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 0.0,
-            border_width: 0.0,
+            corner_radii: [0.0; 4],
+            border_widths: [0.0; 4],
         };
         let items = [
             CoverageItem::cullee(rect(0.0, 0.0, 100.0, 100.0)),
@@ -737,8 +737,8 @@ mod tests {
             size: [100.0, 100.0],
             background: [0.2, 0.2, 0.2, 0.9],
             border_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 0.0,
-            border_width: 0.0,
+            corner_radii: [0.0; 4],
+            border_widths: [0.0; 4],
         };
         let item = quad_coverage_item(&quad, unclipped(), false);
         assert_eq!(item.opaque, None);
@@ -751,8 +751,8 @@ mod tests {
             size: [100.0, 100.0],
             background: [0.2, 0.2, 0.2, 1.0],
             border_color: [0.0, 0.0, 0.0, 1.0],
-            corner_radius: 0.0,
-            border_width: 0.0,
+            corner_radii: [0.0; 4],
+            border_widths: [0.0; 4],
         };
         let item = quad_coverage_item(&quad, rect(25.0, 25.0, 25.0, 25.0), false);
         assert_eq!(item.visible, rect(25.0, 25.0, 25.0, 25.0));
