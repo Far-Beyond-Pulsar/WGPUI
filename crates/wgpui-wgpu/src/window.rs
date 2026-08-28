@@ -127,7 +127,7 @@ pub enum SurfaceFormatChoice {
 /// How a frame acquisition ended.
 ///
 /// Three outcomes rather than two, for the same reason
-/// `DrawStats::glyph_slots_unavailable` exists in Phase 5.6: "the window could
+/// `DrawStats::sprite_slots_unavailable` exists in Phase 5.6: "the window could
 /// not be drawn to" is genuinely not "the draw was skipped" and genuinely not
 /// "an error occurred", and collapsing it into either would make the loop's own
 /// counters lie about what happened.

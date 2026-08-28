@@ -2,12 +2,13 @@
 //! quads/shadows/.../paths pipeline construction in `src/renderer.rs`).
 //! See docs/gpu-native-architecture.md §3.5.
 //!
-//! # Three pipelines, not eight, and why that is not a shortcut
+//! # Four pipelines, not eight, and why that is not a shortcut
 //!
 //! The legacy renderer has eight (`quads`, `shadows`, `mono_sprites`,
 //! `poly_sprites`, `paths`, `underlines`, `backdrop_blur`, `surfaces`). Phase 4
-//! built two — [`QuadPipeline`] and [`CompositePipeline`] — and Phase 5.6 adds
-//! the third, [`MonoSpritePipeline`].
+//! built two — [`QuadPipeline`] and [`CompositePipeline`] — Phase 5.6 added the
+//! third, [`MonoSpritePipeline`], and Phase 6.2 the fourth,
+//! [`PolySpritePipeline`].
 //!
 //! That is the same ratio Phase 1 chose for primitive kinds and for the same
 //! reason (`patch/primitive.rs`'s module doc: two kinds because they are the
@@ -28,14 +29,28 @@
 //!   change inside a draw call, so "which page" has to become part of how the
 //!   draw sequence is issued. See `shaders/mono_sprites.wgsl` for the resolution
 //!   and [`crate::render::draw::issue_glyphs`] for the sequence.
+//! - **[`PolySpritePipeline`]** is [`MonoSpritePipeline`]'s shape over a colour
+//!   page: one image per instance, four channels instead of one. It is the
+//!   fourth pipeline and the *first* that needed no new mechanism at all — the
+//!   bind-group shape, the page loop, and the slot-base plan were all already
+//!   there, which is the strongest form of the claim `render/draw.rs` has been
+//!   making since Phase 4 that nothing in it is written per kind.
 //! - **[`CompositePipeline`]** draws one already-rendered texture into the
 //!   scene, and is where §5.5's Gap 2 lands: both producers bind the same
 //!   layout and take the same call.
 //!
-//! What is still genuinely absent is `poly_sprites` — colour glyphs and images,
-//! which sample an `Rgba8Unorm` page rather than a coverage mask and which no
-//! primitive kind yet carries — and `paths`' own vertex buffer, which needs
-//! tessellation machinery no phase has built.
+//! What is still genuinely absent is `shadows` and `underlines` (both
+//! [`QuadPipeline`]-shaped — Phase 6.3), `backdrop_blur`, and `paths`' own
+//! vertex buffer, which needs tessellation machinery no phase has built
+//! (Phase 6.4).
+//!
+//! **Colour glyphs are not drawn either, and that is not the same absence.**
+//! [`PolySpritePipeline`] samples exactly the page a colour emoji's raster
+//! lands in, so the pipeline that would draw one now exists. What is missing is
+//! that `wgpui-text`'s conversion emits emoji into a [`MonoSpritePipeline`]-only
+//! `GlyphRun`, and routing them to this kind instead is a `wgpui-text` change,
+//! not a renderer one. Recorded here because "poly_sprites exists" would
+//! otherwise read as "colour emoji work."
 
 use wgpui_core::patch::primitive::Primitive;
 
@@ -392,6 +407,171 @@ impl MonoSpritePipeline {
     }
 }
 
+/// The instanced polychrome-sprite pipeline: one image per instance, its colour
+/// bitmap read out of one atlas page.
+///
+/// [`MonoSpritePipeline`]'s bind-group shape exactly — frame, slot, page — over
+/// the `PolySprite` arena and an `Rgba8Unorm` page. That it *is* exactly the
+/// same shape is the finding, not a coincidence to tidy away later: the third
+/// instanced pipeline needed a shader and a layout and no new mechanism, which
+/// is what `render/draw.rs` was claiming when it said nothing there is written
+/// per kind.
+///
+/// **Colour pages only**, and the mirror image of the mono pipeline's rule: this
+/// shader reads four channels and binding a coverage page here would sample its
+/// single channel as RGBA and paint nonsense. [`crate::render::frame`] selects
+/// pages by [`wgpui_core::scene::atlas::AtlasKind`] for exactly this reason.
+pub struct PolySpritePipeline {
+    /// The pipeline itself.
+    pub pipeline: wgpu::RenderPipeline,
+    /// Globals, sprite arena, and indirection buffer.
+    pub frame_layout: wgpu::BindGroupLayout,
+    /// The per-slot base index, addressed by dynamic offset.
+    pub slot_layout: wgpu::BindGroupLayout,
+    /// The bound page's index and its texture.
+    pub page_layout: wgpu::BindGroupLayout,
+    /// Byte stride between two slots' entries in the slot-base buffer.
+    pub slot_stride: u32,
+}
+
+impl PolySpritePipeline {
+    /// Bytes one atlas-page parameter block occupies: one `vec4<u32>`, the same
+    /// block [`MonoSpritePipeline`] uses and for the same alignment reason.
+    pub const PAGE_PARAMS_SIZE: u64 = MonoSpritePipeline::PAGE_PARAMS_SIZE;
+
+    /// Build the pipeline. Once per device, never per frame.
+    pub fn new(device: &wgpu::Device) -> PolySpritePipeline {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wgpui poly sprites"),
+            source: wgpu::ShaderSource::Wgsl(super::shaders::POLY_SPRITES_WGSL.into()),
+        });
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("poly sprites frame"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, false),
+                storage_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                storage_entry(2, wgpu::ShaderStages::VERTEX),
+            ],
+        });
+        let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("poly sprites slot base"),
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+        });
+        let page_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("poly sprites atlas page"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX, Self::PAGE_PARAMS_SIZE, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // Not filterable, and no sampler: the shader reads texels
+                        // at integer addresses. See `shaders/poly_sprites.wgsl`,
+                        // which also records what that costs for scaled images.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("poly sprites"),
+            bind_group_layouts: &[Some(&frame_layout), Some(&slot_layout), Some(&page_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("poly sprites"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vertex_main"),
+                compilation_options: Default::default(),
+                // §1's rule, unchanged for this kind too.
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fragment_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: TARGET_FORMAT,
+                    blend: Some(ALPHA_OVER),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: Default::default(),
+            cache: None,
+        });
+        PolySpritePipeline {
+            pipeline,
+            frame_layout,
+            slot_layout,
+            page_layout,
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+        }
+    }
+
+    /// The bind group holding this frame's globals, sprite arena, and
+    /// indirection buffer.
+    pub fn frame_bind_group(
+        &self,
+        device: &wgpu::Device,
+        globals: &wgpu::Buffer,
+        arena: &wgpu::Buffer,
+        visible: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("poly sprites frame"),
+            layout: &self.frame_layout,
+            entries: &[
+                buffer_entry(0, globals),
+                buffer_entry(1, arena),
+                buffer_entry(2, visible),
+            ],
+        })
+    }
+
+    /// The bind group over a slot-base buffer.
+    pub fn slot_bind_group(&self, device: &wgpu::Device, bases: &wgpu::Buffer) -> wgpu::BindGroup {
+        slot_base_bind_group(device, &self.slot_layout, bases)
+    }
+
+    /// One atlas page's bind group: which page it is, and its texture.
+    pub fn page_bind_group(
+        &self,
+        device: &wgpu::Device,
+        params: &wgpu::Buffer,
+        view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("poly sprites atlas page"),
+            layout: &self.page_layout,
+            entries: &[
+                buffer_entry(0, params),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+            ],
+        })
+    }
+
+    /// Bytes one sprite occupies in the arena, restated from `wgpui-core` so a
+    /// drift between the shader's `SpriteSlot` and the protocol's `PolySprite`
+    /// fails a test rather than rendering garbage.
+    pub const fn arena_slot_stride() -> usize {
+        wgpui_core::patch::primitive::PolySprite::SLOT_STRIDE
+    }
+}
+
 /// The one composite pipeline both producers draw through (§5.5, Gap 2).
 pub struct CompositePipeline {
     /// The pipeline itself.
@@ -598,6 +778,46 @@ mod tests {
         assert!(shader.contains("struct GlyphSlot"));
         for field in ["color_r", "color_g", "color_b", "color_a", "atlas_tile"] {
             assert!(shader.contains(field), "the shader dropped `{field}`");
+        }
+    }
+
+    #[test]
+    fn the_shader_agrees_with_the_protocol_about_a_sprite_slot() {
+        // The same drift hazard `QuadSlot` and `GlyphSlot` have. `SpriteSlot`
+        // is the one of the three whose members all land on their natural
+        // alignment, so it can be spelled the obvious way — which makes it
+        // *more* important to assert, not less: nothing about the spelling
+        // would look wrong if the encoder's field order moved.
+        assert_eq!(PolySpritePipeline::arena_slot_stride(), 48);
+        let shader = super::super::shaders::POLY_SPRITES_WGSL;
+        assert!(shader.contains("struct SpriteSlot"));
+        for field in [
+            "origin",
+            "size",
+            "atlas_origin",
+            "atlas_size",
+            "corner_radius",
+            "opacity",
+            "grayscale",
+            "atlas_tile",
+        ] {
+            assert!(shader.contains(field), "the shader dropped `{field}`");
+        }
+    }
+
+    #[test]
+    fn both_sprite_pipelines_transcribe_the_same_tile_packing() {
+        // Two shaders now hard-code `AtlasTileId`'s page/slot split, and WGSL
+        // checks neither against the Rust constant. A shader that disagreed
+        // would filter its sprites onto the wrong page and silently draw
+        // nothing — the failure mode with no error anywhere.
+        for shader in [
+            super::super::shaders::MONO_SPRITES_WGSL,
+            super::super::shaders::POLY_SPRITES_WGSL,
+        ] {
+            assert!(shader.contains("const UNUSED_INSTANCE: u32 = 0xffffffffu;"));
+            assert!(shader.contains("const NO_TILE: u32 = 0xffffffffu;"));
+            assert!(shader.contains("const TILE_SLOT_BITS: u32 = 24u;"));
         }
     }
 

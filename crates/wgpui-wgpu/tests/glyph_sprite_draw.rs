@@ -313,12 +313,12 @@ fn every_glyph_draws_its_own_tile_texels_at_its_own_position() {
          {} painted pixels, instances known to CPU: {:?}",
         mode.name(),
         output.stats.slots_visited,
-        output.stats.glyph_draws_issued,
+        output.stats.sprite_draws_issued,
         output.stats.atlas_pages_bound,
         painted_pixels(&pixels),
         output.stats.instances_known_to_cpu,
     );
-    assert!(output.stats.glyph_draws_issued > 0, "no glyph draw was issued");
+    assert!(output.stats.sprite_draws_issued > 0, "no glyph draw was issued");
     assert!(
         painted_pixels(&pixels) > 500,
         "twenty glyphs of 24px text painted {} pixels, which is not text",
@@ -508,7 +508,7 @@ fn every_draw_mode_draws_the_same_text() {
                     "  reference {}: {} painted pixels, {} glyph draws",
                     mode.name(),
                     painted_pixels(&pixels),
-                    output.stats.glyph_draws_issued
+                    output.stats.sprite_draws_issued
                 );
                 reference = Some(pixels);
             }
@@ -588,16 +588,20 @@ fn a_blank_glyph_and_a_missing_atlas_are_both_ordinary() {
         without_atlas.stats.atlas_pages_bound, 0,
         "no page means nothing to bind"
     );
-    assert_eq!(without_atlas.stats.glyph_draws_issued, 0);
+    assert_eq!(without_atlas.stats.sprite_draws_issued, 0);
     assert_eq!(
-        without_atlas.stats.glyph_slots_unavailable, 1,
-        "the scene's one glyph slot was walked and found to have no texture to \
-         bind, which is `DrawStats::glyph_slots_unavailable`'s whole purpose"
+        without_atlas.stats.sprite_slots_unavailable, 2,
+        "the scene's one layer contributes one slot to each of the two sprite \
+         passes, and with no atlas at all both are walked and found to have no \
+         texture to bind — which is `DrawStats::sprite_slots_unavailable`'s \
+         whole purpose"
     );
     assert_eq!(
-        with_atlas.stats.glyph_slots_unavailable, 0,
-        "and with an atlas it is available, so the counter is measuring the \
-         difference rather than always reporting the slot count"
+        with_atlas.stats.sprite_slots_unavailable, 1,
+        "with a monochrome page the glyph slot becomes available and the image \
+         slot does not, so the counter is measuring the difference rather than \
+         always reporting the slot count. Phase 5.6 asserted 0 here because \
+         there was one sprite pass; the number changed and the claim did not"
     );
     assert_eq!(
         painted_pixels(&blank),

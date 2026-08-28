@@ -16,9 +16,9 @@
 //!
 //! # The one place the claim is not O(layer slots) flat
 //!
-//! [`issue_glyphs`] multiplies the sequence by the number of live monochrome
-//! atlas pages, because a bind group cannot change inside a draw call and a
-//! glyph's page decides its texture. That is the same reason
+//! [`issue_sprites`] multiplies the sequence by the number of live atlas pages
+//! of its own kind, because a bind group cannot change inside a draw call and a
+//! sprite's page decides its texture. That is the same reason
 //! [`issue_composites`] is per entry even where multi-draw is available, and it
 //! is a property of sampling textures rather than a shortcoming of the mode.
 //! [`DrawStats::atlas_pages_bound`] reports the multiplier rather than leaving
@@ -57,7 +57,7 @@ use wgpui_core::indirect::{DRAW_INDIRECT_ARGS_STRIDE, DrawIndirectArgs, DrawSlot
 use crate::render::compute::indirect_args_pass::IndirectArgsBuffers;
 use crate::render::device::IndirectSupport;
 use crate::render::pipelines::{
-    CompositePipeline, MonoSpritePipeline, QuadPipeline, slot_base_bind_group,
+    CompositePipeline, MonoSpritePipeline, PolySpritePipeline, QuadPipeline, slot_base_bind_group,
 };
 use crate::render::readback::{ReadbackError, StagingReader};
 use crate::render::textures::external_surface::CompositePlan;
@@ -192,24 +192,34 @@ pub struct DrawStats {
     pub composite_entries_unavailable: u32,
     /// Composite draw calls issued.
     pub composite_draws_issued: u32,
-    /// Atlas pages the glyph pass bound, one bind group each.
+    /// Atlas pages the sprite passes bound, one bind group each.
     ///
-    /// The number `issue_glyphs` multiplies its slot sequence by, and therefore
-    /// the honest form of "this pipeline's CPU cost is O(layer slots × live
-    /// monochrome pages)" rather than O(layer slots) flat.
+    /// The number [`issue_sprites`] multiplies its slot sequence by, summed over
+    /// both sprite pipelines, and therefore the honest form of "this pipeline's
+    /// CPU cost is O(layer slots × live pages of its own kind)" rather than
+    /// O(layer slots) flat.
     pub atlas_pages_bound: u32,
-    /// Glyph draw calls issued.
-    pub glyph_draws_issued: u32,
-    /// Glyph slots that could not be issued at all, because no atlas page was
-    /// available to bind.
+    /// Sprite draw calls issued, across both the monochrome (text) and
+    /// polychrome (image) passes.
+    ///
+    /// Merged rather than split per pipeline, and named for what it counts
+    /// rather than for the first pipeline that happened to need it. The two
+    /// passes are the same sequence over different arenas — a split counter
+    /// would suggest a difference in *kind* where there is only a difference in
+    /// which texture is bound, and a test that needs to tell them apart builds a
+    /// scene holding one of them.
+    pub sprite_draws_issued: u32,
+    /// Sprite slots that could not be issued at all, because no atlas page of
+    /// the right kind was available to bind.
     ///
     /// The same idea as [`DrawStats::composite_entries_unavailable`] and not an
-    /// error: a window whose text has not been rasterised yet has glyph slots
-    /// and no texture to sample them from, and there is no such thing as a draw
-    /// call without a bound texture. Counted rather than silently dropped so
-    /// that `slots_skipped + draw_calls_issued + glyph_slots_unavailable` still
-    /// accounts for every slot the frame's fixed sequence named.
-    pub glyph_slots_unavailable: u32,
+    /// error: a window whose text has not been rasterised yet — or whose images
+    /// have not decoded yet — has sprite slots and no texture to sample them
+    /// from, and there is no such thing as a draw call without a bound texture.
+    /// Counted rather than silently dropped so that `slots_skipped +
+    /// draw_calls_issued + sprite_slots_unavailable` still accounts for every
+    /// slot the frame's fixed sequence named.
+    pub sprite_slots_unavailable: u32,
 }
 
 impl DrawStats {
@@ -225,8 +235,8 @@ impl DrawStats {
         self.composite_entries_unavailable += other.composite_entries_unavailable;
         self.composite_draws_issued += other.composite_draws_issued;
         self.atlas_pages_bound += other.atlas_pages_bound;
-        self.glyph_draws_issued += other.glyph_draws_issued;
-        self.glyph_slots_unavailable += other.glyph_slots_unavailable;
+        self.sprite_draws_issued += other.sprite_draws_issued;
+        self.sprite_slots_unavailable += other.sprite_slots_unavailable;
         self.instances_known_to_cpu = match (self.instances_known_to_cpu, other.instances_known_to_cpu)
         {
             // Unknown is contagious on purpose: a frame that took one indirect
@@ -404,6 +414,22 @@ impl SlotBasePlan {
         )
     }
 
+    /// Build the plan for the poly-sprite pipeline's slots.
+    pub fn for_poly_sprites(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &PolySpritePipeline,
+        slots: &[DrawSlot],
+    ) -> SlotBasePlan {
+        SlotBasePlan::new(
+            device,
+            queue,
+            &pipeline.slot_layout,
+            pipeline.slot_stride,
+            slots,
+        )
+    }
+
     /// Entries in the fixed sequence.
     pub fn slot_count(&self) -> u32 {
         u32::try_from(self.slots.len()).unwrap_or(u32::MAX)
@@ -493,43 +519,57 @@ pub fn issue_quads(
     stats
 }
 
-/// The atlas pages one glyph pass will bind, in ascending page order.
+/// The atlas pages one sprite pass will bind, in ascending page order.
 ///
 /// Built per frame rather than per slot-table change, because the atlas is what
-/// changes: a frame that rasterised a glyph into a new page has a new page to
-/// bind, and a frame that evicted one has a bind group referencing a texture
-/// that no longer exists. Paired with the [`SlotBasePlan`] rather than folded
-/// into it for exactly that reason — the two have different lifetimes, and
-/// merging them would rebuild the slot bases every time a glyph was rasterised.
-pub struct GlyphDraw<'a> {
+/// changes: a frame that rasterised a glyph or decoded an image into a new page
+/// has a new page to bind, and a frame that evicted one has a bind group
+/// referencing a texture that no longer exists. Paired with the [`SlotBasePlan`]
+/// rather than folded into it for exactly that reason — the two have different
+/// lifetimes, and merging them would rebuild the slot bases every time a glyph
+/// was rasterised.
+pub struct SpriteDraw<'a> {
+    /// The pipeline this pass sets.
+    ///
+    /// A `&wgpu::RenderPipeline` and not one of the two pipeline structs,
+    /// because that is genuinely all [`issue_sprites`] reads out of either of
+    /// them. Taking the struct would let the function *look* per-kind while
+    /// being per-kind in nothing but its signature.
+    pub pipeline: &'a wgpu::RenderPipeline,
     /// The per-slot bases, held across frames.
     pub plan: &'a SlotBasePlan,
-    /// One bind group per live monochrome page: its index and its texture.
+    /// One bind group per live page of this pipeline's own atlas kind: its
+    /// index and its texture.
     pub pages: &'a [wgpu::BindGroup],
 }
 
-/// Issue the glyph kind's fixed draw sequence, once per bound atlas page.
+/// Issue one atlas-sampling kind's fixed draw sequence, once per bound page.
 ///
 /// The sequence within a page is byte-for-byte [`issue_quads`]': the same
 /// argument buffer, the same dynamic slot-base offsets, the same four modes. The
 /// outer loop over `draw.pages` is the whole of the difference, and it exists
-/// because `mono_sprites.wgsl` filters glyphs by the bound page rather than
-/// looking a texture up per glyph — see that shader's header for why a lookup is
-/// not available on a device without binding arrays.
+/// because both sprite shaders filter by the bound page rather than looking a
+/// texture up per instance — see `mono_sprites.wgsl`'s header for why a lookup
+/// is not available on a device without binding arrays.
 ///
-/// A glyph whose page is not the bound one collapses to a degenerate triangle
+/// A sprite whose page is not the bound one collapses to a degenerate triangle
 /// strip, so drawing the same slot once per page is correct and not merely
-/// harmless: each glyph is rasterised into the framebuffer exactly once, by the
+/// harmless: each sprite is rasterised into the framebuffer exactly once, by the
 /// pass that bound its own page.
+///
+/// **One function, two pipelines.** Phase 5.6 wrote this as `issue_glyphs` and
+/// Phase 6.2 found that the polychrome pass needed it unchanged — same bind
+/// group indices, same page loop, same mode handling — so it took the glyph name
+/// off rather than copying the body. That the second sprite kind cost zero lines
+/// here is the point; a duplicate would have hidden it.
 ///
 /// **The CPU still never learns an instance count.** It issues the same record
 /// `pages.len()` times and does not read it, which is why
 /// [`DrawStats::instances_known_to_cpu`] is `None` on every indirect path here
 /// too.
-pub fn issue_glyphs(
+pub fn issue_sprites(
     pass: &mut wgpu::RenderPass<'_>,
-    pipeline: &MonoSpritePipeline,
-    draw: GlyphDraw<'_>,
+    draw: SpriteDraw<'_>,
     frame_group: &wgpu::BindGroup,
     args: &IndirectArgsBuffers,
     mode: DrawMode,
@@ -545,17 +585,17 @@ pub fn issue_glyphs(
     };
     if plan.slots.is_empty() || draw.pages.is_empty() {
         // No page means no texture to sample, which is a scene with no
-        // rasterised text in it rather than an error. The slots are still
-        // reported as visited — §5.3's sequence is fixed — and reported as
-        // *unavailable*, because there is no such thing as a draw call without a
-        // bound texture and pretending they were skipped would say the CPU
-        // decided something it did not.
+        // rasterised text and no decoded image in it rather than an error. The
+        // slots are still reported as visited — §5.3's sequence is fixed — and
+        // reported as *unavailable*, because there is no such thing as a draw
+        // call without a bound texture and pretending they were skipped would
+        // say the CPU decided something it did not.
         stats.atlas_pages_bound = 0;
-        stats.glyph_slots_unavailable = stats.slots_visited;
+        stats.sprite_slots_unavailable = stats.slots_visited;
         return stats;
     }
 
-    pass.set_pipeline(&pipeline.pipeline);
+    pass.set_pipeline(draw.pipeline);
     pass.set_bind_group(0, frame_group, &[]);
     stats.bind_group_binds += 1;
 
@@ -563,7 +603,7 @@ pub fn issue_glyphs(
     for (page_index, page) in draw.pages.iter().enumerate() {
         // `slots_visited` is the length of the *fixed sequence*, which the page
         // loop repeats rather than lengthens — so a skip is counted once, on the
-        // first page, and `slots_skipped + (glyph_draws_issued / pages)` still
+        // first page, and `slots_skipped + (this pass's draws / pages)` still
         // equals it. `atlas_pages_bound` carries the multiplier separately.
         let count_skips = page_index == 0;
         pass.set_bind_group(2, page, &[]);
@@ -580,14 +620,14 @@ pub fn issue_glyphs(
                     plan.slot_count(),
                 );
                 stats.draw_calls_issued += 1;
-                stats.glyph_draws_issued += 1;
+                stats.sprite_draws_issued += 1;
             }
             DrawMode::MultiDrawIndirect => {
                 pass.set_bind_group(1, &plan.bind_group, &[plan.zero_offset]);
                 stats.bind_group_binds += 1;
                 pass.multi_draw_indirect(&args.args, 0, plan.slot_count());
                 stats.draw_calls_issued += 1;
-                stats.glyph_draws_issued += 1;
+                stats.sprite_draws_issued += 1;
             }
             DrawMode::PerSlotIndirect => {
                 for index in 0..plan.slots.len() {
@@ -595,7 +635,7 @@ pub fn issue_glyphs(
                     stats.bind_group_binds += 1;
                     pass.draw_indirect(&args.args, index as u64 * DRAW_INDIRECT_ARGS_STRIDE as u64);
                     stats.draw_calls_issued += 1;
-                    stats.glyph_draws_issued += 1;
+                    stats.sprite_draws_issued += 1;
                 }
             }
             DrawMode::CpuReadback => {
@@ -610,7 +650,7 @@ pub fn issue_glyphs(
                     stats.bind_group_binds += 1;
                     pass.draw(0..record.vertex_count, 0..record.instance_count);
                     stats.draw_calls_issued += 1;
-                    stats.glyph_draws_issued += 1;
+                    stats.sprite_draws_issued += 1;
                     known += record.instance_count;
                 }
             }

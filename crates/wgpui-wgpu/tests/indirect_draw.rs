@@ -41,12 +41,17 @@ const LAYERS: usize = 6;
 /// Kept separate from [`PrimitiveKind::COUNT`] so the two claims stay
 /// distinguishable: the *table* names every (layer, kind) pair that could be
 /// populated, while the *pass* walks the kinds that have a pipeline behind
-/// them. They were unequal through Phases 4–5.6 and are unequal again at the
-/// point in Phase 6.2 where `PolySprite` exists as a kind and its pipeline does
-/// not — and stating which of the two an assertion is about is the difference
-/// between the gate tracking the renderer and the gate tracking an enum's
-/// length.
-const DRAWN_KINDS: usize = 2;
+/// them. They were unequal through Phases 4–5.6 and equal again from the end of
+/// Phase 6.2 — and stating which of the two an assertion is about is the
+/// difference between the gate tracking the renderer and the gate tracking an
+/// enum's length.
+const DRAWN_KINDS: usize = PrimitiveKind::COUNT;
+
+/// Of those, the ones that sample an atlas page and therefore report through
+/// [`wgpui_wgpu::render::draw::DrawStats::sprite_slots_unavailable`]:
+/// `GlyphRun` and `PolySprite`. `Quad` samples nothing and always has a slot it
+/// can issue.
+const SPRITE_KINDS: usize = 2;
 
 fn window(spec: &UiSceneSpec) -> Rect {
     Rect::from_origin_size([0.0, 0.0], [spec.width, spec.height])
@@ -335,12 +340,14 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
          the primitive count — and what changed is the premise, not the claim"
     );
     assert_eq!(
-        large_output.stats.glyph_slots_unavailable as usize,
-        LAYERS,
-        "this scene has no atlas, so its glyph slots are walked and found to \
-         have no texture to bind — see `DrawStats::glyph_slots_unavailable`"
+        large_output.stats.sprite_slots_unavailable as usize,
+        LAYERS * SPRITE_KINDS,
+        "this scene has no atlas, so both sprite passes' slots are walked and \
+         found to have no texture to bind — see \
+         `DrawStats::sprite_slots_unavailable`, which is one counter across both \
+         passes"
     );
-    assert_eq!(large_output.stats.glyph_draws_issued, 0);
+    assert_eq!(large_output.stats.sprite_draws_issued, 0);
     assert_eq!(
         scene_slot_table_len(&large),
         LAYERS * PrimitiveKind::COUNT,
@@ -405,7 +412,7 @@ fn the_fallback_path_is_the_one_that_learns_the_counts() {
     assert_eq!(
         first.stats.slots_skipped
             + first.stats.draw_calls_issued
-            + first.stats.glyph_slots_unavailable,
+            + first.stats.sprite_slots_unavailable,
         first.stats.slots_visited,
         "every slot is either drawn, knowingly skipped, or — since Phase 5.6 — \
          found to have no atlas page to bind at all, which is a third outcome \

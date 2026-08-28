@@ -61,11 +61,11 @@ use crate::render::compute::indirect_args_pass::{
 use crate::render::compute::occlusion_pass::{OcclusionError, OcclusionPass};
 use crate::render::compute::ordering_pass::{OrderingError, OrderingPass};
 use crate::render::draw::{
-    DrawMode, DrawStats, GlyphDraw, ResolvedArgs, SlotBasePlan, issue_composites, issue_glyphs,
-    issue_quads,
+    DrawMode, DrawStats, ResolvedArgs, SlotBasePlan, SpriteDraw, issue_composites, issue_quads,
+    issue_sprites,
 };
 use crate::render::pipelines::{
-    CompositePipeline, Globals, MonoSpritePipeline, QuadPipeline, TARGET_FORMAT,
+    CompositePipeline, Globals, MonoSpritePipeline, PolySpritePipeline, QuadPipeline, TARGET_FORMAT,
 };
 use crate::render::readback::{ReadbackError, StagingReader, read_texture_rgba8};
 use crate::render::surface_registry::SurfaceRegistry;
@@ -167,8 +167,10 @@ pub struct FrameInput<'a> {
     /// Borrowed rather than owned by the renderer because the atlas is shared:
     /// the same [`AtlasTextures`] serves every window, and the phase that
     /// rasterises into it (`render/atlas.rs`, `render/atlas_upload.rs`) is not
-    /// this one. `None` — or a set with no monochrome page in it — is an
-    /// ordinary frame with no rasterised text, not an error.
+    /// this one. `None` — or a set with no page of a given kind in it — is an
+    /// ordinary frame with no rasterised text or no decoded image, not an error.
+    /// Both sprite passes read this one field and each filters it to its own
+    /// [`AtlasKind`].
     pub atlas: Option<&'a AtlasTextures>,
     /// Framebuffer size in pixels.
     pub viewport: [f32; 2],
@@ -311,6 +313,8 @@ pub struct FrameRenderer {
     pub quads: QuadPipeline,
     /// The instanced monochrome-sprite pipeline (Phase 5.6).
     pub glyphs: MonoSpritePipeline,
+    /// The instanced polychrome-sprite pipeline (Phase 6.2).
+    pub sprites: PolySpritePipeline,
     /// The one composite pipeline.
     pub composite: CompositePipeline,
     /// The quad arena.
@@ -319,19 +323,28 @@ pub struct FrameRenderer {
     /// first: the two kinds have different slot strides, and §5.0's upload
     /// instructions are already addressed per kind.
     pub glyph_arena: SlabBuffer,
+    /// The image-sprite arena. Its own buffer for the same reason, even though
+    /// `PolySprite` and `GlyphRun` happen to share a 48-byte stride: the strides
+    /// agreeing today is a coincidence of two independent layout decisions, and
+    /// sharing an arena on the strength of it would make one kind's field
+    /// changing corrupt the other's.
+    pub sprite_arena: SlabBuffer,
     /// Boundary texture retention (§5.5).
     pub textures: LayerTexturePool,
     globals: wgpu::Buffer,
     quad_args: IndirectArgsBuffers,
     glyph_args: IndirectArgsBuffers,
+    sprite_args: IndirectArgsBuffers,
     composite_args: IndirectArgsBuffers,
     /// The per-slot bases and their bind group, kept until the slot table
     /// itself changes — see [`SlotBasePlan`], which is only true of it if
     /// something holds it across frames.
     quad_plan: Option<SlotBasePlan>,
     glyph_plan: Option<SlotBasePlan>,
+    sprite_plan: Option<SlotBasePlan>,
     quad_plan_builds: u64,
     glyph_plan_builds: u64,
+    sprite_plan_builds: u64,
     /// One 16-byte `AtlasPage` uniform per page index ever bound.
     ///
     /// Keyed by page index and never invalidated, because the value is the page
@@ -352,9 +365,11 @@ impl FrameRenderer {
             indirect: IndirectArgsPass::new(device),
             quads: QuadPipeline::new(device),
             glyphs: MonoSpritePipeline::new(device),
+            sprites: PolySpritePipeline::new(device),
             composite: CompositePipeline::new(device),
             arena: SlabBuffer::new(device, "quad arena"),
             glyph_arena: SlabBuffer::new(device, "glyph arena"),
+            sprite_arena: SlabBuffer::new(device, "sprite arena"),
             textures: LayerTexturePool::default(),
             globals: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("frame globals"),
@@ -364,11 +379,14 @@ impl FrameRenderer {
             }),
             quad_args: IndirectArgsBuffers::new(device, 1, 1),
             glyph_args: IndirectArgsBuffers::new(device, 1, 1),
+            sprite_args: IndirectArgsBuffers::new(device, 1, 1),
             composite_args: IndirectArgsBuffers::new(device, 1, 1),
             quad_plan: None,
             glyph_plan: None,
+            sprite_plan: None,
             quad_plan_builds: 0,
             glyph_plan_builds: 0,
+            sprite_plan_builds: 0,
             page_params: HashMap::new(),
             reader: StagingReader::new(),
             uploaded_generation: None,
@@ -395,30 +413,43 @@ impl FrameRenderer {
         self.glyph_plan_builds
     }
 
-    /// One bind group per live **monochrome** atlas page, in ascending page
-    /// order.
+    /// The same counter for the image-sprite pipeline's slot bases.
+    pub fn sprite_plan_builds(&self) -> u64 {
+        self.sprite_plan_builds
+    }
+
+    /// One bind group per live atlas page of `kind`, in ascending page order.
     ///
-    /// Colour pages are skipped rather than bound: `mono_sprites.wgsl` reads a
-    /// single coverage channel, and handing it an `Rgba8Unorm` page would paint
-    /// an emoji's red channel as if it were coverage. Colour glyphs need the
-    /// `poly_sprites` pipeline, which no phase has built.
+    /// **Pages are filtered by kind and not merely enumerated.** A coverage page
+    /// bound to `poly_sprites.wgsl` would have its single channel read as RGBA,
+    /// and a colour page bound to `mono_sprites.wgsl` would have an emoji's red
+    /// channel painted as coverage. Neither is an error anything would report —
+    /// both just draw the wrong picture — so the filter is what keeps the two
+    /// passes apart, and it is one function rather than two so a new kind cannot
+    /// acquire a copy that forgets it.
+    ///
+    /// The 16-byte page uniform is shared between the two pipelines, which is
+    /// legitimate rather than a shortcut: both declare the same
+    /// `PAGE_PARAMS_SIZE` block holding the same value, the page index, and a
+    /// page index is a fact about the atlas rather than about a shader.
     fn atlas_page_bind_groups(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         atlas: Option<&AtlasTextures>,
+        kind: AtlasKind,
     ) -> Vec<wgpu::BindGroup> {
         let Some(atlas) = atlas else {
             return Vec::new();
         };
         let mut groups = Vec::new();
-        for page in atlas.pages_of_kind(AtlasKind::Monochrome) {
+        for page in atlas.pages_of_kind(kind) {
             let Some(view) = atlas.view(page) else {
                 continue;
             };
             let params = self.page_params.entry(page).or_insert_with(|| {
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("mono sprites atlas page"),
+                    label: Some("sprite atlas page"),
                     size: MonoSpritePipeline::PAGE_PARAMS_SIZE,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
@@ -428,23 +459,27 @@ impl FrameRenderer {
                 queue.write_buffer(&buffer, 0, &bytes);
                 buffer
             });
-            groups.push(self.glyphs.page_bind_group(device, params, view));
+            groups.push(match kind {
+                AtlasKind::Monochrome => self.glyphs.page_bind_group(device, params, view),
+                AtlasKind::Polychrome => self.sprites.page_bind_group(device, params, view),
+            });
         }
         groups
     }
 
     /// Render one frame into `target`.
     ///
-    /// **Both instanced kinds are drawn.** Phase 4 drew only `Quad` and said so
-    /// here; Phase 5.6 added the `GlyphRun` half, which takes the identical
-    /// route — upload, ordering, occlusion, indirect-argument generation, fixed
-    /// draw sequence — over its own arena, with one addition that is genuinely
-    /// its own: the pass repeats per bound atlas page, because a glyph's texture
-    /// is chosen by its tile and a bind group cannot change inside a draw call.
-    /// See [`issue_glyphs`].
+    /// **All three instanced kinds are drawn.** Phase 4 drew only `Quad` and
+    /// said so here; Phase 5.6 added the `GlyphRun` half and Phase 6.2 the
+    /// `PolySprite` half, both taking the identical route — upload, ordering,
+    /// occlusion, indirect-argument generation, fixed draw sequence — over their
+    /// own arenas, with one addition the two sprite kinds share: the pass
+    /// repeats per bound atlas page, because a sprite's texture is chosen by its
+    /// tile and a bind group cannot change inside a draw call. See
+    /// [`issue_sprites`], which is one function for both.
     ///
-    /// What still has no pipeline: `poly_sprites` (colour glyphs and images),
-    /// `shadows`, `paths`, `underlines`, `backdrop_blur`.
+    /// What still has no pipeline: `shadows`, `underlines`, `paths`,
+    /// `backdrop_blur`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -474,11 +509,14 @@ impl FrameRenderer {
         let table = input.scene.draw_slots();
         let quad_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Quad).to_vec();
         let glyph_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::GlyphRun).to_vec();
+        let sprite_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::PolySprite).to_vec();
         let arena_slots = input.scene.arena_slots(PrimitiveKind::Quad);
         let glyph_arena_slots = input.scene.arena_slots(PrimitiveKind::GlyphRun);
+        let sprite_arena_slots = input.scene.arena_slots(PrimitiveKind::PolySprite);
         let primitives_resident: u32 = quad_slots
             .iter()
             .chain(glyph_slots.iter())
+            .chain(sprite_slots.iter())
             .map(|slot| slot.count)
             .sum();
 
@@ -486,17 +524,23 @@ impl FrameRenderer {
         let started = Instant::now();
         let resident = input.scene.quads.resident_bytes();
         let glyph_resident = input.scene.glyph_runs.resident_bytes();
+        let sprite_resident = input.scene.poly_sprites.resident_bytes();
         let grew = self.arena.reserve(device, resident.len() as u64);
         let glyphs_grew = self
             .glyph_arena
             .reserve(device, glyph_resident.len() as u64);
+        let sprites_grew = self
+            .sprite_arena
+            .reserve(device, sprite_resident.len() as u64);
         if grew
             || glyphs_grew
+            || sprites_grew
             || self.uploaded_generation.is_none()
             || matches!(input.dirty, Dirty::All)
         {
             self.arena.upload_all(device, queue, resident);
             self.glyph_arena.upload_all(device, queue, glyph_resident);
+            self.sprite_arena.upload_all(device, queue, sprite_resident);
             self.uploaded_generation = Some(0);
         } else {
             // Filtered by kind rather than handed the whole list: an
@@ -512,6 +556,12 @@ impl FrameRenderer {
                 queue,
                 glyph_resident,
                 &kind_uploads(input.uploads, PrimitiveKind::GlyphRun),
+            );
+            self.sprite_arena.upload(
+                device,
+                queue,
+                sprite_resident,
+                &kind_uploads(input.uploads, PrimitiveKind::PolySprite),
             );
         }
         queue.write_buffer(
@@ -536,6 +586,16 @@ impl FrameRenderer {
                 device,
                 glyph_arena_slots.max(1),
                 glyph_slots.len() as u32 + 1,
+            );
+        }
+        if !self
+            .sprite_args
+            .fits(sprite_arena_slots, sprite_slots.len() as u32)
+        {
+            self.sprite_args = IndirectArgsBuffers::new(
+                device,
+                sprite_arena_slots.max(1),
+                sprite_slots.len() as u32 + 1,
             );
         }
 
@@ -632,6 +692,52 @@ impl FrameRenderer {
                 queue.submit(Some(encoder.finish()));
                 layers_recomputed += 1;
             }
+
+            // The image half, through the identical passes and for the identical
+            // reason. A sprite is a `CoverageItem::cullee` and never an occluder
+            // even when the image behind it is fully opaque: whether a decoded
+            // PNG has an alpha channel is not knowable from the primitive, and
+            // treating a transparent avatar as an occluder would erase whatever
+            // is behind it. The legacy renderer makes the same call — its
+            // occlusion pass skips `Primitive::PolychromeSprite` entirely
+            // (`src/occlusion.rs`).
+            for slot in &sprite_slots {
+                if slot.count == 0 || !input.dirty.contains(slot.layer) {
+                    continue;
+                }
+                let bounds = layer_sprite_bounds(input.scene, slot.layer);
+                let items: Vec<CoverageItem> = bounds
+                    .iter()
+                    .map(|sprite| CoverageItem::cullee(sprite.intersect(&input.clip)))
+                    .collect();
+
+                encode_ordering_items(&bounds, &mut bounds_bytes);
+                let ordered = self.ordering.run(device, queue, &bounds_bytes)?;
+                encode_coverage_items(&items, &mut item_bytes);
+                let culled = self
+                    .occlusion
+                    .run(device, queue, &item_bytes, &poison_bytes)?;
+
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("sprite scatter"),
+                });
+                IndirectArgsPass::scatter(
+                    &mut encoder,
+                    &ordered.draw_order,
+                    &self.sprite_args.draw_order,
+                    slot.base,
+                    slot.count,
+                );
+                IndirectArgsPass::scatter(
+                    &mut encoder,
+                    &culled.culled,
+                    &self.sprite_args.culled,
+                    slot.base,
+                    slot.count,
+                );
+                queue.submit(Some(encoder.finish()));
+                layers_recomputed += 1;
+            }
         }
         timing.compute = started.elapsed();
 
@@ -656,6 +762,16 @@ impl FrameRenderer {
             queue,
             &self.glyph_args,
             &glyph_slot_bytes,
+            QUAD_VERTEX_COUNT,
+            input.mode.first_instance(),
+        )?;
+        let mut sprite_slot_bytes = Vec::new();
+        encode_slots(&sprite_slots, &mut sprite_slot_bytes);
+        let sprite_output = self.indirect.run(
+            device,
+            queue,
+            &self.sprite_args,
+            &sprite_slot_bytes,
             QUAD_VERTEX_COUNT,
             input.mode.first_instance(),
         )?;
@@ -724,6 +840,14 @@ impl FrameRenderer {
             glyph_output.slot_count,
             &mut self.reader,
         )?;
+        let sprite_resolved = ResolvedArgs::resolve(
+            input.mode,
+            device,
+            queue,
+            &self.sprite_args,
+            sprite_output.slot_count,
+            &mut self.reader,
+        )?;
         let composite_resolved = ResolvedArgs::resolve(
             input.mode,
             device,
@@ -755,6 +879,13 @@ impl FrameRenderer {
                 SlotBasePlan::for_glyphs(device, queue, &self.glyphs, &glyph_slots)
             }
         };
+        let sprite_plan = match self.sprite_plan.take() {
+            Some(plan) if plan.slots() == sprite_slots.as_slice() => plan,
+            _ => {
+                self.sprite_plan_builds += 1;
+                SlotBasePlan::for_poly_sprites(device, queue, &self.sprites, &sprite_slots)
+            }
+        };
         let quad_frame_group = self.quads.frame_bind_group(
             device,
             &self.globals,
@@ -767,11 +898,20 @@ impl FrameRenderer {
             self.glyph_arena.buffer(),
             &self.glyph_args.visible,
         );
+        let sprite_frame_group = self.sprites.frame_bind_group(
+            device,
+            &self.globals,
+            self.sprite_arena.buffer(),
+            &self.sprite_args.visible,
+        );
         // Rebuilt per frame, not cached: a bind group names a texture view, and
         // an atlas page destroyed between frames leaves a cached one pointing at
         // a texture that no longer exists. The 16-byte uniform behind it *is*
         // cached, because its value is the page index and that never changes.
-        let glyph_pages = self.atlas_page_bind_groups(device, queue, input.atlas);
+        let glyph_pages =
+            self.atlas_page_bind_groups(device, queue, input.atlas, AtlasKind::Monochrome);
+        let sprite_pages =
+            self.atlas_page_bind_groups(device, queue, input.atlas, AtlasKind::Polychrome);
         let composite_frame_group = self.composite.frame_bind_group(device, &self.globals);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -808,10 +948,10 @@ impl FrameRenderer {
             // After the quads and before the composites: text paints over the
             // chrome behind it and under a modal composited on top, which is the
             // painter order §5.3's kind grouping already puts the slots in.
-            stats.merge(issue_glyphs(
+            stats.merge(issue_sprites(
                 &mut pass,
-                &self.glyphs,
-                GlyphDraw {
+                SpriteDraw {
+                    pipeline: &self.glyphs.pipeline,
                     plan: &glyph_plan,
                     pages: &glyph_pages,
                 },
@@ -819,6 +959,22 @@ impl FrameRenderer {
                 &self.glyph_args,
                 input.mode,
                 &glyph_resolved,
+            ));
+            // After the text and before the composites, which is the order
+            // `PrimitiveKind::ALL` declares and therefore the order the slot
+            // table groups: an avatar or a thumbnail paints over the row label
+            // behind it, and under a modal composited on top.
+            stats.merge(issue_sprites(
+                &mut pass,
+                SpriteDraw {
+                    pipeline: &self.sprites.pipeline,
+                    plan: &sprite_plan,
+                    pages: &sprite_pages,
+                },
+                &sprite_frame_group,
+                &self.sprite_args,
+                input.mode,
+                &sprite_resolved,
             ));
             stats.merge(issue_composites(
                 &mut pass,
@@ -834,6 +990,7 @@ impl FrameRenderer {
         queue.submit(Some(encoder.finish()));
         self.quad_plan = Some(quad_plan);
         self.glyph_plan = Some(glyph_plan);
+        self.sprite_plan = Some(sprite_plan);
 
         Ok(FrameOutput {
             stats,
@@ -880,6 +1037,25 @@ fn layer_glyph_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
         );
     }
     bounds
+}
+
+/// One layer's image sprites as bounding rectangles, in arena slot order.
+///
+/// [`layer_glyph_bounds`]' argument about slot order applies unchanged and is
+/// not repeated. The one difference is which rectangle a sprite contributes: it
+/// is the *drawn* rectangle (`origin`/`size`), not the tile's extent, because
+/// that is what covers pixels — an image scaled down to a 24px avatar occludes
+/// and orders as 24px however large its bitmap is. A sprite whose image has not
+/// decoded is still a real rectangle with a real position; it draws nothing
+/// because its tile is `NONE`, not because its bounds are empty.
+fn layer_sprite_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    scene
+        .poly_sprites
+        .keys(layer)
+        .into_iter()
+        .filter_map(|key| scene.poly_sprites.get(layer, key))
+        .map(|sprite| Rect::from_origin_size(sprite.origin, sprite.size))
+        .collect()
 }
 
 /// The upload instructions addressed to one kind's arena.
