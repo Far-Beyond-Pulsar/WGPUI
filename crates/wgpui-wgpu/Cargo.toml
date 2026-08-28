@@ -15,6 +15,11 @@ doctest = false
 # descriptors as plain Rust structs"). The edge runs one way only — wgpui-core
 # names nothing here, and cannot, since it is forbidden a live device.
 wgpui-core = { path = "../wgpui-core" }
+# Phase 6's `window/frame_loop.rs` drives the whole of §2's picture, which means
+# it holds the `LayoutTree` the reconciler builds and `Emitter::emit` reads.
+# `wgpui-core` already depends on this crate for exactly that type; naming it
+# here adds no edge to the graph, only the ability to say `LayoutTree` out loud.
+wgpui-layout = { path = "../wgpui-layout" }
 # The only crate that touches a live wgpu::Device (docs/gpu-native-architecture.md
 # §3.5) — this dependency is genuinely needed even at the Phase 0 stub stage
 # because the Phase 0 spike harnesses (benches/) live here and open a real
@@ -36,6 +41,11 @@ bytemuck = { version = "1.24", features = ["derive"] }
 # keeps the move mechanical — deleting the one `log::trace!` would be a change
 # to code §9's risk table specifically asks this phase not to change.
 log = "0.4.16"
+# Phase 6: `src/window.rs` opens a real OS window and binds a `wgpu::Surface` to
+# it. Pinned to the same version the root gpui-ce crate already resolves, so the
+# two backends share one winit in the lock file rather than linking two copies
+# of a library that registers OS-level window classes.
+winit = "0.30.12"
 
 [dev-dependencies]
 rand = "0.10"

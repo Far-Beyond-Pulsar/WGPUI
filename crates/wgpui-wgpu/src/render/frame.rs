@@ -67,7 +67,7 @@ use crate::render::draw::{
 use crate::render::pipelines::{
     CompositePipeline, Globals, MonoSpritePipeline, QuadPipeline, TARGET_FORMAT,
 };
-use crate::render::readback::{ReadbackError, StagingReader};
+use crate::render::readback::{ReadbackError, StagingReader, read_texture_rgba8};
 use crate::render::surface_registry::SurfaceRegistry;
 use crate::render::textures::external_surface::{
     CompositeConsumer, CompositePlan, plan_composites,
@@ -251,78 +251,55 @@ impl OffscreenTarget {
 
     /// Read the target back as tightly-packed RGBA8 rows.
     ///
-    /// Row padding to `COPY_BYTES_PER_ROW_ALIGNMENT` is undone here rather than
-    /// left to every caller, because a comparison that forgot to would report
-    /// two identical images as differing in their padding.
+    /// The body moved to [`read_texture_rgba8`] in Phase 6, unchanged, so that
+    /// the swapchain image — which this type does not own and cannot own — is
+    /// read by the identical code. A comparison between an offscreen render and
+    /// a presented frame is only a comparison if both sides were unpacked the
+    /// same way.
     pub fn read_pixels(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<Vec<u8>, ReadbackError> {
-        let unpadded = self.width * 4;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded = unpadded.div_ceil(align) * align;
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frame target readback"),
-            size: u64::from(padded) * u64::from(self.height),
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("frame target readback"),
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit(Some(encoder.finish()));
-
-        let slice = staging.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            if sender.send(result).is_err() {
-                log::warn!("wgpui-wgpu: frame readback completed after its receiver was dropped");
-            }
-        });
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(ReadbackError::Poll)?;
-        receiver
-            .recv()
-            .map_err(|_| ReadbackError::Cancelled)?
-            .map_err(ReadbackError::Map)?;
-
-        let pixels = {
-            let view = slice.get_mapped_range().map_err(ReadbackError::Range)?;
-            let mut pixels = Vec::with_capacity((unpadded * self.height) as usize);
-            for row in 0..self.height {
-                let start = (row * padded) as usize;
-                if let Some(bytes) = view.get(start..start + unpadded as usize) {
-                    pixels.extend_from_slice(bytes);
-                }
-            }
-            pixels
-        };
-        staging.unmap();
-        Ok(pixels)
+        read_texture_rgba8(device, queue, &self.texture, self.width, self.height)
     }
+
+    /// This target as a [`RenderTarget`], cleared to black.
+    ///
+    /// Black is what every test written before Phase 6 expects, and Phase 5.6's
+    /// byte-exact text proof depends on it specifically: white text over black
+    /// through a straight-alpha `over` blend is an identity, which is what makes
+    /// a rendered pixel *equal* to its atlas texel rather than merely close to
+    /// it.
+    pub fn target(&self) -> RenderTarget<'_> {
+        RenderTarget {
+            view: &self.view,
+            width: self.width,
+            height: self.height,
+            clear: wgpu::Color::BLACK,
+        }
+    }
+}
+
+/// Where one frame's colour goes.
+///
+/// Phase 4 took an [`OffscreenTarget`] by reference and could, because the only
+/// thing a frame had ever been drawn into was a texture this crate allocated.
+/// Phase 6 draws into a swapchain image, which is allocated by the presentation
+/// engine, handed over one frame at a time, and cannot be owned by anything
+/// here. What the renderer actually needs is a view and its extent, so that is
+/// what it now asks for — and the fact that both paths pass through this one
+/// struct is what makes "the offscreen test and the window draw the same frame"
+/// a property of the code rather than a claim about it.
+pub struct RenderTarget<'a> {
+    /// The view the render pass attaches.
+    pub view: &'a wgpu::TextureView,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// What the pass loads with.
+    pub clear: wgpu::Color,
 }
 
 /// Everything a frame needs that outlives one: pipelines, arenas, pools.
@@ -474,6 +451,22 @@ impl FrameRenderer {
         queue: &wgpu::Queue,
         input: &FrameInput<'_>,
         target: &OffscreenTarget,
+    ) -> Result<FrameOutput, FrameError> {
+        self.render_to(device, queue, input, &target.target())
+    }
+
+    /// Render one frame into any colour target.
+    ///
+    /// [`Self::render`]'s body, with the target generalised. The swapchain path
+    /// calls this and the offscreen path calls it through `render`, so there is
+    /// exactly one implementation of "what a frame does" — see [`RenderTarget`]
+    /// for why that mattered enough to change a signature five phases in.
+    pub fn render_to(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &FrameInput<'_>,
+        target: &RenderTarget<'_>,
     ) -> Result<FrameOutput, FrameError> {
         self.textures.begin_frame();
         let mut timing = FrameTiming::default();
@@ -789,11 +782,11 @@ impl FrameRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.view,
+                    view: target.view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(target.clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

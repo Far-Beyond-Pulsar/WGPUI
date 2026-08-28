@@ -60,6 +60,94 @@ impl std::fmt::Display for ReadbackError {
 
 impl std::error::Error for ReadbackError {}
 
+/// Copy an `Rgba8`-family texture back as tightly-packed rows.
+///
+/// Row padding to `COPY_BYTES_PER_ROW_ALIGNMENT` is undone here rather than
+/// left to every caller, because a comparison that forgot to would report two
+/// identical images as differing in their padding.
+///
+/// `texture` must carry `TextureUsages::COPY_SRC`. Phase 4 had one caller for
+/// this (`OffscreenTarget`, which owns its texture and can guarantee the usage
+/// at creation); Phase 6 added a second that owns nothing — the **swapchain
+/// image itself**, whose usage comes from `SurfaceConfiguration::usage`. That
+/// second caller is the whole reason this is a free function over a
+/// `&wgpu::Texture` rather than a method: reading back the image that is about
+/// to be presented is what makes Phase 6's on-screen claim a byte comparison
+/// instead of a parallel render standing in for one.
+///
+/// Submits its own encoder and blocks until the copy and the map complete.
+pub fn read_texture_rgba8(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, ReadbackError> {
+    let unpadded = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("texture readback"),
+        size: u64::from(padded) * u64::from(height),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("texture readback"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        if sender.send(result).is_err() {
+            log::warn!("wgpui-wgpu: texture readback completed after its receiver was dropped");
+        }
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(ReadbackError::Poll)?;
+    receiver
+        .recv()
+        .map_err(|_| ReadbackError::Cancelled)?
+        .map_err(ReadbackError::Map)?;
+
+    let pixels = {
+        let view = slice.get_mapped_range().map_err(ReadbackError::Range)?;
+        let mut pixels = Vec::with_capacity((unpadded * height) as usize);
+        for row in 0..height {
+            let start = (row * padded) as usize;
+            if let Some(bytes) = view.get(start..start + unpadded as usize) {
+                pixels.extend_from_slice(bytes);
+            }
+        }
+        pixels
+    };
+    staging.unmap();
+    Ok(pixels)
+}
+
 /// Copy `count` `u32`s out of `source` and return them.
 ///
 /// `source` must carry `BufferUsages::COPY_SRC`. Submits its own encoder and

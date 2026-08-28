@@ -6774,7 +6774,9 @@ dependencies = [
  "rand 0.10.0",
  "wgpu",
  "wgpui-core",
+ "wgpui-layout",
  "wgpui-text",
+ "winit",
 ]
 
 [[package]]

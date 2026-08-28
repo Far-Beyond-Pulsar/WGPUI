@@ -166,6 +166,14 @@ pub struct ComputeContext {
     pub device: wgpu::Device,
     /// Its queue.
     pub queue: wgpu::Queue,
+    /// The adapter the device was opened on.
+    ///
+    /// Kept rather than only its `get_info()` because
+    /// `wgpu::Surface::get_capabilities` needs the adapter itself: a surface's
+    /// formats, present modes and alpha modes are a property of the
+    /// adapter/surface *pair*, not of either alone. Phase 6 is the first caller
+    /// that has a surface to ask about.
+    pub adapter: wgpu::Adapter,
     /// The adapter's self-report, carried so every measurement can name the
     /// hardware it ran on — Phase 0's honesty standard, kept.
     pub adapter_info: wgpu::AdapterInfo,
@@ -224,17 +232,42 @@ pub fn is_software_adapter(info: &wgpu::AdapterInfo) -> bool {
 /// ships wants the driver's own preference, and `request_adapter` is what
 /// declines a software fallback when hardware is present.
 pub fn headless_compute_context() -> Result<ComputeContext, ContextError> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+    let instance = instance();
+    context_for(&instance, None)
+}
+
+/// The instance descriptor every path in this crate opens.
+///
+/// One function rather than a literal at each call site because Phase 6 added a
+/// second one: a surface may only be created from the same instance the adapter
+/// came from, so "the backends this crate uses" has to be a single fact rather
+/// than two copies that could drift.
+pub fn instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN | wgpu::Backends::DX12,
         flags: wgpu::InstanceFlags::default(),
         backend_options: wgpu::BackendOptions::default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         display: None,
-    });
+    })
+}
+
+/// Open a device on `instance`, optionally one that can present to `surface`.
+///
+/// Passing the surface matters and is not cosmetic: on a machine with more than
+/// one adapter, `request_adapter` without `compatible_surface` may hand back an
+/// adapter that cannot present to the window at all, and the failure then shows
+/// up as an empty capability list at `configure` time rather than at selection
+/// time. This machine's own probe enumerates five adapters, so that is not a
+/// hypothetical.
+pub fn context_for(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+) -> Result<ComputeContext, ContextError> {
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
-        compatible_surface: None,
+        compatible_surface: surface,
         ..Default::default()
     }))
     .map_err(ContextError::NoAdapter)?;
@@ -266,6 +299,7 @@ pub fn headless_compute_context() -> Result<ComputeContext, ContextError> {
     Ok(ComputeContext {
         device,
         queue,
+        adapter,
         adapter_info,
         indirect,
     })
