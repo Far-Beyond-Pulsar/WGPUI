@@ -24,8 +24,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use wgpui_core::invalidation::request::FrameSignals;
+use wgpui_core::patch::primitive::GlyphRun;
+use wgpui_wgpu::render::atlas::{AtlasTileSource, GlyphAtlas};
+use wgpui_wgpu::render::atlas_upload::AtlasTextures;
 use wgpui_wgpu::render::device::ComputeContext;
+use wgpui_wgpu::render::draw::DrawMode;
+use wgpui_wgpu::render::frame::RenderTarget;
 use wgpui_wgpu::render::readback::read_texture_rgba8;
+use wgpui_wgpu::window::frame_loop::{FrameLoop, ReferenceScene};
 use wgpui_wgpu::window::resize_detector::ResizeDetector;
 use wgpui_wgpu::window::{
     Acquired, PROOF_MAGENTA, PROOF_MAGENTA_BYTES, SurfaceStats, WindowSurface, clear_frame,
@@ -33,6 +40,20 @@ use wgpui_wgpu::window::{
 
 const INITIAL_WIDTH: u32 = 800;
 const INITIAL_HEIGHT: u32 = 500;
+
+/// The reference quad's fill.
+///
+/// Each component is an exact multiple of 1/255, so an opaque quad written to
+/// `Rgba8Unorm` reads back as exactly `[64, 160, 240, 255]` — see
+/// [`ReferenceScene::fill`] for why an arbitrary float would not.
+const FILL: [f32; 4] = [64.0 / 255.0, 160.0 / 255.0, 240.0 / 255.0, 1.0];
+const FILL_BYTES: [u8; 4] = [64, 160, 240, 255];
+const FILL_SIZE: [f32; 2] = [320.0, 180.0];
+const TEXT_HEIGHT: f32 = 64.0;
+const TEXT: &str = "WGPUI 2.0 through the new stack";
+const TEXT_SIZE: f32 = 24.0;
+/// Where the shaped line's pen starts, relative to the text element's bounds.
+const TEXT_ORIGIN: [f32; 2] = [16.0, 40.0];
 
 /// A scripted resize sequence, in physical pixels.
 ///
@@ -62,6 +83,8 @@ struct Options {
     hold: Option<Duration>,
     resize: bool,
     verify: bool,
+    scene: bool,
+    no_fingerprint: bool,
 }
 
 impl Options {
@@ -71,6 +94,8 @@ impl Options {
             hold: None,
             resize: false,
             verify: false,
+            scene: false,
+            no_fingerprint: false,
         };
         let mut arguments = std::env::args().skip(1);
         while let Some(argument) = arguments.next() {
@@ -88,6 +113,8 @@ impl Options {
                 }
                 "--resize" => options.resize = true,
                 "--verify" => options.verify = true,
+                "--scene" => options.scene = true,
+                "--no-fingerprint" => options.no_fingerprint = true,
                 other => return Err(format!("unrecognised argument {other:?}")),
             }
         }
@@ -107,6 +134,10 @@ struct Observed {
     verify_failures: Vec<String>,
     resize_steps_dispatched: usize,
     resizes_answered_synchronously: usize,
+    /// `--scene` only: frames where the patch was empty, no layer was dirty,
+    /// and nothing was uploaded. A steady window's every frame after the first.
+    idle_frames: u32,
+    last_frame: Option<String>,
     sizes_presented: Vec<(u32, u32)>,
     surface: SurfaceStats,
     resize_events_seen: u64,
@@ -129,6 +160,15 @@ struct Live {
     next_resize_step: usize,
     /// Frames drawn since the last scripted resize was requested.
     frames_since_resize: u32,
+    /// `--scene` only: the whole pipeline, and the atlas its text samples.
+    scene: Option<SceneState>,
+}
+
+struct SceneState {
+    frame_loop: FrameLoop,
+    atlas: AtlasTextures,
+    reference: ReferenceScene,
+    mode: DrawMode,
 }
 
 impl winit::application::ApplicationHandler for App {
@@ -168,12 +208,39 @@ impl winit::application::ApplicationHandler for App {
         let (width, height) = surface.size();
         resizes.seed(width, height);
 
+        let scene = if self.options.scene {
+            let (runs, mut atlas) = shape_reference_text();
+            let mut textures = AtlasTextures::for_atlas(&atlas);
+            let upload = textures.sync(&context.device, &context.queue, &mut atlas);
+            println!(
+                "atlas: {} rectangle(s) uploaded, {} skipped, {} page(s)",
+                upload.rectangles,
+                upload.skipped,
+                textures.page_count()
+            );
+            Some(SceneState {
+                frame_loop: FrameLoop::new(&context.device),
+                atlas: textures,
+                reference: ReferenceScene {
+                    fill: FILL,
+                    fingerprinted: !self.options.no_fingerprint,
+                    fill_size: FILL_SIZE,
+                    text: runs,
+                    text_height: TEXT_HEIGHT,
+                },
+                mode: DrawMode::best_available(context.indirect),
+            })
+        } else {
+            None
+        };
+
         self.live = Some(Live {
             surface,
             context,
             resizes,
             next_resize_step: 0,
             frames_since_resize: 0,
+            scene,
         });
         window.request_redraw();
     }
@@ -234,14 +301,62 @@ impl App {
         let view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        clear_frame(
-            &live.context.device,
-            &live.context.queue,
-            &view,
-            PROOF_MAGENTA,
-        );
-
         let (width, height) = live.surface.size();
+
+        // The one place the two modes differ. `--scene` runs the real pipeline
+        // — reconcile, lay out, emit, apply, compute, indirect draw — straight
+        // into the swapchain view; the default clears it. Both write into the
+        // same acquired image and both are presented by the same call below.
+        let mut idle_frames = 0u32;
+        match live.scene.as_mut() {
+            Some(scene) => {
+                let target = RenderTarget {
+                    view: &view,
+                    width,
+                    height,
+                    // Black, so Phase 5.6's white-on-black identity holds and
+                    // the text's pixels are its atlas texels exactly.
+                    clear: wgpu::Color::BLACK,
+                };
+                match scene.frame_loop.draw(
+                    &live.context.device,
+                    &live.context.queue,
+                    scene.reference.describe(),
+                    Some(&scene.atlas),
+                    &target,
+                    scene.mode,
+                    &FrameSignals::new(),
+                    &[],
+                ) {
+                    Ok(frame) => {
+                        if frame.was_idle() {
+                            idle_frames = 1;
+                        }
+                        self.observed.last_frame = Some(format!(
+                            "resident={} draws={} slots={} plan_builds={}/{}",
+                            frame.frame.primitives_resident,
+                            frame.frame.stats.draw_calls_issued,
+                            frame.frame.stats.slots_visited,
+                            scene.frame_loop.draw_plan_builds(),
+                            scene.frame_loop.glyph_plan_builds(),
+                        ));
+                    }
+                    Err(error) => {
+                        self.observed.failure = Some(format!("FrameLoop::draw failed: {error}"));
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            }
+            None => clear_frame(
+                &live.context.device,
+                &live.context.queue,
+                &view,
+                PROOF_MAGENTA,
+            ),
+        }
+        self.observed.idle_frames += idle_frames;
+
         if self.options.verify {
             match read_texture_rgba8(
                 &live.context.device,
@@ -252,7 +367,17 @@ impl App {
             ) {
                 Ok(pixels) => {
                     self.observed.frames_verified += 1;
-                    if let Some(message) = wrong_pixel(&pixels, width, height) {
+                    let wrong = match live.scene.as_ref() {
+                        Some(scene) => wrong_scene_pixel(
+                            &pixels,
+                            width,
+                            height,
+                            &scene.frame_loop.resident_quads(),
+                            &scene.frame_loop.resident_glyphs(),
+                        ),
+                        None => wrong_pixel(&pixels, width, height),
+                    };
+                    if let Some(message) = wrong {
                         self.observed.verify_failures.push(format!(
                             "frame {} at {width}x{height}: {message}",
                             self.observed.frames_drawn
@@ -315,6 +440,200 @@ impl App {
             event_loop.exit();
         }
     }
+}
+
+/// Shape and rasterise the reference line through the real text path.
+///
+/// Positions are rounded to whole pixels for the same reason Phase 5.6's gate
+/// rounds them: a glyph sprite is a 1:1 texel blit, which is only texel-exact
+/// when the quad's corners are whole pixels, and
+/// `wgpui_text::patch::glyph_runs` keeps the fractional pen position because
+/// the atlas already carries the fraction as a sub-pixel variant. The flooring
+/// belongs in `wgpui-text`; §11's action 4 still carries it as open.
+fn shape_reference_text() -> (Vec<GlyphRun>, GlyphAtlas) {
+    use wgpui_text::patch::{RunPlacement, glyph_runs};
+    use wgpui_text::raster::GlyphRasterizer;
+    use wgpui_text::shaping::{FontRun, SharedString, font};
+
+    let mut shaper = wgpui_text::test_fonts::shaper();
+    let font_id = match shaper.resolve_font(&font(wgpui_text::test_fonts::FAMILY)) {
+        Ok(font_id) => font_id,
+        Err(error) => {
+            eprintln!("phase6_window: the embedded face did not resolve: {error:?}");
+            return (Vec::new(), GlyphAtlas::new(512));
+        }
+    };
+    let text = SharedString::from(TEXT);
+    let line = match shaper.shape_line(&text, TEXT_SIZE, &[FontRun::new(text.len(), font_id)]) {
+        Ok(line) => line,
+        Err(error) => {
+            eprintln!("phase6_window: shaping failed: {error:?}");
+            return (Vec::new(), GlyphAtlas::new(512));
+        }
+    };
+
+    let mut atlas = GlyphAtlas::new(512);
+    let mut rasterizer = GlyphRasterizer::new();
+    let runs = {
+        let mut source = AtlasTileSource::new(&mut atlas, |key| {
+            rasterizer.rasterize(&mut shaper, key).ok()
+        });
+        glyph_runs(
+            &line,
+            RunPlacement {
+                origin: TEXT_ORIGIN,
+                // White, so the straight-alpha `over` blend over a black clear
+                // reduces to the identity Phase 5.6's proof rests on.
+                color: [1.0, 1.0, 1.0, 1.0],
+                scale_factor: 1.0,
+            },
+            &mut source,
+        )
+        .0
+    };
+    let runs = runs
+        .into_iter()
+        .map(|mut run| {
+            for glyph in &mut run.glyphs {
+                glyph.position = [glyph.position[0].round(), glyph.position[1].round()];
+            }
+            run
+        })
+        .collect();
+    (runs, atlas)
+}
+
+/// The reference scene's expected framebuffer, checked against the presented
+/// image.
+///
+/// **Checked against the primitives the scene actually holds, not against the
+/// constants they were described with.** Those two are the same thing at
+/// 800x500 and are *not* the same thing at 320x200: the column's two children
+/// want 244px of a 200px box, taffy's default `flex_shrink` applies, and the
+/// quad is legitimately 147px tall. The first version of this function compared
+/// against `FILL_SIZE` and failed on exactly those frames — with the renderer
+/// right and the check wrong. Reading the emitted quad back is what makes
+/// "matches what was described" mean the whole chain rather than one constant.
+///
+/// Three claims, and each fails differently:
+///
+/// 1. **The quad is exactly its emitted rectangle, in exactly its emitted
+///    colour** — equality, not a tolerance.
+/// 2. **The quad does not spill**: one column past its right edge and one row
+///    past its bottom edge are not the fill.
+/// 3. **The text is present, and only inside the rows its glyphs claim.**
+///
+/// The byte-exact glyph-texel comparison — every glyph's own tile, at its own
+/// position — lives in `tests/window_present.rs`, which carries the atlas's
+/// texels alongside. This is the cheap check that runs every presented frame.
+fn wrong_scene_pixel(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quads: &[wgpui_core::patch::primitive::Quad],
+    glyphs: &[(wgpui_core::patch::primitive::Glyph, [f32; 4])],
+) -> Option<String> {
+    let expected = (width as usize) * (height as usize) * 4;
+    if pixels.len() != expected {
+        return Some(format!(
+            "readback is {} bytes, expected {expected}",
+            pixels.len()
+        ));
+    }
+    let at = |x: u32, y: u32| -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        match pixels.get(offset..offset + 4) {
+            Some(bytes) => [bytes[0], bytes[1], bytes[2], bytes[3]],
+            None => [0, 0, 0, 0],
+        }
+    };
+
+    let [quad] = quads else {
+        return Some(format!(
+            "the scene holds {} quads, expected exactly the reference fill",
+            quads.len()
+        ));
+    };
+    if quad.background != FILL {
+        return Some(format!(
+            "the emitted quad's background is {:?}, expected {FILL:?}",
+            quad.background
+        ));
+    }
+    let left = quad.origin[0].round().max(0.0) as u32;
+    let top = quad.origin[1].round().max(0.0) as u32;
+    let right = ((quad.origin[0] + quad.size[0]).round().max(0.0) as u32).min(width);
+    let bottom = ((quad.origin[1] + quad.size[1]).round().max(0.0) as u32).min(height);
+    for y in top..bottom {
+        for x in left..right {
+            if at(x, y) != FILL_BYTES {
+                return Some(format!(
+                    "quad pixel ({x}, {y}) is {:?}, expected {FILL_BYTES:?}; the emitted quad is \
+                     {:?} at {:?}",
+                    at(x, y),
+                    quad.size,
+                    quad.origin
+                ));
+            }
+        }
+    }
+    if right < width && bottom > top && at(right, (top + bottom) / 2) == FILL_BYTES {
+        return Some(format!(
+            "the quad painted x={right}, one past the right edge it emitted"
+        ));
+    }
+    if bottom < height && right > left && at((left + right) / 2, bottom) == FILL_BYTES {
+        return Some(format!(
+            "the quad painted y={bottom}, one past the bottom edge it emitted"
+        ));
+    }
+
+    // The rows the glyphs themselves claim, taken from the emitted glyphs
+    // rather than from `TEXT_HEIGHT` — at a shrunk size the text element is
+    // shorter than it asked for, exactly as the quad is.
+    let inked: Vec<&wgpui_core::patch::primitive::Glyph> = glyphs
+        .iter()
+        .map(|(glyph, _)| glyph)
+        .filter(|glyph| glyph.atlas_size[0] > 0.0 && glyph.atlas_size[1] > 0.0)
+        .collect();
+    let Some(first) = inked.first() else {
+        return Some("the scene holds no inked glyphs at all".to_string());
+    };
+    let mut text_top = first.position[1];
+    let mut text_bottom = first.position[1] + first.atlas_size[1];
+    for glyph in &inked {
+        text_top = text_top.min(glyph.position[1]);
+        text_bottom = text_bottom.max(glyph.position[1] + glyph.atlas_size[1]);
+    }
+    let text_top = (text_top.max(0.0) as u32).min(height);
+    let text_bottom = ((text_bottom.ceil().max(0.0) as u32) + 1).min(height);
+
+    let mut ink = 0usize;
+    for y in text_top..text_bottom {
+        for x in 0..width {
+            if at(x, y) != [0, 0, 0, 255] && !(x >= left && x < right && y >= top && y < bottom) {
+                ink += 1;
+            }
+        }
+    }
+    if ink < 100 {
+        return Some(format!(
+            "rows {text_top}..{text_bottom}, which the emitted glyphs claim, hold only {ink} \
+             non-clear pixels outside the quad, so the line did not draw"
+        ));
+    }
+    if text_bottom < height {
+        for x in 0..width {
+            if at(x, text_bottom) != [0, 0, 0, 255]
+                && !(x >= left && x < right && text_bottom >= top && text_bottom < bottom)
+            {
+                return Some(format!(
+                    "row {text_bottom}, below every emitted glyph's extent, is painted"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// The first pixel that is not [`PROOF_MAGENTA_BYTES`], described.
@@ -390,6 +709,13 @@ fn main() -> std::process::ExitCode {
         observed.resizes_answered_synchronously
     );
     println!("sizes presented:         {:?}", observed.sizes_presented);
+    if options.scene {
+        println!("idle frames:             {}", observed.idle_frames);
+        println!(
+            "last frame:              {}",
+            observed.last_frame.as_deref().unwrap_or("none")
+        );
+    }
     println!("elapsed:                 {:?}", app.started.elapsed());
 
     let mut failed = false;

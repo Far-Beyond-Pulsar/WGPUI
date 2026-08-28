@@ -51,6 +51,7 @@
 
 pub mod app_menu;
 pub mod dispatcher;
+pub mod frame_loop;
 pub mod keyboard;
 pub mod resize_detector;
 
