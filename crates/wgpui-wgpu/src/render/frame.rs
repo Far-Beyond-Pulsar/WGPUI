@@ -61,11 +61,12 @@ use crate::render::compute::indirect_args_pass::{
 use crate::render::compute::occlusion_pass::{OcclusionError, OcclusionPass};
 use crate::render::compute::ordering_pass::{OrderingError, OrderingPass};
 use crate::render::draw::{
-    DrawMode, DrawStats, ResolvedArgs, SlotBasePlan, SpriteDraw, issue_composites, issue_quads,
+    DrawMode, DrawStats, ResolvedArgs, SlotBasePlan, SpriteDraw, issue_composites, issue_instanced,
     issue_sprites,
 };
 use crate::render::pipelines::{
-    CompositePipeline, Globals, MonoSpritePipeline, PolySpritePipeline, QuadPipeline, TARGET_FORMAT,
+    CompositePipeline, Globals, MonoSpritePipeline, PolySpritePipeline, QuadPipeline,
+    ShadowPipeline, TARGET_FORMAT,
 };
 use crate::render::readback::{ReadbackError, StagingReader, read_texture_rgba8};
 use crate::render::surface_registry::SurfaceRegistry;
@@ -309,6 +310,8 @@ pub struct FrameRenderer {
     ordering: OrderingPass,
     occlusion: OcclusionPass,
     indirect: IndirectArgsPass,
+    /// The instanced shadow pipeline (Phase 6.3).
+    pub shadows: ShadowPipeline,
     /// The instanced quad pipeline.
     pub quads: QuadPipeline,
     /// The instanced monochrome-sprite pipeline (Phase 5.6).
@@ -317,6 +320,10 @@ pub struct FrameRenderer {
     pub sprites: PolySpritePipeline,
     /// The one composite pipeline.
     pub composite: CompositePipeline,
+    /// The shadow arena. Its own buffer, for the reason `sprite_arena` records:
+    /// two kinds sharing a slot stride today is a coincidence of two
+    /// independent layout decisions, not a licence to share an arena.
+    pub shadow_arena: SlabBuffer,
     /// The quad arena.
     pub arena: SlabBuffer,
     /// The glyph arena. A second buffer rather than a second range of the
@@ -332,6 +339,7 @@ pub struct FrameRenderer {
     /// Boundary texture retention (§5.5).
     pub textures: LayerTexturePool,
     globals: wgpu::Buffer,
+    shadow_args: IndirectArgsBuffers,
     quad_args: IndirectArgsBuffers,
     glyph_args: IndirectArgsBuffers,
     sprite_args: IndirectArgsBuffers,
@@ -339,9 +347,11 @@ pub struct FrameRenderer {
     /// The per-slot bases and their bind group, kept until the slot table
     /// itself changes — see [`SlotBasePlan`], which is only true of it if
     /// something holds it across frames.
+    shadow_plan: Option<SlotBasePlan>,
     quad_plan: Option<SlotBasePlan>,
     glyph_plan: Option<SlotBasePlan>,
     sprite_plan: Option<SlotBasePlan>,
+    shadow_plan_builds: u64,
     quad_plan_builds: u64,
     glyph_plan_builds: u64,
     sprite_plan_builds: u64,
@@ -363,10 +373,12 @@ impl FrameRenderer {
             ordering: OrderingPass::new(device),
             occlusion: OcclusionPass::new(device),
             indirect: IndirectArgsPass::new(device),
+            shadows: ShadowPipeline::new(device),
             quads: QuadPipeline::new(device),
             glyphs: MonoSpritePipeline::new(device),
             sprites: PolySpritePipeline::new(device),
             composite: CompositePipeline::new(device),
+            shadow_arena: SlabBuffer::new(device, "shadow arena"),
             arena: SlabBuffer::new(device, "quad arena"),
             glyph_arena: SlabBuffer::new(device, "glyph arena"),
             sprite_arena: SlabBuffer::new(device, "sprite arena"),
@@ -377,13 +389,16 @@ impl FrameRenderer {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            shadow_args: IndirectArgsBuffers::new(device, 1, 1),
             quad_args: IndirectArgsBuffers::new(device, 1, 1),
             glyph_args: IndirectArgsBuffers::new(device, 1, 1),
             sprite_args: IndirectArgsBuffers::new(device, 1, 1),
             composite_args: IndirectArgsBuffers::new(device, 1, 1),
+            shadow_plan: None,
             quad_plan: None,
             glyph_plan: None,
             sprite_plan: None,
+            shadow_plan_builds: 0,
             quad_plan_builds: 0,
             glyph_plan_builds: 0,
             sprite_plan_builds: 0,
@@ -406,6 +421,11 @@ impl FrameRenderer {
     /// intended.
     pub fn draw_plan_builds(&self) -> u64 {
         self.quad_plan_builds
+    }
+
+    /// The same counter for the shadow pipeline's slot bases.
+    pub fn shadow_plan_builds(&self) -> u64 {
+        self.shadow_plan_builds
     }
 
     /// The same counter for the glyph pipeline's slot bases.
@@ -469,17 +489,22 @@ impl FrameRenderer {
 
     /// Render one frame into `target`.
     ///
-    /// **All three instanced kinds are drawn.** Phase 4 drew only `Quad` and
-    /// said so here; Phase 5.6 added the `GlyphRun` half and Phase 6.2 the
-    /// `PolySprite` half, both taking the identical route — upload, ordering,
-    /// occlusion, indirect-argument generation, fixed draw sequence — over their
-    /// own arenas, with one addition the two sprite kinds share: the pass
-    /// repeats per bound atlas page, because a sprite's texture is chosen by its
-    /// tile and a bind group cannot change inside a draw call. See
-    /// [`issue_sprites`], which is one function for both.
+    /// **All four instanced kinds are drawn.** Phase 4 drew only `Quad` and
+    /// said so here; Phase 5.6 added the `GlyphRun` half, Phase 6.2 the
+    /// `PolySprite` half, and Phase 6.3 the `Shadow` half, all taking the
+    /// identical route — upload, ordering, occlusion, indirect-argument
+    /// generation, fixed draw sequence — over their own arenas. Two kinds add
+    /// something to that route and each addition is one thing:
     ///
-    /// What still has no pipeline: `shadows`, `underlines`, `paths`,
-    /// `backdrop_blur`.
+    /// - The two **sprite** kinds repeat the pass per bound atlas page, because
+    ///   a sprite's texture is chosen by its tile and a bind group cannot change
+    ///   inside a draw call. See [`issue_sprites`], one function for both.
+    /// - **Shadows** feed the compute passes
+    ///   [`wgpui_core::patch::primitive::Shadow::drawn_bounds`] rather than the
+    ///   primitive's own rectangle, and take [`CoverageItem::uncullable`] rather
+    ///   than [`CoverageItem::cullee`]. Both are noted at the loop that does it.
+    ///
+    /// What still has no pipeline: `underlines`, `paths`, `backdrop_blur`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -507,14 +532,17 @@ impl FrameRenderer {
         let mut timing = FrameTiming::default();
 
         let table = input.scene.draw_slots();
+        let shadow_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Shadow).to_vec();
         let quad_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Quad).to_vec();
         let glyph_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::GlyphRun).to_vec();
         let sprite_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::PolySprite).to_vec();
+        let shadow_arena_slots = input.scene.arena_slots(PrimitiveKind::Shadow);
         let arena_slots = input.scene.arena_slots(PrimitiveKind::Quad);
         let glyph_arena_slots = input.scene.arena_slots(PrimitiveKind::GlyphRun);
         let sprite_arena_slots = input.scene.arena_slots(PrimitiveKind::PolySprite);
-        let primitives_resident: u32 = quad_slots
+        let primitives_resident: u32 = shadow_slots
             .iter()
+            .chain(quad_slots.iter())
             .chain(glyph_slots.iter())
             .chain(sprite_slots.iter())
             .map(|slot| slot.count)
@@ -522,9 +550,13 @@ impl FrameRenderer {
 
         // --- 1. Upload.
         let started = Instant::now();
+        let shadow_resident = input.scene.shadows.resident_bytes();
         let resident = input.scene.quads.resident_bytes();
         let glyph_resident = input.scene.glyph_runs.resident_bytes();
         let sprite_resident = input.scene.poly_sprites.resident_bytes();
+        let shadows_grew = self
+            .shadow_arena
+            .reserve(device, shadow_resident.len() as u64);
         let grew = self.arena.reserve(device, resident.len() as u64);
         let glyphs_grew = self
             .glyph_arena
@@ -532,12 +564,15 @@ impl FrameRenderer {
         let sprites_grew = self
             .sprite_arena
             .reserve(device, sprite_resident.len() as u64);
-        if grew
+        if shadows_grew
+            || grew
             || glyphs_grew
             || sprites_grew
             || self.uploaded_generation.is_none()
             || matches!(input.dirty, Dirty::All)
         {
+            self.shadow_arena
+                .upload_all(device, queue, shadow_resident);
             self.arena.upload_all(device, queue, resident);
             self.glyph_arena.upload_all(device, queue, glyph_resident);
             self.sprite_arena.upload_all(device, queue, sprite_resident);
@@ -549,6 +584,12 @@ impl FrameRenderer {
             // unrelated primitive with a glyph's bytes. Before this phase there
             // was one arena and the filter was unnecessary; with two it is the
             // difference between a delta upload and corruption.
+            self.shadow_arena.upload(
+                device,
+                queue,
+                shadow_resident,
+                &kind_uploads(input.uploads, PrimitiveKind::Shadow),
+            );
             self.arena
                 .upload(device, queue, resident, &kind_uploads(input.uploads, PrimitiveKind::Quad));
             self.glyph_arena.upload(
@@ -574,6 +615,16 @@ impl FrameRenderer {
         );
         timing.upload = started.elapsed();
 
+        if !self
+            .shadow_args
+            .fits(shadow_arena_slots, shadow_slots.len() as u32)
+        {
+            self.shadow_args = IndirectArgsBuffers::new(
+                device,
+                shadow_arena_slots.max(1),
+                shadow_slots.len() as u32 + 1,
+            );
+        }
         if !self.quad_args.fits(arena_slots, quad_slots.len() as u32) {
             self.quad_args =
                 IndirectArgsBuffers::new(device, arena_slots.max(1), quad_slots.len() as u32 + 1);
@@ -607,6 +658,67 @@ impl FrameRenderer {
             let mut item_bytes = Vec::new();
             let mut poison_bytes = Vec::new();
             encode_poison_regions(input.poison, &mut poison_bytes);
+
+            // The shadow half, through the identical passes — with the two
+            // differences §8's "`QuadPipeline`-shaped" wording does not cover,
+            // both of which live here rather than in the pipeline:
+            //
+            // 1. **The rectangle is the drawn one, not the primitive's.** A
+            //    shadow's Gaussian tail rasterises up to
+            //    `Shadow::BLUR_MARGIN_SIGMAS * blur_radius` outside its own
+            //    bounds, so ordering against `origin`/`size` would sort a large
+            //    soft shadow as if it were the small hard rectangle at its
+            //    centre.
+            // 2. **A shadow is never culled.** `CoverageItem::uncullable`, not
+            //    `cullee` — the legacy sweep skips shadows for the same reason
+            //    (`src/occlusion.rs:255`), and 2.0's own
+            //    `CoverageItem::cullable` doc has named shadows specifically
+            //    since Phase 3. Feeding the *drawn* rectangle would in fact make
+            //    culling sound, but that would be a deviation from legacy output
+            //    on a phase whose gate is byte-exactness against it, so it is
+            //    left as an option rather than taken.
+            //
+            // A shadow is never an occluder either, and for a stronger reason
+            // than a sprite's: its own interior is a blurred gradient, so there
+            // is no rectangle over which it is opaque at all.
+            for slot in &shadow_slots {
+                if slot.count == 0 || !input.dirty.contains(slot.layer) {
+                    continue;
+                }
+                let bounds = layer_shadow_bounds(input.scene, slot.layer);
+                let items: Vec<CoverageItem> = bounds
+                    .iter()
+                    .map(|shadow| CoverageItem::uncullable(shadow.intersect(&input.clip)))
+                    .collect();
+
+                encode_ordering_items(&bounds, &mut bounds_bytes);
+                let ordered = self.ordering.run(device, queue, &bounds_bytes)?;
+                encode_coverage_items(&items, &mut item_bytes);
+                let culled = self
+                    .occlusion
+                    .run(device, queue, &item_bytes, &poison_bytes)?;
+
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("shadow scatter"),
+                });
+                IndirectArgsPass::scatter(
+                    &mut encoder,
+                    &ordered.draw_order,
+                    &self.shadow_args.draw_order,
+                    slot.base,
+                    slot.count,
+                );
+                IndirectArgsPass::scatter(
+                    &mut encoder,
+                    &culled.culled,
+                    &self.shadow_args.culled,
+                    slot.base,
+                    slot.count,
+                );
+                queue.submit(Some(encoder.finish()));
+                layers_recomputed += 1;
+            }
+
             for slot in &quad_slots {
                 if slot.count == 0 || !input.dirty.contains(slot.layer) {
                     continue;
@@ -743,6 +855,16 @@ impl FrameRenderer {
 
         // --- 3. Arguments.
         let started = Instant::now();
+        let mut shadow_slot_bytes = Vec::new();
+        encode_slots(&shadow_slots, &mut shadow_slot_bytes);
+        let shadow_output = self.indirect.run(
+            device,
+            queue,
+            &self.shadow_args,
+            &shadow_slot_bytes,
+            QUAD_VERTEX_COUNT,
+            input.mode.first_instance(),
+        )?;
         let mut slot_bytes = Vec::new();
         encode_slots(&quad_slots, &mut slot_bytes);
         let quad_output = self.indirect.run(
@@ -824,6 +946,14 @@ impl FrameRenderer {
         // --- 3b. Readback, on the fallback path only. Before the pass begins,
         // because it submits its own encoder and blocks.
         let started = Instant::now();
+        let shadow_resolved = ResolvedArgs::resolve(
+            input.mode,
+            device,
+            queue,
+            &self.shadow_args,
+            shadow_output.slot_count,
+            &mut self.reader,
+        )?;
         let quad_resolved = ResolvedArgs::resolve(
             input.mode,
             device,
@@ -865,6 +995,13 @@ impl FrameRenderer {
         // changed contents but not residency reuses the buffer and the bind
         // group untouched. The clean frame the gate measures is exactly that
         // frame.
+        let shadow_plan = match self.shadow_plan.take() {
+            Some(plan) if plan.slots() == shadow_slots.as_slice() => plan,
+            _ => {
+                self.shadow_plan_builds += 1;
+                SlotBasePlan::for_shadows(device, queue, &self.shadows, &shadow_slots)
+            }
+        };
         let quad_plan = match self.quad_plan.take() {
             Some(plan) if plan.slots() == quad_slots.as_slice() => plan,
             _ => {
@@ -886,6 +1023,12 @@ impl FrameRenderer {
                 SlotBasePlan::for_poly_sprites(device, queue, &self.sprites, &sprite_slots)
             }
         };
+        let shadow_frame_group = self.shadows.frame_bind_group(
+            device,
+            &self.globals,
+            self.shadow_arena.buffer(),
+            &self.shadow_args.visible,
+        );
         let quad_frame_group = self.quads.frame_bind_group(
             device,
             &self.globals,
@@ -936,15 +1079,27 @@ impl FrameRenderer {
                 multiview_mask: Default::default(),
             });
             let started = Instant::now();
-            stats = issue_quads(
+            // First, and under everything: `PrimitiveKind::ALL` declares
+            // `Shadow` before `Quad` because the legacy sorter's own
+            // discriminant does, so a card's drop shadow paints beneath the card.
+            stats = issue_instanced(
                 &mut pass,
-                &self.quads,
+                &self.shadows.pipeline,
+                &shadow_plan,
+                &shadow_frame_group,
+                &self.shadow_args,
+                input.mode,
+                &shadow_resolved,
+            );
+            stats.merge(issue_instanced(
+                &mut pass,
+                &self.quads.pipeline,
                 &quad_plan,
                 &quad_frame_group,
                 &self.quad_args,
                 input.mode,
                 &quad_resolved,
-            );
+            ));
             // After the quads and before the composites: text paints over the
             // chrome behind it and under a modal composited on top, which is the
             // painter order §5.3's kind grouping already puts the slots in.
@@ -988,6 +1143,7 @@ impl FrameRenderer {
             timing.draw_issue = started.elapsed();
         }
         queue.submit(Some(encoder.finish()));
+        self.shadow_plan = Some(shadow_plan);
         self.quad_plan = Some(quad_plan);
         self.glyph_plan = Some(glyph_plan);
         self.sprite_plan = Some(sprite_plan);
@@ -999,6 +1155,29 @@ impl FrameRenderer {
             primitives_resident,
         })
     }
+}
+
+/// One layer's shadows as the rectangles they actually paint into, in arena
+/// slot order.
+///
+/// [`layer_glyph_bounds`]' argument about slot order applies unchanged. The
+/// difference here is [`wgpui_core::patch::primitive::Shadow::drawn_bounds`]:
+/// unlike every other kind, a
+/// shadow's `origin`/`size` is *not* what it covers — the shader grows it by
+/// three blur radii on every side and integrates the falloff across that
+/// margin. Ordering a shadow by its unblurred rectangle would sort a wide soft
+/// shadow as though it were the small hard rectangle at its centre.
+fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    scene
+        .shadows
+        .keys(layer)
+        .into_iter()
+        .filter_map(|key| scene.shadows.get(layer, key))
+        .map(|shadow| {
+            let (origin, size) = shadow.drawn_bounds();
+            Rect::from_origin_size(origin, size)
+        })
+        .collect()
 }
 
 fn layer_quads(scene: &Scene, layer: LayerId) -> Vec<Quad> {

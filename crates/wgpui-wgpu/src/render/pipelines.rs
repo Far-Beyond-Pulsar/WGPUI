@@ -39,10 +39,16 @@
 //!   scene, and is where §5.5's Gap 2 lands: both producers bind the same
 //!   layout and take the same call.
 //!
-//! What is still genuinely absent is `shadows` and `underlines` (both
-//! [`QuadPipeline`]-shaped — Phase 6.3), `backdrop_blur`, and `paths`' own
-//! vertex buffer, which needs tessellation machinery no phase has built
-//! (Phase 6.4).
+//! - **[`ShadowPipeline`]** (Phase 6.3) is the first that needed nothing new at
+//!   *this* layer either — same layouts, same draw, another shader — which is
+//!   what §8's "`QuadPipeline`-shaped" claim was about and where it holds. The
+//!   two places it does not hold are outside this file entirely (a shadow paints
+//!   past its own rectangle, and is never culled); see [`ShadowPipeline`]'s own
+//!   doc, which names them rather than letting "cheap" stand unqualified.
+//!
+//! What is still genuinely absent is `underlines`, `backdrop_blur`, and
+//! `paths`' own vertex buffer, which needs tessellation machinery no phase has
+//! built (Phase 6.4).
 //!
 //! **Colour glyphs are not drawn either, and that is not the same absence.**
 //! [`PolySpritePipeline`] samples exactly the page a colour emoji's raster
@@ -207,6 +213,132 @@ impl QuadPipeline {
     }
 }
 
+/// The instanced shadow pipeline: a blurred, rounded rectangle per instance.
+///
+/// **[`QuadPipeline`]'s shape exactly** — the same two bind group layouts over
+/// the same three frame resources, the same empty vertex buffer list, the same
+/// triangle strip, the same blend state — over the `Shadow` arena and a
+/// different shader. §8's `6.3` row calls this "`QuadPipeline`-shaped" and at
+/// *this* layer the claim holds without qualification; the two places it does
+/// not are both outside this file and are recorded at
+/// [`crate::render::frame::FrameRenderer::render_to`] and on
+/// [`wgpui_core::patch::primitive::Shadow`]:
+///
+/// 1. The shader draws a rectangle *larger* than the primitive's own, so the
+///    ordering pass is fed [`wgpui_core::patch::primitive::Shadow::drawn_bounds`]
+///    rather than `origin`/`size`.
+/// 2. A shadow is never culled
+///    ([`wgpui_core::occlusion::CoverageItem::uncullable`]), where every prior
+///    kind is a `cullee`.
+///
+/// Neither changes anything here, which is the point of recording them here:
+/// the *pipeline* really is another shader against the quad layout, and the
+/// real work of the phase was elsewhere.
+pub struct ShadowPipeline {
+    /// The pipeline itself.
+    pub pipeline: wgpu::RenderPipeline,
+    /// Globals, arena, and indirection buffer.
+    pub frame_layout: wgpu::BindGroupLayout,
+    /// The per-slot base index, addressed by dynamic offset.
+    pub slot_layout: wgpu::BindGroupLayout,
+    /// Byte stride between two slots' entries in the slot-base buffer.
+    pub slot_stride: u32,
+}
+
+impl ShadowPipeline {
+    /// Build the pipeline. Once per device, never per frame.
+    pub fn new(device: &wgpu::Device) -> ShadowPipeline {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wgpui shadows"),
+            source: wgpu::ShaderSource::Wgsl(super::shaders::SHADOWS_WGSL.into()),
+        });
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadows frame"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, false),
+                storage_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                storage_entry(2, wgpu::ShaderStages::VERTEX),
+            ],
+        });
+        let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadows slot base"),
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadows"),
+            bind_group_layouts: &[Some(&frame_layout), Some(&slot_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadows"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vertex_main"),
+                compilation_options: Default::default(),
+                // §1's rule, unchanged for this kind too.
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fragment_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: TARGET_FORMAT,
+                    blend: Some(ALPHA_OVER),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: Default::default(),
+            cache: None,
+        });
+        ShadowPipeline {
+            pipeline,
+            frame_layout,
+            slot_layout,
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+        }
+    }
+
+    /// The bind group holding this frame's globals, shadow arena, and
+    /// indirection buffer.
+    pub fn frame_bind_group(
+        &self,
+        device: &wgpu::Device,
+        globals: &wgpu::Buffer,
+        arena: &wgpu::Buffer,
+        visible: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadows frame"),
+            layout: &self.frame_layout,
+            entries: &[
+                buffer_entry(0, globals),
+                buffer_entry(1, arena),
+                buffer_entry(2, visible),
+            ],
+        })
+    }
+
+    /// The bind group over a slot-base buffer.
+    pub fn slot_bind_group(&self, device: &wgpu::Device, bases: &wgpu::Buffer) -> wgpu::BindGroup {
+        slot_base_bind_group(device, &self.slot_layout, bases)
+    }
+
+    /// Bytes one shadow occupies in the arena, restated from `wgpui-core` so a
+    /// drift between the shader's `ShadowSlot` and the protocol's `Shadow` fails
+    /// a test rather than rendering garbage.
+    pub const fn arena_slot_stride() -> usize {
+        wgpui_core::patch::primitive::Shadow::SLOT_STRIDE
+    }
+}
+
 /// A bind group over a slot-base buffer, read one slot at a time through a
 /// dynamic offset.
 ///
@@ -245,7 +377,7 @@ pub fn slot_base_bind_group(
 /// 2. **page** — which atlas page is bound, and the page's texture. The one
 ///    thing a quad has no equivalent of, and the reason
 ///    [`crate::render::draw::issue_glyphs`] has an outer loop that
-///    [`crate::render::draw::issue_quads`] does not.
+///    [`crate::render::draw::issue_instanced`] does not.
 ///
 /// **Monochrome pages only.** A colour glyph's raster is an `Rgba8Unorm` page
 /// and this shader reads a single coverage channel; binding a colour page here
@@ -759,6 +891,34 @@ mod tests {
         // the agreement is asserted rather than left to a comment.
         assert_eq!(QuadPipeline::arena_slot_stride(), 4 * 16);
         assert!(super::super::shaders::QUADS_WGSL.contains("struct QuadSlot"));
+    }
+
+    #[test]
+    fn the_shader_agrees_with_the_protocol_about_a_shadow_slot() {
+        // `QuadSlot`'s drift hazard, one kind over.
+        assert_eq!(ShadowPipeline::arena_slot_stride(), 3 * 16);
+        let shader = super::super::shaders::SHADOWS_WGSL;
+        assert!(shader.contains("struct ShadowSlot"));
+        for field in ["origin_size", "color", "radius_blur"] {
+            assert!(shader.contains(field), "the shader dropped `{field}`");
+        }
+    }
+
+    #[test]
+    fn the_shadow_shaders_blur_margin_is_the_protocols_own() {
+        // Transcribed into WGSL, where nothing checks it against the Rust
+        // constant. If the two ever disagree the ordering pass reserves a
+        // different rectangle from the one the strip covers, and the outermost
+        // band of the falloff is clipped by a triangle edge — a subtly wrong
+        // shadow, with no error anywhere.
+        assert_eq!(
+            wgpui_core::patch::primitive::Shadow::BLUR_MARGIN_SIGMAS,
+            3.0
+        );
+        assert!(
+            super::super::shaders::SHADOWS_WGSL
+                .contains("const BLUR_MARGIN_SIGMAS: f32 = 3.0;")
+        );
     }
 
     #[test]

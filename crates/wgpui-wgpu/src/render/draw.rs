@@ -57,7 +57,8 @@ use wgpui_core::indirect::{DRAW_INDIRECT_ARGS_STRIDE, DrawIndirectArgs, DrawSlot
 use crate::render::compute::indirect_args_pass::IndirectArgsBuffers;
 use crate::render::device::IndirectSupport;
 use crate::render::pipelines::{
-    CompositePipeline, MonoSpritePipeline, PolySpritePipeline, QuadPipeline, slot_base_bind_group,
+    CompositePipeline, MonoSpritePipeline, PolySpritePipeline, QuadPipeline, ShadowPipeline,
+    slot_base_bind_group,
 };
 use crate::render::readback::{ReadbackError, StagingReader};
 use crate::render::textures::external_surface::CompositePlan;
@@ -382,6 +383,22 @@ impl SlotBasePlan {
         }
     }
 
+    /// Build the plan for the shadow pipeline's slots.
+    pub fn for_shadows(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &ShadowPipeline,
+        slots: &[DrawSlot],
+    ) -> SlotBasePlan {
+        SlotBasePlan::new(
+            device,
+            queue,
+            &pipeline.slot_layout,
+            pipeline.slot_stride,
+            slots,
+        )
+    }
+
     /// Build the plan for the quad pipeline's slots.
     pub fn for_quads(
         device: &wgpu::Device,
@@ -441,15 +458,23 @@ impl SlotBasePlan {
     }
 }
 
-/// Issue one kind's fixed draw sequence.
+/// Issue one texture-free instanced kind's fixed draw sequence.
 ///
-/// `frame_group` is [`QuadPipeline::frame_bind_group`]'s output for this
-/// frame's globals, arena, and indirection buffer; `args` holds the records the
-/// compute pass wrote. Nothing else is read, and in particular nothing about
-/// the scene's contents is.
-pub fn issue_quads(
+/// `frame_group` is the pipeline's `frame_bind_group` output for this frame's
+/// globals, arena, and indirection buffer; `args` holds the records the compute
+/// pass wrote. Nothing else is read, and in particular nothing about the
+/// scene's contents is.
+///
+/// **One function, two pipelines**, the same finding [`issue_sprites`] recorded
+/// in Phase 6.2 and for the same reason: Phase 6.3's shadow pass needed this
+/// body unchanged — same bind group indices, same dynamic offsets, same four
+/// modes — so it took the quad name off and now takes a
+/// `&wgpu::RenderPipeline` rather than one pipeline struct, because that is
+/// genuinely all it reads out of either. Taking [`QuadPipeline`] would let the
+/// function *look* per-kind while being per-kind in nothing but its signature.
+pub fn issue_instanced(
     pass: &mut wgpu::RenderPass<'_>,
-    pipeline: &QuadPipeline,
+    pipeline: &wgpu::RenderPipeline,
     plan: &SlotBasePlan,
     frame_group: &wgpu::BindGroup,
     args: &IndirectArgsBuffers,
@@ -466,7 +491,7 @@ pub fn issue_quads(
         return stats;
     }
 
-    pass.set_pipeline(&pipeline.pipeline);
+    pass.set_pipeline(pipeline);
     pass.set_bind_group(0, frame_group, &[]);
     stats.bind_group_binds += 1;
 

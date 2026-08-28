@@ -49,9 +49,19 @@ const DRAWN_KINDS: usize = PrimitiveKind::COUNT;
 
 /// Of those, the ones that sample an atlas page and therefore report through
 /// [`wgpui_wgpu::render::draw::DrawStats::sprite_slots_unavailable`]:
-/// `GlyphRun` and `PolySprite`. `Quad` samples nothing and always has a slot it
-/// can issue.
+/// `GlyphRun` and `PolySprite`.
 const SPRITE_KINDS: usize = 2;
+
+/// The rest: kinds with a pipeline that samples no texture, so their slots are
+/// always issuable. `Quad` since Phase 4 and `Shadow` since Phase 6.3 — both go
+/// through [`wgpui_wgpu::render::draw::issue_instanced`], which is one function
+/// for both.
+///
+/// This is the multiplier the per-slot path's draw count carries, and it was
+/// implicitly `1` before Phase 6.3 rather than absent: two assertions below read
+/// `LAYERS` where they meant `LAYERS * NON_ATLAS_KINDS`, and failed the moment a
+/// second texture-free kind existed. Naming it is what stops that recurring.
+const NON_ATLAS_KINDS: usize = DRAWN_KINDS - SPRITE_KINDS;
 
 fn window(spec: &UiSceneSpec) -> Rect {
     Rect::from_origin_size([0.0, 0.0], [spec.width, spec.height])
@@ -298,9 +308,12 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
         );
         if mode == DrawMode::PerSlotIndirect {
             assert_eq!(
-                large_result.stats.draw_calls_issued as usize, LAYERS,
-                "the per-slot path must issue exactly one call per slot — the \
-                 form of the claim that is not satisfiable by collapsing"
+                large_result.stats.draw_calls_issued as usize,
+                LAYERS * NON_ATLAS_KINDS,
+                "the per-slot path must issue exactly one call per slot of every \
+                 kind that has a texture-free pipeline — the form of the claim \
+                 that is not satisfiable by collapsing. The sprite passes issue \
+                 nothing here because this scene has no atlas at all."
             );
             small_output = Some(small_result);
             large_output = Some(large_result);
@@ -419,9 +432,12 @@ fn the_fallback_path_is_the_one_that_learns_the_counts() {
          and not a fourth name for skipping"
     );
     assert_eq!(
-        first.stats.slots_skipped, 1,
-        "the emptied layer's slot is the one the fallback declines to issue — \
-         the one thing an indirect path cannot do, because it does not know"
+        first.stats.slots_skipped as usize,
+        LAYERS + 1,
+        "the fallback declines to issue exactly the slots it has read and found \
+         empty — the one thing an indirect path cannot do, because it does not \
+         know. That is every one of this scene's shadow slots (it holds no \
+         shadows at all) plus the one quad layer emptied above."
     );
 
     // The staging buffer must be reused across frames, or the fallback
