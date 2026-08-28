@@ -176,13 +176,28 @@ fn cases() -> Vec<Case> {
     let white = ([0.0, 0.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
 
     vec![
+        // Phase 6.6's addition: four different radii, so `pick_corner_radius`
+        // has to select a different one in each quadrant. This case is the whole
+        // reason `Shadow` grew from one radius to four, and it would have been
+        // unrepresentable before that.
+        Case {
+            name: "four different corner radii, one per quadrant",
+            shadow: Shadow {
+                origin: [48.0, 40.0],
+                size: [128.0, 96.0],
+                color: grey.1,
+                corner_radii: [24.0, 4.0, 16.0, 0.0],
+                blur_radius: 9.0,
+            },
+            hsla: grey.0,
+        },
         Case {
             name: "the ordinary card shadow",
             shadow: Shadow {
                 origin: [48.0, 40.0],
                 size: [128.0, 96.0],
                 color: black_half.1,
-                corner_radius: 8.0,
+                corner_radii: [8.0; 4],
                 blur_radius: 12.0,
             },
             hsla: black_half.0,
@@ -193,7 +208,7 @@ fn cases() -> Vec<Case> {
                 origin: [80.0, 64.0],
                 size: [24.0, 20.0],
                 color: grey.1,
-                corner_radius: 4.0,
+                corner_radii: [4.0; 4],
                 blur_radius: 28.0,
             },
             hsla: grey.0,
@@ -204,7 +219,7 @@ fn cases() -> Vec<Case> {
                 origin: [40.5, 32.25],
                 size: [100.75, 80.5],
                 color: red.1,
-                corner_radius: 0.0,
+                corner_radii: [0.0; 4],
                 blur_radius: 6.5,
             },
             hsla: red.0,
@@ -215,7 +230,7 @@ fn cases() -> Vec<Case> {
                 origin: [32.0, 60.0],
                 size: [160.0, 48.0],
                 color: cyan.1,
-                corner_radius: 24.0,
+                corner_radii: [24.0; 4],
                 blur_radius: 9.25,
             },
             hsla: cyan.0,
@@ -226,7 +241,7 @@ fn cases() -> Vec<Case> {
                 origin: [72.0, 56.0],
                 size: [60.0, 40.0],
                 color: white.1,
-                corner_radius: 45.0,
+                corner_radii: [45.0; 4],
                 blur_radius: 7.0,
             },
             hsla: white.0,
@@ -237,7 +252,7 @@ fn cases() -> Vec<Case> {
                 origin: [56.25, 48.75],
                 size: [110.5, 70.0],
                 color: grey.1,
-                corner_radius: 3.5,
+                corner_radii: [3.5; 4],
                 blur_radius: 0.75,
             },
             hsla: grey.0,
@@ -248,7 +263,7 @@ fn cases() -> Vec<Case> {
                 origin: [-30.0, -24.0],
                 size: [90.0, 70.0],
                 color: red.1,
-                corner_radius: 10.0,
+                corner_radii: [10.0; 4],
                 blur_radius: 14.0,
             },
             hsla: red.0,
@@ -259,7 +274,7 @@ fn cases() -> Vec<Case> {
                 origin: [64.0, 52.0],
                 size: [96.0, 72.0],
                 color: white.1,
-                corner_radius: 6.0,
+                corner_radii: [6.0; 4],
                 blur_radius: 0.0,
             },
             hsla: white.0,
@@ -285,11 +300,16 @@ fn encode_legacy_shadow(shadow: &Shadow, hsla: [f32; 4]) -> [u8; LEGACY_SHADOW_S
     put(12, shadow.origin[1]);
     put(16, shadow.size[0]);
     put(20, shadow.size[1]);
-    // Four per-corner radii, all equal: 2.0 carries one uniform radius, so the
-    // legacy `pick_corner_radius` selects the same value in every quadrant and
-    // the branch collapses. **Per-corner radii are outside this proof.**
-    for corner in 0..4 {
-        put(24 + corner * 4, shadow.corner_radius);
+    // Four per-corner radii, in the legacy `Corners` field order.
+    //
+    // Phase 6.3 wrote one value four times here and disclosed "per-corner radii
+    // are outside this proof," because 2.0's `Shadow` carried one uniform
+    // radius. Phase 6.6 widened it (a `rounded_t_md()` box's shadow has two
+    // round corners and two square ones), so this passes the four through and
+    // [`a_per_corner_shadow_agrees_with_the_legacy_pick_corner_radius`] moves
+    // all four independently. **That limitation is closed, not restated.**
+    for (corner, radius) in shadow.corner_radii.iter().enumerate() {
+        put(24 + corner * 4, *radius);
     }
     // A content mask far larger than the viewport, per this module's doc.
     put(40, -100_000.0);
@@ -664,7 +684,7 @@ fn the_comparison_actually_detects_a_wrong_shadow() {
             origin: [48.0, 40.0],
             size: [128.0, 96.0],
             color: [0.5, 0.5, 0.5, 1.0],
-            corner_radius: 8.0,
+            corner_radii: [8.0; 4],
             blur_radius: 12.0,
         },
         hsla: [0.0, 0.0, 0.5, 1.0],
@@ -718,7 +738,7 @@ fn every_draw_mode_produces_the_same_shadow() {
             origin: [40.0, 36.0],
             size: [120.0, 88.0],
             color: [1.0, 0.0, 0.0, 1.0],
-            corner_radius: 10.0,
+            corner_radii: [10.0; 4],
             blur_radius: 11.0,
         },
         hsla: [0.0, 1.0, 0.5, 1.0],
@@ -788,7 +808,7 @@ fn a_shadow_covered_by_an_opaque_quad_still_paints_its_falloff_outside_it() {
         origin: [80.0, 60.0],
         size: [64.0, 48.0],
         color: [1.0, 1.0, 1.0, 1.0],
-        corner_radius: 4.0,
+        corner_radii: [4.0; 4],
         blur_radius: 16.0,
     };
     // Strictly larger than the shadow's own rectangle on every side. Written
@@ -932,7 +952,7 @@ fn the_legacy_struct_layout_is_the_one_wgsl_derives() {
         origin: [1.0, 2.0],
         size: [3.0, 4.0],
         color: [0.0, 0.0, 0.0, 0.25],
-        corner_radius: 5.0,
+        corner_radii: [5.0; 4],
         blur_radius: 6.0,
     };
     let bytes = encode_legacy_shadow(&shadow, [0.125, 0.25, 0.375, 0.25]);

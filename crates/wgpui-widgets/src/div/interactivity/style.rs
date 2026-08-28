@@ -325,14 +325,13 @@ impl DivStyle {
                 size[1] + 2.0 * shadow.spread_radius,
             ],
             color: shadow.color,
-            // 2.0's `Shadow` carries one uniform radius where `Quad` now carries
-            // four, so a per-corner shadow is the one thing `Style::paint`
-            // expresses and this cannot. The widest corner is used, which is the
-            // choice that never *loses* a rounded corner (a too-large radius
-            // clips the shadow's own square corners; a too-small one would leave
-            // a square shadow poking out from under a rounded box). Named in
-            // `docs/phase-6.6-results.md`, not glossed over.
-            corner_radius: corner_radii.max(),
+            // The *unspread* box's clamped radii, which is what
+            // `Window::paint_shadows` is handed: `Style::paint` computes
+            // `corner_radii` once against `bounds.size` and passes the same
+            // value to every shadow layer, however far that layer's own spread
+            // moved its rectangle. Recomputing the clamp against the spread
+            // rectangle here would be more principled and would not match.
+            corner_radii: corner_radii.to_array(),
             blur_radius: shadow.blur_radius,
         }
     }
@@ -493,7 +492,7 @@ mod tests {
         assert_eq!(shadow.origin, [11.0, 25.0], "offset by (0,4), shrunk by 1");
         assert_eq!(shadow.size, [98.0, 58.0]);
         assert_eq!(shadow.blur_radius, 6.0);
-        assert_eq!(shadow.corner_radius, 8.0);
+        assert_eq!(shadow.corner_radii, [8.0; 4]);
         assert_eq!(
             style.primitive_count(),
             3,

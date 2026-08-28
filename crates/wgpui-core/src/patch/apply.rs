@@ -864,7 +864,7 @@ mod tests {
             origin: [1.0, 2.0],
             size: [30.0, 40.0],
             color: [0.0, 0.0, 0.0, 0.5],
-            corner_radius: 4.0,
+            corner_radii: [4.0; 4],
             blur_radius: 8.0,
         };
         let mut patch = ScenePatch::new();

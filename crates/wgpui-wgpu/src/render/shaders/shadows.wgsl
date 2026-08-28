@@ -62,13 +62,16 @@ struct SlotBase {
     padding_2: u32,
 };
 
-// 48 bytes, matching `wgpui_core::patch::primitive::Shadow::SLOT_STRIDE` and the
+// 64 bytes, matching `wgpui_core::patch::primitive::Shadow::SLOT_STRIDE` and the
 // field order `Shadow::encode` writes.
 struct ShadowSlot {
     origin_size: vec4<f32>,
     color: vec4<f32>,
-    // corner_radius, blur_radius, and two words of padding.
-    radius_blur: vec4<f32>,
+    // Corner radii in the legacy `Corners` order: top-left, top-right,
+    // bottom-right, bottom-left.
+    corner_radii: vec4<f32>,
+    // blur_radius, and three words of padding.
+    blur: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -94,6 +97,25 @@ struct VertexOutput {
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
     let device_position = position / globals.viewport * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     return vec4<f32>(device_position, 0.0, 1.0);
+}
+
+// `pick_corner_radius`, transcribed from the legacy shadow shader, which shares
+// it verbatim with the legacy quad shader. The quadrant test is `< 0.0` on both
+// axes and the four radii are in the legacy `Corners` field order.
+fn pick_corner_radius(center_to_point: vec2<f32>, radii: vec4<f32>) -> f32 {
+    if center_to_point.x < 0.0 {
+        if center_to_point.y < 0.0 {
+            return radii.x;
+        } else {
+            return radii.w;
+        }
+    } else {
+        if center_to_point.y < 0.0 {
+            return radii.y;
+        } else {
+            return radii.z;
+        }
+    }
 }
 
 fn gaussian(x: f32, sigma: f32) -> f32 {
@@ -141,7 +163,7 @@ fn vertex_main(
     // than matching the legacy file where it makes no difference.
     let unit = vec2<f32>(f32(corner & 1u), f32((corner >> 1u) & 1u));
 
-    let margin = BLUR_MARGIN_SIGMAS * shadow.radius_blur.y;
+    let margin = BLUR_MARGIN_SIGMAS * shadow.blur.x;
     let expanded_origin = shadow.origin_size.xy - vec2<f32>(margin);
     let expanded_size = shadow.origin_size.zw + 2.0 * vec2<f32>(margin);
 
@@ -159,14 +181,16 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let center = shadow.origin_size.xy + half_size;
     let center_to_point = in.position.xy - center;
 
-    // The legacy `pick_corner_radius` selects one of four per-corner radii by
-    // quadrant. 2.0 carries one uniform radius (`Quad`'s convention, and
-    // `PolySprite` follows it too), so every quadrant selects the same value and
-    // the branch collapses. Note what is *not* here: unlike `quads.wgsl`, no
+    // `pick_corner_radius`, transcribed. Phase 6.3 collapsed this branch because
+    // `Shadow` carried one uniform radius; Phase 6.6 widened the primitive to
+    // four (a `rounded_t_md()` box casts a shadow with two round corners and two
+    // square ones), so the branch is now the legacy one.
+    //
+    // Note what is still *not* here: unlike `quads.wgsl`, no
     // `min(radius, half_size)` clamp — the legacy shadow shader does not clamp
     // either, and adding one would change output for an over-large radius.
-    let corner_radius = shadow.radius_blur.x;
-    let blur_radius = shadow.radius_blur.y;
+    let corner_radius = pick_corner_radius(center_to_point, shadow.corner_radii);
+    let blur_radius = shadow.blur.x;
 
     let low = center_to_point.y - half_size.y;
     let high = center_to_point.y + half_size.y;

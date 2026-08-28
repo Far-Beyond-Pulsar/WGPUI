@@ -713,8 +713,15 @@ pub struct Shadow {
     pub size: [f32; 2],
     /// Straight-alpha RGBA the shadow composites at full coverage.
     pub color: [f32; 4],
-    /// Uniform corner radius of the unblurred rectangle.
-    pub corner_radius: f32,
+    /// Corner radii of the unblurred rectangle, in [`Quad::corner_radii`]'s
+    /// order: top-left, top-right, bottom-right, bottom-left.
+    ///
+    /// Widened from one uniform radius by Phase 6.6, for `Quad`'s reason and at
+    /// the same time: a `div()` with `rounded_t_md()` and a `box-shadow` casts a
+    /// shadow whose top corners are round and whose bottom corners are square,
+    /// and one radius cannot say that. Before the widening a `DivStyle` had to
+    /// pick the widest corner and over-round the other three.
+    pub corner_radii: [f32; 4],
     /// Gaussian sigma, in the same units as `size`. Zero is a legitimate value
     /// and draws a hard-edged rounded rectangle.
     pub blur_radius: f32,
@@ -738,7 +745,7 @@ impl Shadow {
         origin: [0.0, 0.0],
         size: [0.0, 0.0],
         color: [0.0, 0.0, 0.0, 0.0],
-        corner_radius: 0.0,
+        corner_radii: [0.0; 4],
         blur_radius: 0.0,
     };
 
@@ -760,9 +767,10 @@ impl Shadow {
 impl Primitive for Shadow {
     const KIND: PrimitiveKind = PrimitiveKind::Shadow;
 
-    // 40 bytes of payload, padded to 48 so a slot boundary is also a 16-byte
-    // std430 boundary — `Quad`'s reasoning, one field set over.
-    const SLOT_STRIDE: usize = 48;
+    // 52 bytes of payload, padded to 64 so a slot boundary is also a 16-byte
+    // std430 boundary — `Quad`'s reasoning, one field set over. Phase 6.6 grew
+    // this from 48 by replacing one radius scalar with four.
+    const SLOT_STRIDE: usize = 64;
 
     fn slot_count(&self) -> u32 {
         1
@@ -773,9 +781,9 @@ impl Primitive for Shadow {
         writer.write_f32_array(self.origin)?;
         writer.write_f32_array(self.size)?;
         writer.write_f32_array(self.color)?;
-        writer.write_f32(self.corner_radius)?;
+        writer.write_f32_array(self.corner_radii)?;
         writer.write_f32(self.blur_radius)?;
-        writer.write_padding(8)?;
+        writer.write_padding(12)?;
         writer.finish()
     }
 }
@@ -1003,7 +1011,7 @@ mod tests {
             origin: [10.0, 20.0],
             size: [64.0, 48.0],
             color: [0.25, 0.5, 0.75, 1.0],
-            corner_radius: 6.0,
+            corner_radii: [6.0, 7.0, 8.0, 9.0],
             blur_radius: 4.0,
         };
         assert_eq!(shadow.slot_count(), 1);
@@ -1016,9 +1024,13 @@ mod tests {
         assert_eq!(&bytes[12..16], &48.0f32.to_le_bytes());
         assert_eq!(&bytes[16..20], &0.25f32.to_le_bytes());
         assert_eq!(&bytes[28..32], &1.0f32.to_le_bytes());
+        // Each radius in its own word, in `pick_corner_radius`'s quadrant order.
         assert_eq!(&bytes[32..36], &6.0f32.to_le_bytes());
-        assert_eq!(&bytes[36..40], &4.0f32.to_le_bytes());
-        assert_eq!(&bytes[40..48], &[0u8; 8]);
+        assert_eq!(&bytes[36..40], &7.0f32.to_le_bytes());
+        assert_eq!(&bytes[40..44], &8.0f32.to_le_bytes());
+        assert_eq!(&bytes[44..48], &9.0f32.to_le_bytes());
+        assert_eq!(&bytes[48..52], &4.0f32.to_le_bytes());
+        assert_eq!(&bytes[52..64], &[0u8; 12]);
     }
 
     #[test]
