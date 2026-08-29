@@ -1,6 +1,6 @@
 use gpui::{
     Application, Context, ElementId, InstanceKey, IntoElement, Pixels, Render, Window,
-    WindowOptions, Styled, div, rgb, size,
+    WindowOptions, Styled, FocusHandleBuilder, StatefulElement, div, rgb, size,
 };
 
 gpui::actions!(compatibility, [ProbeAction]);
@@ -79,4 +79,15 @@ fn legacy_geometry_adapters_reach_resolved_style_values() {
     assert_eq!(style.border_widths.top, 2.0);
     assert_eq!(style.box_shadow[0].offset, [1.0, 2.0]);
     assert_eq!(style.box_shadow[0].blur_radius, 4.0);
+}
+
+#[test]
+fn focus_adapters_preserve_handle_state_and_event_registration() {
+    let mut app = gpui::App::new();
+    let handle_entity = app.new_entity(|cx| cx.focus_handle().tab_index(3).tab_stop(true));
+    let handle = handle_entity.read();
+    assert_eq!(handle.tab_index, 3);
+    assert!(handle.tab_stop);
+    let element = gpui::div().track_focus(&handle).on_click(|_: &mut (), _: &gpui::ClickEvent, _: &mut gpui::Window, _: &mut gpui::Context<()>| {});
+    assert!(element.focus.is_some());
 }

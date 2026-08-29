@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 use std::any::TypeId;
+use std::ops::{Deref, DerefMut};
 
 pub use wgpui_core::boundary::policy::Pixels;
 pub use wgpui_core::geometry::Rect;
@@ -361,12 +362,14 @@ impl<T> WeakEntity<T> {
 pub struct Context<T> {
     entity: Option<Entity<T>>,
     notifications: Rc<RefCell<u64>>,
+    quit_requested: Rc<RefCell<bool>>,
 }
 impl<T> Context<T> {
     fn from_entity(entity: Entity<T>, notifications: Rc<RefCell<u64>>) -> Self {
         Self {
             entity: Some(entity),
             notifications,
+            quit_requested: Rc::new(RefCell::new(false)),
         }
     }
     pub fn entity(&self) -> Entity<T> {
@@ -375,12 +378,25 @@ impl<T> Context<T> {
     pub fn notify(&mut self) {
         *self.notifications.borrow_mut() += 1;
     }
+    pub fn quit(&mut self) {
+        *self.quit_requested.borrow_mut() = true;
+    }
+    pub fn focus_handle(&mut self) -> FocusHandle {
+        FocusHandle::new()
+    }
+    pub fn listener<A, F>(&mut self, handler: F) -> F
+    where
+        F: Fn(&mut T, &A, &mut Window, &mut Context<T>) + 'static,
+    {
+        handler
+    }
     #[allow(clippy::new_ret_no_self, clippy::wrong_self_convention)]
     pub fn new<U>(&mut self, build: impl FnOnce(&mut Context<U>) -> U) -> Entity<U> {
         let entity = Entity(Rc::new(RefCell::new(None)));
         let mut context = Context {
             entity: None,
             notifications: Rc::clone(&self.notifications),
+            quit_requested: Rc::new(RefCell::new(false)),
         };
         entity.initialize(build(&mut context));
         entity
@@ -421,6 +437,7 @@ impl App {
         let mut context = Context {
             entity: None,
             notifications: Rc::clone(&self.notifications),
+            quit_requested: Rc::new(RefCell::new(false)),
         };
         entity.initialize(build(&mut context));
         entity
@@ -497,6 +514,127 @@ pub enum WindowBounds {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DisplayId;
 
+#[derive(Clone, Debug, Default)]
+pub struct FocusHandle {
+    focused: Rc<RefCell<bool>>,
+    pub tab_index: usize,
+    pub tab_stop: bool,
+}
+
+impl FocusHandle {
+    fn new() -> Self {
+        Self::default()
+    }
+    pub fn is_focused<C>(&self, _window: &C) -> bool {
+        *self.focused.borrow()
+    }
+}
+
+pub trait FocusHandleBuilder: Sized {
+    fn tab_index(self, index: usize) -> Self;
+    fn tab_stop(self, enabled: bool) -> Self;
+}
+impl FocusHandleBuilder for FocusHandle {
+    fn tab_index(self, index: usize) -> Self {
+        Self { tab_index: index, ..self }
+    }
+    fn tab_stop(self, enabled: bool) -> Self {
+        Self { tab_stop: enabled, ..self }
+    }
+}
+
+impl Window {
+    pub fn focus(&mut self, handle: &FocusHandle, _cx: &mut Context<impl Sized>) {
+        *handle.focused.borrow_mut() = true;
+    }
+    pub fn focus_next(&mut self, _cx: &mut Context<impl Sized>) {}
+    pub fn focus_prev(&mut self, _cx: &mut Context<impl Sized>) {}
+}
+
+pub struct Stateful<T> {
+    pub element: T,
+    pub focus: Option<FocusHandle>,
+    event_bindings: usize,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ClickEvent {
+    count: usize,
+}
+impl ClickEvent {
+    pub fn click_count(&self) -> usize { self.count.max(1) }
+}
+
+impl<T> Stateful<T> {
+    pub fn new(element: T) -> Self {
+        Self { element, focus: None, event_bindings: 0 }
+    }
+}
+impl<T> Deref for Stateful<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target { &self.element }
+}
+impl<T> DerefMut for Stateful<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.element }
+}
+impl Stateful<Div> {
+    pub fn track_focus(mut self, handle: &FocusHandle) -> Self {
+        self.focus = Some(handle.clone());
+        self
+    }
+    pub fn focus(mut self, style: impl FnOnce(Div) -> Div) -> Self {
+        self.element = style(self.element);
+        self
+    }
+    pub fn focus_visible(mut self, style: impl FnOnce(Div) -> Div) -> Self {
+        self.element = style(self.element);
+        self
+    }
+    pub fn on_action<F>(mut self, _handler: F) -> Self where F: 'static {
+        self.event_bindings += 1;
+        self
+    }
+    pub fn on_click<T, F>(mut self, _handler: F) -> Self
+    where
+        F: Fn(&mut T, &ClickEvent, &mut Window, &mut Context<T>) + 'static,
+    {
+        self.event_bindings += 1;
+        self
+    }
+}
+impl IntoDescription for Stateful<Div> {
+    fn into_description(self) -> Description {
+        self.element.describe()
+    }
+}
+pub trait StatefulElement: Sized {
+    fn track_focus(self, handle: &FocusHandle) -> Stateful<Self>;
+}
+impl StatefulElement for Div {
+    fn track_focus(self, handle: &FocusHandle) -> Stateful<Self> {
+        Stateful { element: self, focus: Some(handle.clone()), event_bindings: 0 }
+    }
+}
+
+impl Styled for Stateful<Div> {
+    fn style(&mut self) -> &mut wgpui_widgets::div::interactivity::style::DivStyle {
+        self.element.style()
+    }
+}
+
+pub trait FocusStyle: Sized {
+    fn focus(self, style: impl FnOnce(Div) -> Div) -> Stateful<Div>;
+    fn focus_visible(self, style: impl FnOnce(Div) -> Div) -> Stateful<Div>;
+}
+impl FocusStyle for Div {
+    fn focus(self, style: impl FnOnce(Div) -> Div) -> Stateful<Div> {
+        Stateful::new(style(self))
+    }
+    fn focus_visible(self, style: impl FnOnce(Div) -> Div) -> Stateful<Div> {
+        Stateful::new(style(self))
+    }
+}
+
 pub trait IntoElement: Sized + IntoDescription {
     type Element;
     fn into_element(self) -> Self::Element;
@@ -539,6 +677,6 @@ pub mod widgets {
 pub mod prelude {
     pub use crate::{
         div, linear_color_stop, Div, IntoDescription, IntoElement, ReconcileKey, Render,
-        RenderOnce, Styled,
+        RenderOnce, Stateful, StatefulElement, Styled, FocusHandleBuilder, FocusStyle,
     };
 }

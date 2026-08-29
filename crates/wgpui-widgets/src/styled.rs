@@ -46,7 +46,7 @@
 //! argument becomes an RGBA field; putting the conversion here would put a
 //! colour space in `wgpui-widgets` that nothing in `2.0` otherwise names.
 
-use crate::div::interactivity::style::{BoxShadow, Corners, DivStyle, Edges};
+use crate::div::interactivity::style::{BoxShadow, Corners, CursorStyle, DivStyle, Edges};
 use wgpui_core::boundary::policy::Pixels;
 use wgpui_layout::taffy_tree::{
     AlignContent, AlignItems, Dimension, Display, FlexDirection, FlexWrap, LayoutStyle,
@@ -715,6 +715,23 @@ pub trait Styled: Sized {
 
     fn text_color(mut self, color: impl Into<[f32; 4]>) -> Self {
         self.style().text_color = Some(color.into());
+        self
+    }
+
+    fn cursor_pointer(mut self) -> Self {
+        self.style().cursor = CursorStyle::Pointer;
+        self
+    }
+    fn cursor_grab(mut self) -> Self {
+        self.style().cursor = CursorStyle::Grab;
+        self
+    }
+    fn cursor_crosshair(mut self) -> Self {
+        self.style().cursor = CursorStyle::Crosshair;
+        self
+    }
+    fn cursor_not_allowed(mut self) -> Self {
+        self.style().cursor = CursorStyle::NotAllowed;
         self
     }
 

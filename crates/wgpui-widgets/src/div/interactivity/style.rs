@@ -197,6 +197,17 @@ pub struct DivStyle {
     pub text_line_through: bool,
     pub text_gradient: Option<Vec<([f32; 4], f32)>>,
     pub text_gradient_angle: Option<f32>,
+    pub cursor: CursorStyle,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CursorStyle {
+    #[default]
+    Default,
+    Pointer,
+    Grab,
+    Crosshair,
+    NotAllowed,
 }
 
 impl DivStyle {
