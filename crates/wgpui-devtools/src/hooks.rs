@@ -1,5 +1,40 @@
-//! The small trait `wgpui-core`/`wgpui-wgpu` expose into: span push/pop, GPU
-//! timestamp write, frame-capture trigger — the same shape `profiling`
-//! (already a dependency of the legacy backend) uses for its own
-//! backend-agnostic design. See docs/gpu-native-architecture.md §3.6.
-#![allow(dead_code)]
+//! Devtools implementation of the core instrumentation contract.
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use wgpui_core::hooks::InstrumentationHooks;
+#[derive(Default)]
+pub struct DevtoolsHooks {
+    next_token: AtomicU64,
+    starts: Mutex<HashMap<u64, (&'static str, Instant)>>,
+}
+impl InstrumentationHooks for DevtoolsHooks {
+    fn begin_span(&self, name: &'static str) -> Option<u64> {
+        if !super::render_stats::enabled() {
+            return None;
+        }
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        self.starts
+            .lock()
+            .expect("devtools hook mutex poisoned")
+            .insert(token, (name, Instant::now()));
+        Some(token)
+    }
+    fn end_span(&self, token: u64) {
+        if let Some((name, start)) = self
+            .starts
+            .lock()
+            .expect("devtools hook mutex poisoned")
+            .remove(&token)
+        {
+            super::render_stats::record(name, start.elapsed());
+        }
+    }
+    fn counter(&self, name: &'static str, amount: u64) {
+        super::render_stats::add(name, amount);
+    }
+    fn frame_presented(&self) {
+        super::render_stats::count("frame: presented");
+    }
+}

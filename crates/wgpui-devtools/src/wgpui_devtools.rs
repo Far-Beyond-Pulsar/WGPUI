@@ -5,8 +5,22 @@
 //! See docs/gpu-native-architecture.md §3.6, §8 Phase 7.
 #![allow(dead_code)]
 
+#[cfg(feature = "flamegraph")]
 pub mod flamegraph;
+#[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod hooks;
+#[cfg(feature = "inspector")]
 pub mod inspector;
+#[cfg(feature = "perf-ab")]
 pub mod perf_ab_tests;
+#[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod render_stats;
+
+#[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
+pub use hooks::DevtoolsHooks;
+#[cfg(feature = "inspector")]
+pub use inspector::{ElementInfo, Inspector};
+#[cfg(feature = "perf-ab")]
+pub use perf_ab_tests::Sample;
+#[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
+pub use render_stats::{Scope, Snapshot, TimerSnapshot};

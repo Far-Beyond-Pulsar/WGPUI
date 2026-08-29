@@ -617,7 +617,16 @@ impl FrameRenderer {
         input: &FrameInput<'_>,
         target: &OffscreenTarget,
     ) -> Result<FrameOutput, FrameError> {
-        self.render_to(device, queue, input, &target.target())
+        let output = self.render_to(device, queue, input, &target.target());
+        #[cfg(feature = "devtools")]
+        if output.is_ok() {
+            static HOOKS: std::sync::OnceLock<wgpui_devtools::hooks::DevtoolsHooks> =
+                std::sync::OnceLock::new();
+            wgpui_core::hooks::InstrumentationHooks::frame_presented(
+                HOOKS.get_or_init(Default::default),
+            );
+        }
+        output
     }
 
     /// Render one frame into any colour target.
@@ -633,6 +642,13 @@ impl FrameRenderer {
         input: &FrameInput<'_>,
         target: &RenderTarget<'_>,
     ) -> Result<FrameOutput, FrameError> {
+        #[cfg(feature = "devtools")]
+        let _instrumentation_span = {
+            static HOOKS: std::sync::OnceLock<wgpui_devtools::hooks::DevtoolsHooks> =
+                std::sync::OnceLock::new();
+            let hooks = HOOKS.get_or_init(Default::default);
+            wgpui_core::hooks::Span::new(hooks, "frame: render")
+        };
         self.textures.begin_frame();
         let mut timing = FrameTiming::default();
 
