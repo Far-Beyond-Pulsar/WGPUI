@@ -36,16 +36,11 @@ use wgpui_wgpu::render::surface_registry::SurfaceRegistry;
 
 const LAYERS: usize = 6;
 
-/// Primitive kinds the render pass actually walks a slot sequence for.
-///
-/// Kept separate from [`PrimitiveKind::COUNT`] so the two claims stay
-/// distinguishable: the *table* names every (layer, kind) pair that could be
-/// populated, while the *pass* walks the kinds that have a pipeline behind
-/// them. They were unequal through Phases 4–5.6 and equal again from the end of
-/// Phase 6.2 — and stating which of the two an assertion is about is the
-/// difference between the gate tracking the renderer and the gate tracking an
-/// enum's length.
+/// Primitive kinds with a render path. Backdrop filters are conditional: their
+/// pass is omitted when the scene has no filter records.
 const DRAWN_KINDS: usize = PrimitiveKind::COUNT;
+
+const VISITED_KINDS: usize = DRAWN_KINDS - 1;
 
 /// Of those, the ones that sample an atlas page and therefore report through
 /// [`wgpui_wgpu::render::draw::DrawStats::sprite_slots_unavailable`]:
@@ -62,6 +57,10 @@ const SPRITE_KINDS: usize = 2;
 /// `LAYERS` where they meant `LAYERS * NON_ATLAS_KINDS`, and failed the moment a
 /// second texture-free kind existed. Naming it is what stops that recurring.
 const NON_ATLAS_KINDS: usize = DRAWN_KINDS - SPRITE_KINDS;
+
+const INSTANCED_NON_ATLAS_KINDS: usize = NON_ATLAS_KINDS - 2;
+
+const VISITED_NON_ATLAS_KINDS: usize = NON_ATLAS_KINDS - 1;
 
 fn window(spec: &UiSceneSpec) -> Rect {
     Rect::from_origin_size([0.0, 0.0], [spec.width, spec.height])
@@ -309,7 +308,7 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
         if mode == DrawMode::PerSlotIndirect {
             assert_eq!(
                 large_result.stats.draw_calls_issued as usize,
-                LAYERS * NON_ATLAS_KINDS,
+                LAYERS * INSTANCED_NON_ATLAS_KINDS,
                 "the per-slot path must issue exactly one call per slot of every \
                  kind that has a texture-free pipeline — the form of the claim \
                  that is not satisfiable by collapsing. The sprite passes issue \
@@ -344,7 +343,7 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
     );
     assert_eq!(
         large_output.stats.slots_visited as usize,
-        LAYERS * DRAWN_KINDS,
+        LAYERS * VISITED_KINDS,
         "one entry per (layer, drawn-kind) slot. Phase 4 asserted `LAYERS` here \
          and explained that nothing drew the GlyphRun half because only one \
          instanced pipeline existed; Phase 5.6 built the second and Phase 6.2 \
@@ -433,11 +432,12 @@ fn the_fallback_path_is_the_one_that_learns_the_counts() {
     );
     assert_eq!(
         first.stats.slots_skipped as usize,
-        LAYERS * (NON_ATLAS_KINDS - 1) + 1,
+        LAYERS * (VISITED_NON_ATLAS_KINDS - 1) + 1,
         "the fallback declines to issue exactly the slots it has read and found \
          empty — the one thing an indirect path cannot do, because it does not \
-         know. That is every slot of every texture-free kind this scene holds \
-         none of (it holds only quads) plus the one quad layer emptied above."
+         know. That is every visited empty kind this scene holds none of (shadow, \
+         underline, and path), plus the one quad layer emptied above; backdrop \
+         slots are not visited when the scene has no backdrop filter."
     );
 
     // The staging buffer must be reused across frames, or the fallback

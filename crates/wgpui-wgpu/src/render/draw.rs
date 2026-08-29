@@ -609,7 +609,10 @@ pub fn issue_paths(
     plan: &SlotBasePlan,
     frame_group: &wgpu::BindGroup,
 ) -> DrawStats {
-    let mut stats = DrawStats::default();
+    let mut stats = DrawStats {
+        instances_known_to_cpu: Some(0),
+        ..DrawStats::default()
+    };
     if plan.slots().is_empty() {
         return stats;
     }
@@ -628,6 +631,7 @@ pub fn issue_paths(
         stats.draw_calls_issued += 1;
         stats.path_draws_issued += 1;
         stats.path_vertices_issued += slot.count;
+        stats.instances_known_to_cpu = stats.instances_known_to_cpu.map(|count| count + 1);
     }
     stats
 }
@@ -642,7 +646,10 @@ pub fn issue_backdrop_filters(
     frame_group: &wgpu::BindGroup,
     texture_group: &wgpu::BindGroup,
 ) -> DrawStats {
-    let mut stats = DrawStats::default();
+    let mut stats = DrawStats {
+        instances_known_to_cpu: Some(0),
+        ..DrawStats::default()
+    };
     if plan.slots().is_empty() {
         return stats;
     }
@@ -661,6 +668,7 @@ pub fn issue_backdrop_filters(
         stats.bind_group_binds += 1;
         stats.draw_calls_issued += 1;
         stats.backdrop_filters_drawn += slot.count;
+        stats.instances_known_to_cpu = stats.instances_known_to_cpu.map(|count| count + slot.count);
     }
     stats
 }
