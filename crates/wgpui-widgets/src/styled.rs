@@ -518,6 +518,10 @@ pub trait Styled: Sized {
         self.border(2.0)
     }
 
+    fn border_3(self) -> Self {
+        self.border(3.0)
+    }
+
     /// A 4px border on every side.
     fn border_4(self) -> Self {
         self.border(4.0)

@@ -63,6 +63,16 @@ impl From<u64> for ElementId {
     }
 }
 
+impl From<(&str, usize)> for ElementId {
+    fn from((name, index): (&str, usize)) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        name.hash(&mut hasher);
+        index.hash(&mut hasher);
+        ElementId::Integer(hasher.finish())
+    }
+}
+
 /// The per-frame value a `render()` equivalent produces for one element.
 ///
 /// Cheap to build and dropped at the end of the frame; everything expensive

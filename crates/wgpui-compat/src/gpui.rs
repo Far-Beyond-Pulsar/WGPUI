@@ -601,6 +601,13 @@ impl Stateful<Div> {
         self.event_bindings += 1;
         self
     }
+    pub fn map(self, transform: impl FnOnce(Div) -> Div) -> Self {
+        Self { element: transform(self.element), ..self }
+    }
+    pub fn tab_index(mut self, index: usize) -> Self {
+        self.focus = Some(self.focus.unwrap_or_default().tab_index(index));
+        self
+    }
 }
 impl IntoDescription for Stateful<Div> {
     fn into_description(self) -> Description {
