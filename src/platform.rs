@@ -1097,7 +1097,7 @@ pub trait InputHandler: 'static {
     fn apple_press_and_hold_enabled(&mut self) -> bool {
         #[cfg(target_os = "macos")]
         {
-            std::env::set_var("ApplePressAndHoldEnabled", "NO");
+            unsafe { std::env::set_var("ApplePressAndHoldEnabled", "NO") };
             false
         }
         #[cfg(not(target_os = "macos"))]
