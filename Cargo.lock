@@ -6741,6 +6741,7 @@ dependencies = [
 name = "wgpui-core"
 version = "0.1.0"
 dependencies = [
+ "lyon",
  "wgpui-layout",
 ]
 

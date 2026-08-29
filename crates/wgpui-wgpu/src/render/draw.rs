@@ -57,8 +57,8 @@ use wgpui_core::indirect::{DRAW_INDIRECT_ARGS_STRIDE, DrawIndirectArgs, DrawSlot
 use crate::render::compute::indirect_args_pass::IndirectArgsBuffers;
 use crate::render::device::IndirectSupport;
 use crate::render::pipelines::{
-    CompositePipeline, MonoSpritePipeline, PolySpritePipeline, QuadPipeline, ShadowPipeline,
-    UnderlinePipeline, slot_base_bind_group,
+    BackdropPipeline, CompositePipeline, MonoSpritePipeline, PathPipeline, PolySpritePipeline,
+    QuadPipeline, ShadowPipeline, UnderlinePipeline, slot_base_bind_group,
 };
 use crate::render::readback::{ReadbackError, StagingReader};
 use crate::render::textures::external_surface::CompositePlan;
@@ -221,6 +221,12 @@ pub struct DrawStats {
     /// draw_calls_issued + sprite_slots_unavailable` still accounts for every
     /// slot the frame's fixed sequence named.
     pub sprite_slots_unavailable: u32,
+    /// Path vertices issued through the direct variable-size path stream.
+    pub path_vertices_issued: u32,
+    /// Path layer draws issued.
+    pub path_draws_issued: u32,
+    /// Backdrop-filter layer draws issued after the snapshot pass.
+    pub backdrop_filters_drawn: u32,
 }
 
 impl DrawStats {
@@ -238,6 +244,9 @@ impl DrawStats {
         self.atlas_pages_bound += other.atlas_pages_bound;
         self.sprite_draws_issued += other.sprite_draws_issued;
         self.sprite_slots_unavailable += other.sprite_slots_unavailable;
+        self.path_vertices_issued += other.path_vertices_issued;
+        self.path_draws_issued += other.path_draws_issued;
+        self.backdrop_filters_drawn += other.backdrop_filters_drawn;
         self.instances_known_to_cpu = match (self.instances_known_to_cpu, other.instances_known_to_cpu)
         {
             // Unknown is contagious on purpose: a frame that took one indirect
@@ -463,6 +472,26 @@ impl SlotBasePlan {
         )
     }
 
+    /// Build the plan for flattened path streams.
+    pub fn for_paths(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &PathPipeline,
+        slots: &[DrawSlot],
+    ) -> SlotBasePlan {
+        SlotBasePlan::new(device, queue, &pipeline.slot_layout, pipeline.slot_stride, slots)
+    }
+
+    /// Build the plan for backdrop filters.
+    pub fn for_backdrop_filters(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &BackdropPipeline,
+        slots: &[DrawSlot],
+    ) -> SlotBasePlan {
+        SlotBasePlan::new(device, queue, &pipeline.slot_layout, pipeline.slot_stride, slots)
+    }
+
     /// Entries in the fixed sequence.
     pub fn slot_count(&self) -> u32 {
         u32::try_from(self.slots.len()).unwrap_or(u32::MAX)
@@ -471,6 +500,16 @@ impl SlotBasePlan {
     /// The slots this plan draws.
     pub fn slots(&self) -> &[DrawSlot] {
         &self.slots
+    }
+
+    /// The bind group holding slot bases.
+    pub(crate) fn bind_group(&self) -> &wgpu::BindGroup {
+        &self.bind_group
+    }
+
+    /// Dynamic-uniform stride.
+    pub(crate) fn stride(&self) -> u32 {
+        self.stride
     }
 }
 
@@ -556,6 +595,72 @@ pub fn issue_instanced(
             }
             stats.instances_known_to_cpu = Some(known);
         }
+    }
+    stats
+}
+
+/// Issue flattened path streams. A path record owns a variable number of
+/// vertices, so it cannot use the fixed instance-count contract used by the
+/// rectangle kinds; the slot base still comes from the retained scene and the
+/// draw itself remains O(layer slots).
+pub fn issue_paths(
+    pass: &mut wgpu::RenderPass<'_>,
+    pipeline: &PathPipeline,
+    plan: &SlotBasePlan,
+    frame_group: &wgpu::BindGroup,
+) -> DrawStats {
+    let mut stats = DrawStats::default();
+    if plan.slots().is_empty() {
+        return stats;
+    }
+    pass.set_pipeline(&pipeline.pipeline);
+    pass.set_bind_group(0, frame_group, &[]);
+    stats.bind_group_binds += 1;
+    for (index, slot) in plan.slots().iter().enumerate() {
+        stats.slots_visited += 1;
+        if slot.count == 0 {
+            stats.slots_skipped += 1;
+            continue;
+        }
+        pass.set_bind_group(1, plan.bind_group(), &[index as u32 * plan.stride()]);
+        pass.draw(0..slot.count, 0..1);
+        stats.bind_group_binds += 1;
+        stats.draw_calls_issued += 1;
+        stats.path_draws_issued += 1;
+        stats.path_vertices_issued += slot.count;
+    }
+    stats
+}
+
+/// Issue backdrop filters over the framebuffer snapshot. This is deliberately
+/// a direct per-layer draw: the filter pass is separated from the base pass by
+/// the resource copy, and a direct draw keeps that ordering explicit.
+pub fn issue_backdrop_filters(
+    pass: &mut wgpu::RenderPass<'_>,
+    pipeline: &BackdropPipeline,
+    plan: &SlotBasePlan,
+    frame_group: &wgpu::BindGroup,
+    texture_group: &wgpu::BindGroup,
+) -> DrawStats {
+    let mut stats = DrawStats::default();
+    if plan.slots().is_empty() {
+        return stats;
+    }
+    pass.set_pipeline(&pipeline.pipeline);
+    pass.set_bind_group(0, frame_group, &[]);
+    pass.set_bind_group(2, texture_group, &[]);
+    stats.bind_group_binds += 2;
+    for (index, slot) in plan.slots().iter().enumerate() {
+        stats.slots_visited += 1;
+        if slot.count == 0 {
+            stats.slots_skipped += 1;
+            continue;
+        }
+        pass.set_bind_group(1, plan.bind_group(), &[index as u32 * plan.stride()]);
+        pass.draw(0..4, 0..1);
+        stats.bind_group_binds += 1;
+        stats.draw_calls_issued += 1;
+        stats.backdrop_filters_drawn += 1;
     }
     stats
 }

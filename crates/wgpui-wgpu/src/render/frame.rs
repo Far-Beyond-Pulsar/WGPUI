@@ -48,7 +48,7 @@ use wgpui_core::occlusion::{
     CoverageItem, PoisonRegion, encode_coverage_items, encode_poison_regions, quad_coverage_item,
 };
 use wgpui_core::ordering::encode_ordering_items;
-use wgpui_core::patch::primitive::{PrimitiveKind, Quad};
+use wgpui_core::patch::primitive::{BackdropFilter, Path, PrimitiveKind, Quad};
 use wgpui_core::scene::atlas::AtlasKind;
 use wgpui_core::scene::layer::LayerId;
 use wgpui_core::scene::{Scene, UploadRange};
@@ -61,12 +61,12 @@ use crate::render::compute::indirect_args_pass::{
 use crate::render::compute::occlusion_pass::{OcclusionError, OcclusionPass};
 use crate::render::compute::ordering_pass::{OrderingError, OrderingPass};
 use crate::render::draw::{
-    DrawMode, DrawStats, ResolvedArgs, SlotBasePlan, SpriteDraw, issue_composites, issue_instanced,
-    issue_sprites,
+    DrawMode, DrawStats, ResolvedArgs, SlotBasePlan, SpriteDraw, issue_backdrop_filters,
+    issue_composites, issue_instanced, issue_paths, issue_sprites,
 };
 use crate::render::pipelines::{
-    CompositePipeline, Globals, MonoSpritePipeline, PolySpritePipeline, QuadPipeline,
-    ShadowPipeline, TARGET_FORMAT, UnderlinePipeline,
+    BackdropPipeline, CompositePipeline, Globals, MonoSpritePipeline, PathPipeline,
+    PolySpritePipeline, QuadPipeline, ShadowPipeline, TARGET_FORMAT, UnderlinePipeline,
 };
 use crate::render::readback::{ReadbackError, StagingReader, read_texture_rgba8};
 use crate::render::surface_registry::SurfaceRegistry;
@@ -86,6 +86,9 @@ pub enum FrameError {
     IndirectArgs(IndirectArgsError),
     /// A readback failed.
     Readback(ReadbackError),
+    /// A backdrop filter needs the target texture so the renderer can take the
+    /// legacy-style snapshot between render passes.
+    BackdropSourceUnavailable,
 }
 
 impl std::fmt::Display for FrameError {
@@ -95,6 +98,10 @@ impl std::fmt::Display for FrameError {
             FrameError::Occlusion(error) => write!(formatter, "{error}"),
             FrameError::IndirectArgs(error) => write!(formatter, "{error}"),
             FrameError::Readback(error) => write!(formatter, "{error}"),
+            FrameError::BackdropSourceUnavailable => write!(
+                formatter,
+                "backdrop filtering requires a copyable render-target texture"
+            ),
         }
     }
 }
@@ -280,6 +287,7 @@ impl OffscreenTarget {
             width: self.width,
             height: self.height,
             clear: wgpu::Color::BLACK,
+            source: Some(&self.texture),
         }
     }
 }
@@ -303,6 +311,10 @@ pub struct RenderTarget<'a> {
     pub height: u32,
     /// What the pass loads with.
     pub clear: wgpu::Color,
+    /// The texture behind `view`, when it can be copied for a backdrop filter.
+    /// Surface textures and [`OffscreenTarget`] both provide this; callers
+    /// supplying only a view get an explicit frame error if a filter is used.
+    pub source: Option<&'a wgpu::Texture>,
 }
 
 /// Everything a frame needs that outlives one: pipelines, arenas, pools.
@@ -320,6 +332,10 @@ pub struct FrameRenderer {
     pub glyphs: MonoSpritePipeline,
     /// The instanced polychrome-sprite pipeline (Phase 6.2).
     pub sprites: PolySpritePipeline,
+    /// The Lyon-tessellated path pipeline.
+    pub paths: PathPipeline,
+    /// The framebuffer-sampling backdrop-filter pipeline.
+    pub backdrop_filters: BackdropPipeline,
     /// The one composite pipeline.
     pub composite: CompositePipeline,
     /// The shadow arena. Its own buffer, for the reason `sprite_arena` records:
@@ -342,6 +358,10 @@ pub struct FrameRenderer {
     /// sharing an arena on the strength of it would make one kind's field
     /// changing corrupt the other's.
     pub sprite_arena: SlabBuffer,
+    /// Flattened path-vertex arena.
+    pub path_arena: SlabBuffer,
+    /// Backdrop-filter records.
+    pub backdrop_arena: SlabBuffer,
     /// Boundary texture retention (§5.5).
     pub textures: LayerTexturePool,
     globals: wgpu::Buffer,
@@ -359,11 +379,15 @@ pub struct FrameRenderer {
     underline_plan: Option<SlotBasePlan>,
     glyph_plan: Option<SlotBasePlan>,
     sprite_plan: Option<SlotBasePlan>,
+    path_plan: Option<SlotBasePlan>,
+    backdrop_plan: Option<SlotBasePlan>,
     shadow_plan_builds: u64,
     quad_plan_builds: u64,
     underline_plan_builds: u64,
     glyph_plan_builds: u64,
     sprite_plan_builds: u64,
+    path_plan_builds: u64,
+    backdrop_plan_builds: u64,
     /// One 16-byte `AtlasPage` uniform per page index ever bound.
     ///
     /// Keyed by page index and never invalidated, because the value is the page
@@ -373,6 +397,9 @@ pub struct FrameRenderer {
     page_params: HashMap<u32, wgpu::Buffer>,
     reader: StagingReader,
     uploaded_generation: Option<u64>,
+    backdrop_snapshot: Option<wgpu::Texture>,
+    backdrop_snapshot_view: Option<wgpu::TextureView>,
+    backdrop_sampler: wgpu::Sampler,
 }
 
 impl FrameRenderer {
@@ -387,12 +414,16 @@ impl FrameRenderer {
             underlines: UnderlinePipeline::new(device),
             glyphs: MonoSpritePipeline::new(device),
             sprites: PolySpritePipeline::new(device),
+            paths: PathPipeline::new(device),
+            backdrop_filters: BackdropPipeline::new(device),
             composite: CompositePipeline::new(device),
             shadow_arena: SlabBuffer::new(device, "shadow arena"),
             arena: SlabBuffer::new(device, "quad arena"),
             underline_arena: SlabBuffer::new(device, "underline arena"),
             glyph_arena: SlabBuffer::new(device, "glyph arena"),
             sprite_arena: SlabBuffer::new(device, "sprite arena"),
+            path_arena: SlabBuffer::new(device, "path arena"),
+            backdrop_arena: SlabBuffer::new(device, "backdrop filter arena"),
             textures: LayerTexturePool::default(),
             globals: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("frame globals"),
@@ -411,15 +442,57 @@ impl FrameRenderer {
             underline_plan: None,
             glyph_plan: None,
             sprite_plan: None,
+            path_plan: None,
+            backdrop_plan: None,
             shadow_plan_builds: 0,
             quad_plan_builds: 0,
             underline_plan_builds: 0,
             glyph_plan_builds: 0,
             sprite_plan_builds: 0,
+            path_plan_builds: 0,
+            backdrop_plan_builds: 0,
             page_params: HashMap::new(),
             reader: StagingReader::new(),
             uploaded_generation: None,
+            backdrop_snapshot: None,
+            backdrop_snapshot_view: None,
+            backdrop_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("backdrop filter sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                ..Default::default()
+            }),
         }
+    }
+
+    fn ensure_backdrop_snapshot(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        let matches_size = self.backdrop_snapshot.as_ref().is_some_and(|texture| {
+            texture.width() == width.max(1) && texture.height() == height.max(1)
+        });
+        if matches_size {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("backdrop filter snapshot"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TARGET_FORMAT,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.backdrop_snapshot = Some(texture);
+        self.backdrop_snapshot_view = Some(view);
     }
 
     /// How many times the readback staging buffer has been allocated.
@@ -455,6 +528,16 @@ impl FrameRenderer {
     /// The same counter for the image-sprite pipeline's slot bases.
     pub fn sprite_plan_builds(&self) -> u64 {
         self.sprite_plan_builds
+    }
+
+    /// How many times the path slot-base plan has been built.
+    pub fn path_plan_builds(&self) -> u64 {
+        self.path_plan_builds
+    }
+
+    /// How many times the backdrop slot-base plan has been built.
+    pub fn backdrop_plan_builds(&self) -> u64 {
+        self.backdrop_plan_builds
     }
 
     /// One bind group per live atlas page of `kind`, in ascending page order.
@@ -527,7 +610,6 @@ impl FrameRenderer {
     /// beside `Shadow`: two kinds landed in the same phase and only one of them
     /// needed a qualification.
     ///
-    /// What still has no pipeline: `paths`, `backdrop_blur`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -560,17 +642,27 @@ impl FrameRenderer {
         let underline_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Underline).to_vec();
         let glyph_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::GlyphRun).to_vec();
         let sprite_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::PolySprite).to_vec();
+        let path_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Path).to_vec();
+        let backdrop_slots: Vec<DrawSlot> =
+            table.kind_slots(PrimitiveKind::BackdropFilter).to_vec();
+        if backdrop_slots.iter().any(|slot| slot.count > 0) && target.source.is_none() {
+            return Err(FrameError::BackdropSourceUnavailable);
+        }
         let shadow_arena_slots = input.scene.arena_slots(PrimitiveKind::Shadow);
         let arena_slots = input.scene.arena_slots(PrimitiveKind::Quad);
         let underline_arena_slots = input.scene.arena_slots(PrimitiveKind::Underline);
         let glyph_arena_slots = input.scene.arena_slots(PrimitiveKind::GlyphRun);
         let sprite_arena_slots = input.scene.arena_slots(PrimitiveKind::PolySprite);
+        let path_arena_slots = input.scene.arena_slots(PrimitiveKind::Path);
+        let backdrop_arena_slots = input.scene.arena_slots(PrimitiveKind::BackdropFilter);
         let primitives_resident: u32 = shadow_slots
             .iter()
             .chain(quad_slots.iter())
             .chain(underline_slots.iter())
             .chain(glyph_slots.iter())
             .chain(sprite_slots.iter())
+            .chain(path_slots.iter())
+            .chain(backdrop_slots.iter())
             .map(|slot| slot.count)
             .sum();
 
@@ -581,6 +673,8 @@ impl FrameRenderer {
         let underline_resident = input.scene.underlines.resident_bytes();
         let glyph_resident = input.scene.glyph_runs.resident_bytes();
         let sprite_resident = input.scene.poly_sprites.resident_bytes();
+        let path_resident = input.scene.paths.resident_bytes();
+        let backdrop_resident = input.scene.backdrop_filters.resident_bytes();
         let shadows_grew = self
             .shadow_arena
             .reserve(device, shadow_resident.len() as u64);
@@ -594,11 +688,17 @@ impl FrameRenderer {
         let sprites_grew = self
             .sprite_arena
             .reserve(device, sprite_resident.len() as u64);
+        let paths_grew = self.path_arena.reserve(device, path_resident.len() as u64);
+        let backdrops_grew = self
+            .backdrop_arena
+            .reserve(device, backdrop_resident.len() as u64);
         if shadows_grew
             || grew
             || underlines_grew
             || glyphs_grew
             || sprites_grew
+            || paths_grew
+            || backdrops_grew
             || self.uploaded_generation.is_none()
             || matches!(input.dirty, Dirty::All)
         {
@@ -609,6 +709,9 @@ impl FrameRenderer {
                 .upload_all(device, queue, underline_resident);
             self.glyph_arena.upload_all(device, queue, glyph_resident);
             self.sprite_arena.upload_all(device, queue, sprite_resident);
+            self.path_arena.upload_all(device, queue, path_resident);
+            self.backdrop_arena
+                .upload_all(device, queue, backdrop_resident);
             self.uploaded_generation = Some(0);
         } else {
             // Filtered by kind rather than handed the whole list: an
@@ -642,6 +745,18 @@ impl FrameRenderer {
                 queue,
                 sprite_resident,
                 &kind_uploads(input.uploads, PrimitiveKind::PolySprite),
+            );
+            self.path_arena.upload(
+                device,
+                queue,
+                path_resident,
+                &kind_uploads(input.uploads, PrimitiveKind::Path),
+            );
+            self.backdrop_arena.upload(
+                device,
+                queue,
+                backdrop_resident,
+                &kind_uploads(input.uploads, PrimitiveKind::BackdropFilter),
             );
         }
         queue.write_buffer(
@@ -1156,6 +1271,25 @@ impl FrameRenderer {
                 SlotBasePlan::for_poly_sprites(device, queue, &self.sprites, &sprite_slots)
             }
         };
+        let path_plan = match self.path_plan.take() {
+            Some(plan) if plan.slots() == path_slots.as_slice() => plan,
+            _ => {
+                self.path_plan_builds += 1;
+                SlotBasePlan::for_paths(device, queue, &self.paths, &path_slots)
+            }
+        };
+        let backdrop_plan = match self.backdrop_plan.take() {
+            Some(plan) if plan.slots() == backdrop_slots.as_slice() => plan,
+            _ => {
+                self.backdrop_plan_builds += 1;
+                SlotBasePlan::for_backdrop_filters(
+                    device,
+                    queue,
+                    &self.backdrop_filters,
+                    &backdrop_slots,
+                )
+            }
+        };
         let shadow_frame_group = self.shadows.frame_bind_group(
             device,
             &self.globals,
@@ -1186,6 +1320,28 @@ impl FrameRenderer {
             self.sprite_arena.buffer(),
             &self.sprite_args.visible,
         );
+        let path_frame_group = self
+            .paths
+            .frame_bind_group(device, &self.globals, self.path_arena.buffer());
+        let backdrop_frame_group = self.backdrop_filters.frame_bind_group(
+            device,
+            &self.globals,
+            self.backdrop_arena.buffer(),
+        );
+        let has_backdrop_filters = backdrop_slots.iter().any(|slot| slot.count > 0);
+        let backdrop_texture_group = if has_backdrop_filters {
+            self.ensure_backdrop_snapshot(device, target.width, target.height);
+            let Some(view) = self.backdrop_snapshot_view.as_ref() else {
+                return Err(FrameError::BackdropSourceUnavailable);
+            };
+            Some(self.backdrop_filters.texture_bind_group(
+                device,
+                view,
+                &self.backdrop_sampler,
+            ))
+        } else {
+            None
+        };
         // Rebuilt per frame, not cached: a bind group names a texture view, and
         // an atlas page destroyed between frames leaves a cached one pointing at
         // a texture that no longer exists. The 16-byte uniform behind it *is*
@@ -1239,6 +1395,12 @@ impl FrameRenderer {
                 input.mode,
                 &quad_resolved,
             ));
+            stats.merge(issue_paths(
+                &mut pass,
+                &self.paths,
+                &path_plan,
+                &path_frame_group,
+            ));
             // Between the quads and the text, which is where the legacy
             // discriminant puts `Underline`: a rule paints over the row
             // background and under the glyphs it belongs to.
@@ -1282,6 +1444,49 @@ impl FrameRenderer {
                 input.mode,
                 &sprite_resolved,
             ));
+            if has_backdrop_filters {
+                drop(pass);
+                let Some(source) = target.source else {
+                    return Err(FrameError::BackdropSourceUnavailable);
+                };
+                let Some(snapshot) = self.backdrop_snapshot.as_ref() else {
+                    return Err(FrameError::BackdropSourceUnavailable);
+                };
+                encoder.copy_texture_to_texture(
+                    source.as_image_copy(),
+                    snapshot.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: target.width.min(source.width()),
+                        height: target.height.min(source.height()),
+                        depth_or_array_layers: 1,
+                    },
+                );
+                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("backdrop filters"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: Default::default(),
+                });
+                if let Some(texture_group) = backdrop_texture_group.as_ref() {
+                    stats.merge(issue_backdrop_filters(
+                        &mut pass,
+                        &self.backdrop_filters,
+                        &backdrop_plan,
+                        &backdrop_frame_group,
+                        texture_group,
+                    ));
+                }
+            }
             stats.merge(issue_composites(
                 &mut pass,
                 &self.composite,
@@ -1299,6 +1504,8 @@ impl FrameRenderer {
         self.underline_plan = Some(underline_plan);
         self.glyph_plan = Some(glyph_plan);
         self.sprite_plan = Some(sprite_plan);
+        self.path_plan = Some(path_plan);
+        self.backdrop_plan = Some(backdrop_plan);
 
         Ok(FrameOutput {
             stats,

@@ -362,6 +362,230 @@ pub struct UnderlinePipeline {
     pub slot_stride: u32,
 }
 
+/// The Lyon-tessellated path pipeline.
+pub struct PathPipeline {
+    /// The pipeline itself.
+    pub pipeline: wgpu::RenderPipeline,
+    /// Globals and path arena.
+    pub frame_layout: wgpu::BindGroupLayout,
+    /// The base vertex for the current layer's flattened stream.
+    pub slot_layout: wgpu::BindGroupLayout,
+    /// Dynamic-uniform alignment in bytes.
+    pub slot_stride: u32,
+}
+
+impl PathPipeline {
+    /// Build the path pipeline. Paths use a triangle list and one direct draw
+    /// per layer because one primitive owns a variable number of vertices.
+    pub fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wgpui paths"),
+            source: wgpu::ShaderSource::Wgsl(super::shaders::PATHS_WGSL.into()),
+        });
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("paths frame"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, false),
+                storage_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+            ],
+        });
+        let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("paths slot base"),
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("paths"),
+            bind_group_layouts: &[Some(&frame_layout), Some(&slot_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("paths"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vertex_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fragment_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: TARGET_FORMAT,
+                    blend: Some(ALPHA_OVER),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: Default::default(),
+            cache: None,
+        });
+        Self {
+            pipeline,
+            frame_layout,
+            slot_layout,
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+        }
+    }
+
+    /// Bind globals and the flattened path arena.
+    pub fn frame_bind_group(
+        &self,
+        device: &wgpu::Device,
+        globals: &wgpu::Buffer,
+        arena: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paths frame"),
+            layout: &self.frame_layout,
+            entries: &[buffer_entry(0, globals), buffer_entry(1, arena)],
+        })
+    }
+}
+
+/// The framebuffer-sampling backdrop-filter pipeline.
+pub struct BackdropPipeline {
+    /// The pipeline itself.
+    pub pipeline: wgpu::RenderPipeline,
+    /// Globals and filter arena.
+    pub frame_layout: wgpu::BindGroupLayout,
+    /// The filter record base for the current layer.
+    pub slot_layout: wgpu::BindGroupLayout,
+    /// Source snapshot texture and sampler.
+    pub texture_layout: wgpu::BindGroupLayout,
+    /// Dynamic-uniform alignment in bytes.
+    pub slot_stride: u32,
+}
+
+impl BackdropPipeline {
+    /// Build the backdrop-filter pipeline.
+    pub fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wgpui backdrop blur"),
+            source: wgpu::ShaderSource::Wgsl(super::shaders::BACKDROP_BLUR_WGSL.into()),
+        });
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backdrop filters frame"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, false),
+                storage_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT),
+            ],
+        });
+        let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backdrop filters slot base"),
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, true)],
+        });
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backdrop filters texture"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("backdrop filters"),
+            bind_group_layouts: &[
+                Some(&frame_layout),
+                Some(&slot_layout),
+                Some(&texture_layout),
+            ],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("backdrop filters"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vertex_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fragment_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: TARGET_FORMAT,
+                    blend: Some(ALPHA_OVER),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: Default::default(),
+            cache: None,
+        });
+        Self {
+            pipeline,
+            frame_layout,
+            slot_layout,
+            texture_layout,
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+        }
+    }
+
+    /// Bind globals and the filter arena.
+    pub fn frame_bind_group(
+        &self,
+        device: &wgpu::Device,
+        globals: &wgpu::Buffer,
+        arena: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("backdrop filters frame"),
+            layout: &self.frame_layout,
+            entries: &[buffer_entry(0, globals), buffer_entry(1, arena)],
+        })
+    }
+
+    /// Bind the current framebuffer snapshot.
+    pub fn texture_bind_group(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("backdrop filters texture"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    }
+}
+
 impl UnderlinePipeline {
     /// Build the pipeline. Once per device, never per frame.
     pub fn new(device: &wgpu::Device) -> UnderlinePipeline {
