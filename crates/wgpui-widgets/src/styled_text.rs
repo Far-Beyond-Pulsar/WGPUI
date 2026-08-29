@@ -55,8 +55,7 @@ use wgpui_core::scene::atlas::GlyphTileSource;
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 use wgpui_text::patch::{ConversionStats, RunPlacement, glyph_runs};
 use wgpui_text::shaping::{
-    ShapedLine,
-    Font, FontRun, FontStyle, FontWeight, SharedString, ShapeError, TextShaper,
+    Font, FontRun, FontStyle, FontWeight, ShapeError, ShapedLine, SharedString, TextShaper,
 };
 
 /// The text properties that decide shaping, plus the one that does not.
@@ -680,11 +679,11 @@ fn log_shape_error(error: &ShapeError) {
 mod tests {
     use super::*;
     use wgpui_core::patch::primitive::AtlasTileId;
-    use wgpui_core::scene::atlas::{GlyphRasterKey, GlyphTile};
     use wgpui_core::reconcile::description::ElementId;
     use wgpui_core::reconcile::instance::InstanceKey;
     use wgpui_core::reconcile::plan::{FramePlan, NodeOutcome, PlannedNode, RebuildReason};
     use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
+    use wgpui_core::scene::atlas::{GlyphRasterKey, GlyphTile};
     use wgpui_layout::taffy_tree::LayoutTree;
     use wgpui_text::shaping::font;
 
@@ -789,7 +788,9 @@ mod tests {
     fn changed_text_is_a_layout_and_display_change() {
         let engine = engine();
         assert_eq!(
-            text(&engine, "after").diff_key().compare(&text(&engine, "before").diff_key()),
+            text(&engine, "after")
+                .diff_key()
+                .compare(&text(&engine, "before").diff_key()),
             Invalidation::LAYOUT.union(Invalidation::DISPLAY)
         );
     }
@@ -865,10 +866,8 @@ mod tests {
     #[test]
     fn a_highlight_recolour_repaints_and_a_highlight_reweight_reshapes() {
         let engine = engine();
-        let base = text(&engine, "highlighted").with_highlights(Arc::from(vec![(
-            0..3,
-            HighlightStyle::default(),
-        )]));
+        let base = text(&engine, "highlighted")
+            .with_highlights(Arc::from(vec![(0..3, HighlightStyle::default())]));
         let recoloured = text(&engine, "highlighted").with_highlights(Arc::from(vec![(
             0..3,
             HighlightStyle {
@@ -1237,14 +1236,10 @@ mod tests {
     #[test]
     fn adding_an_underline_repaints_without_reshaping() {
         let engine = engine();
-        let plain = text(&engine, "row").with_highlights(Arc::from(vec![(
-            0..3,
-            HighlightStyle::default(),
-        )]));
-        let decorated = text(&engine, "row").with_highlights(Arc::from(vec![(
-            0..3,
-            underlined(1.0, None, false),
-        )]));
+        let plain = text(&engine, "row")
+            .with_highlights(Arc::from(vec![(0..3, HighlightStyle::default())]));
+        let decorated = text(&engine, "row")
+            .with_highlights(Arc::from(vec![(0..3, underlined(1.0, None, false))]));
         assert_eq!(
             decorated.diff_key().compare(&plain.diff_key()),
             Invalidation::DISPLAY,

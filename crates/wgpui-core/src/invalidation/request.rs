@@ -112,7 +112,9 @@ impl FrameSignals {
     /// the layer standing in for the view it names, since `wgpui-core` has no
     /// `EntityId` yet (see [`InvalidationScope`]'s own doc).
     pub fn scrolled(&mut self, layer: LayerId) -> &mut Self {
-        self.raise(InvalidationRequest::scrolled(InvalidationScope::Layer(layer)))
+        self.raise(InvalidationRequest::scrolled(InvalidationScope::Layer(
+            layer,
+        )))
     }
 
     /// Record an ordinary data-change notification against a layer.
@@ -237,9 +239,11 @@ mod tests {
     #[test]
     fn an_instance_scoped_request_does_not_speak_for_a_layer() {
         let mut signals = FrameSignals::new();
-        signals.scrolled(PANEL).raise(InvalidationRequest::data_changed(
-            InvalidationScope::Instance(InstanceKey::from_raw(3)),
-        ));
+        signals
+            .scrolled(PANEL)
+            .raise(InvalidationRequest::data_changed(
+                InvalidationScope::Instance(InstanceKey::from_raw(3)),
+            ));
         assert_eq!(signals.reason_for_layer(PANEL), Reason::Scroll);
     }
 

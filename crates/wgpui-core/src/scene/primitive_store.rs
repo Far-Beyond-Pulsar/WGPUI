@@ -293,12 +293,10 @@ impl<P: Primitive> PrimitiveStore<P> {
             let stored = records
                 .get_mut(key)
                 .ok_or(PatchError::UnknownKey { layer, key: *key })?;
-            stored.slot_offset =
-                u32::try_from(total_slots).map_err(|_| overflow(total_slots))?;
+            stored.slot_offset = u32::try_from(total_slots).map_err(|_| overflow(total_slots))?;
             total_slots += stored.slot_count as u64;
         }
-        let total_slots_u32 =
-            u32::try_from(total_slots).map_err(|_| overflow(total_slots))?;
+        let total_slots_u32 = u32::try_from(total_slots).map_err(|_| overflow(total_slots))?;
 
         let reallocation = allocator
             .reallocate(P::KIND, *range, total_slots_u32)
@@ -518,7 +516,8 @@ mod tests {
         }
 
         fn apply(&mut self, list: &PatchList<P>) -> Result<(), PatchError> {
-            self.store.apply(list, &mut self.allocator, &mut self.uploads)
+            self.store
+                .apply(list, &mut self.allocator, &mut self.uploads)
         }
 
         fn take_uploads(&mut self) -> Vec<UploadRange> {
@@ -749,7 +748,11 @@ mod tests {
             .filter_map(|index| harness.store.record_byte_range(LAYER, key(index)))
             .collect();
 
-        assert_eq!(before[..4], after[..4], "records before the edit never move");
+        assert_eq!(
+            before[..4],
+            after[..4],
+            "records before the edit never move"
+        );
         assert_ne!(before[5], after[5], "records after it do");
     }
 

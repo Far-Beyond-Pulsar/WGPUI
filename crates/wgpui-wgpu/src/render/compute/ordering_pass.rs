@@ -368,8 +368,22 @@ impl OrderingPass {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("ordering"),
         });
-        dispatch(&mut encoder, &self.build_blocks, &data_groups[parity], &stage_group, 0, block_groups);
-        dispatch(&mut encoder, &self.build_superblocks, &data_groups[parity], &stage_group, 0, superblock_groups);
+        dispatch(
+            &mut encoder,
+            &self.build_blocks,
+            &data_groups[parity],
+            &stage_group,
+            0,
+            block_groups,
+        );
+        dispatch(
+            &mut encoder,
+            &self.build_superblocks,
+            &data_groups[parity],
+            &stage_group,
+            0,
+            superblock_groups,
+        );
         let relaxation = Relaxation {
             data_groups: &data_groups,
             stage_group: &stage_group,

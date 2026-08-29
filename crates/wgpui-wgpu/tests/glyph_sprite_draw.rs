@@ -44,18 +44,18 @@ use wgpui_core::geometry::Rect;
 use wgpui_core::patch::RecordKey;
 use wgpui_core::patch::apply::{ScenePatch, apply};
 use wgpui_core::patch::primitive::{Glyph, GlyphRun};
+use wgpui_core::scene::Scene;
 use wgpui_core::scene::atlas::{AtlasKind, GlyphRasterKey, RasterizedGlyph};
 use wgpui_core::scene::layer::{BoundaryId, LayerKey};
-use wgpui_core::scene::Scene;
+use wgpui_text::patch::{RunPlacement, glyph_runs};
+use wgpui_text::raster::GlyphRasterizer;
+use wgpui_text::shaping::{FontRun, SharedString, font};
+use wgpui_text::test_fonts;
 use wgpui_wgpu::render::atlas::{AtlasTileSource, GlyphAtlas, TilePlacement};
 use wgpui_wgpu::render::atlas_upload::AtlasTextures;
 use wgpui_wgpu::render::device::{ComputeContext, context_or_report};
 use wgpui_wgpu::render::draw::DrawMode;
 use wgpui_wgpu::render::frame::{Dirty, FrameInput, FrameOutput, FrameRenderer, OffscreenTarget};
-use wgpui_text::patch::{RunPlacement, glyph_runs};
-use wgpui_text::raster::GlyphRasterizer;
-use wgpui_text::shaping::{FontRun, SharedString, font};
-use wgpui_text::test_fonts;
 
 const WIDTH: u32 = 512;
 const HEIGHT: u32 = 128;
@@ -77,11 +77,7 @@ fn scene_with(runs: &[GlyphRun]) -> Scene {
     scene
 }
 
-fn input<'a>(
-    scene: &'a Scene,
-    atlas: &'a AtlasTextures,
-    mode: DrawMode,
-) -> FrameInput<'a> {
+fn input<'a>(scene: &'a Scene, atlas: &'a AtlasTextures, mode: DrawMode) -> FrameInput<'a> {
     FrameInput {
         scene,
         clip: Rect::from_origin_size([0.0, 0.0], [WIDTH as f32, HEIGHT as f32]),
@@ -206,11 +202,7 @@ struct TexelComparison {
 /// Panics with the offending glyph and pixel on the first disagreement, which is
 /// the whole of the phase's gate — see this file's doc for why equality rather
 /// than a threshold is the right assertion.
-fn compare_glyph_texels(
-    runs: &[GlyphRun],
-    atlas: &GlyphAtlas,
-    pixels: &[u8],
-) -> TexelComparison {
+fn compare_glyph_texels(runs: &[GlyphRun], atlas: &GlyphAtlas, pixels: &[u8]) -> TexelComparison {
     let coverage = glyph_coverage(runs);
     let mut result = TexelComparison::default();
     for run in runs {
@@ -295,7 +287,10 @@ fn every_glyph_draws_its_own_tile_texels_at_its_own_position() {
     let mut textures = AtlasTextures::for_atlas(&atlas);
     let upload = textures.sync(&context.device, &context.queue, &mut atlas);
     assert_eq!(upload.skipped, 0);
-    assert!(upload.rectangles > 10, "a real line of text is many rasters");
+    assert!(
+        upload.rectangles > 10,
+        "a real line of text is many rasters"
+    );
 
     let scene = scene_with(&runs);
     let mut renderer = FrameRenderer::new(&context.device);
@@ -318,7 +313,10 @@ fn every_glyph_draws_its_own_tile_texels_at_its_own_position() {
         painted_pixels(&pixels),
         output.stats.instances_known_to_cpu,
     );
-    assert!(output.stats.sprite_draws_issued > 0, "no glyph draw was issued");
+    assert!(
+        output.stats.sprite_draws_issued > 0,
+        "no glyph draw was issued"
+    );
     assert!(
         painted_pixels(&pixels) > 500,
         "twenty glyphs of 24px text painted {} pixels, which is not text",
@@ -363,7 +361,11 @@ fn text_draws_without_being_rounded_first() {
         &context,
         &mut renderer,
         &target,
-        &input(&scene, &textures, DrawMode::best_available(context.indirect)),
+        &input(
+            &scene,
+            &textures,
+            DrawMode::best_available(context.indirect),
+        ),
     );
 
     let mut found_ink = 0usize;
@@ -445,7 +447,11 @@ fn glyphs_on_several_atlas_pages_all_draw_and_none_draws_twice() {
         &context,
         &mut renderer,
         &target,
-        &input(&scene, &textures, DrawMode::best_available(context.indirect)),
+        &input(
+            &scene,
+            &textures,
+            DrawMode::best_available(context.indirect),
+        ),
     );
     assert_eq!(
         output.stats.atlas_pages_bound as usize,
@@ -673,7 +679,11 @@ fn a_ramp_raster_lands_texel_for_texel_with_no_row_shift() {
         &context,
         &mut renderer,
         &target,
-        &input(&scene, &textures, DrawMode::best_available(context.indirect)),
+        &input(
+            &scene,
+            &textures,
+            DrawMode::best_available(context.indirect),
+        ),
     );
 
     for row in 0..height {

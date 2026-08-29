@@ -190,10 +190,17 @@ fn an_image_drawn_at_its_natural_size_is_its_atlas_texels_exactly() {
         &context,
         &mut renderer,
         &target,
-        &input(&scene, &textures, DrawMode::best_available(context.indirect)),
+        &input(
+            &scene,
+            &textures,
+            DrawMode::best_available(context.indirect),
+        ),
     );
 
-    assert_eq!(output.stats.atlas_pages_bound, 1, "one colour page is bound");
+    assert_eq!(
+        output.stats.atlas_pages_bound, 1,
+        "one colour page is bound"
+    );
     assert!(
         output.stats.sprite_draws_issued > 0,
         "no sprite draw was issued, so the comparison below would be vacuous"
@@ -260,7 +267,10 @@ fn every_draw_mode_draws_the_same_image() {
         .into_iter()
         .filter(|mode| mode.is_available(context.indirect))
         .collect();
-    assert!(available.len() >= 2, "at least two modes are always available");
+    assert!(
+        available.len() >= 2,
+        "at least two modes are always available"
+    );
 
     let mut reference: Option<Vec<u8>> = None;
     for mode in available {
@@ -315,7 +325,11 @@ fn a_translucent_sprite_composites_over_the_target() {
         &context,
         &mut renderer,
         &target,
-        &input(&scene, &textures, DrawMode::best_available(context.indirect)),
+        &input(
+            &scene,
+            &textures,
+            DrawMode::best_available(context.indirect),
+        ),
     );
 
     assert_eq!(pixel(&pixels, 10, 10), [255, 255, 255, 255]);
@@ -369,7 +383,11 @@ fn a_scaled_sprite_samples_the_nearest_texel() {
         &context,
         &mut renderer,
         &target,
-        &input(&scene, &textures, DrawMode::best_available(context.indirect)),
+        &input(
+            &scene,
+            &textures,
+            DrawMode::best_available(context.indirect),
+        ),
     );
 
     for x in 20..22u32 {
@@ -513,10 +531,18 @@ fn a_sprite_with_no_tile_draws_nothing_and_does_not_disturb_its_neighbour() {
         &context,
         &mut renderer,
         &target,
-        &input(&scene, &textures, DrawMode::best_available(context.indirect)),
+        &input(
+            &scene,
+            &textures,
+            DrawMode::best_available(context.indirect),
+        ),
     );
 
-    assert_eq!(pixel(&pixels, 15, 15), [0, 0, 0, 255], "the blank paints nothing");
+    assert_eq!(
+        pixel(&pixels, 15, 15),
+        [0, 0, 0, 255],
+        "the blank paints nothing"
+    );
     assert_eq!(
         painted_pixels(&pixels),
         20 * 20,

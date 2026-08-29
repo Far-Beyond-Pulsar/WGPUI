@@ -454,12 +454,7 @@ impl Compositor {
     /// identity keeps its transform and its residency, which is the entire
     /// point of deriving that identity positionally (SFD §1.0) rather than
     /// requiring a name.
-    pub fn visit(
-        &mut self,
-        boundary: BoundaryId,
-        policy: BoundaryPolicy,
-        frame: u64,
-    ) -> LayerId {
+    pub fn visit(&mut self, boundary: BoundaryId, policy: BoundaryPolicy, frame: u64) -> LayerId {
         let layer = LayerId::from_key(LayerKey::untiled(boundary));
         let state = self
             .boundaries
@@ -813,7 +808,10 @@ mod tests {
             2,
         );
         assert_eq!(compositor.state(PANEL).map(BoundaryState::layer), layer);
-        assert_eq!(compositor.transform(PANEL), LayerTransform::translated(3.0, 5.0));
+        assert_eq!(
+            compositor.transform(PANEL),
+            LayerTransform::translated(3.0, 5.0)
+        );
         assert_eq!(
             compositor
                 .state(PANEL)
@@ -1020,7 +1018,10 @@ mod tests {
         let first = compositor
             .visit_tiled(PANEL, tiled_policy(), 1, canvas_viewport())
             .expect("a tiled policy with a usable tile size resolves");
-        assert!(first.visible.len() > 1, "a 900x600 viewport spans several tiles");
+        assert!(
+            first.visible.len() > 1,
+            "a 900x600 viewport spans several tiles"
+        );
         assert_eq!(
             first.revealed.len(),
             first.visible.len(),
@@ -1098,7 +1099,10 @@ mod tests {
             .chain(Some(LayerId::from_key(LayerKey::untiled(PANEL))))
             .collect();
         assert_eq!(
-            evicted.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            evicted
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
             expected,
             "an evicted tiled boundary must name its overlay and every resident \
              tile, or their slab reservations outlive the scene"
@@ -1128,7 +1132,10 @@ mod tests {
         let panned = compositor
             .visit_tiled(PANEL, tiled_policy(), 2, canvas_viewport())
             .expect("still tiled");
-        assert!(!panned.revealed.is_empty(), "one tile of pan reveals a column");
+        assert!(
+            !panned.revealed.is_empty(),
+            "one tile of pan reveals a column"
+        );
         assert!(
             panned.revealed.len() < first.visible.len(),
             "a one-tile pan revealed {} of {} tiles, which is a refill",

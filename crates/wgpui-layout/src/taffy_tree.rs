@@ -24,9 +24,10 @@
 
 use std::collections::HashSet;
 use taffy::TaffyTree;
-use taffy::geometry::Size as TaffySize;
-use taffy::tree::NodeId;
+pub use taffy::geometry::{Line, Size as TaffySize};
+pub use taffy::style_helpers::FromFr;
 pub use taffy::style::AvailableSpace;
+use taffy::tree::NodeId;
 
 /// The style a layout node is laid out with.
 ///
@@ -57,7 +58,8 @@ pub type LayoutSides<T> = taffy::geometry::Rect<T>;
 /// set a real `div()` builder needs; nothing about the policy changed.
 pub use taffy::style::{
     AlignContent, AlignItems, BoxSizing, Dimension, Display, FlexDirection, FlexWrap,
-    LengthPercentage, LengthPercentageAuto, Overflow, Position,
+    GridPlacement, GridTemplateComponent, LengthPercentage, LengthPercentageAuto, Overflow,
+    Position, TrackSizingFunction,
 };
 
 /// The available space for a subtree with a known width and height.
@@ -236,11 +238,7 @@ impl LayoutTree {
 
     /// Replace a live node's style. Taffy's own dirty propagation decides what
     /// that invalidates.
-    pub fn set_style(
-        &mut self,
-        node: LayoutNodeId,
-        style: LayoutStyle,
-    ) -> Result<(), LayoutError> {
+    pub fn set_style(&mut self, node: LayoutNodeId, style: LayoutStyle) -> Result<(), LayoutError> {
         self.require_live(node)?;
         self.tree.set_style(node.to_taffy(), style)?;
         Ok(())
@@ -429,8 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn children_can_be_relinked_without_recreating_the_parent()
-    -> Result<(), LayoutError> {
+    fn children_can_be_relinked_without_recreating_the_parent() -> Result<(), LayoutError> {
         let mut tree = LayoutTree::new();
         tree.begin_frame();
         let first = tree.request_layout(sized(10.0, 10.0), &[])?;

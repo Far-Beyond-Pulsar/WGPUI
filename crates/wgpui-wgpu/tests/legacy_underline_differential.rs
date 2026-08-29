@@ -31,9 +31,7 @@ use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::{BoundaryId, LayerKey};
 use wgpui_wgpu::render::device::{ComputeContext, context_or_report};
 use wgpui_wgpu::render::draw::DrawMode;
-use wgpui_wgpu::render::frame::{
-    Dirty, FrameInput, FrameRenderer, OffscreenTarget, RenderTarget,
-};
+use wgpui_wgpu::render::frame::{Dirty, FrameInput, FrameRenderer, OffscreenTarget, RenderTarget};
 use wgpui_wgpu::render::pipelines::TARGET_FORMAT;
 
 /// The legacy shader, byte for byte off disk.
@@ -203,10 +201,7 @@ fn cases() -> Vec<Case> {
 /// The 64 bytes the legacy `Underline` occupies, in its own field order:
 /// `order: u32` at 0, `pad: u32` at 4, `bounds` at 8, `content_mask` at 24,
 /// `color` at 40, `thickness` at 56, `wavy` at 60.
-fn encode_legacy_underline(
-    underline: &Underline,
-    hsla: [f32; 4],
-) -> [u8; LEGACY_UNDERLINE_STRIDE] {
+fn encode_legacy_underline(underline: &Underline, hsla: [f32; 4]) -> [u8; LEGACY_UNDERLINE_STRIDE] {
     let mut bytes = [0u8; LEGACY_UNDERLINE_STRIDE];
     {
         let mut put = |offset: usize, value: f32| {
@@ -246,8 +241,13 @@ fn render_legacy(context: &ComputeContext, case: &Case) -> Vec<u8> {
     globals[4..8].copy_from_slice(&(HEIGHT as f32).to_le_bytes());
     // premultiplied_alpha = 0, matching `flamegraph_replay.rs:596`'s offscreen
     // use of these same shaders.
-    let globals_buffer =
-        buffer_with(device, queue, "legacy globals", wgpu::BufferUsages::UNIFORM, &globals);
+    let globals_buffer = buffer_with(
+        device,
+        queue,
+        "legacy globals",
+        wgpu::BufferUsages::UNIFORM,
+        &globals,
+    );
     let underline_bytes = encode_legacy_underline(&case.underline, case.hsla);
     let underline_buffer = buffer_with(
         device,
@@ -440,7 +440,11 @@ struct Comparison {
 
 fn compare(legacy: &[u8], ours: &[u8], clear: [u8; 4]) -> Comparison {
     let mut result = Comparison::default();
-    assert_eq!(legacy.len(), ours.len(), "both arms read back the same extent");
+    assert_eq!(
+        legacy.len(),
+        ours.len(),
+        "both arms read back the same extent"
+    );
     for (index, (left, right)) in legacy.chunks_exact(4).zip(ours.chunks_exact(4)).enumerate() {
         let left: [u8; 4] = [left[0], left[1], left[2], left[3]];
         let right: [u8; 4] = [right[0], right[1], right[2], right[3]];
@@ -568,7 +572,11 @@ fn the_comparison_actually_detects_a_wrong_underline() {
         hsla: [0.0, 1.0, 0.5, 1.0],
     };
     let legacy = render_legacy(&context, &case);
-    let control = compare(&legacy, &render_2_0(&context, Some(case.underline), mode), clear);
+    let control = compare(
+        &legacy,
+        &render_2_0(&context, Some(case.underline), mode),
+        clear,
+    );
     assert_eq!(control.exact, control.total, "the control must agree");
     assert!(control.painted > 200);
 
@@ -582,7 +590,10 @@ fn the_comparison_actually_detects_a_wrong_underline() {
         wavy: false,
         ..case.underline
     };
-    for (label, wrong) in [("a 2.5% thicker wave", thicker), ("wavy turned off", straightened)] {
+    for (label, wrong) in [
+        ("a 2.5% thicker wave", thicker),
+        ("wavy turned off", straightened),
+    ] {
         let result = compare(&legacy, &render_2_0(&context, Some(wrong), mode), clear);
         assert!(
             result.exact < result.total,
@@ -625,9 +636,14 @@ fn every_draw_mode_produces_the_same_underline() {
             continue;
         }
         modes += 1;
-        let result = compare(&legacy, &render_2_0(&context, Some(case.underline), mode), clear);
+        let result = compare(
+            &legacy,
+            &render_2_0(&context, Some(case.underline), mode),
+            clear,
+        );
         assert_eq!(
-            result.exact, result.total,
+            result.exact,
+            result.total,
             "[{}] first difference at {:?}",
             mode.name(),
             result.first_difference

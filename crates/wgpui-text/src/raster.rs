@@ -290,7 +290,10 @@ fn convert(kind: AtlasKind, content: SwashContent, data: &[u8]) -> Vec<u8> {
         AtlasKind::Monochrome => match content {
             SwashContent::Mask => data.to_vec(),
             SwashContent::SubpixelMask => data.chunks_exact(4).map(luminance).collect(),
-            SwashContent::Color => data.chunks_exact(4).filter_map(|pixel| pixel.get(3).copied()).collect(),
+            SwashContent::Color => data
+                .chunks_exact(4)
+                .filter_map(|pixel| pixel.get(3).copied())
+                .collect(),
         },
     }
 }
@@ -552,11 +555,20 @@ mod tests {
         // coverage lives in the alpha channel, so the sprite pipeline can tint
         // it the same way it tints a mask.
         assert_eq!(
-            colour.texels.chunks_exact(4).map(|texel| texel[3]).collect::<Vec<u8>>(),
+            colour
+                .texels
+                .chunks_exact(4)
+                .map(|texel| texel[3])
+                .collect::<Vec<u8>>(),
             mask.texels,
             "widening must move coverage into alpha and nowhere else"
         );
-        assert!(colour.texels.chunks_exact(4).all(|texel| texel[..3] == [255, 255, 255]));
+        assert!(
+            colour
+                .texels
+                .chunks_exact(4)
+                .all(|texel| texel[..3] == [255, 255, 255])
+        );
     }
 
     #[test]
@@ -566,7 +578,11 @@ mod tests {
         // organically. Checked directly against the legacy expressions instead,
         // so a future tidy-up of `convert` that changes a weight fails here.
         assert_eq!(
-            convert(AtlasKind::Monochrome, SwashContent::SubpixelMask, &[10, 20, 30, 255]),
+            convert(
+                AtlasKind::Monochrome,
+                SwashContent::SubpixelMask,
+                &[10, 20, 30, 255]
+            ),
             vec![(10.0 * 0.2126 + 20.0 * 0.7152 + 30.0 * 0.0722) as u8]
         );
         assert_eq!(

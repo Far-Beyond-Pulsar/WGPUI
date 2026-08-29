@@ -420,10 +420,7 @@ fn render_legacy(context: &ComputeContext, elements: &[Painted]) -> Vec<u8> {
     let device = &context.device;
     let queue = &context.queue;
 
-    let shadows: Vec<LegacyShadow> = elements
-        .iter()
-        .flat_map(Painted::legacy_shadows)
-        .collect();
+    let shadows: Vec<LegacyShadow> = elements.iter().flat_map(Painted::legacy_shadows).collect();
     let quads: Vec<LegacyQuad> = elements.iter().flat_map(Painted::legacy_quads).collect();
 
     let mut globals = [0u8; 16];
@@ -474,13 +471,8 @@ fn render_legacy(context: &ComputeContext, elements: &[Painted]) -> Vec<u8> {
         label: Some("legacy shadows"),
         source: wgpu::ShaderSource::Wgsl(LEGACY_SHADOWS_WGSL.into()),
     });
-    let quad_pipeline = legacy_pipeline(
-        device,
-        &quad_module,
-        "vs_quad",
-        "fs_quad",
-        &pipeline_layout,
-    );
+    let quad_pipeline =
+        legacy_pipeline(device, &quad_module, "vs_quad", "fs_quad", &pipeline_layout);
     let shadow_pipeline = legacy_pipeline(
         device,
         &shadow_module,
@@ -682,7 +674,12 @@ fn measured_clear_pixel(context: &ComputeContext) -> [u8; 4] {
         DrawMode::best_available(context.indirect),
     );
     let legacy = render_legacy(context, &[]);
-    let ours: [u8; 4] = [ours.pixels[0], ours.pixels[1], ours.pixels[2], ours.pixels[3]];
+    let ours: [u8; 4] = [
+        ours.pixels[0],
+        ours.pixels[1],
+        ours.pixels[2],
+        ours.pixels[3],
+    ];
     let legacy: [u8; 4] = [legacy[0], legacy[1], legacy[2], legacy[3]];
     assert_eq!(
         ours, legacy,
@@ -949,7 +946,11 @@ fn the_comparison_detects_a_misplaced_child_and_a_missing_one() {
     let mode = DrawMode::best_available(context.indirect);
     let legacy = render_legacy(&context, &card_tree_oracle());
 
-    let control = compare(&legacy, &render_div(&context, card_tree(), mode).pixels, clear);
+    let control = compare(
+        &legacy,
+        &render_div(&context, card_tree(), mode).pixels,
+        clear,
+    );
     assert_eq!(control.exact, control.total, "the control must agree");
 
     // 1. One pixel of extra gap: every row below the first moves down by one,
@@ -1048,7 +1049,11 @@ fn the_comparison_detects_a_misplaced_child_and_a_missing_one() {
                 .children(rows),
         )
     };
-    let flat = compare(&legacy, &render_div(&context, unshadowed, mode).pixels, clear);
+    let flat = compare(
+        &legacy,
+        &render_div(&context, unshadowed, mode).pixels,
+        clear,
+    );
     assert!(
         flat.exact < flat.total,
         "removing the box-shadow must be visible; it reported {} of {} exact",
@@ -1076,7 +1081,11 @@ fn every_draw_mode_renders_the_same_tree() {
             continue;
         }
         modes += 1;
-        let result = compare(&legacy, &render_div(&context, card_tree(), mode).pixels, clear);
+        let result = compare(
+            &legacy,
+            &render_div(&context, card_tree(), mode).pixels,
+            clear,
+        );
         assert_eq!(
             result.exact, result.total,
             "{mode:?} disagrees with legacy at {:?}",
@@ -1172,7 +1181,10 @@ fn an_overflowing_child_is_where_the_paint_order_difference_becomes_visible() {
     // And the same tree with the child moved fully inside the padding agrees
     // exactly — which is what makes the divergence a *scoped* one rather than a
     // general disagreement about children.
-    let inside_origin = [parent_origin[0] + border + 4.0, parent_origin[1] + border + 4.0];
+    let inside_origin = [
+        parent_origin[0] + border + 4.0,
+        parent_origin[1] + border + 4.0,
+    ];
     let inside_tree = div().w(WIDTH as f32).h(HEIGHT as f32).child(
         div()
             .absolute()

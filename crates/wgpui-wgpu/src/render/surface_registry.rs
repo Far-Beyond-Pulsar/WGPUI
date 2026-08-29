@@ -245,8 +245,10 @@ impl SurfaceRegistry {
                         // path (the fast blit) left the composited generation
                         // behind, it would look to them like their frames were
                         // never being consumed.
-                        tb.last_composited_generation
-                            .store(tb.frame_generation.load(Ordering::Acquire), Ordering::Release);
+                        tb.last_composited_generation.store(
+                            tb.frame_generation.load(Ordering::Acquire),
+                            Ordering::Release,
+                        );
                         return true;
                     }
                     Err(updated) => current = updated,
@@ -430,16 +432,12 @@ impl SurfaceRegistry {
     /// ([`swap_ready_display`](Self::swap_ready_display)) does not advance the
     /// composited generation, so this can stay true indefinitely on that path.
     pub fn has_unconsumed_frame(&self, id: SurfaceId) -> bool {
-        self.surfaces
-            .lock()
-            .unwrap()
-            .get(&id)
-            .is_some_and(|tb| {
-                Self::should_composite_swap(
-                    tb.frame_generation.load(Ordering::Acquire),
-                    tb.last_composited_generation.load(Ordering::Acquire),
-                )
-            })
+        self.surfaces.lock().unwrap().get(&id).is_some_and(|tb| {
+            Self::should_composite_swap(
+                tb.frame_generation.load(Ordering::Acquire),
+                tb.last_composited_generation.load(Ordering::Acquire),
+            )
+        })
     }
 
     /// The current producer-swap generation for a surface (increments once per
@@ -616,7 +614,11 @@ mod tests {
             m.produce(frame);
             m.composite_gated();
             let (r, ready, d) = TripleBuffer::unpack_state(m.state);
-            assert!(r != ready && ready != d && d != r, "roles collided: {:?}", (r, ready, d));
+            assert!(
+                r != ready && ready != d && d != r,
+                "roles collided: {:?}",
+                (r, ready, d)
+            );
         }
     }
 
@@ -628,7 +630,11 @@ mod tests {
         let mut m = Model::new();
         m.produce(1);
         m.composite_ungated();
-        assert_eq!(m.displayed_frame(), 1, "first composite shows the new frame");
+        assert_eq!(
+            m.displayed_frame(),
+            1,
+            "first composite shows the new frame"
+        );
 
         m.composite_ungated(); // unpaired paint, no new frame produced
         assert_ne!(

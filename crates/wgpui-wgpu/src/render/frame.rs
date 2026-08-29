@@ -716,8 +716,7 @@ impl FrameRenderer {
             || self.uploaded_generation.is_none()
             || matches!(input.dirty, Dirty::All)
         {
-            self.shadow_arena
-                .upload_all(device, queue, shadow_resident);
+            self.shadow_arena.upload_all(device, queue, shadow_resident);
             self.arena.upload_all(device, queue, resident);
             self.underline_arena
                 .upload_all(device, queue, underline_resident);
@@ -740,8 +739,12 @@ impl FrameRenderer {
                 shadow_resident,
                 &kind_uploads(input.uploads, PrimitiveKind::Shadow),
             );
-            self.arena
-                .upload(device, queue, resident, &kind_uploads(input.uploads, PrimitiveKind::Quad));
+            self.arena.upload(
+                device,
+                queue,
+                resident,
+                &kind_uploads(input.uploads, PrimitiveKind::Quad),
+            );
             self.underline_arena.upload(
                 device,
                 queue,
@@ -1334,9 +1337,9 @@ impl FrameRenderer {
             self.sprite_arena.buffer(),
             &self.sprite_args.visible,
         );
-        let path_frame_group = self
-            .paths
-            .frame_bind_group(device, &self.globals, self.path_arena.buffer());
+        let path_frame_group =
+            self.paths
+                .frame_bind_group(device, &self.globals, self.path_arena.buffer());
         let backdrop_frame_group = self.backdrop_filters.frame_bind_group(
             device,
             &self.globals,
@@ -1348,11 +1351,10 @@ impl FrameRenderer {
             let Some(view) = self.backdrop_snapshot_view.as_ref() else {
                 return Err(FrameError::BackdropSourceUnavailable);
             };
-            Some(self.backdrop_filters.texture_bind_group(
-                device,
-                view,
-                &self.backdrop_sampler,
-            ))
+            Some(
+                self.backdrop_filters
+                    .texture_bind_group(device, view, &self.backdrop_sampler),
+            )
         } else {
             None
         };

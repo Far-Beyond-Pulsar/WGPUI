@@ -22,6 +22,8 @@
 //! workspace replaces them and nothing else in this file changes.
 
 use crate::scene::tile::TileGrid;
+use std::fmt;
+use std::ops::{Add, AddAssign, Neg, Sub};
 
 /// A length in logical pixels.
 #[derive(Copy, Clone, Debug, Default, PartialEq, PartialOrd)]
@@ -39,6 +41,42 @@ impl Pixels {
     /// The underlying value.
     pub const fn value(self) -> f32 {
         self.0
+    }
+
+    pub const fn to_f64(self) -> f64 { self.0 as f64 }
+
+    pub fn max(self, other: Self) -> Self { Self(self.0.max(other.0)) }
+}
+
+impl Add for Pixels {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self(self.0 + other.0)
+    }
+}
+
+impl Sub for Pixels {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        Self(self.0 - other.0)
+    }
+}
+
+impl AddAssign for Pixels {
+    fn add_assign(&mut self, other: Self) { self.0 += other.0; }
+}
+
+impl Neg for Pixels {
+    type Output = Self;
+
+    fn neg(self) -> Self { Self(-self.0) }
+}
+
+impl fmt::Display for Pixels {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -297,7 +335,10 @@ mod tests {
             tile_size: Size::pixels(256.0, 256.0),
             retain_radius: 2,
         };
-        assert_eq!(tiled.margin(Size::pixels(800.0, 600.0)), Size::pixels(512.0, 512.0));
+        assert_eq!(
+            tiled.margin(Size::pixels(800.0, 600.0)),
+            Size::pixels(512.0, 512.0)
+        );
         assert_eq!(tiled.retain_radius(), 2);
         assert!(tiled.tile_grid().is_some());
 

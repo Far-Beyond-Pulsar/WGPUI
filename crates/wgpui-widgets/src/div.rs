@@ -53,7 +53,7 @@ pub mod scroll_state;
 use crate::div::diff::DivDiffKey;
 use crate::div::interactivity::style::DivStyle;
 use crate::styled::Styled;
-use wgpui_core::patch::emit::{EmitContext, Emission};
+use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::reconcile::description::{Description, ElementId};
 
 /// Anything that can become one node of a description tree.
@@ -77,6 +77,12 @@ impl IntoDescription for Description {
 impl IntoDescription for String {
     fn into_description(self) -> Description {
         Description::new::<String>()
+    }
+}
+
+impl IntoDescription for wgpui_text::shaping::SharedString {
+    fn into_description(self) -> Description {
+        Description::new::<wgpui_text::shaping::SharedString>()
     }
 }
 
@@ -246,8 +252,8 @@ mod tests {
     use wgpui_core::invalidation::request::FrameSignals;
     use wgpui_core::patch::apply::apply;
     use wgpui_core::patch::emit::{EmitError, Emitter};
-    use wgpui_core::reconcile::plan::NodeOutcome;
     use wgpui_core::reconcile::instance::InstanceKey;
+    use wgpui_core::reconcile::plan::NodeOutcome;
     use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
     use wgpui_core::scene::Scene;
     use wgpui_core::scene::layer::{BoundaryId, LayerId, LayerKey};
@@ -404,12 +410,14 @@ mod tests {
     }
 
     #[test]
-    fn an_identical_second_frame_reuses_everything_and_uploads_nothing()
-    -> Result<(), FrameError> {
+    fn an_identical_second_frame_reuses_everything_and_uploads_nothing() -> Result<(), FrameError> {
         let mut window = Window::new();
         window.draw(card())?;
         let settled = window.draw(card())?;
-        assert_eq!(settled.outcome_at(&[ElementId::Slot(0)]), Some(NodeOutcome::Reused));
+        assert_eq!(
+            settled.outcome_at(&[ElementId::Slot(0)]),
+            Some(NodeOutcome::Reused)
+        );
         assert_eq!(settled.emitted, 0, "a clean, unmoved div must not re-emit");
         assert_eq!(settled.inserted, 0);
         assert_eq!(settled.updated, 0);

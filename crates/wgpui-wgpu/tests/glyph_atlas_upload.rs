@@ -16,13 +16,13 @@
 use wgpui_core::scene::atlas::{
     AtlasKind, GlyphRasterKey, GlyphTileSource, ImageRasterKey, RasterizedGlyph, RasterizedImage,
 };
-use wgpui_wgpu::render::atlas::{AtlasTileSource, GlyphAtlas};
-use wgpui_wgpu::render::atlas_upload::{AtlasTextures, texture_format};
-use wgpui_wgpu::render::device::context_or_report;
 use wgpui_text::patch::{RunPlacement, glyph_runs};
 use wgpui_text::raster::GlyphRasterizer;
 use wgpui_text::shaping::{FontRun, SharedString, font};
 use wgpui_text::test_fonts;
+use wgpui_wgpu::render::atlas::{AtlasTileSource, GlyphAtlas};
+use wgpui_wgpu::render::atlas_upload::{AtlasTextures, texture_format};
+use wgpui_wgpu::render::device::context_or_report;
 
 /// Read a whole atlas page texture back into a tightly-packed buffer.
 ///
@@ -160,13 +160,18 @@ fn an_uploaded_page_reads_back_exactly_as_the_cpu_side_holds_it() {
     let report = textures.sync(&context.device, &context.queue, &mut atlas);
     println!("upload: {report:?}");
     assert_eq!(report.rectangles, 16);
-    assert_eq!(report.pages_created, 2, "one monochrome page and one colour");
+    assert_eq!(
+        report.pages_created, 2,
+        "one monochrome page and one colour"
+    );
     assert_eq!(report.skipped, 0);
     assert!(!atlas.has_pending_uploads(), "sync drains what it uploads");
 
     for page in atlas.page_indices() {
         let kind = atlas.page_kind(page).expect("a live page has a kind");
-        let texture = textures.texture(page).expect("every live page has a texture");
+        let texture = textures
+            .texture(page)
+            .expect("every live page has a texture");
         assert_eq!(texture.format(), texture_format(kind));
         let read_back = read_page_back(&context.device, &context.queue, texture, kind);
         let expected = atlas.page_texels(page).expect("a live page has texels");
@@ -248,7 +253,10 @@ fn an_image_frame_reaches_a_colour_texture_with_its_bytes_unchanged() {
     // The whole page matches the CPU side, and — the part that matters — the
     // rectangle the tile occupies holds the decoded bytes in row order.
     let expected_page = atlas.page_texels(page).expect("a live page has texels");
-    assert!(read_back == expected_page, "the colour page diverged from the CPU side");
+    assert!(
+        read_back == expected_page,
+        "the colour page diverged from the CPU side"
+    );
 
     let origin = [placement.origin[0] as usize, placement.origin[1] as usize];
     let stride = 128 * 4;
@@ -290,7 +298,11 @@ fn a_second_sync_uploads_only_what_changed() {
         )
         .expect("resident");
     let second = textures.sync(&context.device, &context.queue, &mut atlas);
-    assert_eq!(second, Default::default(), "a resident atlas uploads nothing");
+    assert_eq!(
+        second,
+        Default::default(),
+        "a resident atlas uploads nothing"
+    );
 
     atlas
         .get_or_insert_raster(
@@ -379,7 +391,10 @@ fn real_text_reaches_a_real_texture() {
         stats.tiles_referenced,
         stats.glyphs
     );
-    assert!(stats.blank_glyphs > 0, "the spaces must still hold their slots");
+    assert!(
+        stats.blank_glyphs > 0,
+        "the spaces must still hold their slots"
+    );
     assert!(atlas.stats().allocations > 10);
     assert!(
         atlas.stats().cache_hits > 0,

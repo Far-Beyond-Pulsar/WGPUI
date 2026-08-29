@@ -280,7 +280,11 @@ mod tests {
         }
 
         fn next_in(&mut self, range: u32) -> u32 {
-            if range == 0 { 0 } else { self.next_u32() % range }
+            if range == 0 {
+                0
+            } else {
+                self.next_u32() % range
+            }
         }
     }
 
@@ -375,7 +379,10 @@ mod tests {
             rect(0.0, 0.0, 0.0, 10.0),
             rect(0.0, 0.0, 10.0, 0.0),
         ];
-        assert_eq!(super::super::painter_orders_via_tree(&bounds), vec![1, 1, 1]);
+        assert_eq!(
+            super::super::painter_orders_via_tree(&bounds),
+            vec![1, 1, 1]
+        );
         assert_eq!(painter_orders(&bounds), vec![1, 1, 1]);
     }
 }

@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
+use std::any::TypeId;
 
 pub use wgpui_core::boundary::policy::Pixels;
 pub use wgpui_core::geometry::Rect;
@@ -18,7 +19,9 @@ pub use wgpui_core::reconcile::instance::{ElementInstance, InstanceKey, Instance
 pub use wgpui_layout::taffy_tree::LayoutNodeId;
 pub use wgpui_text::shaping::{Font, FontId, FontStyle, FontWeight, SharedString};
 pub use wgpui_widgets::div::{Div, IntoDescription, div};
+pub use wgpui_widgets::div::interactivity::style::BoxShadow;
 pub use wgpui_widgets::styled::Styled;
+pub use wgpui_widgets::styled::LinearColorStop;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Size<T> {
@@ -37,6 +40,15 @@ pub struct Bounds<T> {
     pub origin: Point<T>,
     pub size: Size<T>,
 }
+impl<T> Bounds<T> {
+    pub fn new(origin: Point<T>, size: Size<T>) -> Self { Self { origin, size } }
+}
+
+impl Size<Pixels> {
+    pub fn center(self) -> Point<Pixels> {
+        Point { x: Pixels(self.width.value() / 2.0), y: Pixels(self.height.value() / 2.0) }
+    }
+}
 
 impl Bounds<Pixels> {
     pub fn centered<C>(_display: Option<DisplayId>, size: Size<Pixels>, _cx: &C) -> Self {
@@ -50,7 +62,7 @@ impl Bounds<Pixels> {
     }
 }
 
-pub fn px(value: f32) -> Pixels {
+pub const fn px(value: f32) -> Pixels {
     Pixels(value)
 }
 pub fn size<T>(width: T, height: T) -> Size<T> {
@@ -68,12 +80,26 @@ pub struct Rgba {
     pub a: f32,
 }
 
+impl Rgba {
+    pub fn opacity(mut self, alpha: f32) -> Self {
+        self.a = alpha;
+        self
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Hsla {
     pub h: f32,
     pub s: f32,
     pub l: f32,
     pub a: f32,
+}
+
+impl Hsla {
+    pub fn opacity(mut self, alpha: f32) -> Self {
+        self.a = alpha;
+        self
+    }
 }
 
 pub fn rgb(hex: u32) -> Rgba {
@@ -94,6 +120,10 @@ pub fn rgba(hex: u32) -> Rgba {
 }
 pub fn hsla(h: f32, s: f32, l: f32, a: f32) -> Hsla {
     Hsla { h, s, l, a }
+}
+
+pub fn linear_color_stop(color: impl Into<[f32; 4]>, position: f32) -> LinearColorStop {
+    LinearColorStop { color: color.into(), position }
 }
 impl From<Rgba> for [f32; 4] {
     fn from(value: Rgba) -> Self {
@@ -136,23 +166,72 @@ impl From<Hsla> for [f32; 4] {
         }
     }
 }
-pub fn red() -> Rgba {
-    rgb(0xff0000)
+pub const fn red() -> Hsla {
+    Hsla { h: 0.0, s: 1.0, l: 0.5, a: 1.0 }
 }
-pub fn green() -> Rgba {
-    rgb(0x00ff00)
+pub const fn green() -> Hsla {
+    Hsla { h: 1.0 / 3.0, s: 1.0, l: 0.5, a: 1.0 }
 }
-pub fn blue() -> Rgba {
-    rgb(0x0000ff)
+pub const fn blue() -> Hsla {
+    Hsla { h: 2.0 / 3.0, s: 1.0, l: 0.5, a: 1.0 }
 }
-pub fn black() -> Rgba {
-    rgb(0x000000)
+pub const fn black() -> Hsla {
+    Hsla { h: 0.0, s: 0.0, l: 0.0, a: 1.0 }
 }
-pub fn white() -> Rgba {
-    rgb(0xffffff)
+pub const fn white() -> Hsla {
+    Hsla { h: 0.0, s: 0.0, l: 1.0, a: 1.0 }
 }
-pub fn yellow() -> Rgba {
-    rgb(0xffff00)
+pub const fn yellow() -> Hsla {
+    Hsla { h: 1.0 / 6.0, s: 1.0, l: 0.5, a: 1.0 }
+}
+pub fn transparent_black() -> Rgba { Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }
+pub fn relative(value: f32) -> f32 { value * 16.0 }
+
+#[derive(Clone, Debug)]
+pub struct Colors {
+    pub text: Rgba, pub text_muted: Rgba, pub selected_text: Rgba,
+    pub background: Rgba, pub surface: Rgba, pub surface_hover: Rgba,
+    pub disabled: Rgba, pub selected: Rgba, pub border: Rgba, pub separator: Rgba,
+    pub container: Rgba, pub accent: Rgba, pub accent_hover: Rgba,
+    pub accent_active: Rgba, pub success: Rgba, pub success_hover: Rgba,
+    pub warning: Rgba, pub warning_hover: Rgba, pub error: Rgba, pub error_hover: Rgba,
+}
+impl Colors {
+    pub fn light() -> Self { Self::from_palette(0xffffff, 0xf5f5f5, 0x007aff) }
+    pub fn dark() -> Self { Self::from_palette(0xffffff, 0x1e1e1e, 0x0a84ff) }
+    fn from_palette(text: u32, background: u32, accent: u32) -> Self {
+        let text = rgb(text); let background = rgb(background); let accent = rgb(accent);
+        Self { text, text_muted: rgb(0x888888), selected_text: rgb(0xffffff), background,
+            surface: rgb(0x2d2d2d), surface_hover: rgb(0x3d3d3d), disabled: rgb(0x666666),
+            selected: accent, border: rgb(0x777777), separator: rgb(0x777777),
+            container: background, accent, accent_hover: accent, accent_active: accent,
+            success: rgb(0x28cd41), success_hover: rgb(0x28cd41), warning: rgb(0xffcc00),
+            warning_hover: rgb(0xffcc00), error: rgb(0xff3b30), error_hover: rgb(0xff3b30) }
+    }
+}
+impl Default for Colors { fn default() -> Self { Self::light() } }
+impl Colors {
+    pub fn for_appearance<C>(_window: &C) -> Self { Self::default() }
+}
+impl From<Rgba> for Hsla {
+    fn from(color: Rgba) -> Self {
+        let max = color.r.max(color.g).max(color.b);
+        let min = color.r.min(color.g).min(color.b);
+        let lightness = (max + min) / 2.0;
+        if (max - min).abs() < f32::EPSILON {
+            return Hsla { h: 0.0, s: 0.0, l: lightness, a: color.a };
+        }
+        let delta = max - min;
+        let saturation = delta / (1.0 - (2.0 * lightness - 1.0).abs());
+        let hue = if (max - color.r).abs() < f32::EPSILON {
+            ((color.g - color.b) / delta).rem_euclid(6.0)
+        } else if (max - color.g).abs() < f32::EPSILON {
+            (color.b - color.r) / delta + 2.0
+        } else {
+            (color.r - color.g) / delta + 4.0
+        } / 6.0;
+        Hsla { h: hue, s: saturation, l: lightness, a: color.a }
+    }
 }
 
 pub struct Task<T>(Option<T>);
@@ -161,6 +240,49 @@ impl<T> Task<T> {
         Self(Some(value))
     }
     pub fn detach(self) {}
+}
+
+pub trait Action: 'static + Send + Sync {
+    fn name() -> &'static str where Self: Sized;
+}
+
+#[macro_export]
+macro_rules! actions {
+    ($namespace:path, [$( $(#[$attr:meta])* $name:ident),* $(,)?]) => {
+        $(
+            $(#[$attr])*
+            #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+            pub struct $name;
+            impl $crate::Action for $name {
+                fn name() -> &'static str { concat!(stringify!($namespace), "::", stringify!($name)) }
+            }
+        )*
+    };
+    ([$( $(#[$attr:meta])* $name:ident),* $(,)?]) => {
+        $(
+            $(#[$attr])*
+            #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+            pub struct $name;
+            impl $crate::Action for $name {
+                fn name() -> &'static str { stringify!($name) }
+            }
+        )*
+    };
+}
+
+#[derive(Clone)]
+pub struct KeyBinding { pub keystrokes: SharedString, pub action: &'static str, pub context: Option<SharedString> }
+impl KeyBinding {
+    pub fn new<A: Action>(keystrokes: &str, _action: A, context: Option<&str>) -> Self {
+        Self { keystrokes: keystrokes.into(), action: A::name(), context: context.map(Into::into) }
+    }
+}
+pub struct Menu { pub name: SharedString, pub items: Vec<MenuItem> }
+pub enum MenuItem { Action { name: SharedString, action: &'static str } }
+impl MenuItem {
+    pub fn action<A: Action>(name: impl Into<SharedString>, _action: A) -> Self {
+        Self::Action { name: name.into(), action: A::name() }
+    }
 }
 impl<T> Future for Task<T> {
     type Output = T;
@@ -250,6 +372,11 @@ pub struct App {
     notifications: Rc<RefCell<u64>>,
     descriptions: Vec<Description>,
     active: bool,
+    key_bindings: Vec<KeyBinding>,
+    menus: Vec<Menu>,
+    action_types: Vec<TypeId>,
+    quit_requested: bool,
+    window_closed_handlers: Vec<WindowClosedHandler>,
 }
 impl App {
     pub fn new() -> Self {
@@ -257,6 +384,11 @@ impl App {
             notifications: Rc::new(RefCell::new(0)),
             descriptions: Vec::new(),
             active: false,
+            key_bindings: Vec::new(),
+            menus: Vec::new(),
+            action_types: Vec::new(),
+            quit_requested: false,
+            window_closed_handlers: Vec::new(),
         }
     }
     pub fn new_entity<T>(&mut self, build: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
@@ -281,13 +413,28 @@ impl App {
         );
         let mut context = Context::from_entity(root_entity.clone(), Rc::clone(&self.notifications));
         let description =
-            root_entity.update(|root| root.render(&mut window, &mut context).into_description());
+            root_entity.update(|root| {
+                IntoDescription::into_description(root.render(&mut window, &mut context))
+            });
         self.descriptions.push(description);
         Ok(WindowHandle)
     }
     pub fn activate(&mut self, active: bool) {
         self.active = active;
     }
+    pub fn on_action<A: Action>(&mut self, _handler: impl FnMut(&A, &mut App) + 'static) {
+        self.action_types.push(TypeId::of::<A>());
+    }
+    pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
+        self.key_bindings.extend(bindings);
+    }
+    pub fn set_menus(&mut self, menus: Vec<Menu>) { self.menus = menus; }
+    pub fn on_window_closed(&mut self, handler: impl FnMut(&mut App, WindowHandle) + 'static) -> Task<()> {
+        self.window_closed_handlers.push(Box::new(handler));
+        Task::ready(())
+    }
+    pub fn quit(&mut self) { self.quit_requested = true; }
+    pub fn windows(&self) -> &[WindowHandle] { &[] }
     pub fn descriptions(&self) -> &[Description] {
         &self.descriptions
     }
@@ -314,6 +461,7 @@ impl Application {
 }
 pub struct Window;
 pub struct WindowHandle;
+type WindowClosedHandler = Box<dyn FnMut(&mut App, WindowHandle)>;
 #[derive(Default)]
 pub struct WindowOptions {
     pub window_bounds: Option<WindowBounds>,
@@ -324,18 +472,14 @@ pub enum WindowBounds {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DisplayId;
 
-pub trait IntoElement: Sized {
+pub trait IntoElement: Sized + IntoDescription {
     type Element;
     fn into_element(self) -> Self::Element;
-    fn into_description(self) -> Description;
 }
-impl IntoElement for Div {
+impl<T: IntoDescription> IntoElement for T {
     type Element = Div;
     fn into_element(self) -> Div {
-        self
-    }
-    fn into_description(self) -> Description {
-        IntoDescription::into_description(self)
+        div().child(self)
     }
 }
 impl<T: 'static> IntoDescription for Entity<T> {
@@ -369,6 +513,7 @@ pub mod widgets {
 
 pub mod prelude {
     pub use crate::{
-        Div, IntoDescription, IntoElement, ReconcileKey, Render, RenderOnce, Styled, div,
+        div, linear_color_stop, Div, IntoDescription, IntoElement, ReconcileKey, Render,
+        RenderOnce, Styled,
     };
 }

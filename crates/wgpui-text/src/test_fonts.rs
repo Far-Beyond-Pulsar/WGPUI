@@ -22,7 +22,8 @@ use cosmic_text::{FontSystem, fontdb};
 pub const FAMILY: &str = "IBM Plex Sans";
 
 /// The face itself.
-pub const REGULAR: &[u8] = include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+pub const REGULAR: &[u8] =
+    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
 
 /// A font database holding the embedded face and nothing else.
 pub fn font_system() -> FontSystem {

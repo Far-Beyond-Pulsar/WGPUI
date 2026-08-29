@@ -213,7 +213,9 @@ impl CpuBoundsTree {
             self.stack.push(index);
 
             let left_cost = new_bounds.union(self.nodes[left].bounds()).half_perimeter();
-            let right_cost = new_bounds.union(self.nodes[right].bounds()).half_perimeter();
+            let right_cost = new_bounds
+                .union(self.nodes[right].bounds())
+                .half_perimeter();
             if left_cost < right_cost {
                 max_intersecting_ordering =
                     self.find_max_ordering(right, &new_bounds, max_intersecting_ordering);
@@ -273,7 +275,10 @@ impl CpuBoundsTree {
 
     fn find_max_ordering(&self, index: usize, bounds: &Bounds, mut max_ordering: u32) -> u32 {
         match &self.nodes[index] {
-            Node::Leaf { bounds: node_bounds, order } => {
+            Node::Leaf {
+                bounds: node_bounds,
+                order,
+            } => {
                 if bounds.intersects(node_bounds) {
                     max_ordering = max_ordering.max(*order);
                 }
@@ -307,7 +312,9 @@ impl CpuBoundsTree {
 
     fn push_internal(&mut self, left: usize, right: usize) -> usize {
         let new_bounds = self.nodes[left].bounds().union(self.nodes[right].bounds());
-        let max_order = self.nodes[left].max_ordering().max(self.nodes[right].max_ordering());
+        let max_order = self.nodes[left]
+            .max_ordering()
+            .max(self.nodes[right].max_ordering());
         self.nodes.push(Node::Internal {
             bounds: new_bounds,
             left,
@@ -467,7 +474,8 @@ fn run_cpu_path(scene: &Scene) -> CpuResult {
     for cluster in 0..CLUSTERS {
         let cluster_start = (cluster * PER_CLUSTER) as usize;
         let occluder_start = cluster as usize * OCCLUDERS_PER_CLUSTER as usize;
-        let cluster_occluders = &occluders[occluder_start..occluder_start + OCCLUDERS_PER_CLUSTER as usize];
+        let cluster_occluders =
+            &occluders[occluder_start..occluder_start + OCCLUDERS_PER_CLUSTER as usize];
         for local_index in 0..PER_CLUSTER as usize {
             let i = cluster_start + local_index;
             let quad = &scene.quads[i];
@@ -667,7 +675,8 @@ fn read_storage_buffer_u32(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
     queue.submit(Some(encoder.finish()));
 
@@ -679,7 +688,9 @@ fn read_storage_buffer_u32(
     device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("device.poll failed");
-    rx.recv().expect("map_async channel closed").expect("buffer map failed");
+    rx.recv()
+        .expect("map_async channel closed")
+        .expect("buffer map failed");
 
     let data = slice.get_mapped_range().expect("get_mapped_range failed");
     let values: Vec<u32> = bytemuck::cast_slice(&data[..]).to_vec();
@@ -709,7 +720,9 @@ fn main() {
         instance.enumerate_adapters(wgpu::Backends::VULKAN | wgpu::Backends::DX12),
     );
     let Some(adapter) = adapters.into_iter().next() else {
-        println!("NO GPU ADAPTER AVAILABLE (real or software) — cannot run the GPU half of this spike.");
+        println!(
+            "NO GPU ADAPTER AVAILABLE (real or software) — cannot run the GPU half of this spike."
+        );
         println!("See examples/adapter_probe.rs for the full honesty report.");
         return;
     };
@@ -740,7 +753,10 @@ fn main() {
     println!("--- CPU path (src/bounds_tree.rs + src/scene.rs algorithm, ported) ---");
     println!("  BoundsTree insert (ordering):  {:>10.3?}", cpu.tree_time);
     println!("  sort_by_key (draw order):      {:>10.3?}", cpu.sort_time);
-    println!("  occlusion cull (simplified):   {:>10.3?}", cpu.occlusion_time);
+    println!(
+        "  occlusion cull (simplified):   {:>10.3?}",
+        cpu.occlusion_time
+    );
     let cpu_total = cpu.tree_time + cpu.sort_time + cpu.occlusion_time;
     println!("  CPU total:                     {:>10.3?}", cpu_total);
     let cpu_culled_count = cpu.culled.iter().filter(|c| **c).count();
@@ -751,7 +767,9 @@ fn main() {
         100.0 * cpu_culled_count as f64 / scene.quads.len() as f64
     );
     let max_order = cpu.orders.iter().copied().max().unwrap_or(0);
-    println!("  max painter order in scene: {max_order} (relaxation iteration budget: {RELAX_ITERATIONS})");
+    println!(
+        "  max painter order in scene: {max_order} (relaxation iteration budget: {RELAX_ITERATIONS})"
+    );
     if max_order >= RELAX_ITERATIONS {
         println!(
             "  WARNING: max order ({max_order}) >= relaxation iteration budget ({RELAX_ITERATIONS}) — \
@@ -776,13 +794,17 @@ fn main() {
     let order_a = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("order_a"),
         size: (n * std::mem::size_of::<u32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     let order_b = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("order_b"),
         size: (n * std::mem::size_of::<u32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     let initial_orders = vec![1u32; n];
@@ -792,7 +814,9 @@ fn main() {
     let changed_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("changed"),
         size: 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     queue.write_buffer(&changed_buffer, 0, bytemuck::bytes_of(&0u32));
@@ -815,20 +839,44 @@ fn main() {
         label: Some("relax a->b"),
         layout: &relax_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: quad_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: order_a.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: order_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: changed_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: quad_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: order_a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: order_b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: changed_buffer.as_entire_binding(),
+            },
         ],
     });
     let bind_group_b_to_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("relax b->a"),
         layout: &relax_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: quad_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: order_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: order_a.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: changed_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: quad_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: order_b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: order_a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: changed_buffer.as_entire_binding(),
+            },
         ],
     });
 
@@ -846,13 +894,17 @@ fn main() {
     let keys_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("bitonic keys"),
         size: (padded_len * std::mem::size_of::<u32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     let vals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("bitonic vals"),
         size: (padded_len * std::mem::size_of::<u32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     queue.write_buffer(&keys_buffer, 0, bytemuck::cast_slice(&initial_keys));
@@ -922,15 +974,29 @@ fn main() {
         queue.write_buffer(
             &params_buffer,
             0,
-            bytemuck::bytes_of(&BitonicParams { j, k, _pad0: 0, _pad1: 0 }),
+            bytemuck::bytes_of(&BitonicParams {
+                j,
+                k,
+                _pad0: 0,
+                _pad1: 0,
+            }),
         );
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bitonic stage"),
             layout: &bitonic_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: keys_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: vals_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: keys_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: vals_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
             ],
         });
         bitonic_param_buffers.push(params_buffer);
@@ -949,7 +1015,9 @@ fn main() {
     let culled_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("culled"),
         size: (n * std::mem::size_of::<u32>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
@@ -961,7 +1029,11 @@ fn main() {
     // negligible and does not change what's being measured (the per-quad
     // relax/sort/cull compute cost).
     let occluders_with_orders = fill_occluders(&scene, &cpu.orders);
-    queue.write_buffer(&occluder_buffer, 0, bytemuck::cast_slice(&occluders_with_orders));
+    queue.write_buffer(
+        &occluder_buffer,
+        0,
+        bytemuck::cast_slice(&occluders_with_orders),
+    );
 
     let cull_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("cull"),
@@ -993,7 +1065,11 @@ fn main() {
         if iteration == RELAX_ITERATIONS - 1 {
             encoder.clear_buffer(&changed_buffer, 0, None);
         }
-        let bind_group = if iteration % 2 == 0 { &bind_group_a_to_b } else { &bind_group_b_to_a };
+        let bind_group = if iteration % 2 == 0 {
+            &bind_group_a_to_b
+        } else {
+            &bind_group_b_to_a
+        };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         pass.set_pipeline(&relax_pipeline);
         pass.set_bind_group(0, bind_group, &[]);
@@ -1002,15 +1078,25 @@ fn main() {
     // Final relax output lives in order_b if RELAX_ITERATIONS is odd,
     // order_a if even (since iteration 0 writes a->b, iteration 1 writes
     // b->a, ...).
-    let final_order_buffer = if RELAX_ITERATIONS % 2 == 1 { &order_b } else { &order_a };
+    let final_order_buffer = if RELAX_ITERATIONS % 2 == 1 {
+        &order_b
+    } else {
+        &order_a
+    };
 
     let pack_layout = pack_pipeline.get_bind_group_layout(0);
     let pack_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("pack bind group"),
         layout: &pack_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: final_order_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: keys_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: final_order_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: keys_buffer.as_entire_binding(),
+            },
         ],
     });
     {
@@ -1032,10 +1118,22 @@ fn main() {
         label: Some("cull bind group"),
         layout: &cull_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: quad_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: final_order_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: occluder_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: culled_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: quad_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: final_order_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: occluder_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: culled_buffer.as_entire_binding(),
+            },
         ],
     });
     {
@@ -1068,9 +1166,14 @@ fn main() {
         .count();
 
     println!();
-    println!("--- GPU path (compute: relax x{RELAX_ITERATIONS} + bitonic sort + cull, end-to-end) ---");
-    println!("  total (buffer create+upload, {} compute passes, submit, poll): {:>10.3?}",
-        RELAX_ITERATIONS + 1 + bitonic_bind_groups.len() as u32 + 1, gpu_total);
+    println!(
+        "--- GPU path (compute: relax x{RELAX_ITERATIONS} + bitonic sort + cull, end-to-end) ---"
+    );
+    println!(
+        "  total (buffer create+upload, {} compute passes, submit, poll): {:>10.3?}",
+        RELAX_ITERATIONS + 1 + bitonic_bind_groups.len() as u32 + 1,
+        gpu_total
+    );
     println!(
         "  relax convergence check (last-iteration changed count, 0 = fully converged): {}",
         gpu_changed[0]
@@ -1089,7 +1192,10 @@ fn main() {
     println!();
     println!("--- Summary ---");
     println!("  CPU total: {cpu_total:>10.3?}");
-    println!("  GPU total: {gpu_total:>10.3?}  (adapter: {:?}, software_fallback={is_software})", info.name);
+    println!(
+        "  GPU total: {gpu_total:>10.3?}  (adapter: {:?}, software_fallback={is_software})",
+        info.name
+    );
     if gpu_total < cpu_total {
         println!(
             "  GPU path is {:.2}x faster end-to-end on this hardware.",

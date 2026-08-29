@@ -4,15 +4,23 @@ use std::time::{Duration, Instant};
 
 /// A coalescing request queue for a window's next animation frame.
 #[derive(Debug, Default)]
-pub struct AnimationScheduler { requested: bool }
+pub struct AnimationScheduler {
+    requested: bool,
+}
 
 impl AnimationScheduler {
     /// Create an idle scheduler.
-    pub const fn new() -> Self { Self { requested: false } }
+    pub const fn new() -> Self {
+        Self { requested: false }
+    }
     /// Request the next display frame.
-    pub fn request_animation_frame(&mut self) { self.requested = true; }
+    pub fn request_animation_frame(&mut self) {
+        self.requested = true;
+    }
     /// Whether a frame has been requested.
-    pub const fn is_requested(&self) -> bool { self.requested }
+    pub const fn is_requested(&self) -> bool {
+        self.requested
+    }
     /// Consume the request when the platform begins drawing it.
     pub const fn take_request(&mut self) -> bool {
         let requested = self.requested;

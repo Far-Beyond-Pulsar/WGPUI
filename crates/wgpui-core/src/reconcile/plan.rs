@@ -227,12 +227,7 @@ impl FramePlan {
     /// stop index `0` being the root) or return descendant lists up the
     /// recursion (which would allocate per element per frame), the reconciler
     /// records its optimistic decision and revises it here.
-    pub(crate) fn amend(
-        &mut self,
-        index: usize,
-        outcome: NodeOutcome,
-        invalidation: Invalidation,
-    ) {
+    pub(crate) fn amend(&mut self, index: usize, outcome: NodeOutcome, invalidation: Invalidation) {
         let Some(node) = self.nodes.get_mut(index) else {
             return;
         };
@@ -357,11 +352,7 @@ mod tests {
     fn counters_track_each_outcome_separately() {
         let mut plan = FramePlan::new();
         plan.push(node(NodeOutcome::Reused, 0, 1));
-        plan.push(node(
-            NodeOutcome::Rebuilt(RebuildReason::KeyChanged),
-            1,
-            2,
-        ));
+        plan.push(node(NodeOutcome::Rebuilt(RebuildReason::KeyChanged), 1, 2));
         plan.push(node(NodeOutcome::Uncached, 1, 3));
         let stats = plan.stats();
         assert_eq!(stats.visited, 3);
@@ -377,7 +368,11 @@ mod tests {
         plan.push(node(NodeOutcome::Reused, 0, 1));
         plan.push(node(NodeOutcome::Reused, 1, 2));
         assert!(plan.fully_reused());
-        assert!(plan.nodes().iter().all(PlannedNode::skipped_prepaint_and_paint));
+        assert!(
+            plan.nodes()
+                .iter()
+                .all(PlannedNode::skipped_prepaint_and_paint)
+        );
     }
 
     #[test]
@@ -387,14 +382,8 @@ mod tests {
         plan.push(node(NodeOutcome::Reused, 1, 2));
         plan.push(node(NodeOutcome::Reused, 1, 3));
         assert_eq!(plan.nodes_at_depth(1).len(), 2);
-        assert!(
-            plan.node_for_instance(InstanceKey::from_raw(3))
-                .is_some()
-        );
-        assert!(
-            plan.node_for_instance(InstanceKey::from_raw(9))
-                .is_none()
-        );
+        assert!(plan.node_for_instance(InstanceKey::from_raw(3)).is_some());
+        assert!(plan.node_for_instance(InstanceKey::from_raw(9)).is_none());
     }
 
     #[test]
@@ -427,7 +416,9 @@ mod tests {
         assert!(plan.emitter(index).is_none());
         plan.set_emitter(
             index,
-            Some(Box::new(|_: &crate::patch::emit::EmitContext, _: &mut crate::patch::emit::Emission| {})),
+            Some(Box::new(
+                |_: &crate::patch::emit::EmitContext, _: &mut crate::patch::emit::Emission| {},
+            )),
         );
         assert!(plan.emitter(index).is_some());
         assert!(plan.emitter(index + 1).is_none());
@@ -438,7 +429,9 @@ mod tests {
         let mut plan = FramePlan::new();
         plan.set_emitter(
             7,
-            Some(Box::new(|_: &crate::patch::emit::EmitContext, _: &mut crate::patch::emit::Emission| {})),
+            Some(Box::new(
+                |_: &crate::patch::emit::EmitContext, _: &mut crate::patch::emit::Emission| {},
+            )),
         );
         assert!(plan.emitter(7).is_none());
     }

@@ -318,8 +318,14 @@ fn keep_item(
     }
 
     let mut occluders = [Rect::EMPTY; MAX_OCCLUDERS];
-    let occluder_count =
-        gather_occluders(items, poison, hierarchy, index, &item.visible, &mut occluders);
+    let occluder_count = gather_occluders(
+        items,
+        poison,
+        hierarchy,
+        index,
+        &item.visible,
+        &mut occluders,
+    );
     !fully_covered(item.visible, &occluders[..occluder_count])
 }
 

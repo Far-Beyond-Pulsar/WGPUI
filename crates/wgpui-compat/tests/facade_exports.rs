@@ -3,6 +3,8 @@ use gpui::{
     WindowOptions, div, rgb, size,
 };
 
+gpui::actions!(compatibility, [ProbeAction]);
+
 #[test]
 fn exports_are_backed_by_2_0_types() {
     let element_id = ElementId::from("root");
@@ -44,4 +46,18 @@ fn color_and_geometry_constructors_preserve_legacy_values() {
         ]
     );
     assert_eq!(size(Pixels(3.0), Pixels(4.0)).height.value(), 4.0);
+}
+
+#[test]
+fn color_adapters_preserve_alpha_and_hue_conversion() {
+    assert_eq!(gpui::rgb(0x123456).opacity(0.25).a, 0.25);
+    let red: gpui::Hsla = gpui::rgb(0xff0000).into();
+    assert!((red.h - 0.0).abs() < f32::EPSILON);
+    assert!((red.s - 1.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn action_macro_and_keybinding_retain_legacy_identity() {
+    let binding = gpui::KeyBinding::new("cmd-p", ProbeAction, None);
+    assert_eq!(binding.action, "compatibility::ProbeAction");
 }

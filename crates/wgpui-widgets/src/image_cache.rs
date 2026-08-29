@@ -169,7 +169,10 @@ impl DecodedImage {
 
     /// The natural size of frame 0, which is the size an unsized `Img` takes.
     pub fn natural_size(&self) -> [u32; 2] {
-        self.frames.first().map(|frame| frame.size).unwrap_or([0, 0])
+        self.frames
+            .first()
+            .map(|frame| frame.size)
+            .unwrap_or([0, 0])
     }
 }
 
@@ -212,7 +215,9 @@ impl std::fmt::Display for ImageDecodeError {
                 formatter,
                 "the bytes are not an image format this build decodes, and not SVG either: {svg}"
             ),
-            ImageDecodeError::Decode(message) => write!(formatter, "image decode failed: {message}"),
+            ImageDecodeError::Decode(message) => {
+                write!(formatter, "image decode failed: {message}")
+            }
             ImageDecodeError::NoFrames => formatter.write_str("the decoder produced no frames"),
             ImageDecodeError::EmptySize => {
                 formatter.write_str("the image decoded to a zero-area bitmap")
@@ -656,7 +661,11 @@ mod tests {
     #[test]
     fn animation_uses_each_decoded_frame_delay_and_loops() {
         let frames = (0..3)
-            .map(|_| DecodedFrame { size: [1, 1], texels: vec![0; 4], delay: Duration::from_millis(100) })
+            .map(|_| DecodedFrame {
+                size: [1, 1],
+                texels: vec![0; 4],
+                delay: Duration::from_millis(100),
+            })
             .collect();
         let image = DecodedImage::from_frames(frames).expect("frames");
         assert_eq!(image.frame_index_at(Duration::from_millis(0)), 0);

@@ -123,9 +123,7 @@ fn main() {
                 micros(row.visibility_best),
                 row.buffered_area_ratio,
             ),
-            None => println!(
-                "  {edge:>5.0}  unusable at this viewport — see TileSpan::MAX_TILES"
-            ),
+            None => println!("  {edge:>5.0}  unusable at this viewport — see TileSpan::MAX_TILES"),
         }
     }
 
@@ -285,7 +283,10 @@ fn time_visibility(
             params,
         )
         .ok()?;
-        context.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        context
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .ok()?;
         let elapsed = started.elapsed();
         if run >= WARM_UP {
             samples.push(elapsed);

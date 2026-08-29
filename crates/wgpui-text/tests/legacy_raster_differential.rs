@@ -132,9 +132,11 @@ mod legacy {
             let font = loaded_font.font.clone();
             let weight = loaded_font.weight;
             let subpixel_shift = [
-                params.subpixel_variant[0] as f32 / SUBPIXEL_VARIANTS_X as f32
+                params.subpixel_variant[0] as f32
+                    / SUBPIXEL_VARIANTS_X as f32
                     / params.scale_factor,
-                params.subpixel_variant[1] as f32 / SUBPIXEL_VARIANTS_Y as f32
+                params.subpixel_variant[1] as f32
+                    / SUBPIXEL_VARIANTS_Y as f32
                     / params.scale_factor,
             ];
             self.swash_cache
@@ -364,12 +366,8 @@ fn every_rasterised_glyph_matches_the_legacy_path_byte_for_byte() {
         for &font_size in &FONT_SIZES {
             for &scale_factor in &SCALE_FACTORS {
                 for variant in 0..4u8 {
-                    let (mine, theirs) = sides.compare(Request::monochrome(
-                        glyph,
-                        font_size,
-                        scale_factor,
-                        variant,
-                    ));
+                    let (mine, theirs) =
+                        sides.compare(Request::monochrome(glyph, font_size, scale_factor, variant));
                     compared += 1;
                     match &theirs {
                         Raster::Bitmap { .. } => with_ink += 1,
@@ -409,7 +407,10 @@ fn every_rasterised_glyph_matches_the_legacy_path_byte_for_byte() {
         with_ink > compared / 2,
         "most of the sample must actually rasterise: {with_ink} of {compared}"
     );
-    assert!(blank > 0, "the sample must include the space glyph's decline");
+    assert!(
+        blank > 0,
+        "the sample must include the space glyph's decline"
+    );
 }
 
 /// The colour arm: the same glyphs requested out of the polychrome atlas, which

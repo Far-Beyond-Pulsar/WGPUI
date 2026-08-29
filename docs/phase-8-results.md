@@ -1,6 +1,25 @@
 # Phase 8 compatibility probe
 
-Status: probe and first façade slice implemented on `wgpui-2.0/phase-8-compatibility-probe`.
+Status: continuation in progress from `0fdee0f617`; this is not a Phase 8
+completion claim. The next continuation boundary is the interaction/text and
+native surface adapters listed below.
+
+## Continuation 2 live probe
+
+The actual dirty worktree was probed before this continuation's edits. Its
+per-example result was **2/41**, not the earlier report's 21/41: `emoji_display`
+and `tree` compiled; the other 39 did not. The discrepancy is recorded rather
+than treated as a pass-count regression, because the current branch contains
+additional uncommitted compatibility work beyond the report's snapshot.
+
+This continuation adds real Taffy grid templates and grid placement, overflow
+axes, retained text-style metadata, common legacy spacing/size and border-side
+aliases, `Pixels` arithmetic/formatting/conversion helpers, and color-stop
+adapters. Focused widget and façade adapter tests pass. The matrix still cannot
+be called complete: frontend interaction/focus/listener contracts, image/SVG
+and WGPU-surface ownership, path/canvas/gradient rendering, and native window
+options/lifecycle remain compiler blockers. No no-op compatibility methods were
+added for those missing behaviors.
 
 ## Scope and method
 
@@ -78,11 +97,24 @@ remains the real GPU integration point and the legacy root backend remains
 available. Legacy geometry/color constructors (`px`, `size`, `point`,
 `Bounds`, `Rgba`, `Hsla`, `rgb`, `rgba`, `hsla`) are covered by focused tests.
 
-The compile-only matrix was rerun across all 41 examples. Lifecycle and
-constructor names now resolve; remaining failures are concentrated in action
-and derive macros, interaction/focus, specialized widgets, and native window
-surface ownership. No additional example is counted as passing until the
-per-example command completes successfully after those surfaces are implemented.
+The compile-only matrix was rerun after the style and action adapter groups:
+21/41 pass and 20/41 fail (unchanged count, although the failure diagnostics
+are now further downstream). No example is counted as passing unless its
+per-example command succeeds.
+
+The continuation added real `Pixels`-accepting style sizing, legacy spacing and
+size aliases, alpha-preserving color adapters, RGBA-to-HSLA conversion,
+`Colors`, `Bounds::new`, `px` const construction, and an `actions!`/
+`Action`/`KeyBinding`/menu registration surface. Focused tests cover the color
+and action adapters. The legacy backend remains available.
+
+Current exact blockers from the authoritative matrix are: text style and text
+element state (`text_xs`, `text_sm`, `text_lg`, `text_color`, and related text
+rendering); grid/overflow/blur/gradient behavior; event, focus, hit-testing,
+listener, `Stateful`, and scroll APIs; uniform/virtual list and canvas
+adapters; image/SVG/WGPU surface ownership; and remaining window lifecycle
+types and methods. The derive `IntoElement` macro is still unavailable, and
+the `relative` adapter currently only covers the scalar sizing cases.
 
 Phase 7 devtools work was treated as an adjacent consumer boundary; no
 devtools files were changed by this compatibility slice.

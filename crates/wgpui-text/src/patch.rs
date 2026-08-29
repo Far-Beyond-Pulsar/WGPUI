@@ -262,7 +262,11 @@ mod tests {
     fn each_shaped_glyph_becomes_one_slab_slot() {
         let mut atlas = FakeAtlas::default();
         let (runs, stats) = glyph_runs(
-            &line(vec![shaped(&[(1, 0.0, false), (2, 8.0, false), (3, 16.0, false)])]),
+            &line(vec![shaped(&[
+                (1, 0.0, false),
+                (2, 8.0, false),
+                (3, 16.0, false),
+            ])]),
             RunPlacement::default(),
             &mut atlas,
         );
@@ -285,7 +289,11 @@ mod tests {
             ..FakeAtlas::default()
         };
         let (runs, stats) = glyph_runs(
-            &line(vec![shaped(&[(1, 0.0, false), (2, 8.0, false), (3, 16.0, false)])]),
+            &line(vec![shaped(&[
+                (1, 0.0, false),
+                (2, 8.0, false),
+                (3, 16.0, false),
+            ])]),
             RunPlacement::default(),
             &mut atlas,
         );
@@ -314,9 +322,15 @@ mod tests {
             origin: [100.0, 200.0],
             ..RunPlacement::default()
         };
-        let (runs, _) = glyph_runs(&line(vec![shaped(&[(1, 8.0, false)])]), placement, &mut atlas);
+        let (runs, _) = glyph_runs(
+            &line(vec![shaped(&[(1, 8.0, false)])]),
+            placement,
+            &mut atlas,
+        );
         assert_eq!(
-            runs.first().and_then(|run| run.glyphs.first()).map(|g| g.position),
+            runs.first()
+                .and_then(|run| run.glyphs.first())
+                .map(|g| g.position),
             // origin + shaped offset + the fake atlas's bearing of [0.5, -9.0]
             Some([108.5, 191.0])
         );
@@ -334,7 +348,10 @@ mod tests {
             placement,
             &mut atlas,
         );
-        assert_eq!(runs.first().map(|run| run.color), Some([0.2, 0.4, 0.6, 1.0]));
+        assert_eq!(
+            runs.first().map(|run| run.color),
+            Some([0.2, 0.4, 0.6, 1.0])
+        );
     }
 
     #[test]
@@ -412,8 +429,14 @@ mod tests {
         let (at_two, _) = glyph_runs(&line(vec![shaped(&[(7, 3.0, false)])]), two_x, &mut atlas);
         assert_eq!(atlas.tiles.len(), 2, "two scales are two sets of bitmaps");
         assert_eq!(
-            at_one.first().and_then(|r| r.glyphs.first()).map(|g| g.position),
-            at_two.first().and_then(|r| r.glyphs.first()).map(|g| g.position),
+            at_one
+                .first()
+                .and_then(|r| r.glyphs.first())
+                .map(|g| g.position),
+            at_two
+                .first()
+                .and_then(|r| r.glyphs.first())
+                .map(|g| g.position),
             "layout positions are in logical pixels and do not move with the scale"
         );
     }

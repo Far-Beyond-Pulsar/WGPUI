@@ -906,7 +906,9 @@ mod tests {
              eight million layers"
         );
         assert!(
-            grid().visible_span(rect(0.0, 0.0, 3840.0, 2160.0), 2).is_some(),
+            grid()
+                .visible_span(rect(0.0, 0.0, 3840.0, 2160.0), 2)
+                .is_some(),
             "the guard must not refuse a 4K viewport at the default tile size"
         );
     }
@@ -965,7 +967,10 @@ mod tests {
             TilePlacement::Overlay => panic!("a 130x70 node fits in a 256px tile"),
         };
         assert_eq!(anchor, TileCoord::ORIGIN);
-        assert!(node.max_x > grid.tile_bounds(anchor).max_x, "it does overhang");
+        assert!(
+            node.max_x > grid.tile_bounds(anchor).max_x,
+            "it does overhang"
+        );
 
         // A viewport showing only tile (1,0) — the overhang is visible and the
         // tile it belongs to is not.
@@ -981,9 +986,7 @@ mod tests {
 
         // And at radius zero it genuinely would not, which is what makes
         // `overhang_is_covered` a real constraint rather than a formality.
-        let bare = grid
-            .visible_span(viewport, 0)
-            .expect("one tile is usable");
+        let bare = grid.visible_span(viewport, 0).expect("one tile is usable");
         assert!(!bare.contains(anchor));
     }
 
@@ -1176,7 +1179,10 @@ mod tests {
             .visible_span(viewport, 1)
             .expect("a 900x600 viewport is usable at 256px");
         let visible = span.tile_count() as usize;
-        assert!(visible > 8, "the premise: this viewport needs more than 8 tiles");
+        assert!(
+            visible > 8,
+            "the premise: this viewport needs more than 8 tiles"
+        );
 
         residency.mark(span, 1);
         residency.sweep(1, 60);

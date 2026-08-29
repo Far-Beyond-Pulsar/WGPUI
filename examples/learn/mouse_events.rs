@@ -5,8 +5,8 @@ mod example_prelude;
 use example_prelude::init_example;
 
 use gpui::{
-    App, Application, Bounds, Context, Hsla, IntoElement, Render, Styled, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App, Application, Bounds, Context, Hsla, IntoElement, Render, Styled, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, size,
 };
 
 #[derive(Clone, Copy)]

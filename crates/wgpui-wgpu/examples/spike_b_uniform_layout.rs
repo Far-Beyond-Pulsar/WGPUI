@@ -112,7 +112,8 @@ fn read_storage_buffer_vec2(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
     queue.submit(Some(encoder.finish()));
 
@@ -124,7 +125,9 @@ fn read_storage_buffer_vec2(
     device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("device.poll failed");
-    rx.recv().expect("map_async channel closed").expect("buffer map failed");
+    rx.recv()
+        .expect("map_async channel closed")
+        .expect("buffer map failed");
 
     let data = slice.get_mapped_range().expect("get_mapped_range failed");
     let values: Vec<[f32; 2]> = bytemuck::cast_slice(&data[..]).to_vec();
@@ -148,7 +151,9 @@ fn main() {
         instance.enumerate_adapters(wgpu::Backends::VULKAN | wgpu::Backends::DX12),
     );
     let Some(adapter) = adapters.into_iter().next() else {
-        println!("NO GPU ADAPTER AVAILABLE (real or software) — cannot run the GPU half of this spike.");
+        println!(
+            "NO GPU ADAPTER AVAILABLE (real or software) — cannot run the GPU half of this spike."
+        );
         println!("See examples/adapter_probe.rs for the full honesty report.");
         return;
     };
@@ -174,7 +179,10 @@ fn main() {
     let (cpu_positions, cpu_time) = run_cpu_path();
     println!();
     println!("--- CPU path (src/elements/uniform_list.rs's per-item formula) ---");
-    println!("  total: {cpu_time:>10.3?}  ({:.1} ns/row)", cpu_time.as_nanos() as f64 / ITEM_COUNT as f64);
+    println!(
+        "  total: {cpu_time:>10.3?}  ({:.1} ns/row)",
+        cpu_time.as_nanos() as f64 / ITEM_COUNT as f64
+    );
 
     // --- GPU path, single dispatch, timed end-to-end.
     let gpu_start = Instant::now();
@@ -221,8 +229,14 @@ fn main() {
         label: Some("layout bind group"),
         layout: &bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: positions_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: positions_buffer.as_entire_binding(),
+            },
         ],
     });
 
@@ -241,7 +255,8 @@ fn main() {
         .expect("device.poll failed");
     let gpu_total = gpu_start.elapsed();
 
-    let gpu_positions = read_storage_buffer_vec2(&device, &queue, &positions_buffer, ITEM_COUNT as usize);
+    let gpu_positions =
+        read_storage_buffer_vec2(&device, &queue, &positions_buffer, ITEM_COUNT as usize);
 
     let mut mismatches = 0usize;
     for i in 0..ITEM_COUNT as usize {
@@ -262,7 +277,10 @@ fn main() {
     println!();
     println!("--- Summary ---");
     println!("  CPU total: {cpu_time:>10.3?}");
-    println!("  GPU total: {gpu_total:>10.3?}  (adapter: {:?}, software_fallback={is_software})", info.name);
+    println!(
+        "  GPU total: {gpu_total:>10.3?}  (adapter: {:?}, software_fallback={is_software})",
+        info.name
+    );
     if gpu_total < cpu_time {
         println!(
             "  GPU path is {:.2}x faster end-to-end on this hardware.",

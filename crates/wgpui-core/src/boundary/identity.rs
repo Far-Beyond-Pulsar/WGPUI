@@ -131,7 +131,10 @@ mod tests {
         let first = BoundaryIdentity::layer_for_path(&[ElementId::Slot(0)]);
         let second = BoundaryIdentity::layer_for_path(&[ElementId::Slot(1)]);
         assert_ne!(first, second);
-        assert_eq!(first, BoundaryIdentity::layer_for_path(&[ElementId::Slot(0)]));
+        assert_eq!(
+            first,
+            BoundaryIdentity::layer_for_path(&[ElementId::Slot(0)])
+        );
         assert_eq!(
             BoundaryIdentity::layer_for_path(&[]),
             LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT))

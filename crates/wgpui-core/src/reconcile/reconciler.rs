@@ -344,9 +344,7 @@ impl Reconciler {
 
         if outcome == NodeOutcome::Reused {
             let children_unchanged = !any_child_node_changed
-                && self
-                    .instances
-                    .child_nodes_match(instance_key, &child_nodes);
+                && self.instances.child_nodes_match(instance_key, &child_nodes);
             match reusable_node.filter(|node| children_unchanged && context.layout.reuse(*node)) {
                 Some(node) => settled_node = Some(node),
                 None => {
@@ -435,7 +433,9 @@ impl Reconciler {
             outcome,
             invalidation: Invalidation::all(),
         });
-        context.plan.set_emitter(plan_index, description.emitter.take());
+        context
+            .plan
+            .set_emitter(plan_index, description.emitter.take());
 
         let child_position = WalkPosition {
             depth: position.depth + 1,
@@ -576,7 +576,10 @@ mod tests {
         let second = reconciler.reconcile(second_description, &mut layout)?;
 
         assert!(
-            second.nodes().iter().all(PlannedNode::skipped_prepaint_and_paint),
+            second
+                .nodes()
+                .iter()
+                .all(PlannedNode::skipped_prepaint_and_paint),
             "every element in an unchanged unboundaried tree must skip prepaint/paint"
         );
         assert_eq!(second.stats().reused, 6);
@@ -647,16 +650,10 @@ mod tests {
                 .unwrap_or(0)
         }
 
-        let reconciled_leaf = StateScope::from_path(&[
-            ElementId::Slot(0),
-            ElementId::Slot(0),
-            ElementId::Slot(0),
-        ]);
-        let uncached_leaf = StateScope::from_path(&[
-            ElementId::Slot(0),
-            ElementId::Slot(1),
-            ElementId::Slot(0),
-        ]);
+        let reconciled_leaf =
+            StateScope::from_path(&[ElementId::Slot(0), ElementId::Slot(0), ElementId::Slot(0)]);
+        let uncached_leaf =
+            StateScope::from_path(&[ElementId::Slot(0), ElementId::Slot(1), ElementId::Slot(0)]);
 
         let mut reconciler = Reconciler::new();
         let mut layout = LayoutTree::new();
@@ -712,7 +709,8 @@ mod tests {
                 .is_some_and(PlannedNode::skipped_prepaint_and_paint)
         );
         assert!(
-            !plan.node_for_state(uncached_leaf)
+            !plan
+                .node_for_state(uncached_leaf)
                 .is_some_and(PlannedNode::skipped_prepaint_and_paint)
         );
         Ok(())
@@ -766,8 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_uncached_subtrees_stay_suppressed_past_the_inner_one()
-    -> Result<(), ReconcileError> {
+    fn nested_uncached_subtrees_stay_suppressed_past_the_inner_one() -> Result<(), ReconcileError> {
         let mut reconciler = Reconciler::new();
         let mut layout = LayoutTree::new();
         let plan = reconciler.reconcile(
@@ -842,8 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn a_type_mismatch_rebuilds_the_subtree_and_takes_a_fresh_node()
-    -> Result<(), ReconcileError> {
+    fn a_type_mismatch_rebuilds_the_subtree_and_takes_a_fresh_node() -> Result<(), ReconcileError> {
         let mut reconciler = Reconciler::new();
         let mut layout = LayoutTree::new();
         let before = reconciler.reconcile(

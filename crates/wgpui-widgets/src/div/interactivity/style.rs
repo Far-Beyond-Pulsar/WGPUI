@@ -188,6 +188,15 @@ pub struct DivStyle {
     pub corner_radii: Corners,
     /// `box-shadow` layers, painted in order, all *behind* the element.
     pub box_shadow: Vec<BoxShadow>,
+    pub text_color: Option<[f32; 4]>,
+    pub text_size: Option<f32>,
+    pub text_line_height: Option<f32>,
+    pub text_weight: Option<wgpui_text::shaping::FontWeight>,
+    pub text_italic: bool,
+    pub text_alignment: u8,
+    pub text_line_through: bool,
+    pub text_gradient: Option<Vec<([f32; 4], f32)>>,
+    pub text_gradient_angle: Option<f32>,
 }
 
 impl DivStyle {

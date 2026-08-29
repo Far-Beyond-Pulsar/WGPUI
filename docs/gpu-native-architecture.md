@@ -1454,3 +1454,106 @@ next steps, in order:
    to finish (unmodified by any 2.0 branch per every phase's `git diff`,
    but "very likely pre-existing" and "confirmed" remain different
    things) — let it run to completion once, unhurried.
+
+---
+
+## 12. Phase 9 — release-candidate correctness and retention audit
+
+Phase 9 is the final verification phase after the Phase 8 compatibility
+cutover. It is not a cosmetic cleanup pass and it is not allowed to make a
+failing test pass by weakening its oracle. The phase may fix defects, remove
+unnecessary dependencies or dead content, and improve organization, but every
+behavioral correction must add or strengthen a regression test.
+
+### 12.1 Dependency and download hygiene
+
+- Resolve with `--locked` and `--offline` after a cold registry/cache audit.
+- Compare the final dependency graph with the approved graph and flag every
+  new package, feature, target-specific edge, build script, and transitive
+  download.
+- Confirm that dev-only differential dependencies do not enter production
+  targets, and that optional platform features remain optional.
+- Verify reproducible builds from a clean target directory and record the
+  exact commands and package graph.
+
+### 12.2 Source, shader, and file integrity
+
+- Enumerate every tracked source, shader, generated file, fixture, and asset
+  referenced by the workspace; fail on missing, empty, placeholder, duplicate,
+  or orphaned content where the module contract requires real implementation.
+- Compile every WGSL module on every available backend and validate bindings,
+  alignment, interpolation qualifiers, storage usage, and feature guards.
+- Check that comments, reports, execution-ledger entries, and file maps agree
+  with the code. No “ported as-is” claim is accepted without a direct diff or
+  compiled differential.
+- Run formatting, documentation-link, forbidden-pattern, and repository diff
+  checks without mutating user files implicitly.
+
+### 12.3 Rendering correctness and cleanliness
+
+- Repeat byte-exact legacy differentials for every primitive and every supported
+  draw mode, including mixed primitive scenes, clipping, opacity, gradients,
+  paths, blur, text, images, shadows, underlines, and surfaces.
+- Add independent CPU or legacy-renderer oracles where a copied/transcribed
+  oracle could reproduce the same bug as the implementation.
+- Test transparent, translucent, opaque, empty, degenerate, NaN/Infinity,
+  boundary, scale-factor, resize, and device-loss cases explicitly.
+- Verify that presentation contains no uninitialized pixels, magenta debug
+  clears, stale frames, frame tearing caused by ownership errors, or accidental
+  overdraw visible outside the intended content.
+- Compare indirect, direct, and CPU-fallback paths for identical output and
+  equivalent error handling.
+
+### 12.4 Retention, invalidation, and cache correctness
+
+- Prove unchanged trees retain layout nodes, element instances, primitive
+  slots, atlas entries, tile layers, and draw plans without unnecessary work.
+- Prove each invalidation axis (`LAYOUT`, `DISPLAY`, `TRANSFORM`, `CHILDREN`,
+  and compositing) touches exactly the dependent stages and no others.
+- Prove a single changed primitive produces a single stride-sized delta upload,
+  while relocation, insertion, removal, atlas eviction, and resize upload only
+  the required ranges.
+- Prove `.boundary()` retains and recomposites its texture correctly, and the
+  explicit uncache wrapper rebuilds only its subtree while preserving state and
+  surrounding retention.
+- Exercise tile panning in both axes, reveal/refill, LRU eviction, oversized
+  content, zoom/scale changes, boundary destruction, and repeated create/drop
+  cycles; assert no stale layer, slab, atlas, or GPU resource remains.
+- Run long-lived stress tests with allocation, upload, draw, cache-hit, and
+  eviction counters plus leak detection or resource-lifetime assertions.
+
+### 12.5 API and example correctness
+
+- Compile every declared example against the legacy-compatible façade with the
+  crate-name change as the only source difference.
+- Run every example that can run in CI and record platform-specific exclusions
+  with explicit reasons; no silent skips.
+- Exercise the public `App`, `Application`, `Window`, `Entity`, `Context`,
+  `Render`, `RenderOnce`, element, styling, action, event, asset, canvas,
+  platform, and devtools APIs through compatibility tests, not only through
+  type re-exports.
+- Compare representative legacy and 2.0 behavior at cold start, steady state,
+  interaction, animation, image loading, resize, close, and shutdown.
+
+### 12.6 Determinism, stress, and cross-platform validation
+
+- Render identical scripted input repeatedly and compare scene snapshots,
+  patch streams, upload plans, indirect arguments, and final pixels.
+- Run randomized reconciliation/invalidation sequences against a reference
+  model, including interruption, reordering, deletion, and re-insertion.
+- Validate native backends available on the machine and compile/test WASM
+  fallback paths; record adapter capabilities instead of assuming them.
+- Run cold `cargo check`, targeted tests, release tests, and strict clippy with
+  `--deny warnings`; the legacy warning baseline must not be attributed to the
+  new backend or silently inherited as a new suppression.
+
+### 12.7 Phase 9 exit gate
+
+Phase 9 is complete only when the dependency graph is approved, all required
+files and shaders contain verified implementations, the complete compatibility
+matrix passes, rendering and fallback differentials are exact for their stated
+coverage, retention and delta-upload invariants hold under stress, and no new
+warnings, leaks, unexplained skips, or unnecessary downloads remain. Any
+unsupported platform or deliberately preserved legacy quirk must be named in
+the release report with a test demonstrating the behavior and a documented
+follow-up decision.

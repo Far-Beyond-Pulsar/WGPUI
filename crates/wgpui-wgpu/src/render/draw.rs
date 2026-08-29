@@ -247,15 +247,15 @@ impl DrawStats {
         self.path_vertices_issued += other.path_vertices_issued;
         self.path_draws_issued += other.path_draws_issued;
         self.backdrop_filters_drawn += other.backdrop_filters_drawn;
-        self.instances_known_to_cpu = match (self.instances_known_to_cpu, other.instances_known_to_cpu)
-        {
-            // Unknown is contagious on purpose: a frame that took one indirect
-            // path anywhere did not learn its own instance count, and reporting
-            // the sum of the parts it *did* learn would be a smaller lie than
-            // reporting zero but a lie all the same.
-            (Some(left), Some(right)) => Some(left + right),
-            _ => None,
-        };
+        self.instances_known_to_cpu =
+            match (self.instances_known_to_cpu, other.instances_known_to_cpu) {
+                // Unknown is contagious on purpose: a frame that took one indirect
+                // path anywhere did not learn its own instance count, and reporting
+                // the sum of the parts it *did* learn would be a smaller lie than
+                // reporting zero but a lie all the same.
+                (Some(left), Some(right)) => Some(left + right),
+                _ => None,
+            };
     }
 }
 
@@ -479,7 +479,13 @@ impl SlotBasePlan {
         pipeline: &PathPipeline,
         slots: &[DrawSlot],
     ) -> SlotBasePlan {
-        SlotBasePlan::new(device, queue, &pipeline.slot_layout, pipeline.slot_stride, slots)
+        SlotBasePlan::new(
+            device,
+            queue,
+            &pipeline.slot_layout,
+            pipeline.slot_stride,
+            slots,
+        )
     }
 
     /// Build the plan for backdrop filters.
@@ -489,7 +495,13 @@ impl SlotBasePlan {
         pipeline: &BackdropPipeline,
         slots: &[DrawSlot],
     ) -> SlotBasePlan {
-        SlotBasePlan::new(device, queue, &pipeline.slot_layout, pipeline.slot_stride, slots)
+        SlotBasePlan::new(
+            device,
+            queue,
+            &pipeline.slot_layout,
+            pipeline.slot_stride,
+            slots,
+        )
     }
 
     /// Entries in the fixed sequence.

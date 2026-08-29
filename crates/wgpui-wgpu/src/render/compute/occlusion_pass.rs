@@ -165,8 +165,7 @@ impl OcclusionPass {
             });
         }
         let count = u32::try_from(items.len() / COVERAGE_ITEM_STRIDE).unwrap_or(u32::MAX);
-        let poison_count =
-            u32::try_from(poison.len() / POISON_REGION_STRIDE).unwrap_or(u32::MAX);
+        let poison_count = u32::try_from(poison.len() / POISON_REGION_STRIDE).unwrap_or(u32::MAX);
         if count == 0 {
             return Ok(OcclusionOutput {
                 culled: storage_buffer(device, "occlusion culled", 0),

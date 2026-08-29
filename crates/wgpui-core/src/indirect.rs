@@ -458,17 +458,27 @@ mod tests {
         let based = indirect_args(&slots, &order, &culled, 4, 4, FirstInstance::SlotBase);
         assert_eq!(zero.visible, based.visible);
         assert_eq!(
-            zero.args.iter().map(|a| a.first_instance).collect::<Vec<_>>(),
+            zero.args
+                .iter()
+                .map(|a| a.first_instance)
+                .collect::<Vec<_>>(),
             vec![0, 0],
             "README's Custom Device Gotcha: the default path never emits a \
              nonzero firstInstance"
         );
         assert_eq!(
-            based.args.iter().map(|a| a.first_instance).collect::<Vec<_>>(),
+            based
+                .args
+                .iter()
+                .map(|a| a.first_instance)
+                .collect::<Vec<_>>(),
             vec![0, 2]
         );
         assert_eq!(
-            zero.args.iter().map(|a| a.instance_count).collect::<Vec<_>>(),
+            zero.args
+                .iter()
+                .map(|a| a.instance_count)
+                .collect::<Vec<_>>(),
             based
                 .args
                 .iter()

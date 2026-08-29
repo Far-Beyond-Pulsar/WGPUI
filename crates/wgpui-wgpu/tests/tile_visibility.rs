@@ -178,8 +178,7 @@ fn arguments_generated_from_the_gpu_written_slot_table_match_the_cpu_reference()
     encode_tiles(&tiles, &mut tile_bytes);
 
     let visibility_buffers = TileVisibilityBuffers::new(&context.device, tiles.len() as u32);
-    let args_buffers =
-        IndirectArgsBuffers::new(&context.device, slots, tiles.len() as u32 + 1);
+    let args_buffers = IndirectArgsBuffers::new(&context.device, slots, tiles.len() as u32 + 1);
 
     // Identity draw order over the arena, nothing culled: this test is about the
     // slot table's route to the arguments, and Phase 3's own results are already

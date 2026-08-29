@@ -26,21 +26,32 @@ fn main() {
     });
 
     println!("== Adapters enumerated on VULKAN | DX12 ==");
-    let adapters =
-        pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN | wgpu::Backends::DX12));
+    let adapters = pollster::block_on(
+        instance.enumerate_adapters(wgpu::Backends::VULKAN | wgpu::Backends::DX12),
+    );
     if adapters.is_empty() {
-        println!("(none enumerated -- no usable GPU adapter, real or software, on this backend set)");
+        println!(
+            "(none enumerated -- no usable GPU adapter, real or software, on this backend set)"
+        );
     }
     for adapter in &adapters {
         let info = adapter.get_info();
         println!(
             "  name={:?} backend={:?} device_type={:?} driver={:?} driver_info={:?} vendor={:#x} device_id={:#x}",
-            info.name, info.backend, info.device_type, info.driver, info.driver_info, info.vendor, info.device
+            info.name,
+            info.backend,
+            info.device_type,
+            info.driver,
+            info.driver_info,
+            info.vendor,
+            info.device
         );
     }
 
     println!();
-    println!("== Picking the first adapter (this crate's established pattern) and requesting a device ==");
+    println!(
+        "== Picking the first adapter (this crate's established pattern) and requesting a device =="
+    );
     let Some(adapter) = adapters.into_iter().next() else {
         println!("  No adapter available at all -- spikes cannot run a real compute pass here.");
         return;

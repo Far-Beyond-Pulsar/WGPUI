@@ -47,10 +47,12 @@
 //! colour space in `wgpui-widgets` that nothing in `2.0` otherwise names.
 
 use crate::div::interactivity::style::{BoxShadow, Corners, DivStyle, Edges};
+use wgpui_core::boundary::policy::Pixels;
 use wgpui_layout::taffy_tree::{
     AlignContent, AlignItems, Dimension, Display, FlexDirection, FlexWrap, LayoutStyle,
-    LengthPercentage, LengthPercentageAuto, Position,
+    LengthPercentage, LengthPercentageAuto, Overflow, Position,
 };
+use wgpui_text::shaping::FontWeight;
 
 /// One `rem`, in pixels.
 ///
@@ -60,6 +62,28 @@ use wgpui_layout::taffy_tree::{
 /// scale methods below resolve against this constant; a `rem`-aware surface is
 /// the alias crate's problem, not this file's.
 pub const REM: f32 = 16.0;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearColorStop {
+    pub color: [f32; 4],
+    pub position: f32,
+}
+
+pub trait IntoStylePixels {
+    fn into_style_pixels(self) -> f32;
+}
+
+impl IntoStylePixels for f32 {
+    fn into_style_pixels(self) -> f32 {
+        self
+    }
+}
+
+impl IntoStylePixels for Pixels {
+    fn into_style_pixels(self) -> f32 {
+        self.value()
+    }
+}
 
 /// A Tailwind spacing step, in pixels: `n / 4` rem.
 pub const fn spacing(step: f32) -> f32 {
@@ -164,6 +188,64 @@ pub trait Styled: Sized {
         self
     }
 
+    fn grid(mut self) -> Self {
+        self.layout_style().display = Display::Grid;
+        self
+    }
+
+    fn grid_cols(mut self, columns: u16) -> Self {
+        use wgpui_layout::taffy_tree::{GridTemplateComponent, TrackSizingFunction};
+        use wgpui_layout::taffy_tree::FromFr;
+        self.layout_style().display = Display::Grid;
+        self.layout_style().grid_template_columns = (0..columns)
+            .map(|_| GridTemplateComponent::Single(TrackSizingFunction::from_fr(1.0)))
+            .collect();
+        self
+    }
+
+    fn grid_rows(mut self, rows: u16) -> Self {
+        use wgpui_layout::taffy_tree::{GridTemplateComponent, TrackSizingFunction};
+        use wgpui_layout::taffy_tree::FromFr;
+        self.layout_style().display = Display::Grid;
+        self.layout_style().grid_template_rows = (0..rows)
+            .map(|_| GridTemplateComponent::Single(TrackSizingFunction::from_fr(1.0)))
+            .collect();
+        self
+    }
+
+    fn col_span(mut self, span: u16) -> Self {
+        self.layout_style().grid_column = wgpui_layout::taffy_tree::Line {
+            start: wgpui_layout::taffy_tree::GridPlacement::Span(span),
+            end: wgpui_layout::taffy_tree::GridPlacement::Span(span),
+        };
+        self
+    }
+
+    fn col_span_full(mut self) -> Self {
+        self.layout_style().grid_column = wgpui_layout::taffy_tree::Line {
+            start: wgpui_layout::taffy_tree::GridPlacement::Line(1.into()),
+            end: wgpui_layout::taffy_tree::GridPlacement::Line((-1).into()),
+        };
+        self
+    }
+
+    fn overflow_hidden(mut self) -> Self {
+        self.layout_style().overflow.x = Overflow::Hidden;
+        self.layout_style().overflow.y = Overflow::Hidden;
+        self
+    }
+
+    fn overflow_scroll(mut self) -> Self {
+        self.layout_style().overflow.x = Overflow::Scroll;
+        self.layout_style().overflow.y = Overflow::Scroll;
+        self
+    }
+
+    fn overflow_y_scroll(mut self) -> Self {
+        self.layout_style().overflow.y = Overflow::Scroll;
+        self
+    }
+
     // ---- alignment --------------------------------------------------------
 
     /// `align-items: center`.
@@ -211,14 +293,14 @@ pub trait Styled: Sized {
     // ---- size -------------------------------------------------------------
 
     /// `width: <pixels>px`.
-    fn w(mut self, pixels: f32) -> Self {
-        self.layout_style().size.width = Dimension::length(pixels);
+    fn w(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().size.width = Dimension::length(pixels.into_style_pixels());
         self
     }
 
     /// `height: <pixels>px`.
-    fn h(mut self, pixels: f32) -> Self {
-        self.layout_style().size.height = Dimension::length(pixels);
+    fn h(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().size.height = Dimension::length(pixels.into_style_pixels());
         self
     }
 
@@ -245,39 +327,40 @@ pub trait Styled: Sized {
     }
 
     /// `min-width: <pixels>px`.
-    fn min_w(mut self, pixels: f32) -> Self {
-        self.layout_style().min_size.width = Dimension::length(pixels);
+    fn min_w(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().min_size.width = Dimension::length(pixels.into_style_pixels());
         self
     }
 
     /// `min-height: <pixels>px`.
-    fn min_h(mut self, pixels: f32) -> Self {
-        self.layout_style().min_size.height = Dimension::length(pixels);
+    fn min_h(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().min_size.height = Dimension::length(pixels.into_style_pixels());
         self
     }
 
     /// `max-width: <pixels>px`.
-    fn max_w(mut self, pixels: f32) -> Self {
-        self.layout_style().max_size.width = Dimension::length(pixels);
+    fn max_w(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().max_size.width = Dimension::length(pixels.into_style_pixels());
         self
     }
 
     /// `max-height: <pixels>px`.
-    fn max_h(mut self, pixels: f32) -> Self {
-        self.layout_style().max_size.height = Dimension::length(pixels);
+    fn max_h(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().max_size.height = Dimension::length(pixels.into_style_pixels());
         self
     }
 
     // ---- spacing ----------------------------------------------------------
 
     /// `padding: <pixels>px` on every side.
-    fn p(mut self, pixels: f32) -> Self {
-        self.layout_style().padding = uniform_rect(pixels);
+    fn p(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().padding = uniform_rect(pixels.into_style_pixels());
         self
     }
 
     /// Horizontal padding.
-    fn px(mut self, pixels: f32) -> Self {
+    fn px(mut self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         let padding = &mut self.layout_style().padding;
         padding.left = LengthPercentage::length(pixels);
         padding.right = LengthPercentage::length(pixels);
@@ -285,7 +368,8 @@ pub trait Styled: Sized {
     }
 
     /// Vertical padding.
-    fn py(mut self, pixels: f32) -> Self {
+    fn py(mut self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         let padding = &mut self.layout_style().padding;
         padding.top = LengthPercentage::length(pixels);
         padding.bottom = LengthPercentage::length(pixels);
@@ -293,31 +377,32 @@ pub trait Styled: Sized {
     }
 
     /// Top padding.
-    fn pt(mut self, pixels: f32) -> Self {
-        self.layout_style().padding.top = LengthPercentage::length(pixels);
+    fn pt(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().padding.top = LengthPercentage::length(pixels.into_style_pixels());
         self
     }
 
     /// Bottom padding.
-    fn pb(mut self, pixels: f32) -> Self {
-        self.layout_style().padding.bottom = LengthPercentage::length(pixels);
+    fn pb(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().padding.bottom = LengthPercentage::length(pixels.into_style_pixels());
         self
     }
 
     /// Left padding.
-    fn pl(mut self, pixels: f32) -> Self {
-        self.layout_style().padding.left = LengthPercentage::length(pixels);
+    fn pl(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().padding.left = LengthPercentage::length(pixels.into_style_pixels());
         self
     }
 
     /// Right padding.
-    fn pr(mut self, pixels: f32) -> Self {
-        self.layout_style().padding.right = LengthPercentage::length(pixels);
+    fn pr(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().padding.right = LengthPercentage::length(pixels.into_style_pixels());
         self
     }
 
     /// `margin: <pixels>px` on every side.
-    fn m(mut self, pixels: f32) -> Self {
+    fn m(mut self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         let margin = &mut self.layout_style().margin;
         *margin = wgpui_layout::taffy_tree::LayoutSides {
             top: LengthPercentageAuto::length(pixels),
@@ -329,7 +414,8 @@ pub trait Styled: Sized {
     }
 
     /// `gap: <pixels>px` on both axes.
-    fn gap(mut self, pixels: f32) -> Self {
+    fn gap(mut self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         let style = self.layout_style();
         style.gap.width = LengthPercentage::length(pixels);
         style.gap.height = LengthPercentage::length(pixels);
@@ -337,14 +423,14 @@ pub trait Styled: Sized {
     }
 
     /// Horizontal gap.
-    fn gap_x(mut self, pixels: f32) -> Self {
-        self.layout_style().gap.width = LengthPercentage::length(pixels);
+    fn gap_x(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().gap.width = LengthPercentage::length(pixels.into_style_pixels());
         self
     }
 
     /// Vertical gap.
-    fn gap_y(mut self, pixels: f32) -> Self {
-        self.layout_style().gap.height = LengthPercentage::length(pixels);
+    fn gap_y(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().gap.height = LengthPercentage::length(pixels.into_style_pixels());
         self
     }
 
@@ -363,26 +449,26 @@ pub trait Styled: Sized {
     }
 
     /// `top: <pixels>px`.
-    fn top(mut self, pixels: f32) -> Self {
-        self.layout_style().inset.top = LengthPercentageAuto::length(pixels);
+    fn top(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().inset.top = LengthPercentageAuto::length(pixels.into_style_pixels());
         self
     }
 
     /// `left: <pixels>px`.
-    fn left(mut self, pixels: f32) -> Self {
-        self.layout_style().inset.left = LengthPercentageAuto::length(pixels);
+    fn left(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().inset.left = LengthPercentageAuto::length(pixels.into_style_pixels());
         self
     }
 
     /// `right: <pixels>px`.
-    fn right(mut self, pixels: f32) -> Self {
-        self.layout_style().inset.right = LengthPercentageAuto::length(pixels);
+    fn right(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().inset.right = LengthPercentageAuto::length(pixels.into_style_pixels());
         self
     }
 
     /// `bottom: <pixels>px`.
-    fn bottom(mut self, pixels: f32) -> Self {
-        self.layout_style().inset.bottom = LengthPercentageAuto::length(pixels);
+    fn bottom(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().inset.bottom = LengthPercentageAuto::length(pixels.into_style_pixels());
         self
     }
 
@@ -456,6 +542,13 @@ pub trait Styled: Sized {
         self.layout_style().border.left = LengthPercentage::length(pixels);
         self
     }
+
+    fn border_t_1(self) -> Self { self.border_t(1.0) }
+    fn border_r_1(self) -> Self { self.border_r(1.0) }
+    fn border_b_1(self) -> Self { self.border_b(1.0) }
+    fn border_l_1(self) -> Self { self.border_l(1.0) }
+    fn border_y_1(self) -> Self { self.border_t_1().border_b_1() }
+    fn border_l_3(self) -> Self { self.border_l(3.0) }
 
     /// A uniform corner radius, in pixels.
     fn rounded(mut self, pixels: f32) -> Self {
@@ -608,6 +701,112 @@ pub trait Styled: Sized {
         self.shadow(vec![black(0.25, [0.0, 25.0], 50.0, -12.0)])
     }
 
+    fn text_color(mut self, color: impl Into<[f32; 4]>) -> Self {
+        self.style().text_color = Some(color.into());
+        self
+    }
+
+    fn text_gradient_horizontal(mut self, from: LinearColorStop, to: LinearColorStop) -> Self {
+        self.style().text_gradient = Some(vec![(from.color, from.position), (to.color, to.position)]);
+        self.style().text_gradient_angle = Some(90.0);
+        self
+    }
+
+    fn text_gradient_vertical(mut self, from: LinearColorStop, to: LinearColorStop) -> Self {
+        self.style().text_gradient = Some(vec![(from.color, from.position), (to.color, to.position)]);
+        self.style().text_gradient_angle = Some(180.0);
+        self
+    }
+
+    fn text_size(mut self, size: impl IntoStylePixels) -> Self {
+        self.style().text_size = Some(size.into_style_pixels());
+        self
+    }
+
+    fn text_xs(self) -> Self { self.text_size(12.0) }
+    fn text_sm(self) -> Self { self.text_size(14.0) }
+    fn text_base(self) -> Self { self.text_size(16.0) }
+    fn text_lg(self) -> Self { self.text_size(18.0) }
+    fn text_xl(self) -> Self { self.text_size(20.0) }
+    fn text_2xl(self) -> Self { self.text_size(24.0) }
+    fn text_center(mut self) -> Self { self.style().text_alignment = 1; self }
+    fn text_right(mut self) -> Self { self.style().text_alignment = 2; self }
+    fn font_weight(mut self, weight: FontWeight) -> Self { self.style().text_weight = Some(weight); self }
+    fn italic(mut self) -> Self { self.style().text_italic = true; self }
+    fn line_height(mut self, height: impl IntoStylePixels) -> Self {
+        self.style().text_line_height = Some(height.into_style_pixels());
+        self
+    }
+    fn line_through(mut self) -> Self { self.style().text_line_through = true; self }
+
+    fn p_0p5(self) -> Self { self.p(2.0) }
+    fn p_1(self) -> Self { self.p(4.0) }
+    fn p_2(self) -> Self { self.p(8.0) }
+    fn p_3(self) -> Self { self.p(12.0) }
+    fn p_4(self) -> Self { self.p(16.0) }
+    fn p_6(self) -> Self { self.p(24.0) }
+    fn px_2(self) -> Self { self.px(8.0) }
+    fn px_3(self) -> Self { self.px(12.0) }
+    fn px_4(self) -> Self { self.px(16.0) }
+    fn py_1(self) -> Self { self.py(4.0) }
+    fn py_2(self) -> Self { self.py(8.0) }
+    fn gap_1(self) -> Self { self.gap(4.0) }
+    fn gap_2(self) -> Self { self.gap(8.0) }
+    fn gap_3(self) -> Self { self.gap(12.0) }
+    fn gap_4(self) -> Self { self.gap(16.0) }
+    fn gap_6(self) -> Self { self.gap(24.0) }
+    fn w_16(self) -> Self { self.w(64.0) }
+    fn size_8(self) -> Self { self.size(32.0) }
+    fn size_10(self) -> Self { self.size(40.0) }
+    fn h_6(self) -> Self { self.h(24.0) }
+    fn h_8(self) -> Self { self.h(32.0) }
+    fn h_20(self) -> Self { self.h(80.0) }
+    fn h_24(self) -> Self { self.h(96.0) }
+    fn h_32(self) -> Self { self.h(128.0) }
+    fn top_0(self) -> Self { self.top(0.0) }
+    fn top_2(self) -> Self { self.top(8.0) }
+    fn top_4(self) -> Self { self.top(16.0) }
+    fn top_6(self) -> Self { self.top(24.0) }
+    fn left_2(self) -> Self { self.left(8.0) }
+    fn left_4(self) -> Self { self.left(16.0) }
+    fn left_6(self) -> Self { self.left(24.0) }
+    fn right_0(self) -> Self { self.right(0.0) }
+    fn bottom_0(self) -> Self { self.bottom(0.0) }
+    fn mt_2(mut self) -> Self {
+        self.layout_style().margin.top = LengthPercentageAuto::length(8.0);
+        self
+    }
+    fn mb_5(mut self) -> Self {
+        self.layout_style().margin.bottom = LengthPercentageAuto::length(20.0);
+        self
+    }
+
+    fn p_5(self) -> Self { self.p(20.0) }
+    fn p_8(self) -> Self { self.p(32.0) }
+    fn p_12(self) -> Self { self.p(48.0) }
+    fn px_1(self) -> Self { self.px(4.0) }
+    fn py_0p5(self) -> Self { self.py(2.0) }
+    fn py_1p5(self) -> Self { self.py(6.0) }
+    fn py_3(self) -> Self { self.py(12.0) }
+    fn py_12(self) -> Self { self.py(48.0) }
+    fn gap_0p5(self) -> Self { self.gap(2.0) }
+    fn gap_5(self) -> Self { self.gap(20.0) }
+    fn gap_8(self) -> Self { self.gap(32.0) }
+    fn mt_1(mut self) -> Self {
+        self.layout_style().margin.top = LengthPercentageAuto::length(4.0);
+        self
+    }
+    fn h_2(self) -> Self { self.h(8.0) }
+    fn h_10(self) -> Self { self.h(40.0) }
+    fn h_12(self) -> Self { self.h(48.0) }
+    fn h_16(self) -> Self { self.h(64.0) }
+    fn h_48(self) -> Self { self.h(192.0) }
+    fn bottom_4(self) -> Self { self.bottom(16.0) }
+    fn bottom_8(self) -> Self { self.bottom(32.0) }
+    fn left_0(self) -> Self { self.left(0.0) }
+    fn left_8(self) -> Self { self.left(32.0) }
+    fn inset_0(self) -> Self { self.top(0.0).right(0.0).bottom(0.0).left(0.0) }
+
     // ---- conditionals -----------------------------------------------------
 
     /// Apply `then` only when `condition` holds.
@@ -736,7 +935,14 @@ mod tests {
                 },
             ]
         );
-        assert!(Styleable::default().shadow_md().shadow_none().0.box_shadow.is_empty());
+        assert!(
+            Styleable::default()
+                .shadow_md()
+                .shadow_none()
+                .0
+                .box_shadow
+                .is_empty()
+        );
     }
 
     #[test]
@@ -758,5 +964,19 @@ mod tests {
         assert_eq!(some.0.corner_radii, Corners::all(4.0));
         let none = Styleable::default().when_some(None::<f32>, Styleable::rounded);
         assert_eq!(none.0.corner_radii, Corners::default());
+    }
+
+    #[test]
+    fn legacy_layout_aliases_reach_taffy_and_pixel_arithmetic_is_preserved() {
+        let styled = Styleable::default()
+            .grid_cols(3)
+            .overflow_y_scroll()
+            .border_l_3()
+            .text_xs();
+        assert_eq!(styled.0.layout.display, Display::Grid);
+        assert_eq!(styled.0.layout.grid_template_columns.len(), 3);
+        assert_eq!(styled.0.layout.overflow.y, Overflow::Scroll);
+        assert_eq!(styled.0.border_widths.left, 3.0);
+        assert_eq!(styled.0.text_size, Some(12.0));
     }
 }

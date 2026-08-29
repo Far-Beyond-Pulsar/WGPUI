@@ -67,9 +67,7 @@ use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::reconciler::Reconciler;
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::atlas::AtlasKind;
-use wgpui_layout::taffy_tree::{
-    Dimension, LayoutSize, LayoutStyle, LayoutTree, definite,
-};
+use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle, LayoutTree, definite};
 use wgpui_wgpu::render::atlas::{GlyphAtlas, SharedImageAtlas};
 use wgpui_wgpu::render::atlas_upload::AtlasTextures;
 use wgpui_wgpu::render::device::{ComputeContext, context_or_report};
@@ -95,8 +93,12 @@ fn asset(name: &str) -> Vec<u8> {
     ]
     .iter()
     .collect();
-    std::fs::read(&path)
-        .unwrap_or_else(|error| panic!("the gate's own asset {} must exist: {error}", path.display()))
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "the gate's own asset {} must exist: {error}",
+            path.display()
+        )
+    })
 }
 
 /// What the legacy loader produces for these bytes: `src/elements/img.rs`'s
@@ -437,7 +439,12 @@ fn a_real_gifs_first_frame_renders_as_the_legacy_decoder_produced_it() {
         });
     let rendered = render_element(&context, &atlas, image, legacy_size);
 
-    let found = compare(&rendered, legacy_size, &legacy_texels, "black-cat-typing.gif");
+    let found = compare(
+        &rendered,
+        legacy_size,
+        &legacy_texels,
+        "black-cat-typing.gif",
+    );
     let total = (legacy_size[0] * legacy_size[1]) as usize;
     println!(
         "phase_6_2_gif_gate: {} of {total} pixels byte-exact, {} within one unit; \

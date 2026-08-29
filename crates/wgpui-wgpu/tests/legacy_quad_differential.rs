@@ -1239,7 +1239,11 @@ fn phase_6_6_div_gate() {
             case.border_widths,
         )
         .len();
-        assert!(emitted > 0, "[{}] the div emitted no quads at all", case.name);
+        assert!(
+            emitted > 0,
+            "[{}] the div emitted no quads at all",
+            case.name
+        );
 
         let result = compare(&legacy, &ours, clear);
         println!(

@@ -29,7 +29,11 @@ impl BlurShowcase {
     /// Mirrors the `canvas` + `window.on_mouse_event` pattern other examples (e.g.
     /// `bench/data_table`) use to drag scrollbar thumbs, since dragging needs to keep tracking
     /// the pointer even once it leaves the thumb's own hitbox.
-    fn render_scrollbar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_scrollbar(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let scroll_handle = self.scroll_handle.clone();
         let bounds = scroll_handle.bounds();
         let max_offset = scroll_handle.max_offset();
@@ -99,14 +103,12 @@ impl BlurShowcase {
                                         return;
                                     }
 
-                                    let Some(drag_offset) =
-                                        entity.read(cx).scrollbar_drag_offset
+                                    let Some(drag_offset) = entity.read(cx).scrollbar_drag_offset
                                     else {
                                         return;
                                     };
 
-                                    let thumb_top = (ev.position.y - bounds.origin.y
-                                        - drag_offset)
+                                    let thumb_top = (ev.position.y - bounds.origin.y - drag_offset)
                                         .clamp(px(0.), track_room);
                                     let scrolled_fraction = if track_room > px(0.) {
                                         thumb_top / track_room

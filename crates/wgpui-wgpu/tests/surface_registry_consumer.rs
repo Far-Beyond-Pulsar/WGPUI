@@ -152,13 +152,8 @@ fn the_unified_consumer_leaves_the_registry_in_the_same_state_as_the_legacy_one(
             // A frame where the surface is not in the composite list at all —
             // the shape a frame takes when the panel is scrolled out of view.
             Step::Skip => {
-                let plan = plan_composites(
-                    &context.device,
-                    &context.queue,
-                    &pipeline,
-                    &consumer,
-                    &[],
-                );
+                let plan =
+                    plan_composites(&context.device, &context.queue, &pipeline, &consumer, &[]);
                 assert!(plan.prepared.is_empty());
             }
         }
@@ -178,7 +173,10 @@ fn the_unified_consumer_leaves_the_registry_in_the_same_state_as_the_legacy_one(
         legacy_trace.iter().any(|state| !state.unconsumed),
         "and must actually clear it again"
     );
-    println!("surface_registry_differential: {} steps identical", legacy_trace.len());
+    println!(
+        "surface_registry_differential: {} steps identical",
+        legacy_trace.len()
+    );
 }
 
 /// **The one behavioural difference, asserted so it is not mistaken for a
