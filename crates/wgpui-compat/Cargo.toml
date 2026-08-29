@@ -11,6 +11,7 @@ path = "src/gpui.rs"
 doctest = false
 
 [dependencies]
+gpui_legacy = { package = "gpui-ce", path = "../.." }
 wgpui-core = { path = "../wgpui-core" }
 wgpui-layout = { path = "../wgpui-layout" }
 wgpui-text = { path = "../wgpui-text" }
@@ -21,6 +22,7 @@ futures = "0.3"
 smol = "2.0"
 log = "0.4.16"
 rand = "0.10"
+ordered-float = "5.3.0"
 glam = "0.33"
 bytemuck = { version = "1.24", features = ["derive"] }
 env_logger = "0.11"
