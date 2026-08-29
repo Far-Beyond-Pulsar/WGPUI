@@ -126,6 +126,34 @@ impl DecodedImage {
         self.frames.len() > 1
     }
 
+    /// Select the frame visible after `elapsed` in a looping animation.
+    ///
+    /// Delays are accumulated rather than treated as a fixed frame rate. A
+    /// zero-delay animation still advances safely by using its first frame;
+    /// malformed timing data must not create a hot loop in a window driver.
+    pub fn frame_index_at(&self, elapsed: Duration) -> u32 {
+        if self.frames.len() <= 1 {
+            return 0;
+        }
+        let cycle = self
+            .frames
+            .iter()
+            .map(|frame| frame.delay)
+            .fold(Duration::ZERO, |total, delay| total.saturating_add(delay));
+        if cycle.is_zero() {
+            return 0;
+        }
+        let remaining_seconds = elapsed.as_secs_f64() % cycle.as_secs_f64();
+        let mut remaining = Duration::from_secs_f64(remaining_seconds);
+        for (index, frame) in self.frames.iter().enumerate() {
+            if remaining < frame.delay {
+                return index as u32;
+            }
+            remaining = remaining.saturating_sub(frame.delay);
+        }
+        (self.frames.len() - 1) as u32
+    }
+
     /// One frame, wrapping the index into range.
     ///
     /// Wrapping rather than clamping or failing, because that is what a looping
@@ -623,6 +651,18 @@ mod tests {
         let image = decode(&png(2, 2)).expect("decode");
         assert_eq!(image.frame(0), image.frame(7));
         assert_eq!(image.frame(0), image.frame(u32::MAX));
+    }
+
+    #[test]
+    fn animation_uses_each_decoded_frame_delay_and_loops() {
+        let frames = (0..3)
+            .map(|_| DecodedFrame { size: [1, 1], texels: vec![0; 4], delay: Duration::from_millis(100) })
+            .collect();
+        let image = DecodedImage::from_frames(frames).expect("frames");
+        assert_eq!(image.frame_index_at(Duration::from_millis(0)), 0);
+        assert_eq!(image.frame_index_at(Duration::from_millis(100)), 1);
+        assert_eq!(image.frame_index_at(Duration::from_millis(299)), 2);
+        assert_eq!(image.frame_index_at(Duration::from_millis(300)), 0);
     }
 
     /// A real animated GIF, encoded here so the input is a file and not a
