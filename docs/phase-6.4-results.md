@@ -53,12 +53,19 @@ All of these passed on the reference adapter unless noted:
 | `cargo test -p wgpui-wgpu --tests` | 140 passed, 0 failed across all library/integration test binaries |
 | `git diff --check` | passed before the implementation checkpoint |
 | `rustfmt --edition 2024 crates/wgpui-wgpu/tests/paths_backdrop_differential.rs` | passed |
+| `./script/clippy.ps1` | Cargo clippy reported 130 pre-existing `gpui-ce` warnings-as-errors under `--deny warnings`; the wrapper returned 0 without propagating Cargo's failure |
 
 `cargo fmt --all -- --check` could not be used as a repository-wide pass/fail
 signal: the existing tree contains unrelated formatting drift and the command
 also reports the missing `src/_ownership_and_data_flow.rs` module. The new test
-file itself was formatted directly. Final clippy is run separately with the
-repository-required command.
+file itself was formatted directly. The final clippy invocation was run through
+the repository-required wrapper with no lint suppressions. It emitted errors
+such as unused imports, redundant clones, `unsafe_op_in_unsafe_fn`, and other
+warnings-as-errors throughout the existing root `src/` tree, ending with
+`could not compile gpui-ce (lib test) due to 130 previous errors`. The wrapper
+does not `exit $LASTEXITCODE`, so PowerShell reported process exit code 0 even
+though Cargo's clippy run failed. No Phase 6.4-specific diagnostic was observed
+in that output; the phase's targeted and package tests remain green.
 
 ## 2. What the tests prove
 
