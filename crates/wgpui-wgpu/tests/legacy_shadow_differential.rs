@@ -523,6 +523,7 @@ fn render_2_0(context: &ComputeContext, shadow: Option<Shadow>, mode: DrawMode) 
                 width: target.width,
                 height: target.height,
                 clear: CLEAR_COLOR,
+                source: None,
             },
         )
         .expect("a frame must render");
@@ -857,6 +858,7 @@ fn a_shadow_covered_by_an_opaque_quad_still_paints_its_falloff_outside_it() {
                     width: target.width,
                     height: target.height,
                     clear: CLEAR_COLOR,
+                    source: None,
                 },
             )
             .expect("a frame must render");

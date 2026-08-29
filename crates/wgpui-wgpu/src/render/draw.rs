@@ -657,10 +657,10 @@ pub fn issue_backdrop_filters(
             continue;
         }
         pass.set_bind_group(1, plan.bind_group(), &[index as u32 * plan.stride()]);
-        pass.draw(0..4, 0..1);
+        pass.draw(0..4, 0..slot.count);
         stats.bind_group_binds += 1;
         stats.draw_calls_issued += 1;
-        stats.backdrop_filters_drawn += 1;
+        stats.backdrop_filters_drawn += slot.count;
     }
     stats
 }

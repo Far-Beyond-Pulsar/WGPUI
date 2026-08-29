@@ -633,6 +633,7 @@ fn render_2_0(context: &ComputeContext, quads: &[Quad], mode: DrawMode) -> Vec<u
                 width: target.width,
                 height: target.height,
                 clear: CLEAR_COLOR,
+                source: None,
             },
         )
         .expect("a frame must render");
@@ -1064,6 +1065,7 @@ fn render_div(
                 width: target.width,
                 height: target.height,
                 clear: CLEAR_COLOR,
+                source: None,
             },
         )
         .expect("a frame must render");

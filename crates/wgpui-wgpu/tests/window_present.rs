@@ -426,6 +426,7 @@ impl Harness {
                 // Black: Phase 5.6's white-on-black identity is what makes the
                 // glyph comparison below an equality rather than a threshold.
                 clear: wgpu::Color::BLACK,
+                source: Some(&texture.texture),
             };
             match frame_loop.draw(
                 &context.device,

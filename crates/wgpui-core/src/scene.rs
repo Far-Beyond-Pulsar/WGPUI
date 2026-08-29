@@ -157,10 +157,10 @@ impl Scene {
                 let range = match kind {
                     PrimitiveKind::Shadow => self.shadows.slab(*layer),
                     PrimitiveKind::Quad => self.quads.slab(*layer),
+                    PrimitiveKind::Path => self.paths.slab(*layer),
                     PrimitiveKind::Underline => self.underlines.slab(*layer),
                     PrimitiveKind::GlyphRun => self.glyph_runs.slab(*layer),
-            PrimitiveKind::PolySprite => self.poly_sprites.slab(*layer),
-                    PrimitiveKind::Path => self.paths.slab(*layer),
+                    PrimitiveKind::PolySprite => self.poly_sprites.slab(*layer),
                     PrimitiveKind::BackdropFilter => self.backdrop_filters.slab(*layer),
                 };
                 slots.push(DrawSlot {

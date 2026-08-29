@@ -10,6 +10,7 @@ struct BackdropFilter {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) clip_distances: vec4<f32>,
+    @location(1) filter_index: u32,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -18,7 +19,9 @@ struct VertexOutput {
 @group(2) @binding(0) var backdrop_texture: texture_2d<f32>;
 @group(2) @binding(1) var backdrop_sampler: sampler;
 
-fn current_filter() -> BackdropFilter { return filters[slot.base]; }
+fn current_filter(filter_index: u32) -> BackdropFilter {
+    return filters[slot.base + filter_index];
+}
 fn gaussian(x: f32, sigma: f32) -> f32 {
     return exp(-(x * x) / (2.0 * sigma * sigma)) / (sqrt(2.0 * M_PI_F) * sigma);
 }
@@ -34,22 +37,25 @@ fn rounded_rectangle_sdf(point: vec2<f32>, origin: vec2<f32>, size: vec2<f32>, r
 }
 
 @vertex
-fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+fn vertex_main(
+    @builtin(vertex_index) vertex_index: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOutput {
     let unit_vertex = vec2<f32>(f32(vertex_index & 1u), 0.5 * f32(vertex_index & 2u));
-    let current = current_filter();
+    let current = current_filter(instance_index);
     let pixel_position = unit_vertex * current.size + current.origin;
     let device_position = pixel_position / globals.viewport
         * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     let top_left = pixel_position - current.clip_origin;
     let bottom_right = current.clip_origin + current.clip_size - pixel_position;
     return VertexOutput(vec4<f32>(device_position, 0.0, 1.0),
-        vec4<f32>(top_left.x, bottom_right.x, top_left.y, bottom_right.y));
+        vec4<f32>(top_left.x, bottom_right.x, top_left.y, bottom_right.y), instance_index);
 }
 
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if any(input.clip_distances < vec4<f32>(0.0)) { discard; }
-    let current = current_filter();
+    let current = current_filter(input.filter_index);
     let pixel_position = input.position.xy;
     var blurred_color = vec4<f32>(0.0);
     var total_weight = 0.0;

@@ -629,6 +629,7 @@ fn render_div(context: &ComputeContext, root: Div, mode: DrawMode) -> Rendered {
                 width: target.width,
                 height: target.height,
                 clear: CLEAR_COLOR,
+                source: None,
             },
         )
         .expect("a frame must render");

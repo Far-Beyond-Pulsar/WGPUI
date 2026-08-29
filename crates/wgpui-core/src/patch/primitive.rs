@@ -70,6 +70,8 @@ pub enum PrimitiveKind {
     Shadow,
     /// Fixed-size, one slot per primitive. See [`Quad`].
     Quad,
+    /// Variable-size, pre-tessellated vector geometry. See [`Path`].
+    Path,
     /// Fixed-size, one slot per primitive, drawn under its layer's text.
     /// See [`Underline`].
     Underline,
@@ -78,8 +80,6 @@ pub enum PrimitiveKind {
     /// Fixed-size, one slot per sprite, referencing a colour atlas tile.
     /// See [`PolySprite`].
     PolySprite,
-    /// Variable-size, pre-tessellated vector geometry. See [`Path`].
-    Path,
     /// A rounded rectangle that samples the framebuffer behind it. See
     /// [`BackdropFilter`].
     BackdropFilter,
@@ -107,10 +107,10 @@ impl PrimitiveKind {
     pub const ALL: [PrimitiveKind; PrimitiveKind::COUNT] = [
         PrimitiveKind::Shadow,
         PrimitiveKind::Quad,
+        PrimitiveKind::Path,
         PrimitiveKind::Underline,
         PrimitiveKind::GlyphRun,
         PrimitiveKind::PolySprite,
-        PrimitiveKind::Path,
         PrimitiveKind::BackdropFilter,
     ];
 
@@ -127,10 +127,10 @@ impl PrimitiveKind {
         match self {
             PrimitiveKind::Shadow => Shadow::SLOT_STRIDE,
             PrimitiveKind::Quad => Quad::SLOT_STRIDE,
+            PrimitiveKind::Path => Path::SLOT_STRIDE,
             PrimitiveKind::Underline => Underline::SLOT_STRIDE,
             PrimitiveKind::GlyphRun => GlyphRun::SLOT_STRIDE,
             PrimitiveKind::PolySprite => PolySprite::SLOT_STRIDE,
-            PrimitiveKind::Path => Path::SLOT_STRIDE,
             PrimitiveKind::BackdropFilter => BackdropFilter::SLOT_STRIDE,
         }
     }
@@ -1310,15 +1310,18 @@ mod tests {
             [
                 PrimitiveKind::Shadow,
                 PrimitiveKind::Quad,
+                PrimitiveKind::Path,
                 PrimitiveKind::Underline,
                 PrimitiveKind::GlyphRun,
                 PrimitiveKind::PolySprite,
+                PrimitiveKind::BackdropFilter,
             ]
         );
         // Spelled again as the four relations that actually matter, so a
         // failure names which one moved rather than printing two arrays.
         assert!(PrimitiveKind::Shadow < PrimitiveKind::Quad);
-        assert!(PrimitiveKind::Quad < PrimitiveKind::Underline);
+        assert!(PrimitiveKind::Quad < PrimitiveKind::Path);
+        assert!(PrimitiveKind::Path < PrimitiveKind::Underline);
         assert!(PrimitiveKind::Underline < PrimitiveKind::GlyphRun);
         assert!(PrimitiveKind::GlyphRun < PrimitiveKind::PolySprite);
     }
@@ -1331,6 +1334,7 @@ mod tests {
             Underline::SLOT_STRIDE
         );
         assert_eq!(PrimitiveKind::Quad.slot_stride(), Quad::SLOT_STRIDE);
+        assert_eq!(PrimitiveKind::Path.slot_stride(), Path::SLOT_STRIDE);
         assert_eq!(PrimitiveKind::GlyphRun.slot_stride(), GlyphRun::SLOT_STRIDE);
         assert_eq!(
             PrimitiveKind::PolySprite.slot_stride(),

@@ -420,6 +420,7 @@ fn render_2_0(context: &ComputeContext, underline: Option<Underline>, mode: Draw
                 width: target.width,
                 height: target.height,
                 clear: CLEAR_COLOR,
+                source: None,
             },
         )
         .expect("a frame must render");

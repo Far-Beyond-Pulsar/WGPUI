@@ -326,6 +326,7 @@ impl App {
                     // Black, so Phase 5.6's white-on-black identity holds and
                     // the text's pixels are its atlas texels exactly.
                     clear: wgpu::Color::BLACK,
+                    source: Some(&texture.texture),
                 };
                 match scene.frame_loop.draw(
                     &live.context.device,

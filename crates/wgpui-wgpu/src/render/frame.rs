@@ -48,7 +48,7 @@ use wgpui_core::occlusion::{
     CoverageItem, PoisonRegion, encode_coverage_items, encode_poison_regions, quad_coverage_item,
 };
 use wgpui_core::ordering::encode_ordering_items;
-use wgpui_core::patch::primitive::{BackdropFilter, Path, PrimitiveKind, Quad};
+use wgpui_core::patch::primitive::{PrimitiveKind, Quad};
 use wgpui_core::scene::atlas::AtlasKind;
 use wgpui_core::scene::layer::LayerId;
 use wgpui_core::scene::{Scene, UploadRange};
@@ -653,8 +653,6 @@ impl FrameRenderer {
         let underline_arena_slots = input.scene.arena_slots(PrimitiveKind::Underline);
         let glyph_arena_slots = input.scene.arena_slots(PrimitiveKind::GlyphRun);
         let sprite_arena_slots = input.scene.arena_slots(PrimitiveKind::PolySprite);
-        let path_arena_slots = input.scene.arena_slots(PrimitiveKind::Path);
-        let backdrop_arena_slots = input.scene.arena_slots(PrimitiveKind::BackdropFilter);
         let primitives_resident: u32 = shadow_slots
             .iter()
             .chain(quad_slots.iter())
