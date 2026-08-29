@@ -305,7 +305,8 @@ pub trait Styled: Sized {
     }
 
     /// Both dimensions, in pixels.
-    fn size(self, pixels: f32) -> Self {
+    fn size(self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         self.w(pixels).h(pixels)
     }
 
