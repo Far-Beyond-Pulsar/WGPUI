@@ -6738,6 +6738,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpui-core"
+version = "0.1.0"
+dependencies = [
+ "lyon",
+ "wgpui-layout",
+]
+
+[[package]]
+name = "wgpui-devtools"
+version = "0.1.0"
+
+[[package]]
+name = "wgpui-layout"
+version = "0.1.0"
+dependencies = [
+ "taffy",
+]
+
+[[package]]
+name = "wgpui-text"
+version = "0.1.0"
+dependencies = [
+ "cosmic-text",
+ "wgpui-core",
+]
+
+[[package]]
+name = "wgpui-wgpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "etagere",
+ "image",
+ "log",
+ "lyon",
+ "pollster 0.4.0",
+ "rand 0.10.0",
+ "wgpu",
+ "wgpui-core",
+ "wgpui-layout",
+ "wgpui-text",
+ "wgpui-widgets",
+ "winit",
+]
+
+[[package]]
+name = "wgpui-widgets"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "resvg",
+ "usvg",
+ "wgpui-core",
+ "wgpui-layout",
+ "wgpui-text",
+]
+
+[[package]]
 name = "which"
 version = "6.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

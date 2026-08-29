@@ -1,3 +1,20 @@
+[workspace]
+# Phase 0 of docs/gpu-native-architecture.md §3/§11: convert the repo to a
+# Cargo workspace so the new wgpui-* crates can grow alongside the frozen
+# legacy backend without touching it. The root package below is listed
+# explicitly as a member (it would also be included implicitly, since the
+# workspace and package tables live in the same manifest) so the member list
+# reads as complete at a glance.
+members = [
+    ".",
+    "crates/wgpui-core",
+    "crates/wgpui-layout",
+    "crates/wgpui-text",
+    "crates/wgpui-widgets",
+    "crates/wgpui-wgpu",
+    "crates/wgpui-devtools",
+]
+
 [package]
 name = "gpui-ce"
 version = "1.0.0"

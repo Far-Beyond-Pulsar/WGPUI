@@ -1,0 +1,18 @@
+[package]
+name = "wgpui-layout"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "wgpui_layout"
+path = "src/wgpui_layout.rs"
+doctest = false
+
+[dependencies]
+# Same pin as the root `gpui-ce` package, per 2.0 §10 ("reuse the crate ...
+# narrow its call sites, don't reimplement or fork it").
+taffy = "=0.9.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

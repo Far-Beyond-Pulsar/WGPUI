@@ -1,0 +1,21 @@
+[package]
+name = "wgpui-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "wgpui_core"
+path = "src/wgpui_core.rs"
+doctest = false
+
+[dependencies]
+lyon = "1.0"
+# The retained instance records this crate keeps (§4.0) hold the layout node
+# each element reuses, so `wgpui-core` names `wgpui-layout`'s node identity
+# directly. The edge runs one way only: `wgpui-layout` knows nothing of
+# patches, scenes, or reconciliation.
+wgpui-layout = { path = "../wgpui-layout" }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

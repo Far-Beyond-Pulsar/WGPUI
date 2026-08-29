@@ -1,0 +1,84 @@
+[package]
+name = "wgpui-wgpu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "wgpui_wgpu"
+path = "src/wgpui_wgpu.rs"
+doctest = false
+
+[dependencies]
+# Phase 3's compute passes dispatch shader source and consume input encodings
+# that wgpui-core owns (§3.1: "shader source as text, buffer/binding layout
+# descriptors as plain Rust structs"). The edge runs one way only — wgpui-core
+# names nothing here, and cannot, since it is forbidden a live device.
+wgpui-core = { path = "../wgpui-core" }
+# Phase 6's `window/frame_loop.rs` drives the whole of §2's picture, which means
+# it holds the `LayoutTree` the reconciler builds and `Emitter::emit` reads.
+# `wgpui-core` already depends on this crate for exactly that type; naming it
+# here adds no edge to the graph, only the ability to say `LayoutTree` out loud.
+wgpui-layout = { path = "../wgpui-layout" }
+# The only crate that touches a live wgpu::Device (docs/gpu-native-architecture.md
+# §3.5) — this dependency is genuinely needed even at the Phase 0 stub stage
+# because the Phase 0 spike harnesses (benches/) live here and open a real
+# device. Version matches the pin already used by the root gpui-ce crate.
+wgpu = { version = "30", default-features = false, features = [
+    "dx12",
+    "vulkan",
+    "wgsl",
+] }
+pollster = "0.4.0"
+# The bin-packing allocator behind `render/atlas.rs`, at the same version the
+# root crate pins — the legacy atlas (`src/platform/cross/atlas.rs`) uses the
+# same `BucketedAtlasAllocator`, so packing behaviour is shared rather than
+# re-derived while both backends exist.
+etagere = "0.2"
+bytemuck = { version = "1.24", features = ["derive"] }
+# `render/surface_registry.rs` is a mechanical move of the legacy file (§5.5,
+# §9: "moved, not rebuilt"), and that file logs. Taking the dependency is what
+# keeps the move mechanical — deleting the one `log::trace!` would be a change
+# to code §9's risk table specifically asks this phase not to change.
+log = "0.4.16"
+# Phase 6: `src/window.rs` opens a real OS window and binds a `wgpu::Surface` to
+# it. Pinned to the same version the root gpui-ce crate already resolves, so the
+# two backends share one winit in the lock file rather than linking two copies
+# of a library that registers OS-level window classes.
+winit = "0.30.12"
+
+[dev-dependencies]
+# `tests/legacy_image_differential.rs` drives Phase 6.2's gate end to end: a real
+# file on disk, decoded by `wgpui-widgets`, drawn by this crate, compared against
+# the legacy decoder's own bytes. That needs all three in one test binary.
+#
+# A dev-dependency and not a dependency, deliberately. §3.5 makes this "the only
+# crate touching a live device" and §3.4 puts elements the other side of that
+# line; an ordinary edge here would invert the split. A test binary is not the
+# library, and the graph stays acyclic either way (`wgpui-widgets` does not
+# depend on this crate).
+wgpui-widgets = { path = "../wgpui-widgets" }
+wgpui-layout = { path = "../wgpui-layout" }
+# The oracle. Same version the root crate pins, so the differential compares
+# against the decoder legacy actually calls rather than a different one.
+image = { version = "0.25.1", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
+rand = "0.10"
+# Dev-only, and the production edge still runs one way: nothing under `src/`
+# names `wgpui-text`, and `AtlasTileSource` takes its rasteriser as a closure
+# precisely so it does not have to. `tests/glyph_atlas_upload.rs` needs both
+# halves of the path in one process — shape and rasterise on one side, pack and
+# upload on the other — and neither crate can host that test alone. It lives
+# here because this is where the device is.
+wgpui-text = { path = "../wgpui-text" }
+lyon = "1.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
