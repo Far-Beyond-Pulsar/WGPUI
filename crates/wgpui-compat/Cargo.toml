@@ -1,0 +1,196 @@
+[package]
+name = "wgpui-compat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autoexamples = false
+
+[lib]
+name = "gpui"
+path = "src/gpui.rs"
+doctest = false
+
+[dependencies]
+wgpui-core = { path = "../wgpui-core" }
+wgpui-layout = { path = "../wgpui-layout" }
+wgpui-text = { path = "../wgpui-text" }
+wgpui-widgets = { path = "../wgpui-widgets" }
+wgpui-wgpu = { path = "../wgpui-wgpu" }
+anyhow = "1.0.86"
+futures = "0.3"
+log = "0.4.16"
+rand = "0.10"
+glam = "0.33"
+bytemuck = { version = "1.24", features = ["derive"] }
+env_logger = "0.11"
+unicode-segmentation = "1.10"
+wgpu = { version = "30", default-features = false, features = ["dx12", "wgsl"] }
+helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "04a38328c6d1329272072ade89d07098737df6b8" }
+helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "04a38328c6d1329272072ade89d07098737df6b8" }
+
+[[example]]
+name = "karaoke_text"
+path = "../../examples/karaoke_text.rs"
+
+[[example]]
+name = "karaoke_app"
+path = "../../examples/karaoke_app.rs"
+
+[[example]]
+name = "text_gradients"
+path = "../../examples/text_gradients.rs"
+
+[[example]]
+name = "interactive_elements"
+path = "../../examples/learn/interactive_elements.rs"
+
+[[example]]
+name = "creating_components"
+path = "../../examples/learn/creating_components.rs"
+
+[[example]]
+name = "layout"
+path = "../../examples/learn/layout.rs"
+
+[[example]]
+name = "styling"
+path = "../../examples/learn/styling.rs"
+
+[[example]]
+name = "async_tasks"
+path = "../../examples/learn/async_tasks.rs"
+
+[[example]]
+name = "custom_drawing"
+path = "../../examples/learn/custom_drawing.rs"
+
+[[example]]
+name = "animation"
+path = "../../examples/learn/animation.rs"
+
+[[example]]
+name = "text"
+path = "../../examples/learn/text.rs"
+
+[[example]]
+name = "emoji_display"
+path = "../../examples/learn/emoji_display.rs"
+
+[[example]]
+name = "wgpu_surface"
+path = "../../examples/learn/wgpu_surface.rs"
+
+[[example]]
+name = "wgpu_surface_basic"
+path = "../../examples/learn/wgpu_surface_basic.rs"
+
+[[example]]
+name = "wgpu_surface_quad"
+path = "../../examples/learn/wgpu_surface_quad.rs"
+
+[[example]]
+name = "wgpu_surface_stress"
+path = "../../examples/learn/wgpu_surface_stress.rs"
+
+[[example]]
+name = "mouse_events"
+path = "../../examples/learn/mouse_events.rs"
+
+[[example]]
+name = "blur_showcase"
+path = "../../examples/learn/blur_showcase.rs"
+
+[[example]]
+name = "smooth_scrolling"
+path = "../../examples/learn/smooth_scrolling.rs"
+
+[[example]]
+name = "virtual_list"
+path = "../../examples/learn/virtual_list.rs"
+
+[[example]]
+name = "data_table"
+path = "../../examples/bench/data_table.rs"
+
+[[example]]
+name = "plain_scroll_10k"
+path = "../../examples/bench/plain_scroll_10k.rs"
+
+[[example]]
+name = "paths_bench"
+path = "../../examples/bench/paths_bench.rs"
+
+[[example]]
+name = "pattern"
+path = "../../examples/bench/pattern.rs"
+
+[[example]]
+name = "shadow"
+path = "../../examples/bench/shadow.rs"
+
+[[example]]
+name = "focus_visible"
+path = "../../examples/legacy/focus_visible.rs"
+
+[[example]]
+name = "gif_viewer"
+path = "../../examples/legacy/gif_viewer.rs"
+
+[[example]]
+name = "gradient"
+path = "../../examples/legacy/gradient.rs"
+
+[[example]]
+name = "hello_world"
+path = "../../examples/legacy/hello_world.rs"
+
+[[example]]
+name = "image_loading"
+path = "../../examples/legacy/image_loading.rs"
+
+[[example]]
+name = "input"
+path = "../../examples/legacy/input.rs"
+
+[[example]]
+name = "on_window_close_quit"
+path = "../../examples/legacy/on_window_close_quit.rs"
+
+[[example]]
+name = "opacity"
+path = "../../examples/legacy/opacity.rs"
+
+[[example]]
+name = "scrollable"
+path = "../../examples/legacy/scrollable.rs"
+
+[[example]]
+name = "svg"
+path = "../../examples/legacy/svg/svg.rs"
+
+[[example]]
+name = "tab_stop"
+path = "../../examples/legacy/tab_stop.rs"
+
+[[example]]
+name = "tree"
+path = "../../examples/legacy/tree.rs"
+
+[[example]]
+name = "uniform_list"
+path = "../../examples/legacy/uniform_list.rs"
+
+[[example]]
+name = "window"
+path = "../../examples/legacy/window.rs"
+
+[[example]]
+name = "window_positioning"
+path = "../../examples/legacy/window_positioning.rs"
+
+[[example]]
+name = "window_shadow"
+path = "../../examples/legacy/window_shadow.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

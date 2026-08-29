@@ -390,15 +390,15 @@ pub trait Styled: Sized {
 
     /// Fill colour, as straight-alpha RGBA. See this module's doc for why not
     /// `Hsla`.
-    fn bg(mut self, color: [f32; 4]) -> Self {
-        self.style().background = Some(color);
+    fn bg(mut self, color: impl Into<[f32; 4]>) -> Self {
+        self.style().background = Some(color.into());
         self
     }
 
     /// Border colour, as straight-alpha RGBA. A border needs both a colour and
     /// a width to be painted at all.
-    fn border_color(mut self, color: [f32; 4]) -> Self {
-        self.style().border_color = Some(color);
+    fn border_color(mut self, color: impl Into<[f32; 4]>) -> Self {
+        self.style().border_color = Some(color.into());
         self
     }
 

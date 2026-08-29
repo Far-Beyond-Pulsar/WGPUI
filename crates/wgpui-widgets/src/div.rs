@@ -74,6 +74,18 @@ impl IntoDescription for Description {
     }
 }
 
+impl IntoDescription for String {
+    fn into_description(self) -> Description {
+        Description::new::<String>()
+    }
+}
+
+impl IntoDescription for &str {
+    fn into_description(self) -> Description {
+        Description::new::<&'static str>()
+    }
+}
+
 /// A styled, laid-out box with children — `div()`.
 pub struct Div {
     element_id: Option<ElementId>,
@@ -420,16 +432,12 @@ mod tests {
             keys,
             "a stable emission order means stable per-primitive addresses (§5.0)"
         );
-        assert_eq!(
-            quads(&window)[0].background,
-            [1.0, 0.0, 0.0, 1.0]
-        );
+        assert_eq!(quads(&window)[0].background, [1.0, 0.0, 0.0, 1.0]);
         Ok(())
     }
 
     #[test]
-    fn adding_a_background_inserts_a_record_rather_than_updating_one()
-    -> Result<(), FrameError> {
+    fn adding_a_background_inserts_a_record_rather_than_updating_one() -> Result<(), FrameError> {
         let mut window = Window::new();
         let bare = || div().w(200.0).h(120.0).border_color([1.0; 4]).border_1();
         window.draw(bare())?;

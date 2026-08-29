@@ -6742,10 +6742,15 @@ name = "wgpui-compat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
+ "env_logger",
+ "futures",
+ "glam",
  "helio",
  "helio-default-graphs",
  "log",
  "rand 0.10.0",
+ "unicode-segmentation",
  "wgpu",
  "wgpui-core",
  "wgpui-layout",
