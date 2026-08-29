@@ -31,7 +31,9 @@ pub use tile::{
 };
 
 use crate::indirect::{DrawSlot, SlotTable};
-use crate::patch::primitive::{GlyphRun, PolySprite, PrimitiveKind, Quad, Shadow, Underline};
+use crate::patch::primitive::{
+    BackdropFilter, GlyphRun, Path, PolySprite, PrimitiveKind, Quad, Shadow, Underline,
+};
 
 /// The persistent, patched-not-rebuilt scene (R-N Pillar III, §2's picture).
 ///
@@ -62,6 +64,10 @@ pub struct Scene {
     pub glyph_runs: PrimitiveStore<GlyphRun>,
     /// Colour-atlas sprites — images and rasterised SVGs (Phase 6.2).
     pub poly_sprites: PrimitiveStore<PolySprite>,
+    /// Lyon-tessellated vector paths (Phase 6.4).
+    pub paths: PrimitiveStore<Path>,
+    /// Framebuffer-sampling backdrop filters (Phase 6.4).
+    pub backdrop_filters: PrimitiveStore<BackdropFilter>,
     /// §2's "layout inputs".
     pub layout_inputs: RecordStore<LayoutInput>,
     /// §2's "hitboxes".
@@ -112,6 +118,12 @@ impl Scene {
             if let Some(range) = self.poly_sprites.draw_range(layer) {
                 ranges.push((layer, PrimitiveKind::PolySprite, range));
             }
+            if let Some(range) = self.paths.draw_range(layer) {
+                ranges.push((layer, PrimitiveKind::Path, range));
+            }
+            if let Some(range) = self.backdrop_filters.draw_range(layer) {
+                ranges.push((layer, PrimitiveKind::BackdropFilter, range));
+            }
         }
         ranges
     }
@@ -147,7 +159,9 @@ impl Scene {
                     PrimitiveKind::Quad => self.quads.slab(*layer),
                     PrimitiveKind::Underline => self.underlines.slab(*layer),
                     PrimitiveKind::GlyphRun => self.glyph_runs.slab(*layer),
-                    PrimitiveKind::PolySprite => self.poly_sprites.slab(*layer),
+            PrimitiveKind::PolySprite => self.poly_sprites.slab(*layer),
+                    PrimitiveKind::Path => self.paths.slab(*layer),
+                    PrimitiveKind::BackdropFilter => self.backdrop_filters.slab(*layer),
                 };
                 slots.push(DrawSlot {
                     layer: *layer,
@@ -181,6 +195,8 @@ impl Scene {
         self.underlines.remove_layer(layer, &mut self.allocator);
         self.glyph_runs.remove_layer(layer, &mut self.allocator);
         self.poly_sprites.remove_layer(layer, &mut self.allocator);
+        self.paths.remove_layer(layer, &mut self.allocator);
+        self.backdrop_filters.remove_layer(layer, &mut self.allocator);
         self.layout_inputs.remove_layer(layer);
         self.hitboxes.remove_layer(layer);
         self.dispatch_nodes.remove_layer(layer);
@@ -203,6 +219,8 @@ mod tests {
         assert!(scene.underlines.resident_bytes().is_empty());
         assert!(scene.glyph_runs.resident_bytes().is_empty());
         assert!(scene.poly_sprites.resident_bytes().is_empty());
+        assert!(scene.paths.resident_bytes().is_empty());
+        assert!(scene.backdrop_filters.resident_bytes().is_empty());
     }
 
     #[test]

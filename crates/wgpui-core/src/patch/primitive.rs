@@ -78,6 +78,11 @@ pub enum PrimitiveKind {
     /// Fixed-size, one slot per sprite, referencing a colour atlas tile.
     /// See [`PolySprite`].
     PolySprite,
+    /// Variable-size, pre-tessellated vector geometry. See [`Path`].
+    Path,
+    /// A rounded rectangle that samples the framebuffer behind it. See
+    /// [`BackdropFilter`].
+    BackdropFilter,
 }
 
 impl PrimitiveKind {
@@ -105,10 +110,12 @@ impl PrimitiveKind {
         PrimitiveKind::Underline,
         PrimitiveKind::GlyphRun,
         PrimitiveKind::PolySprite,
+        PrimitiveKind::Path,
+        PrimitiveKind::BackdropFilter,
     ];
 
     /// Number of kinds; the width of every per-kind array in this crate.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 7;
 
     /// Dense index into a per-kind array.
     pub const fn index(self) -> usize {
@@ -123,6 +130,8 @@ impl PrimitiveKind {
             PrimitiveKind::Underline => Underline::SLOT_STRIDE,
             PrimitiveKind::GlyphRun => GlyphRun::SLOT_STRIDE,
             PrimitiveKind::PolySprite => PolySprite::SLOT_STRIDE,
+            PrimitiveKind::Path => Path::SLOT_STRIDE,
+            PrimitiveKind::BackdropFilter => BackdropFilter::SLOT_STRIDE,
         }
     }
 }
@@ -855,6 +864,185 @@ impl Primitive for Underline {
         writer.write_padding(8)?;
         writer.finish()
     }
+}
+
+/// One vertex in a Lyon-tessellated path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PathVertex {
+    /// Position in the owning layer's pixel space.
+    pub position: [f32; 2],
+    /// Quadratic-curve coordinates. Lyon-produced fill and stroke triangles
+    /// use `[0, 1]`; the fields remain available for legacy curve triangles.
+    pub st: [f32; 2],
+}
+
+/// A pre-tessellated vector path.
+///
+/// The CPU geometry producer is intentionally Lyon-compatible: callers can
+/// pass the `VertexBuffers` produced by the legacy `PathBuilder` tessellators
+/// to [`Path::from_lyon_tessellation`]. The GPU stores the resulting flat
+/// vertex stream, so no path interpretation or tessellation occurs in a
+/// render pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Path {
+    /// Flat triangle-list vertices in draw order.
+    pub vertices: Vec<PathVertex>,
+    /// Straight-alpha RGBA colour.
+    pub color: [f32; 4],
+    /// Top-left of the per-path content mask.
+    pub clip_origin: [f32; 2],
+    /// Size of the per-path content mask.
+    pub clip_size: [f32; 2],
+    /// Axis-aligned bounds of the tessellated vertices.
+    pub bounds_origin: [f32; 2],
+    /// Size of the axis-aligned bounds.
+    pub bounds_size: [f32; 2],
+}
+
+impl Path {
+    /// Bytes one tessellated vertex occupies in the GPU arena.
+    pub const SLOT_STRIDE: usize = 48;
+
+    /// Build a path from a flat vertex stream.
+    pub fn new(vertices: Vec<PathVertex>, color: [f32; 4]) -> Self {
+        let (bounds_origin, bounds_size) = bounds_of(&vertices);
+        Self {
+            vertices,
+            color,
+            clip_origin: bounds_origin,
+            clip_size: bounds_size,
+            bounds_origin,
+            bounds_size,
+        }
+    }
+
+    /// Convert the exact triangle output of Lyon's fill/stroke tessellators.
+    ///
+    /// Malformed index buffers are tolerated by dropping incomplete triangles;
+    /// Lyon itself never produces them, but this keeps a bad producer from
+    /// turning a render request into an indexing panic.
+    pub fn from_lyon_tessellation(
+        buffers: lyon::tessellation::VertexBuffers<lyon::math::Point, u16>,
+        color: [f32; 4],
+    ) -> Self {
+        let mut vertices = Vec::with_capacity(buffers.indices.len());
+        for triangle in buffers.indices.chunks_exact(3) {
+            let Some(first) = buffers.vertices.get(usize::from(triangle[0])) else {
+                continue;
+            };
+            let Some(second) = buffers.vertices.get(usize::from(triangle[1])) else {
+                continue;
+            };
+            let Some(third) = buffers.vertices.get(usize::from(triangle[2])) else {
+                continue;
+            };
+            for point in [first, second, third] {
+                vertices.push(PathVertex {
+                    position: [point.x, point.y],
+                    st: [0.0, 1.0],
+                });
+            }
+        }
+        Self::new(vertices, color)
+    }
+
+    /// Replace the default bounds mask with the caller's content mask.
+    pub fn with_clip(mut self, origin: [f32; 2], size: [f32; 2]) -> Self {
+        self.clip_origin = origin;
+        self.clip_size = size;
+        self
+    }
+}
+
+impl Primitive for Path {
+    const KIND: PrimitiveKind = PrimitiveKind::Path;
+    const SLOT_STRIDE: usize = Self::SLOT_STRIDE;
+
+    fn slot_count(&self) -> u32 {
+        u32::try_from(self.vertices.len()).unwrap_or(u32::MAX)
+    }
+
+    fn encode(&self, destination: &mut [u8]) -> Result<(), EncodeError> {
+        let mut writer = SlotWriter::new(destination);
+        for vertex in &self.vertices {
+            writer.write_f32_array(vertex.position)?;
+            writer.write_f32_array(vertex.st)?;
+            writer.write_f32_array(self.color)?;
+            writer.write_f32_array(self.clip_origin)?;
+            writer.write_f32_array(self.clip_size)?;
+        }
+        writer.finish()
+    }
+}
+
+/// A rounded rectangle that blurs the already-rendered framebuffer behind it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackdropFilter {
+    /// Top-left of the filter rectangle in the owning layer's pixel space.
+    pub origin: [f32; 2],
+    /// Width and height of the filter rectangle.
+    pub size: [f32; 2],
+    /// Top-left of the content mask.
+    pub clip_origin: [f32; 2],
+    /// Size of the content mask.
+    pub clip_size: [f32; 2],
+    /// Rounded-corner radii in top-left, top-right, bottom-right, bottom-left
+    /// order.
+    pub corner_radii: [f32; 4],
+    /// Gaussian radius in pixels. The legacy shader caps sampling at 32px.
+    pub blur_radius: f32,
+    /// Straight-alpha multiplier applied to the sampled result.
+    pub opacity: f32,
+}
+
+impl BackdropFilter {
+    /// A transparent, empty filter.
+    pub const ZERO: Self = Self {
+        origin: [0.0; 2],
+        size: [0.0; 2],
+        clip_origin: [0.0; 2],
+        clip_size: [0.0; 2],
+        corner_radii: [0.0; 4],
+        blur_radius: 0.0,
+        opacity: 0.0,
+    };
+}
+
+impl Primitive for BackdropFilter {
+    const KIND: PrimitiveKind = PrimitiveKind::BackdropFilter;
+    const SLOT_STRIDE: usize = 64;
+
+    fn slot_count(&self) -> u32 {
+        1
+    }
+
+    fn encode(&self, destination: &mut [u8]) -> Result<(), EncodeError> {
+        let mut writer = SlotWriter::new(destination);
+        writer.write_f32_array(self.origin)?;
+        writer.write_f32_array(self.size)?;
+        writer.write_f32_array(self.clip_origin)?;
+        writer.write_f32_array(self.clip_size)?;
+        writer.write_f32_array(self.corner_radii)?;
+        writer.write_f32(self.blur_radius)?;
+        writer.write_f32(self.opacity)?;
+        writer.write_padding(8)?;
+        writer.finish()
+    }
+}
+
+fn bounds_of(vertices: &[PathVertex]) -> ([f32; 2], [f32; 2]) {
+    let Some(first) = vertices.first() else {
+        return ([0.0; 2], [0.0; 2]);
+    };
+    let mut minimum = first.position;
+    let mut maximum = first.position;
+    for vertex in vertices.iter().skip(1) {
+        minimum[0] = minimum[0].min(vertex.position[0]);
+        minimum[1] = minimum[1].min(vertex.position[1]);
+        maximum[0] = maximum[0].max(vertex.position[0]);
+        maximum[1] = maximum[1].max(vertex.position[1]);
+    }
+    (minimum, [maximum[0] - minimum[0], maximum[1] - minimum[1]])
 }
 
 #[cfg(test)]

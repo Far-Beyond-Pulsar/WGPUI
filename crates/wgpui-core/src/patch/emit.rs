@@ -64,7 +64,9 @@ use crate::boundary::compositor::{BoundaryComposite, Composite, Compositor};
 use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::request::FrameSignals;
 use crate::patch::apply::ScenePatch;
-use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad, Shadow, Underline};
+use crate::patch::primitive::{
+    BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, Underline,
+};
 use crate::patch::{PatchList, RecordKey};
 use crate::reconcile::instance::InstanceKey;
 use crate::reconcile::plan::FramePlan;
@@ -101,6 +103,8 @@ pub struct Emission {
     underlines: Vec<Underline>,
     glyph_runs: Vec<GlyphRun>,
     poly_sprites: Vec<PolySprite>,
+    paths: Vec<Path>,
+    backdrop_filters: Vec<BackdropFilter>,
 }
 
 impl Emission {
@@ -164,6 +168,28 @@ impl Emission {
         &self.poly_sprites
     }
 
+    /// Contribute a Lyon-tessellated vector path.
+    pub fn path(&mut self, path: Path) -> &mut Self {
+        self.paths.push(path);
+        self
+    }
+
+    /// The paths contributed, in emission order.
+    pub fn paths(&self) -> &[Path] {
+        &self.paths
+    }
+
+    /// Contribute a framebuffer-sampling backdrop filter.
+    pub fn backdrop_filter(&mut self, filter: BackdropFilter) -> &mut Self {
+        self.backdrop_filters.push(filter);
+        self
+    }
+
+    /// The backdrop filters contributed, in emission order.
+    pub fn backdrop_filters(&self) -> &[BackdropFilter] {
+        &self.backdrop_filters
+    }
+
     /// Total primitives contributed.
     pub fn len(&self) -> usize {
         self.shadows.len()
@@ -171,6 +197,8 @@ impl Emission {
             + self.underlines.len()
             + self.glyph_runs.len()
             + self.poly_sprites.len()
+            + self.paths.len()
+            + self.backdrop_filters.len()
     }
 
     /// Whether the element contributed nothing.
@@ -180,6 +208,8 @@ impl Emission {
             && self.underlines.is_empty()
             && self.glyph_runs.is_empty()
             && self.poly_sprites.is_empty()
+            && self.paths.is_empty()
+            && self.backdrop_filters.is_empty()
     }
 
     /// Drop everything, keeping the allocations for the next element.
@@ -189,6 +219,8 @@ impl Emission {
         self.underlines.clear();
         self.glyph_runs.clear();
         self.poly_sprites.clear();
+        self.paths.clear();
+        self.backdrop_filters.clear();
     }
 }
 
@@ -319,6 +351,8 @@ struct EmittedNode {
     underlines: u32,
     glyph_runs: u32,
     poly_sprites: u32,
+    paths: u32,
+    backdrop_filters: u32,
     last_visited_frame: u64,
 }
 
@@ -330,6 +364,8 @@ impl EmittedNode {
             + self.underlines as usize
             + self.glyph_runs as usize
             + self.poly_sprites as usize
+            + self.paths as usize
+            + self.backdrop_filters as usize
     }
 }
 
@@ -388,6 +424,8 @@ struct PendingOperations {
     underlines: KindOperations<Underline>,
     glyph_runs: KindOperations<GlyphRun>,
     poly_sprites: KindOperations<PolySprite>,
+    paths: KindOperations<Path>,
+    backdrop_filters: KindOperations<BackdropFilter>,
 }
 
 impl<P: Primitive> KindOperations<P> {
@@ -640,6 +678,20 @@ impl Emitter {
                             emission.poly_sprites(),
                             &mut pending.poly_sprites,
                         );
+                        Self::reconcile_records(
+                            node.address,
+                            layer,
+                            previous.map(|record| (record.layer, record.paths)),
+                            emission.paths(),
+                            &mut pending.paths,
+                        );
+                        Self::reconcile_records(
+                            node.address,
+                            layer,
+                            previous.map(|record| (record.layer, record.backdrop_filters)),
+                            emission.backdrop_filters(),
+                            &mut pending.backdrop_filters,
+                        );
                         let emitted = EmittedNode {
                             layer,
                             bounds,
@@ -650,6 +702,9 @@ impl Emitter {
                             glyph_runs: u32::try_from(emission.glyph_runs().len())
                                 .unwrap_or(u32::MAX),
                             poly_sprites: u32::try_from(emission.poly_sprites().len())
+                                .unwrap_or(u32::MAX),
+                            paths: u32::try_from(emission.paths().len()).unwrap_or(u32::MAX),
+                            backdrop_filters: u32::try_from(emission.backdrop_filters().len())
                                 .unwrap_or(u32::MAX),
                             last_visited_frame: frame,
                         };
@@ -692,6 +747,10 @@ impl Emitter {
             poly_sprites: pending
                 .poly_sprites
                 .into_patch_list(&scene.poly_sprites, &mut stats),
+            paths: pending.paths.into_patch_list(&scene.paths, &mut stats),
+            backdrop_filters: pending
+                .backdrop_filters
+                .into_patch_list(&scene.backdrop_filters, &mut stats),
             ..ScenePatch::new()
         };
 
@@ -853,6 +912,18 @@ impl Emitter {
         for ordinal in 0..record.poly_sprites {
             pending
                 .poly_sprites
+                .removes
+                .push((record.layer, RecordKey::new(address, ordinal)));
+        }
+        for ordinal in 0..record.paths {
+            pending
+                .paths
+                .removes
+                .push((record.layer, RecordKey::new(address, ordinal)));
+        }
+        for ordinal in 0..record.backdrop_filters {
+            pending
+                .backdrop_filters
                 .removes
                 .push((record.layer, RecordKey::new(address, ordinal)));
         }

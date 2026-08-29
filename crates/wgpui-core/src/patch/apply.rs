@@ -31,7 +31,9 @@
 //! layer, read back out of the arena at that layer's own address.
 
 use crate::invalidation::axes::Invalidation;
-use crate::patch::primitive::{GlyphRun, PolySprite, Primitive, Quad, Shadow, Underline};
+use crate::patch::primitive::{
+    BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, Underline,
+};
 use crate::patch::{PatchError, PatchList};
 use crate::scene::layer::LayerId;
 use crate::scene::record::{DispatchNode, Hitbox, LayoutInput};
@@ -57,6 +59,10 @@ pub struct ScenePatch {
     pub glyph_runs: PatchList<GlyphRun>,
     /// Colour-atlas sprites — images and rasterised SVGs.
     pub poly_sprites: PatchList<PolySprite>,
+    /// Lyon-tessellated vector paths.
+    pub paths: PatchList<Path>,
+    /// Framebuffer-sampling backdrop filters.
+    pub backdrop_filters: PatchList<BackdropFilter>,
     /// Retained-layout-node placement.
     pub layout_inputs: PatchList<LayoutInput>,
     /// Registered hit regions.
@@ -79,6 +85,8 @@ impl ScenePatch {
             && self.underlines.is_empty()
             && self.glyph_runs.is_empty()
             && self.poly_sprites.is_empty()
+            && self.paths.is_empty()
+            && self.backdrop_filters.is_empty()
             && self.layout_inputs.is_empty()
             && self.hitboxes.is_empty()
             && self.dispatch_nodes.is_empty()
@@ -90,7 +98,9 @@ impl ScenePatch {
             + self.quads.len()
             + self.underlines.len()
             + self.glyph_runs.len()
-            + self.poly_sprites.len()
+        + self.poly_sprites.len()
+            + self.paths.len()
+            + self.backdrop_filters.len()
             + self.layout_inputs.len()
             + self.hitboxes.len()
             + self.dispatch_nodes.len()
@@ -103,6 +113,8 @@ impl ScenePatch {
         self.underlines.clear();
         self.glyph_runs.clear();
         self.poly_sprites.clear();
+        self.paths.clear();
+        self.backdrop_filters.clear();
         self.layout_inputs.clear();
         self.hitboxes.clear();
         self.dispatch_nodes.clear();
@@ -129,6 +141,12 @@ impl ScenePatch {
             note(patch.layer);
         }
         for patch in self.poly_sprites.patches() {
+            note(patch.layer);
+        }
+        for patch in self.paths.patches() {
+            note(patch.layer);
+        }
+        for patch in self.backdrop_filters.patches() {
             note(patch.layer);
         }
         for patch in self.layout_inputs.patches() {
@@ -215,6 +233,14 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     scene
         .poly_sprites
         .apply(&patch.poly_sprites, &mut scene.allocator, &mut entries)?;
+    scene
+        .paths
+        .apply(&patch.paths, &mut scene.allocator, &mut entries)?;
+    scene.backdrop_filters.apply(
+        &patch.backdrop_filters,
+        &mut scene.allocator,
+        &mut entries,
+    )?;
     scene.layout_inputs.apply(&patch.layout_inputs)?;
     scene.hitboxes.apply(&patch.hitboxes)?;
     scene.dispatch_nodes.apply(&patch.dispatch_nodes)?;
@@ -229,6 +255,8 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
             || names(&patch.underlines, layer)
             || names(&patch.glyph_runs, layer)
             || names(&patch.poly_sprites, layer)
+            || names(&patch.paths, layer)
+            || names(&patch.backdrop_filters, layer)
         {
             axes |= Invalidation::DISPLAY;
             scene
@@ -246,6 +274,14 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
             scene
                 .layers
                 .set_slab(layer, PolySprite::KIND, scene.poly_sprites.slab(layer));
+            scene
+                .layers
+                .set_slab(layer, Path::KIND, scene.paths.slab(layer));
+            scene.layers.set_slab(
+                layer,
+                BackdropFilter::KIND,
+                scene.backdrop_filters.slab(layer),
+            );
         }
         if names(&patch.layout_inputs, layer) {
             axes |= Invalidation::LAYOUT;
@@ -331,6 +367,16 @@ pub fn compare_to_rebuild(patched: &Scene, rebuilt: &Scene) -> Option<ResidencyM
         if let Some(mismatch) =
             compare_store(&patched.poly_sprites, &rebuilt.poly_sprites, layer)
         {
+            return Some(mismatch);
+        }
+        if let Some(mismatch) = compare_store(&patched.paths, &rebuilt.paths, layer) {
+            return Some(mismatch);
+        }
+        if let Some(mismatch) = compare_store(
+            &patched.backdrop_filters,
+            &rebuilt.backdrop_filters,
+            layer,
+        ) {
             return Some(mismatch);
         }
     }
