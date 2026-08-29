@@ -1,6 +1,6 @@
 use gpui::{
     Application, Context, ElementId, InstanceKey, IntoElement, Pixels, Render, Window,
-    WindowOptions, div, rgb, size,
+    WindowOptions, Styled, div, rgb, size,
 };
 
 gpui::actions!(compatibility, [ProbeAction]);
@@ -60,4 +60,23 @@ fn color_adapters_preserve_alpha_and_hue_conversion() {
 fn action_macro_and_keybinding_retain_legacy_identity() {
     let binding = gpui::KeyBinding::new("cmd-p", ProbeAction, None);
     assert_eq!(binding.action, "compatibility::ProbeAction");
+}
+
+#[test]
+fn legacy_geometry_adapters_reach_resolved_style_values() {
+    let element = gpui::div()
+        .size_16()
+        .rounded(gpui::px(8.0))
+        .border(gpui::px(2.0))
+        .shadow(vec![gpui::BoxShadow {
+            color: gpui::hsla(0.0, 0.5, 0.5, 0.25),
+            offset: gpui::point(gpui::px(1.0), gpui::px(2.0)),
+            blur_radius: gpui::px(4.0),
+            spread_radius: gpui::px(0.0),
+        }]);
+    let style = element.div_style();
+    assert_eq!(style.corner_radii.top_left, 8.0);
+    assert_eq!(style.border_widths.top, 2.0);
+    assert_eq!(style.box_shadow[0].offset, [1.0, 2.0]);
+    assert_eq!(style.box_shadow[0].blur_radius, 4.0);
 }

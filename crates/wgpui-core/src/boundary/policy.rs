@@ -23,7 +23,7 @@
 
 use crate::scene::tile::TileGrid;
 use std::fmt;
-use std::ops::{Add, AddAssign, Neg, Sub};
+use std::ops::{Add, AddAssign, Mul, Neg, Sub};
 
 /// A length in logical pixels.
 #[derive(Copy, Clone, Debug, Default, PartialEq, PartialOrd)]
@@ -72,6 +72,20 @@ impl Neg for Pixels {
     type Output = Self;
 
     fn neg(self) -> Self { Self(-self.0) }
+}
+
+impl From<Pixels> for f32 {
+    fn from(value: Pixels) -> Self {
+        value.0
+    }
+}
+
+impl Mul<Pixels> for f32 {
+    type Output = Pixels;
+
+    fn mul(self, other: Pixels) -> Self::Output {
+        Pixels(self * other.0)
+    }
 }
 
 impl fmt::Display for Pixels {

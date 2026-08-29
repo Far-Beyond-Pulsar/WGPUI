@@ -481,6 +481,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Set the element background alpha without changing its layout.
+    fn opacity(mut self, opacity: f32) -> Self {
+        let color = self.style().background.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        self.style().background = Some([color[0], color[1], color[2], color[3] * opacity]);
+        self
+    }
+
     /// Border colour, as straight-alpha RGBA. A border needs both a colour and
     /// a width to be painted at all.
     fn border_color(mut self, color: impl Into<[f32; 4]>) -> Self {
@@ -489,7 +496,8 @@ pub trait Styled: Sized {
     }
 
     /// A uniform border width, in pixels.
-    fn border(mut self, pixels: f32) -> Self {
+    fn border(mut self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         self.style().border_widths = Edges::all(pixels);
         // Taffy lays out against the border box, so a border that is not also
         // declared to the layout style would leave children overlapping it.
@@ -516,28 +524,32 @@ pub trait Styled: Sized {
     }
 
     /// Border width on the top side only.
-    fn border_t(mut self, pixels: f32) -> Self {
+    fn border_t(mut self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         self.style().border_widths.top = pixels;
         self.layout_style().border.top = LengthPercentage::length(pixels);
         self
     }
 
     /// Border width on the right side only.
-    fn border_r(mut self, pixels: f32) -> Self {
+    fn border_r(mut self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         self.style().border_widths.right = pixels;
         self.layout_style().border.right = LengthPercentage::length(pixels);
         self
     }
 
     /// Border width on the bottom side only.
-    fn border_b(mut self, pixels: f32) -> Self {
+    fn border_b(mut self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         self.style().border_widths.bottom = pixels;
         self.layout_style().border.bottom = LengthPercentage::length(pixels);
         self
     }
 
     /// Border width on the left side only.
-    fn border_l(mut self, pixels: f32) -> Self {
+    fn border_l(mut self, pixels: impl IntoStylePixels) -> Self {
+        let pixels = pixels.into_style_pixels();
         self.style().border_widths.left = pixels;
         self.layout_style().border.left = LengthPercentage::length(pixels);
         self
@@ -551,8 +563,8 @@ pub trait Styled: Sized {
     fn border_l_3(self) -> Self { self.border_l(3.0) }
 
     /// A uniform corner radius, in pixels.
-    fn rounded(mut self, pixels: f32) -> Self {
-        self.style().corner_radii = Corners::all(pixels);
+    fn rounded(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.style().corner_radii = Corners::all(pixels.into_style_pixels());
         self
     }
 
@@ -643,8 +655,8 @@ pub trait Styled: Sized {
     }
 
     /// Set the `box-shadow` layers outright.
-    fn shadow(mut self, shadows: Vec<BoxShadow>) -> Self {
-        self.style().box_shadow = shadows;
+    fn shadow<S: Into<BoxShadow>>(mut self, shadows: Vec<S>) -> Self {
+        self.style().box_shadow = shadows.into_iter().map(Into::into).collect();
         self
     }
 
@@ -756,6 +768,7 @@ pub trait Styled: Sized {
     fn gap_4(self) -> Self { self.gap(16.0) }
     fn gap_6(self) -> Self { self.gap(24.0) }
     fn w_16(self) -> Self { self.w(64.0) }
+    fn size_16(self) -> Self { self.size(64.0) }
     fn size_8(self) -> Self { self.size(32.0) }
     fn size_10(self) -> Self { self.size(40.0) }
     fn h_6(self) -> Self { self.h(24.0) }

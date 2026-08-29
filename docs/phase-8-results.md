@@ -6,11 +6,13 @@ native surface adapters listed below.
 
 ## Continuation 2 live probe
 
-The actual dirty worktree was probed before this continuation's edits. Its
-per-example result was **2/41**, not the earlier report's 21/41: `emoji_display`
-and `tree` compiled; the other 39 did not. The discrepancy is recorded rather
-than treated as a pass-count regression, because the current branch contains
-additional uncommitted compatibility work beyond the report's snapshot.
+The continuation-2 report's 21/41 list was stale. Rechecking the committed
+foundation parent (`0fdee0f617`) one example at a time produced **0/41**. The
+reported 21/41 was from an uncommitted intermediate worktree and was not a
+reproducible branch base. Rechecking `3bb9460545` one example at a time
+produced **3/41** (`text_gradients`, `emoji_display`, `tree`), not 2/41. The
+aggregate `cargo check --examples` command is retained as a build check, but
+its single failure status is not used as a per-example count.
 
 This continuation adds real Taffy grid templates and grid placement, overflow
 axes, retained text-style metadata, common legacy spacing/size and border-side
@@ -49,17 +51,24 @@ The repository declares 41 examples. On the final probe, 21 compiled and 20
 failed. “Pass” means Rust type-checking completed; no example was run, so this
 is not runtime compatibility.
 
-Pass: `karaoke_text`, `text_gradients`, `creating_components`, `layout`,
-`async_tasks`, `animation`, `emoji_display`, `wgpu_surface`,
-`wgpu_surface_quad`, `wgpu_surface_stress`, `virtual_list`, `pattern`,
-`focus_visible`, `gif_viewer`, `gradient`, `input`, `opacity`, `scrollable`,
-`tab_stop`, `uniform_list`, `window_shadow`.
+Pass: `text_gradients`, `emoji_display`, `tree`, `shadow`.
 
-Fail: `karaoke_app`, `interactive_elements`, `styling`, `custom_drawing`,
-`text`, `wgpu_surface_basic`, `mouse_events`, `blur_showcase`,
-`smooth_scrolling`, `data_table`, `plain_scroll_10k`, `paths_bench`, `shadow`,
-`hello_world`, `image_loading`, `on_window_close_quit`, `svg`, `tree`,
-`window`, `window_positioning`.
+Fail: `karaoke_text`, `karaoke_app`, `interactive_elements`, `creating_components`,
+`layout`, `styling`, `async_tasks`, `custom_drawing`, `animation`, `text`,
+`wgpu_surface`, `wgpu_surface_basic`, `wgpu_surface_quad`, `wgpu_surface_stress`,
+`mouse_events`, `blur_showcase`, `smooth_scrolling`, `virtual_list`, `data_table`,
+`plain_scroll_10k`, `paths_bench`, `pattern`, `focus_visible`, `gif_viewer`,
+`gradient`, `hello_world`, `image_loading`, `input`, `on_window_close_quit`,
+`opacity`, `scrollable`, `svg`, `tab_stop`, `uniform_list`, `window`,
+`window_positioning`, `window_shadow`.
+
+## Continuation 3 geometry checkpoint
+
+The branch starts at `3bb9460545` with a clean worktree. This checkpoint adds
+real `Pixels` arithmetic/conversion, logical-pixel border and radius builders,
+resolved background opacity, and conversion from the legacy `BoxShadow` shape
+to the 2.0 RGBA shadow primitive. Focused façade tests pass; the individual
+probe recovers `shadow`, reaching **4/41**.
 
 ## Failure classification
 

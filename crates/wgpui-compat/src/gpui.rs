@@ -19,7 +19,7 @@ pub use wgpui_core::reconcile::instance::{ElementInstance, InstanceKey, Instance
 pub use wgpui_layout::taffy_tree::LayoutNodeId;
 pub use wgpui_text::shaping::{Font, FontId, FontStyle, FontWeight, SharedString};
 pub use wgpui_widgets::div::{Div, IntoDescription, div};
-pub use wgpui_widgets::div::interactivity::style::BoxShadow;
+pub use wgpui_widgets::div::interactivity::style::BoxShadow as ResolvedBoxShadow;
 pub use wgpui_widgets::styled::Styled;
 pub use wgpui_widgets::styled::LinearColorStop;
 
@@ -33,6 +33,12 @@ pub struct Size<T> {
 pub struct Point<T> {
     pub x: T,
     pub y: T,
+}
+
+impl From<Point<Pixels>> for [f32; 2] {
+    fn from(value: Point<Pixels>) -> Self {
+        [value.x.value(), value.y.value()]
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -186,6 +192,25 @@ pub const fn yellow() -> Hsla {
 }
 pub fn transparent_black() -> Rgba { Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }
 pub fn relative(value: f32) -> f32 { value * 16.0 }
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct BoxShadow {
+    pub color: Hsla,
+    pub offset: Point<Pixels>,
+    pub blur_radius: Pixels,
+    pub spread_radius: Pixels,
+}
+
+impl From<BoxShadow> for ResolvedBoxShadow {
+    fn from(value: BoxShadow) -> Self {
+        Self {
+            color: value.color.into(),
+            offset: value.offset.into(),
+            blur_radius: value.blur_radius.value(),
+            spread_radius: value.spread_radius.value(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Colors {
