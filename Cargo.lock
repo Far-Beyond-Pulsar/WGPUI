@@ -6750,6 +6750,7 @@ dependencies = [
  "helio-default-graphs",
  "log",
  "rand 0.10.0",
+ "smol",
  "unicode-segmentation",
  "wgpu",
  "wgpui-core",

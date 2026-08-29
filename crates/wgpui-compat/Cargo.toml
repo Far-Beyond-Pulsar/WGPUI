@@ -18,6 +18,7 @@ wgpui-widgets = { path = "../wgpui-widgets" }
 wgpui-wgpu = { path = "../wgpui-wgpu" }
 anyhow = "1.0.86"
 futures = "0.3"
+smol = "2.0"
 log = "0.4.16"
 rand = "0.10"
 glam = "0.33"

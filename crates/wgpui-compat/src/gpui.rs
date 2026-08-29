@@ -11,6 +11,8 @@ use std::rc::Rc;
 use std::any::TypeId;
 use std::ops::{Deref, DerefMut};
 
+pub use smol::Timer;
+
 pub use wgpui_core::boundary::policy::Pixels;
 pub use wgpui_core::geometry::Rect;
 pub use wgpui_core::patch::primitive::{PrimitiveKind, Quad, Shadow, Underline};
@@ -328,6 +330,10 @@ impl<T> Clone for Entity<T> {
     }
 }
 impl<T> Entity<T> {
+    fn new_uninitialized() -> Self {
+        Self(Rc::new(RefCell::new(None)))
+    }
+
     fn initialize(&self, value: T) {
         *self.0.borrow_mut() = Some(value);
     }
@@ -336,8 +342,9 @@ impl<T> Entity<T> {
             value.as_ref().expect("entity is initialized")
         })
     }
-    pub fn update<R>(&self, update: impl FnOnce(&mut T) -> R) -> R {
-        update(self.0.borrow_mut().as_mut().expect("entity is initialized"))
+    pub fn update<R>(&self, cx: &mut Context<T>, update: impl FnOnce(&mut T, &mut Context<T>) -> R) -> R {
+        let mut value = self.0.borrow_mut();
+        update(value.as_mut().expect("entity is initialized"), cx)
     }
     pub fn downgrade(&self) -> WeakEntity<T> {
         WeakEntity(Rc::downgrade(&self.0))
@@ -352,10 +359,11 @@ impl<T> Clone for WeakEntity<T> {
     }
 }
 impl<T> WeakEntity<T> {
-    pub fn update(&self, update: impl FnOnce(&mut T)) -> Result<(), EntityError> {
+    pub fn update<R>(&self, cx: &mut Context<T>, update: impl FnOnce(&mut T, &mut Context<T>) -> R) -> Result<R, EntityError> {
         let entity = self.0.upgrade().ok_or(EntityError)?;
-        update(entity.borrow_mut().as_mut().ok_or(EntityError)?);
-        Ok(())
+        let mut value = entity.borrow_mut();
+        let value = value.as_mut().ok_or(EntityError)?;
+        Ok(update(value, cx))
     }
 }
 
@@ -401,11 +409,22 @@ impl<T> Context<T> {
         entity.initialize(build(&mut context));
         entity
     }
-    pub fn spawn<F, R>(&self, future: F) -> Task<R>
+    pub fn spawn<F, Fut, R>(&self, callback: F) -> Task<R>
     where
-        F: Future<Output = R>,
+        F: FnOnce(WeakEntity<T>, Context<T>) -> Fut,
+        Fut: Future<Output = R>,
     {
-        Task::ready(futures::executor::block_on(future))
+        let entity = self
+            .entity
+            .as_ref()
+            .map(Entity::downgrade)
+            .unwrap_or_else(|| Entity::new_uninitialized().downgrade());
+        let context = Context {
+            entity: None,
+            notifications: Rc::clone(&self.notifications),
+            quit_requested: Rc::clone(&self.quit_requested),
+        };
+        Task::ready(futures::executor::block_on(callback(entity, context)))
     }
 }
 
@@ -455,8 +474,8 @@ impl App {
         );
         let mut context = Context::from_entity(root_entity.clone(), Rc::clone(&self.notifications));
         let description =
-            root_entity.update(|root| {
-                IntoDescription::into_description(root.render(&mut window, &mut context))
+            root_entity.update(&mut context, |root, cx| {
+                IntoDescription::into_description(root.render(&mut window, cx))
             });
         self.descriptions.push(description);
         Ok(WindowHandle)
