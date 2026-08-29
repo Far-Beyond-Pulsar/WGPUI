@@ -514,6 +514,12 @@ pub trait Styled: Sized {
         self.border(1.0)
     }
 
+    /// Render the border as repeating dash-gap segments.
+    fn border_dashed(mut self) -> Self {
+        self.style().border_dashed = true;
+        self
+    }
+
     /// A 2px border on every side.
     fn border_2(self) -> Self {
         self.border(2.0)

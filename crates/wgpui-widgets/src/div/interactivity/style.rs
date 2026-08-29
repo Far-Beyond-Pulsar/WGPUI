@@ -184,6 +184,8 @@ pub struct DivStyle {
     pub border_color: Option<[f32; 4]>,
     /// Per-side border widths.
     pub border_widths: Edges,
+    /// Whether the border uses the repeating dash-gap pattern.
+    pub border_dashed: bool,
     /// Per-corner radii, before [`Corners::clamped_for`].
     pub corner_radii: Corners,
     /// `box-shadow` layers, painted in order, all *behind* the element.
@@ -292,7 +294,7 @@ impl DivStyle {
             });
         }
 
-        if self.is_border_visible() {
+        if self.is_border_visible() && !self.border_dashed {
             let border_color = self.border_color.unwrap_or([0.0; 4]);
             let mut background = border_color;
             background[3] = 0.0;
@@ -304,6 +306,8 @@ impl DivStyle {
                 corner_radii: corner_radii.to_array(),
                 border_widths: self.border_widths.to_array(),
             });
+        } else if self.is_border_visible() {
+            emit_dashed_border(bounds, self.border_color.unwrap_or([0.0; 4]), self.border_widths, emission);
         }
     }
 
@@ -355,6 +359,41 @@ impl DivStyle {
     }
 }
 
+fn emit_dashed_border(
+    bounds: LayoutRect,
+    color: [f32; 4],
+    widths: Edges,
+    emission: &mut Emission,
+) {
+    let width = bounds.width;
+    let height = bounds.height;
+    let dash_gap = |side: f32| (side * 3.0).max(1.0);
+    let mut emit = |origin: [f32; 2], size: [f32; 2]| {
+        emission.quad(Quad {
+            origin,
+            size,
+            background: color,
+            border_color: [0.0; 4],
+            corner_radii: [0.0; 4],
+            border_widths: [0.0; 4],
+        });
+    };
+    let mut cursor = 0.0;
+    while cursor < width {
+        let length = (width - cursor).min(dash_gap(widths.top) * 2.0);
+        emit([bounds.x + cursor, bounds.y], [length, widths.top]);
+        emit([bounds.x + cursor, bounds.y + height - widths.bottom], [length, widths.bottom]);
+        cursor += dash_gap(widths.top);
+    }
+    cursor = 0.0;
+    while cursor < height {
+        let length = (height - cursor).min(dash_gap(widths.left) * 2.0);
+        emit([bounds.x, bounds.y + cursor], [widths.left, length]);
+        emit([bounds.x + width - widths.right, bounds.y + cursor], [widths.right, length]);
+        cursor += dash_gap(widths.left);
+    }
+}
+
 /// Which invalidation axes a style change raises.
 ///
 /// **§6.2's engine, and the reason `Div`'s key is split where `StyledText`'s is
@@ -377,6 +416,7 @@ pub fn classify_style_change(current: &DivStyle, previous: &DivStyle) -> Invalid
     if current.background != previous.background
         || current.border_color != previous.border_color
         || current.border_widths != previous.border_widths
+        || current.border_dashed != previous.border_dashed
         || current.corner_radii != previous.corner_radii
         || current.box_shadow != previous.box_shadow
     {
