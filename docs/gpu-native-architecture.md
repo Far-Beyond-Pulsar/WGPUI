@@ -1252,6 +1252,28 @@ not by touching the example.
 
 ## 8. Phasing
 
+### Execution ledger
+
+The phase rows below are the original design gates. This ledger records the
+authoritative implementation state as work lands; it exists because several
+phases have exposed and corrected assumptions in the original rows during
+verification.
+
+| Phase | State | Evidence and remaining scope |
+|---|---|---|
+| 0–5.6 | **Merged to `2.0`** | Workspace, patch/reconciliation model, boundaries, GPU ordering/occlusion, indirect draws, tiled buffering, text shaping/rasterization/sprite drawing. Results: `docs/phase-0-results.md` through `docs/phase-5.6-results.md`. |
+| 6 | **Merged to `2.0`** | Real winit window, swapchain, resize/recovery, continuous frame loop, and pixel-level presentation proof. Results: `docs/phase-6-results.md`. |
+| 6.2 | **Merged to `2.0`** | PNG/GIF/SVG image decode, polychrome atlas upload, and `PolySpritePipeline` are byte-exact at natural size. Animated GIF advancement and interpolated scaled-image sampling remain open. Results: `docs/phase-6.2-results.md`. |
+| 6.3 | **Merged to `2.0`** | Shadow and underline pipelines are byte-exact against compiled legacy shaders. Their cross-kind occlusion behavior remains limited by per-kind dispatch, and emission coverage is addressed by 6.6. Results: `docs/phase-6.3-results.md`. |
+| 6.6 | **Merged to `2.0`** | Real nested styled `div()` emission, child layout, shadows, and text underline patches are byte-exact for the covered cases. Remaining frontend gaps include interactivity, opacity, gradients/patterns, overflow clipping, and complete style-DSL parity. Results: `docs/phase-6.6-results.md`. |
+| 6.4, 6.5, 7, 8 | **Next / pending** | Paths/backdrop blur, animation, devtools extraction, legacy alias/adaptor crate, complete example parity, and final cutover remain. |
+
+The final completion bar is unchanged: every existing example must build and
+run against the new backend with the crate-name import change as the only
+source change. A phase is not complete merely because its isolated pipeline
+can render a synthetic primitive; the corresponding public element must emit
+it and a real example must exercise it before parity can be claimed.
+
 Each phase has a falsifiable gate, following R-N's own discipline (R-N §10).
 Phases 1–3 are almost entirely additive (new crates, no behavior change to
 the default backend); the switch to `wgpui-core` as default happens only at
