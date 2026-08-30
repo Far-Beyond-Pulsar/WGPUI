@@ -8,7 +8,6 @@ pub mod hitbox;
 pub mod input;
 pub mod keymap;
 pub mod menu;
-pub mod prompts;
 pub mod timer;
 
 use crate::action::Action;

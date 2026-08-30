@@ -429,10 +429,10 @@ crates/wgpui-wgpu/src/
 ├── lib.rs
 ├── window/
 │   ├── mod.rs               # winit window creation/event loop glue — today's platform/cross/window.rs
-│   ├── dispatcher.rs        # moved, not rebuilt
-│   ├── keyboard.rs          # moved, not rebuilt
+│   ├── dispatcher.rs        # reserved; not exported until implemented
+│   ├── keyboard.rs          # reserved; not exported until implemented
 │   ├── resize_detector.rs   # moved, not rebuilt
-│   └── app_menu.rs          # moved, not rebuilt
+│   └── app_menu.rs          # reserved; not exported until implemented
 └── render/
     ├── mod.rs
     ├── device.rs            # device/queue creation, feature negotiation — today's render_context.rs

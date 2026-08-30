@@ -17,7 +17,7 @@ impl InstrumentationHooks for DevtoolsHooks {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         self.starts
             .lock()
-            .expect("devtools hook mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(token, (name, Instant::now()));
         Some(token)
     }
@@ -25,7 +25,7 @@ impl InstrumentationHooks for DevtoolsHooks {
         if let Some((name, start)) = self
             .starts
             .lock()
-            .expect("devtools hook mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&token)
         {
             super::render_stats::record(name, start.elapsed());

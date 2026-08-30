@@ -20,6 +20,11 @@ struct Registry {
     timers: BTreeMap<&'static str, TimerSnapshot>,
 }
 static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::default()));
+fn lock_registry() -> std::sync::MutexGuard<'static, Registry> {
+    REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 /// Whether instrumentation is enabled by `WGPUI_RENDER_STATS`.
 pub fn enabled() -> bool {
     std::env::var("WGPUI_RENDER_STATS")
@@ -29,9 +34,7 @@ pub fn enabled() -> bool {
 /// Adds to a named counter.
 pub fn add(name: &'static str, amount: u64) {
     if enabled() {
-        REGISTRY
-            .lock()
-            .expect("render stats mutex poisoned")
+        lock_registry()
             .counters
             .entry(name)
             .and_modify(|value| *value += amount)
@@ -45,7 +48,7 @@ pub fn count(name: &'static str) {
 /// Records a timing sample.
 pub fn record(name: &'static str, duration: Duration) {
     if enabled() {
-        let mut registry = REGISTRY.lock().expect("render stats mutex poisoned");
+        let mut registry = lock_registry();
         let timer = registry.timers.entry(name).or_default();
         timer.count += 1;
         timer.total += duration;
@@ -61,7 +64,7 @@ pub fn scope(name: &'static str) -> Option<Scope> {
 }
 /// Reads values without consuming them.
 pub fn snapshot() -> Snapshot {
-    let registry = REGISTRY.lock().expect("render stats mutex poisoned");
+    let registry = lock_registry();
     Snapshot {
         counters: registry.counters.clone(),
         timers: registry.timers.clone(),
@@ -69,7 +72,7 @@ pub fn snapshot() -> Snapshot {
 }
 /// Clears all values.
 pub fn reset() {
-    *REGISTRY.lock().expect("render stats mutex poisoned") = Registry::default();
+    *lock_registry() = Registry::default();
 }
 pub struct Scope {
     name: &'static str,
@@ -88,5 +91,15 @@ mod tests {
         reset();
         count("test: disabled");
         assert!(snapshot().counters.is_empty());
+    }
+
+    #[test]
+    fn poisoned_registry_is_recovered_without_panicking() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = REGISTRY.lock();
+            panic!("fault injection");
+        });
+        reset();
+        assert_eq!(snapshot(), Snapshot::default());
     }
 }

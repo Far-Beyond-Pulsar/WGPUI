@@ -41,20 +41,8 @@
 //! colour it was given — and `TARGET_FORMAT` is already the non-sRGB one, so
 //! preferring it agrees with the legacy choice rather than merely happening to.
 //!
-//! # What this file is not
-//!
-//! There is no input plumbing here. `window/keyboard.rs`, `window/dispatcher.rs`
-//! and `window/app_menu.rs` are still the Phase 0 stubs they have always been;
-//! §11's action 1 named "winit event loop, surface/swapchain configuration,
-//! resize handling, an actual runnable entry point" and this file is those four
-//! and nothing else. Claiming otherwise would be the exact failure mode this
-//! phase exists to end.
-
-pub mod app_menu;
 pub mod application;
-pub mod dispatcher;
 pub mod frame_loop;
-pub mod keyboard;
 pub mod resize_detector;
 
 use std::sync::Arc;
@@ -83,6 +71,13 @@ pub enum WindowError {
     /// The surface reports no formats at all — typically an adapter that cannot
     /// present to this window.
     NoFormats,
+    /// The surface does not support the copy source usage required by the
+    /// presentation readback path.
+    MissingCopySourceUsage,
+    /// The surface reports no alpha mode that can be configured.
+    NoAlphaModes,
+    /// The surface reports no present mode that can be configured.
+    NoPresentModes,
 }
 
 impl std::fmt::Display for WindowError {
@@ -98,6 +93,12 @@ impl std::fmt::Display for WindowError {
             WindowError::NoFormats => {
                 write!(formatter, "surface reports no supported formats at all")
             }
+            WindowError::MissingCopySourceUsage => write!(
+                formatter,
+                "surface does not support COPY_SRC, required by the presentation readback path"
+            ),
+            WindowError::NoAlphaModes => write!(formatter, "surface reports no alpha modes"),
+            WindowError::NoPresentModes => write!(formatter, "surface reports no present modes"),
         }
     }
 }
@@ -197,16 +198,36 @@ pub struct SurfaceStats {
 /// anything about it. `Immediate` is not universally available: WebGPU exposes
 /// only `Fifo`, and some Wayland/Mesa configurations offer `Mailbox` without it.
 ///
-/// `Fifo` is the terminal fallback because WebGPU requires every surface to
-/// support it, so this cannot return a mode the surface will refuse — the same
-/// discipline the format and alpha-mode choices beside it already follow.
-fn present_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
+/// If none of the preferred modes is available, the first capability is used;
+/// an empty capability list is rejected before configuration.
+fn present_mode(
+    capabilities: &wgpu::SurfaceCapabilities,
+) -> Result<wgpu::PresentMode, WindowError> {
     const PREFERENCE: [wgpu::PresentMode; 2] =
         [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox];
     PREFERENCE
         .into_iter()
         .find(|mode| capabilities.present_modes.contains(mode))
-        .unwrap_or(wgpu::PresentMode::Fifo)
+        .or_else(|| capabilities.present_modes.first().copied())
+        .ok_or(WindowError::NoPresentModes)
+}
+
+fn validate_surface_capabilities(
+    capabilities: &wgpu::SurfaceCapabilities,
+) -> Result<wgpu::PresentMode, WindowError> {
+    if capabilities.formats.is_empty() {
+        return Err(WindowError::NoFormats);
+    }
+    if !capabilities.formats.contains(&TARGET_FORMAT) {
+        return Err(WindowError::NoTargetFormat(capabilities.formats.to_vec()));
+    }
+    if !capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+        return Err(WindowError::MissingCopySourceUsage);
+    }
+    if capabilities.alpha_modes.is_empty() {
+        return Err(WindowError::NoAlphaModes);
+    }
+    present_mode(capabilities)
 }
 
 /// A live OS window and the swapchain configured on it.
@@ -244,12 +265,7 @@ impl WindowSurface {
         let context = crate::render::device::context_for(&instance, Some(&surface))?;
 
         let capabilities = surface.get_capabilities(&context.adapter);
-        if capabilities.formats.is_empty() {
-            return Err(WindowError::NoFormats);
-        }
-        if !capabilities.formats.contains(&TARGET_FORMAT) {
-            return Err(WindowError::NoTargetFormat(capabilities.formats.to_vec()));
-        }
+        let present_mode = validate_surface_capabilities(&capabilities)?;
 
         let size = window.inner_size();
         let configuration = wgpu::SurfaceConfiguration {
@@ -264,12 +280,12 @@ impl WindowSurface {
             format: TARGET_FORMAT,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: present_mode(&capabilities),
+            present_mode,
             alpha_mode: capabilities
                 .alpha_modes
                 .first()
                 .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+                .ok_or(WindowError::NoAlphaModes)?,
             color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -500,4 +516,47 @@ pub fn clear_frame(
         });
     }
     queue.submit(Some(encoder.finish()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capabilities() -> wgpu::SurfaceCapabilities {
+        wgpu::SurfaceCapabilities {
+            formats: vec![TARGET_FORMAT],
+            present_modes: vec![wgpu::PresentMode::Fifo],
+            alpha_modes: vec![wgpu::CompositeAlphaMode::Auto],
+            usages: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn surface_capability_validation_accepts_the_minimum_safe_configuration() {
+        assert!(matches!(
+            validate_surface_capabilities(&capabilities()),
+            Ok(wgpu::PresentMode::Fifo)
+        ));
+    }
+
+    #[test]
+    fn surface_capability_validation_rejects_missing_readback_usage() {
+        let mut capabilities = capabilities();
+        capabilities.usages.remove(wgpu::TextureUsages::COPY_SRC);
+        assert!(matches!(
+            validate_surface_capabilities(&capabilities),
+            Err(WindowError::MissingCopySourceUsage)
+        ));
+    }
+
+    #[test]
+    fn surface_capability_validation_rejects_empty_present_modes() {
+        let mut capabilities = capabilities();
+        capabilities.present_modes.clear();
+        assert!(matches!(
+            validate_surface_capabilities(&capabilities),
+            Err(WindowError::NoPresentModes)
+        ));
+    }
 }

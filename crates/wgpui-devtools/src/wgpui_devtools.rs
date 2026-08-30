@@ -3,8 +3,6 @@
 //! move-and-decouple, zero behavior change (Phase 7's gate: `wgpui-core`
 //! builds and runs with this crate absent entirely).
 //! See docs/gpu-native-architecture.md §3.6, §8 Phase 7.
-#![allow(dead_code)]
-
 #[cfg(feature = "flamegraph")]
 pub mod flamegraph;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]

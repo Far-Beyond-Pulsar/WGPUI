@@ -1123,6 +1123,16 @@ mod tests {
     }
 
     #[test]
+    fn page_id_exhaustion_is_reported_without_opening_or_aliasing_a_page() {
+        let mut atlas = GlyphAtlas::new(64);
+        atlas.next_page_index = 255;
+        let result = atlas.get_or_insert(key(1), raster(8, 8));
+        assert_eq!(result, Err(AtlasError::OutOfTileIds));
+        assert!(atlas.page_indices().is_empty());
+        assert!(atlas.get(key(1)).is_none());
+    }
+
+    #[test]
     fn a_zero_area_raster_is_refused() {
         let mut atlas = GlyphAtlas::default();
         assert_eq!(

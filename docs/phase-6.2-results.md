@@ -515,8 +515,8 @@ An undecoded source still asks for zero. `img.rs:478-495` says so at the method.
   layers existing." All four now exist. **None of those examples has been ported
   to 2.0** — `crates/*/examples/` contains only probes and phase benches. They
   are additionally blocked on the input plumbing Phase 6 disclosed is entirely
-  missing (`keyboard.rs`, `dispatcher.rs`, `app_menu.rs` are still Phase 0
-  stubs), and `gif_viewer` on the animation driver (§7.1).
+  missing (native keyboard dispatch and application menus are not implemented),
+  and `gif_viewer` on the animation driver (§7.1).
 - **Scaled images are nearest-neighbour, legacy interpolates** (§3). A real
   fidelity gap, self-contained to fix, deliberately not fixed here because it
   would have cost the gate its exactness.

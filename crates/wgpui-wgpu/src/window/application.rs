@@ -511,7 +511,9 @@ impl Handler {
             app: self.app.clone(),
             build,
         });
-        self.live.last().map(|live| live.window.request_redraw());
+        if let Some(live) = self.live.last() {
+            live.window.request_redraw();
+        }
         Ok(())
     }
 
@@ -529,10 +531,10 @@ impl Handler {
                 let build = Box::new(move |window: &mut Window| {
                     (renderer.render)(&mut window.interaction, &mut app)
                 });
-                if let Err(error) = self.create_window(event_loop, request.options, build) {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
+                if let Err(error) = self.create_window(event_loop, request.options, build)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
                 }
             }
             if let Some(error) = first_error {

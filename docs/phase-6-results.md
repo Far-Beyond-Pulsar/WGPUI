@@ -485,12 +485,10 @@ All run at wrap-up, in the final state, on the hardware named at the top.
 - **`shadows` / `underlines`** — flagged as `QuadPipeline`-shaped and cheap;
   still two-line placeholders.
 - **`paths` / `backdrop_blur`** — still two-line placeholders, still not scoped.
-- **The rest of `window/`.** `keyboard.rs`, `dispatcher.rs` and `app_menu.rs`
-  are still exactly the Phase 0 stubs they have always been. **There is no input
-  plumbing in this phase at all.** §11's action 1 named four things — event
-  loop, surface/swapchain configuration, resize handling, a runnable entry point
-  — and this phase is those four and nothing else. A window that opens, draws
-  and resizes is not a window a user can interact with.
+- **The rest of `window/`.** Native keyboard dispatch and application menus are
+  not implemented or exported. Clipboard, IME, accessibility, cursor hooks,
+  and prompts are also outside the native claim; see
+  `docs/native-platform-support.md`.
 
 ### Disclosed by this phase
 
