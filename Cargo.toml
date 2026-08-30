@@ -6,6 +6,7 @@ members = [
     "crates/wgpui-text",
     "crates/wgpui-widgets",
     "crates/wgpui-wgpu",
+    "crates/wgpui",
     "crates/wgpui-devtools",
     "crates/wgpui-compat",
     "crates/wgpui-compat-macros",

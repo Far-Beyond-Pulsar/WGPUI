@@ -51,6 +51,7 @@
 //! phase exists to end.
 
 pub mod app_menu;
+pub mod application;
 pub mod dispatcher;
 pub mod frame_loop;
 pub mod keyboard;

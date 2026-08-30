@@ -6738,6 +6738,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpui"
+version = "0.1.0"
+dependencies = [
+ "wgpui-core",
+ "wgpui-layout",
+ "wgpui-text",
+ "wgpui-wgpu",
+ "wgpui-widgets",
+]
+
+[[package]]
 name = "wgpui-compat"
 version = "0.1.0"
 dependencies = [
@@ -6775,6 +6786,7 @@ dependencies = [
 name = "wgpui-core"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "lyon",
  "wgpui-layout",
 ]
