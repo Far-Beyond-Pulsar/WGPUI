@@ -29,8 +29,7 @@ pub use wgpui_core::{
     App, Context, Entity, EntityError, EntityId, Subscription, Task, TaskError, WeakEntity,
 };
 pub use wgpui_layout::{
-    AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutStyle, LayoutTree,
-    Measure, MeasureSize,
+    AvailableSpace, Dimension, Display, FlexDirection, LayoutStyle, LayoutTree,
 };
 pub use wgpui_text::patch::{RunPlacement, glyph_runs};
 pub use wgpui_text::shaping::{
@@ -38,6 +37,9 @@ pub use wgpui_text::shaping::{
 };
 pub use wgpui_widgets::animation::{
     Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline,
+};
+pub use wgpui_widgets::div::interactivity::style::{
+    Corners, DivStyle, Edges, LinearGradient, Pattern,
 };
 pub use wgpui_widgets::div::{Div, IntoDescription, div};
 pub use wgpui_widgets::image_cache::{
@@ -53,7 +55,6 @@ pub use wgpui_widgets::styled_text::{
 };
 pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
 pub use wgpui_widgets::wgpu_surface::{WgpuSurface, WgpuSurfaceKey};
-pub use wgpui_widgets::{Corners, DivStyle, Edges, LinearGradient, Pattern};
 
 pub use wgpui_wgpu::window::application::{
     Application, ApplicationError, DisplayId, FrameReport, Window, WindowHandle, WindowOptions,

@@ -474,6 +474,19 @@ pub struct TextShaper {
     stats: ShaperStats,
 }
 
+/// Renderer-independent metrics returned by text measurement.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct TextMeasurement {
+    /// Logical advance width.
+    pub width: f32,
+    /// Maximum ascent above the baseline.
+    pub ascent: f32,
+    /// Maximum descent below the baseline.
+    pub descent: f32,
+    /// UTF-8 length of the measured text.
+    pub byte_length: usize,
+}
+
 impl Default for TextShaper {
     fn default() -> Self {
         Self::new()
@@ -693,6 +706,22 @@ impl TextShaper {
             },
         );
         Ok(line)
+    }
+
+    /// Measure text through the same cached shaping path used for emission.
+    pub fn measure_line(
+        &mut self,
+        text: &SharedString,
+        font_size: f32,
+        runs: &[FontRun],
+    ) -> Result<TextMeasurement, ShapeError> {
+        let line = self.shape_line(text, font_size, runs)?;
+        Ok(TextMeasurement {
+            width: line.width,
+            ascent: line.ascent,
+            descent: line.descent,
+            byte_length: line.len,
+        })
     }
 
     /// Shape without consulting or populating the cache.

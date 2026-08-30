@@ -251,6 +251,15 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage, ImageDecodeError> {
     finish(frames)
 }
 
+/// Decode owned bytes without borrowing UI or GPU state.
+///
+/// The future is `Send`, allowing a background executor to perform the
+/// CPU-bound decoder and the foreground thread to commit its result to
+/// `ImageCache`. Cache mutation stays on the foreground thread.
+pub async fn decode_async(bytes: Vec<u8>) -> Result<DecodedImage, ImageDecodeError> {
+    decode(&bytes)
+}
+
 /// Rasterise SVG bytes at `scale_factor`, ignoring `image`'s format detection.
 ///
 /// Exposed beside [`decode`] because an SVG is the one source whose pixels are a
