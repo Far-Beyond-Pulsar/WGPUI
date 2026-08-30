@@ -7,6 +7,11 @@ autoexamples = false
 
 [dependencies]
 wgpui = { path = "../wgpui" }
+# The surface examples intentionally exercise the public WGPU fast path directly.
+# Keep these as direct example dependencies rather than leaking device details
+# into the high-level `wgpui` namespace.
+bytemuck = { version = "1.24", features = ["derive"] }
+wgpu = { version = "30", default-features = false, features = ["dx12", "wgsl"] }
 anyhow = "1"
 futures = "0.3"
 smol = "2"

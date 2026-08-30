@@ -6806,6 +6806,7 @@ name = "wgpui-examples-2"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "env_logger",
  "futures",
  "glam",
@@ -6813,6 +6814,7 @@ dependencies = [
  "rand 0.10.0",
  "smol",
  "unicode-segmentation",
+ "wgpu",
  "wgpui",
 ]
 
