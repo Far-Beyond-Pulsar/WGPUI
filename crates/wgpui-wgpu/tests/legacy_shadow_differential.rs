@@ -70,14 +70,12 @@ use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::{BoundaryId, LayerKey};
 use wgpui_wgpu::render::device::{ComputeContext, context_or_report};
 use wgpui_wgpu::render::draw::DrawMode;
-use wgpui_wgpu::render::frame::{
-    Dirty, FrameInput, FrameRenderer, OffscreenTarget, RenderTarget,
-};
+use wgpui_wgpu::render::frame::{Dirty, FrameInput, FrameRenderer, OffscreenTarget, RenderTarget};
 use wgpui_wgpu::render::pipelines::TARGET_FORMAT;
 
 /// The legacy shader, byte for byte off disk. A build error here means the
 /// frozen tree moved and this differential no longer has a subject.
-const LEGACY_SHADOWS_WGSL: &str = include_str!("../../../src/platform/cross/shaders/shadows.wgsl");
+const LEGACY_SHADOWS_WGSL: &str = include_str!("../../../old/src/platform/cross/shaders/shadows.wgsl");
 
 const WIDTH: u32 = 224;
 const HEIGHT: u32 = 176;
@@ -337,7 +335,13 @@ fn render_legacy(context: &ComputeContext, case: &Case) -> Vec<u8> {
     globals[0..4].copy_from_slice(&(WIDTH as f32).to_le_bytes());
     globals[4..8].copy_from_slice(&(HEIGHT as f32).to_le_bytes());
     // premultiplied_alpha = 0 and pad = 0 — see this module's doc.
-    let globals_buffer = buffer_with(device, queue, "legacy globals", wgpu::BufferUsages::UNIFORM, &globals);
+    let globals_buffer = buffer_with(
+        device,
+        queue,
+        "legacy globals",
+        wgpu::BufferUsages::UNIFORM,
+        &globals,
+    );
 
     let shadow_bytes = encode_legacy_shadow(&case.shadow, case.hsla);
     let shadow_buffer = buffer_with(
@@ -578,12 +582,12 @@ struct Comparison {
 
 fn compare(legacy: &[u8], ours: &[u8], clear: [u8; 4]) -> Comparison {
     let mut result = Comparison::default();
-    assert_eq!(legacy.len(), ours.len(), "both arms read back the same extent");
-    for (index, (left, right)) in legacy
-        .chunks_exact(4)
-        .zip(ours.chunks_exact(4))
-        .enumerate()
-    {
+    assert_eq!(
+        legacy.len(),
+        ours.len(),
+        "both arms read back the same extent"
+    );
+    for (index, (left, right)) in legacy.chunks_exact(4).zip(ours.chunks_exact(4)).enumerate() {
         let left: [u8; 4] = [left[0], left[1], left[2], left[3]];
         let right: [u8; 4] = [right[0], right[1], right[2], right[3]];
         result.total += 1;
@@ -693,7 +697,11 @@ fn the_comparison_actually_detects_a_wrong_shadow() {
     let clear = measured_clear_pixel(&context);
     let mode = DrawMode::best_available(context.indirect);
     let legacy = render_legacy(&context, &case);
-    let control = compare(&legacy, &render_2_0(&context, Some(case.shadow), mode), clear);
+    let control = compare(
+        &legacy,
+        &render_2_0(&context, Some(case.shadow), mode),
+        clear,
+    );
     assert_eq!(control.exact, control.total, "the control must agree");
     assert!(
         control.painted > 500,
@@ -752,9 +760,14 @@ fn every_draw_mode_produces_the_same_shadow() {
             continue;
         }
         modes += 1;
-        let result = compare(&legacy, &render_2_0(&context, Some(case.shadow), mode), clear);
+        let result = compare(
+            &legacy,
+            &render_2_0(&context, Some(case.shadow), mode),
+            clear,
+        );
         assert_eq!(
-            result.exact, result.total,
+            result.exact,
+            result.total,
             "[{}] first difference at {:?}",
             mode.name(),
             result.first_difference
@@ -829,7 +842,9 @@ fn a_shadow_covered_by_an_opaque_quad_still_paints_its_falloff_outside_it() {
         let layer = scene.layer(LayerKey::untiled(BoundaryId::from_raw(1)));
         let mut patch = ScenePatch::new();
         if with_shadow {
-            patch.shadows.append(layer, RecordKey::from_raw(1), 0, shadow);
+            patch
+                .shadows
+                .append(layer, RecordKey::from_raw(1), 0, shadow);
         }
         patch.quads.append(layer, RecordKey::from_raw(2), 0, cover);
         apply(&mut scene, &patch).expect("the patch must apply");
@@ -871,16 +886,16 @@ fn a_shadow_covered_by_an_opaque_quad_still_paints_its_falloff_outside_it() {
     let without_shadow = render(false);
     let pixel = |bytes: &[u8], x: usize, y: usize| -> [u8; 4] {
         let index = (y * WIDTH as usize + x) * 4;
-        [bytes[index], bytes[index + 1], bytes[index + 2], bytes[index + 3]]
+        [
+            bytes[index],
+            bytes[index + 1],
+            bytes[index + 2],
+            bytes[index + 3],
+        ]
     };
 
     // Four samples outside the quad on each side, inside the 3σ margin.
-    let samples = [
-        (60usize, 84usize),
-        (164, 84),
-        (112, 40),
-        (112, 128),
-    ];
+    let samples = [(60usize, 84usize), (164, 84), (112, 40), (112, 128)];
     let mut lit = 0;
     for (x, y) in samples {
         let covered = pixel(&without_shadow, x, y);
@@ -963,7 +978,10 @@ fn the_legacy_struct_layout_is_the_one_wgsl_derives() {
     assert_eq!(&bytes[8..12], &1.0f32.to_le_bytes());
     assert_eq!(&bytes[20..24], &4.0f32.to_le_bytes());
     for corner in 0..4 {
-        assert_eq!(&bytes[24 + corner * 4..28 + corner * 4], &5.0f32.to_le_bytes());
+        assert_eq!(
+            &bytes[24 + corner * 4..28 + corner * 4],
+            &5.0f32.to_le_bytes()
+        );
     }
     assert_eq!(&bytes[56..60], &0.125f32.to_le_bytes());
     assert_eq!(&bytes[68..72], &0.25f32.to_le_bytes());

@@ -4,12 +4,20 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = []
+render-stats = []
+flamegraph = ["render-stats"]
+inspector = []
+perf-ab = ["render-stats"]
+
 [lib]
 name = "wgpui_devtools"
 path = "src/wgpui_devtools.rs"
 doctest = false
 
 [dependencies]
+wgpui-core = { path = "../wgpui-core" }
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }

@@ -27,11 +27,7 @@
 //! track the scroll position every frame, including frames the buffer only
 //! shifts.
 
-use std::{
-    cell::Cell,
-    rc::Rc,
-    time::Instant,
-};
+use std::{cell::Cell, rc::Rc, time::Instant};
 
 use gpui::{
     App, Application, Bounds, Context, Hsla, LayerPolicy, Pixels, Render, ScrollHandle,
@@ -170,7 +166,9 @@ struct OverscrollDemo {
 impl OverscrollDemo {
     fn new(cx: &mut Context<Self>) -> Self {
         let mut rng = Ticker::new(0x9E3779B97F4A7C15);
-        let rows = (0..TOTAL_ITEMS).map(|ix| Row::generate(ix, &mut rng)).collect();
+        let rows = (0..TOTAL_ITEMS)
+            .map(|ix| Row::generate(ix, &mut rng))
+            .collect();
 
         // Sample render_stats on a background timer, never from inside
         // `render()`. Calling `render_stats::snapshot()` synchronously from
@@ -276,11 +274,14 @@ impl Render for OverscrollDemo {
         // No live render_stats access here — see `OverscrollDemo::new`'s doc
         // comment. `self.previous`/`self.delta` are pushed in by the
         // background sampler; this just reads them.
-        let totals = self.previous.map(|(totals, _)| totals).unwrap_or(StatsTotals {
-            shifted: 0,
-            repaints: 0,
-            refills: 0,
-        });
+        let totals = self
+            .previous
+            .map(|(totals, _)| totals)
+            .unwrap_or(StatsTotals {
+                shifted: 0,
+                repaints: 0,
+                refills: 0,
+            });
         let frame_dt_ms = self
             .previous
             .as_ref()
@@ -316,10 +317,9 @@ impl Render for OverscrollDemo {
                         div()
                             .flex()
                             .justify_between()
-                            .child(
-                                div()
-                                    .child("overscroll buffer demo — 10,000 plain (non-virtualized) rows"),
-                            )
+                            .child(div().child(
+                                "overscroll buffer demo — 10,000 plain (non-virtualized) rows",
+                            ))
                             .child(
                                 div()
                                     .text_color(rgb(0x8A8A98))
@@ -353,24 +353,16 @@ impl Render for OverscrollDemo {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(
-                                        div()
-                                            .text_color(rgb(0x6A6A78))
-                                            .child(format!(
-                                                "last frame gap {:.1} ms · render #{}",
-                                                frame_dt_ms.unwrap_or(0.0),
-                                                self.renders.get(),
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(rgb(0x6A6A78))
-                                            .child(format!(
-                                                "margin {} px · refill at ±{} px",
-                                                OVERDRAW_MARGIN as u32,
-                                                OVERDRAW_MARGIN as u32 / 2,
-                                            )),
-                                    ),
+                                    .child(div().text_color(rgb(0x6A6A78)).child(format!(
+                                        "last frame gap {:.1} ms · render #{}",
+                                        frame_dt_ms.unwrap_or(0.0),
+                                        self.renders.get(),
+                                    )))
+                                    .child(div().text_color(rgb(0x6A6A78)).child(format!(
+                                        "margin {} px · refill at ±{} px",
+                                        OVERDRAW_MARGIN as u32,
+                                        OVERDRAW_MARGIN as u32 / 2,
+                                    ))),
                             ),
                     ),
             )
@@ -409,11 +401,7 @@ impl Render for OverscrollDemo {
                                         rgb(0x191922)
                                     })
                                     .child(div().child(row.label))
-                                    .child(
-                                        div()
-                                            .text_color(rgb(0xB8B8C8))
-                                            .child(row.price),
-                                    )
+                                    .child(div().text_color(rgb(0xB8B8C8)).child(row.price))
                             })),
                     )
                     // Thumb overlays the list but lives outside the buffered

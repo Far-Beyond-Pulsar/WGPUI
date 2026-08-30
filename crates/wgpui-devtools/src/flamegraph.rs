@@ -1,9 +1,9 @@
-//! Per-frame CPU/GPU flamegraphs and the RenderDoc-style capture-and-replay
-//! engine — ~9,000 lines across four files in the legacy backend today.
-//! See docs/gpu-native-architecture.md §3.6, §1.
-#![allow(dead_code)]
-
+//! Backend-neutral capture primitives; GPU readback and UI traversal are adapters.
 pub mod cpu;
 pub mod gpu;
 pub mod replay;
 pub mod ui_capture;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureRequest {
+    pub include_gpu: bool,
+}

@@ -92,9 +92,7 @@ impl CompositeConsumer<'_> {
                 registry.swap_ready_display_if_new(id);
                 registry.front_view(id)
             }
-            CompositeSource::BoundaryTexture(boundary) => {
-                self.textures?.view(boundary).cloned()
-            }
+            CompositeSource::BoundaryTexture(boundary) => self.textures?.view(boundary).cloned(),
         }
     }
 }
@@ -275,8 +273,14 @@ mod tests {
             word.copy_from_slice(&bytes[index * 4..index * 4 + 4]);
             f32::from_le_bytes(word)
         };
-        assert_eq!([read(0), read(1), read(2), read(3)], [10.0, 20.0, 300.0, 200.0]);
-        assert_eq!([read(4), read(5), read(6), read(7)], [0.0, 0.0, 1000.0, 800.0]);
+        assert_eq!(
+            [read(0), read(1), read(2), read(3)],
+            [10.0, 20.0, 300.0, 200.0]
+        );
+        assert_eq!(
+            [read(4), read(5), read(6), read(7)],
+            [0.0, 0.0, 1000.0, 800.0]
+        );
         assert_eq!(read(8), 0.5);
         assert_eq!(read(9), 8.0);
     }

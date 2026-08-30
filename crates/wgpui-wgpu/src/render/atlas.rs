@@ -257,8 +257,7 @@ impl Page {
                 (origin[1] as usize + row) * page_stride + origin[0] as usize * bytes_per_pixel;
             let (Some(from), Some(into)) = (
                 texels.get(source..source + row_bytes),
-                self.texels
-                    .get_mut(destination..destination + row_bytes),
+                self.texels.get_mut(destination..destination + row_bytes),
             ) else {
                 return false;
             };
@@ -677,9 +676,8 @@ impl GlyphAtlas {
             requested: [self.page_size, self.page_size],
             page_size: self.page_size,
         })?;
-        let texel_bytes = self.page_size as usize
-            * self.page_size as usize
-            * kind.bytes_per_pixel() as usize;
+        let texel_bytes =
+            self.page_size as usize * self.page_size as usize * kind.bytes_per_pixel() as usize;
         self.pages.push(Page {
             index,
             kind,
@@ -744,9 +742,9 @@ impl GlyphAtlas {
         // upload for a page that no longer exists is either a silent no-op or a
         // read of the wrong page, depending on how carefully the uploader is
         // written — and neither is a thing to leave to the uploader.
-        self.pending_uploads.retain(|upload| upload.page != page_index);
-        self.pending_evictions
-            .push(AtlasEviction::Page(page_index));
+        self.pending_uploads
+            .retain(|upload| upload.page != page_index);
+        self.pending_evictions.push(AtlasEviction::Page(page_index));
         self.stats.evictions += dropped_count as u64;
         true
     }
@@ -1003,7 +1001,9 @@ mod tests {
     #[test]
     fn a_raster_is_allocated_once_and_returned_thereafter() {
         let mut atlas = GlyphAtlas::default();
-        let first = atlas.get_or_insert(key(1), raster(8, 12)).expect("allocate");
+        let first = atlas
+            .get_or_insert(key(1), raster(8, 12))
+            .expect("allocate");
         let second = atlas.get_or_insert(key(1), raster(8, 12)).expect("hit");
         assert_eq!(first, second);
         assert_eq!(atlas.stats().allocations, 1);
@@ -1015,8 +1015,12 @@ mod tests {
     #[test]
     fn different_rasters_get_different_tiles_that_do_not_overlap() {
         let mut atlas = GlyphAtlas::default();
-        let a = atlas.get_or_insert(key(1), raster(16, 16)).expect("allocate");
-        let b = atlas.get_or_insert(key(2), raster(16, 16)).expect("allocate");
+        let a = atlas
+            .get_or_insert(key(1), raster(16, 16))
+            .expect("allocate");
+        let b = atlas
+            .get_or_insert(key(2), raster(16, 16))
+            .expect("allocate");
         assert_ne!(a.tile, b.tile);
 
         let overlaps = a.origin[0] < b.origin[0] + b.size[0]
@@ -1055,7 +1059,9 @@ mod tests {
         let mut atlas = GlyphAtlas::default();
         let original = atlas.get_or_insert(base, raster(8, 8)).expect("allocate");
         for variant in variants {
-            let placement = atlas.get_or_insert(variant, raster(8, 8)).expect("allocate");
+            let placement = atlas
+                .get_or_insert(variant, raster(8, 8))
+                .expect("allocate");
             assert_ne!(
                 placement.tile, original.tile,
                 "{variant:?} must not share a tile with {base:?}"
@@ -1119,14 +1125,22 @@ mod tests {
     #[test]
     fn a_zero_area_raster_is_refused() {
         let mut atlas = GlyphAtlas::default();
-        assert_eq!(atlas.get_or_insert(key(1), raster(0, 8)), Err(AtlasError::EmptyRaster));
-        assert_eq!(atlas.get_or_insert(key(1), raster(8, 0)), Err(AtlasError::EmptyRaster));
+        assert_eq!(
+            atlas.get_or_insert(key(1), raster(0, 8)),
+            Err(AtlasError::EmptyRaster)
+        );
+        assert_eq!(
+            atlas.get_or_insert(key(1), raster(8, 0)),
+            Err(AtlasError::EmptyRaster)
+        );
     }
 
     #[test]
     fn evicting_a_raster_reports_its_tile_and_frees_the_space() {
         let mut atlas = GlyphAtlas::new(64);
-        let placement = atlas.get_or_insert(key(1), raster(32, 32)).expect("allocate");
+        let placement = atlas
+            .get_or_insert(key(1), raster(32, 32))
+            .expect("allocate");
         assert_eq!(atlas.live_tiles_in_page(0), Some(1));
 
         assert!(atlas.evict(key(1)));
@@ -1135,7 +1149,10 @@ mod tests {
             atlas.drain_evictions(),
             vec![AtlasEviction::Tile(placement.tile)]
         );
-        assert!(atlas.drain_evictions().is_empty(), "draining is destructive");
+        assert!(
+            atlas.drain_evictions().is_empty(),
+            "draining is destructive"
+        );
         assert_eq!(atlas.live_tiles_in_page(0), Some(0));
         assert_eq!(atlas.get(key(1)), None);
     }
@@ -1157,7 +1174,9 @@ mod tests {
     fn destroying_a_page_reports_one_event_however_many_tiles_it_held() {
         let mut atlas = GlyphAtlas::new(64);
         for glyph in 0..4 {
-            atlas.get_or_insert(key(glyph), raster(32, 32)).expect("allocate");
+            atlas
+                .get_or_insert(key(glyph), raster(32, 32))
+                .expect("allocate");
         }
         assert_eq!(atlas.stats().tiles, 4);
 
@@ -1204,7 +1223,10 @@ mod tests {
             assert_eq!(first.bearing, [0.5, -9.0]);
             assert_eq!(first.atlas_size, [8.0, 12.0]);
         }
-        assert_eq!(rasterised, 1, "a resident glyph must not be rasterised again");
+        assert_eq!(
+            rasterised, 1,
+            "a resident glyph must not be rasterised again"
+        );
         assert_eq!(atlas.stats().allocations, 1);
         assert_eq!(atlas.stats().cache_hits, 1);
     }
@@ -1223,8 +1245,9 @@ mod tests {
         use wgpui_core::scene::atlas::GlyphTileSource;
 
         let mut atlas = GlyphAtlas::new(16);
-        let mut source =
-            AtlasTileSource::new(&mut atlas, |_key| Some(bitmap(64, 64, AtlasKind::Monochrome, 1)));
+        let mut source = AtlasTileSource::new(&mut atlas, |_key| {
+            Some(bitmap(64, 64, AtlasKind::Monochrome, 1))
+        });
         assert_eq!(
             source.tile_for(key(1)),
             None,
@@ -1279,7 +1302,9 @@ mod tests {
             .expect("allocate");
         assert_eq!(atlas.tile_texels(placement), Some(raster.texels));
         assert_eq!(
-            atlas.page_texels(placement.tile.page().expect("a page")).map(<[u8]>::len),
+            atlas
+                .page_texels(placement.tile.page().expect("a page"))
+                .map(<[u8]>::len),
             Some(16 * 16 * 4)
         );
     }
@@ -1409,13 +1434,18 @@ mod tests {
             Some(vec![0; 16]),
             "a page opens zeroed, so unwritten space samples as nothing"
         );
-        assert!(!atlas.has_pending_uploads(), "reserving space uploads nothing");
+        assert!(
+            !atlas.has_pending_uploads(),
+            "reserving space uploads nothing"
+        );
 
         atlas
             .get_or_insert_raster(key(1), &bitmap(16, 16, AtlasKind::Monochrome, 0xFF))
             .expect("allocate");
         assert!(atlas.evict(key(1)));
-        let reused = atlas.get_or_insert(key(2), raster(16, 16)).expect("allocate");
+        let reused = atlas
+            .get_or_insert(key(2), raster(16, 16))
+            .expect("allocate");
         assert_eq!(
             atlas.tile_texels(reused),
             Some(vec![0xFF; 256]),
@@ -1530,7 +1560,10 @@ mod tests {
             .get_or_insert_image(image_key(1, 0), &image(8, 8))
             .expect("allocate");
         assert_ne!(glyph.tile, picture.tile);
-        assert_eq!(atlas.get(image_key(1, 0)).map(|p| p.tile), Some(picture.tile));
+        assert_eq!(
+            atlas.get(image_key(1, 0)).map(|p| p.tile),
+            Some(picture.tile)
+        );
         assert_eq!(atlas.get(key(1)).map(|p| p.tile), Some(glyph.tile));
     }
 
@@ -1664,11 +1697,11 @@ mod tests {
     fn an_eviction_reaches_the_scene_and_invalidates_the_layer_that_referenced_it()
     -> Result<(), Box<dyn std::error::Error>> {
         use wgpui_core::invalidation::axes::Invalidation;
+        use wgpui_core::patch::RecordKey;
         use wgpui_core::patch::apply::{ScenePatch, apply};
         use wgpui_core::patch::primitive::{Glyph, GlyphRun};
-        use wgpui_core::patch::RecordKey;
-        use wgpui_core::scene::layer::{BoundaryId, LayerKey};
         use wgpui_core::scene::Scene;
+        use wgpui_core::scene::layer::{BoundaryId, LayerKey};
 
         let mut atlas = GlyphAtlas::new(64);
         let placement = atlas.get_or_insert(key(1), raster(8, 8))?;
@@ -1711,7 +1744,10 @@ mod tests {
 
         assert_eq!(affected, vec![with_text]);
         assert_eq!(
-            scene.layers.get(with_text).map(|layer| layer.invalidation()),
+            scene
+                .layers
+                .get(with_text)
+                .map(|layer| layer.invalidation()),
             Some(Invalidation::DISPLAY)
         );
         assert!(

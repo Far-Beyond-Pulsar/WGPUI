@@ -1,3 +1,6 @@
-//! Moved, not rebuilt — today's `src/flamegraph_ui_capture.rs`.
-//! See docs/gpu-native-architecture.md §3.6.
-#![allow(dead_code)]
+//! UI capture data boundary; element traversal remains frontend-owned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementRecord {
+    pub label: String,
+    pub depth: u32,
+}

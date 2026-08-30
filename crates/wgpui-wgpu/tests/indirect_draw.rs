@@ -291,17 +291,20 @@ fn gate_1_a_clean_windows_draw_issuing_work_is_independent_of_primitive_count() 
             large_time
         );
         assert_eq!(
-            large_result.stats.draw_calls_issued, small_result.stats.draw_calls_issued,
+            large_result.stats.draw_calls_issued,
+            small_result.stats.draw_calls_issued,
             "[{}] draw-issuing work must not grow with the primitive count",
             mode.name()
         );
         assert_eq!(
-            large_result.stats.bind_group_binds, small_result.stats.bind_group_binds,
+            large_result.stats.bind_group_binds,
+            small_result.stats.bind_group_binds,
             "[{}] bind-group work must not grow with the primitive count",
             mode.name()
         );
         assert_eq!(
-            large_result.stats.slots_visited, small_result.stats.slots_visited,
+            large_result.stats.slots_visited,
+            small_result.stats.slots_visited,
             "[{}] the fixed sequence must be the same length at both counts",
             mode.name()
         );
@@ -575,10 +578,10 @@ fn gate_2_a_covered_viewport_issues_no_draws_and_consumes_no_produced_frame() {
     );
 
     // --- Uncovered: the same modal moved clear of the viewport.
-    let uncovered = [viewport_entry, modal(Rect::from_origin_size(
-        [400.0, 0.0],
-        [80.0, 320.0],
-    ))];
+    let uncovered = [
+        viewport_entry,
+        modal(Rect::from_origin_size([400.0, 0.0], [80.0, 320.0])),
+    ];
     let (output, _) = render(
         &context,
         &mut renderer,

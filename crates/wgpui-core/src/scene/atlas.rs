@@ -47,8 +47,8 @@
 
 use crate::invalidation::axes::Invalidation;
 use crate::patch::primitive::AtlasTileId;
-use crate::scene::layer::LayerId;
 use crate::scene::Scene;
+use crate::scene::layer::LayerId;
 
 /// Which atlas a raster belongs in.
 ///
@@ -667,8 +667,8 @@ mod tests {
     /// The Phase 6.2 half of the same subscription: an image sprite is a tile
     /// reference too, and an eviction it did not see is the same bug.
     #[test]
-    fn evicting_a_page_invalidates_the_layers_whose_sprites_reference_it()
-    -> Result<(), PatchError> {
+    fn evicting_a_page_invalidates_the_layers_whose_sprites_reference_it() -> Result<(), PatchError>
+    {
         use crate::patch::primitive::PolySprite;
 
         let mut scene = Scene::new();

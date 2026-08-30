@@ -239,7 +239,11 @@ fn measure(
         println!(
             "    run {run}{}: BoundsTree {:>10.3?}  sort {:>10.3?}  occlusion {:>10.3?}  \
              total {:>10.3?}",
-            if run <= WARMUP_RUNS { " (warm-up)" } else { "         " },
+            if run <= WARMUP_RUNS {
+                " (warm-up)"
+            } else {
+                "         "
+            },
             timing.ordering,
             timing.sort,
             timing.occlusion,
@@ -315,7 +319,11 @@ fn measure(
         println!(
             "    run {run}{}: ordering {:>10.3?} ({} relax iterations, {} submissions)  \
              occlusion {:>10.3?}  total {:>10.3?}",
-            if run <= WARMUP_RUNS { " (warm-up)" } else { "         " },
+            if run <= WARMUP_RUNS {
+                " (warm-up)"
+            } else {
+                "         "
+            },
             ordering_time,
             ordered.iterations,
             ordered.submissions,
@@ -363,8 +371,16 @@ fn measure(
         quads.len(),
         cpu_timings.len()
     );
-    report("ordering (tree+sort vs. relax+bitonic)", &cpu_order, &gpu_ordering_totals);
-    report("occlusion (coverage sweep)", &cpu_occlude, &gpu_occlusion_totals);
+    report(
+        "ordering (tree+sort vs. relax+bitonic)",
+        &cpu_order,
+        &gpu_ordering_totals,
+    );
+    report(
+        "occlusion (coverage sweep)",
+        &cpu_occlude,
+        &gpu_occlusion_totals,
+    );
     report("both", &cpu_total, &gpu_totals);
 }
 

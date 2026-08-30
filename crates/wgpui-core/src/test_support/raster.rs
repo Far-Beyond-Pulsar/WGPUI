@@ -208,7 +208,11 @@ fn clamp_to_pixels(value: f32, limit: u32) -> u32 {
         return 0;
     }
     let limit_f32 = limit as f32;
-    if value >= limit_f32 { limit } else { value as u32 }
+    if value >= limit_f32 {
+        limit
+    } else {
+        value as u32
+    }
 }
 
 fn inside_rounded_rect(x: f32, y: f32, bounds: Rect, radius: f32) -> bool {
@@ -282,7 +286,10 @@ mod tests {
         rounded.corner_radii = [4.0; 4];
         let framebuffer = rasterize(&[rounded], &[0], None, 8, 8);
         assert_eq!(framebuffer.pixels.first().copied(), Some([0.0; 4]));
-        assert_eq!(framebuffer.pixels.get(3 * 8 + 4).copied().map(|p| p[3]), Some(1.0));
+        assert_eq!(
+            framebuffer.pixels.get(3 * 8 + 4).copied().map(|p| p[3]),
+            Some(1.0)
+        );
     }
 
     #[test]

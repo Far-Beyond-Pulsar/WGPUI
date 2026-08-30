@@ -194,10 +194,8 @@ mod tests {
     use crate::img::ImageEngine;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use wgpui_core::scene::atlas::{
-        ImageRasterKey, ImageTile, ImageTileSource, RasterizedImage,
-    };
     use wgpui_core::patch::primitive::AtlasTileId;
+    use wgpui_core::scene::atlas::{ImageRasterKey, ImageTile, ImageTileSource, RasterizedImage};
 
     #[derive(Default)]
     struct Tiles {
@@ -281,6 +279,7 @@ mod tests {
                 },
                 layer: LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT)),
                 boundary: BoundaryId::ROOT,
+                clip: None,
             },
             &mut emission,
         );
@@ -308,7 +307,10 @@ mod tests {
             Invalidation::empty()
         );
         assert_eq!(
-            base.clone().size(40.0, 41.0).diff_key().compare(&base.diff_key()),
+            base.clone()
+                .size(40.0, 41.0)
+                .diff_key()
+                .compare(&base.diff_key()),
             Invalidation::LAYOUT.union(Invalidation::DISPLAY),
             "a resize moves the Taffy leaf and repaints"
         );

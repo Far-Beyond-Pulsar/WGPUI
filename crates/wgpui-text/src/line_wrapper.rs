@@ -20,8 +20,8 @@
 //! break at word boundaries, fall back to breaking mid-word only when a single
 //! word does not fit at all.
 
-use crate::shaping::ShapedLine;
 use crate::line_layout::x_for_index;
+use crate::shaping::ShapedLine;
 
 /// Where a wrapped line breaks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

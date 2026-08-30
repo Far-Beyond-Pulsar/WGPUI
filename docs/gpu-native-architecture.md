@@ -1266,7 +1266,7 @@ verification.
 | 6.2 | **Merged to `2.0`** | PNG/GIF/SVG image decode, polychrome atlas upload, and `PolySpritePipeline` are byte-exact at natural size. Animated GIF advancement and interpolated scaled-image sampling remain open. Results: `docs/phase-6.2-results.md`. |
 | 6.3 | **Merged to `2.0`** | Shadow and underline pipelines are byte-exact against compiled legacy shaders. Their cross-kind occlusion behavior remains limited by per-kind dispatch, and emission coverage is addressed by 6.6. Results: `docs/phase-6.3-results.md`. |
 | 6.6 | **Merged to `2.0`** | Real nested styled `div()` emission, child layout, shadows, and text underline patches are byte-exact for the covered cases. Remaining frontend gaps include interactivity, opacity, gradients/patterns, overflow clipping, and complete style-DSL parity. Results: `docs/phase-6.6-results.md`. |
-| 6.4, 6.5, 7, 8 | **Next / pending** | Paths/backdrop blur, animation, devtools extraction, legacy alias/adaptor crate, complete example parity, and final cutover remain. |
+| 6.4, 7, 8 | **Next / pending** | Paths/backdrop blur, devtools extraction, legacy alias/adaptor crate, complete example parity, and final cutover remain. Phase 6.5 animation is executed below. |
 
 The final completion bar is unchanged: every existing example must build and
 run against the new backend with the crate-name import change as the only
@@ -1295,7 +1295,7 @@ Phase 8, after parity is demonstrated, not assumed.
 | **6.2** | Four missing layers (primitive kind, polychrome tile producer, `PolySpritePipeline`, image loading/decoding), built in that order per the confirmed Phase 6 finding. SVG rides the same polychrome path once it exists. **Executed** — merged to `2.0`. All four layers verified end to end against real source code, not commit messages taken on faith: three load-bearing claims were spot-checked directly (occlusion genuinely scans `poly_sprites` alongside glyph runs; one `issue_sprites` function serves both sprite pipelines, not two parallel ones; the `Cargo.lock` diff adds zero new packages, only new edges to dependencies already in the graph). One real commit-message overstatement was caught and disclosed rather than left standing: a claim that a test's "forty avatars" were real decoded frames was false — they're intentionally hand-built substitute data over a substitute atlas, which is correct for what that specific gate measures, and the test's own doc comment already said so; only the commit message oversold it. Two real gaps disclosed, not discovered later: **GIF frames decode correctly (with per-frame delay data) but nothing anywhere in `2.0` advances them — `widgets/animation.rs` and `window/animation.rs` are both still 3-line stubs, so "GIF decoding works" and "GIFs animate" are separately true and false** (§9's newest risk row, and now its own phase, 6.5, below); and image scaling is nearest-neighbor where legacy interpolates, a real, named fidelity gap for any example that scales an image. §6.2's `estimated_size` invariant is **still not closed** — no trait hook exists anywhere in `2.0` yet (`wgpui-layout::containment.rs` is still a stub); what landed instead, correctly distinguished rather than conflated with it, is `Img::layout_size()` returning a *decoded* image's natural size, which prevents an unsized image collapsing to zero but is not the same mechanism as estimating an *undecoded* one's size. 493 tests passing, clippy clean from a genuine cold build (re-verified after a first log capture was found truncated — "a clean exit code on an unread log isn't evidence," directly quoting the verification's own standard). | A real image file loads, decodes, uploads, and renders byte-exact against the legacy renderer's output for the same source — **met, literally byte-exact, zero tolerance consumed**: 512,144 of 512,144 pixels exact across both test assets. Strengthened once, honestly: an all-opaque test asset never exercises the alpha blend the gate is nominally about, so opaque/translucent/transparent classification was added to confirm the blend proof actually rests on the PNG asset's 8,540 translucent texels — all exact — not on an opaque asset that would pass trivially regardless of blend correctness. |
 | **6.3** | `ShadowPipeline` + `UnderlinePipeline` — both flagged in Phase 5.6's own report as `QuadPipeline`-shaped, i.e. genuinely cheap once the pattern is proven three times over (`Quad`, `GlyphRun`, and now `Img`'s sprite). Directly blocks example parity: `shadow` (bench), `window_shadow`, and any text with underline/strikethrough styling. **Executed** — merged to `2.0`. Two claims checked, one held, one didn't. **The shader-port claim was false a third time**: `shadows.wgsl`/`underlines.wgsl` were 2-line placeholders despite their own comments, exactly like `mono_sprites.wgsl` in Phase 5.6 — Phase 6.4 is told explicitly not to trust the same comment on `paths`/`backdrop_blur` a fourth time without checking. **"`QuadPipeline`-shaped" held for underlines, not for shadows**: a shadow is the first `2.0` primitive that paints *outside* its own rectangle — the shader integrates a Gaussian across a region expanded by 3σ, genuinely beyond flat-fill math — which forced real new mechanisms (`Shadow::drawn_bounds()` for ordering, `CoverageItem::uncullable` for occlusion), not just a fourth copy of `Quad`'s shape. Verification found something more interesting than a bug: **it falsified its own claim that those two mechanisms were load-bearing** — removing both left every test passing, including the byte-exact gate, because occlusion dispatches per primitive kind, so a `Quad` occluder is in a different dispatch than a `Shadow` occludee and can never actually cull it today. Both mechanisms are correct and match legacy; they are also currently inert, and the code now says so explicitly rather than implying a coverage guarantee that doesn't yet exist (§9's new cross-kind-occlusion risk row). The verification oracle here is stronger than any prior phase's: it `include_str!`s and compiles the **legacy `.wgsl` source directly**, not a transcription of it, against `2.0`'s real renderer — closing the exact weakness Phase 5.5 had to disclose about its own oracle. Two legacy quirks reproduced deliberately, not fixed, matching this project's established "match legacy while both exist" discipline: a zero-blur shadow renders nothing via a divide-by-zero producing NaN, and underline alpha is legacy's own squared value, not the naively-expected one. **The honest limit, stated plainly**: both pipelines draw byte-exact, and nothing in `2.0` emits either primitive yet — `BoxShadow` has no `2.0` counterpart and `StyledText` has no underline path, because the general `Div` style-to-primitive emission (background, border, shadow, corner radius) was never built past Phase 2's minimal generic path. Named as its own phase, 6.6, below, rather than assumed to fall out of a later one. 517 tests passing, clippy clean from a genuine cold build, `src/`/spec/`Cargo.lock` all untouched — zero new dependencies. | Both pipelines byte-exact against legacy output — **met**, and via a stronger oracle than any prior phase's (the legacy shader source itself, compiled and run, not transcribed): 315,392/315,392 pixels for shadows, 196,608/196,608 for underlines, zero tolerance defined or consumed, all four draw modes identical. Both gates watched actually failing before the fix (the underline gate twice, once per shader branch) — the discipline of proving a test can fail, not just pass, held again. |
 | **6.4** | `PathPipeline` + `BackdropFilterPipeline` — the GPU rasterization half of vector paths (§6 already settled that CPU-side Lyon tessellation stays as-is; this is specifically the pipeline that draws the triangles Lyon already produces) and backdrop blur. Directly blocks example parity: `paths_bench`, `pattern`, `blur_showcase`, `opacity`-adjacent examples using backdrop filters. | Both pipelines byte-exact against legacy output for representative path/blur content. |
-| **6.5** | *(Not in the original table — a gap Phase 6.2 confirmed rather than assumed: `.with_animation()`, easing, and the interpolation-over-time mechanism that drives it don't exist anywhere in `2.0`. `widgets/animation.rs` and `window/animation.rs` are both still the original 3-line Phase 0 stubs.)* Build the actual animation driver: `Animation`/`AnimationExt`'s public API (§7 — unchanged, frozen surface) needs a real implementation underneath it in `2.0` — per-frame interpolation of style deltas over a duration with an easing function, driven by `request_animation_frame` (already real since Phase 6's frame loop exists), producing ordinary per-frame `Description` differences that ambient reconciliation (§4.0) and the rest of the pipeline handle exactly like any other frame-to-frame change — no new rendering mechanism, this is describing *what changes*, not how it's drawn. Directly blocks example parity: `animation`, very likely `smooth_scrolling` and the `karaoke_*` top-level examples (animated text), and now also GIF frame advancement (Phase 6.2's decode-without-animate gap, closed here rather than left to drift into its own separate phase later). | An animated property (e.g. `with_animation`'s rotate/translate transform example from the README) produces the same per-frame interpolated values a human eye would expect from the documented easing curve, verified numerically at sampled time points against the easing function's own definition — not eyeballed. |
+| **6.5** | **Executed** — animation definitions, easing, chained/repeating timeline sampling, coalesced `request_animation_frame`, ordinary sampled `Description` diffs, and delay-based decoded-image frame advancement are implemented. Focused numerical, scheduling, widget-description, and GIF-delay tests pass. Full frontend `Window`/`Render` assembly is still a later boundary, so the scheduler is a platform-neutral request queue consumed by the future window loop. Results: `docs/phase-6.5-results.md`. | An animated property produces numerically sampled values under its easing curve and changes an ordinary `Description` key — **met**; GIF frame advancement by decoded per-frame delays — **met**. Native window integration remains pending with the 2.0 window assembly. |
 | **6.6** | *(Not in the original table — a gap Phase 6.3 confirmed rather than assumed: `ShadowPipeline`/`UnderlinePipeline` can draw both primitives byte-exact, and nothing in `2.0` emits either. `Div`'s style-to-primitive emission never advanced past Phase 2's minimal generic path — no wiring from `StyleRefinement`'s background/border/box-shadow/corner-radius fields to actual `Quad`/`Shadow` patches, and `StyledText` has no underline path from its highlight runs to `Underline` patches.)* Build `Div`'s real `Interactivity`-driven emission: background and border as `Quad`s (with corner-radius/border-width baked into the shader inputs `Quad` already carries, or extended if it doesn't — check rather than assume), `box-shadow` as `Shadow` patches, and `StyledText`'s underline/strikethrough highlight runs as `Underline` patches. This is the biggest single lever for example parity remaining — nearly every example in the repository uses `div()` with real styling, and none of that styling produces GPU primitives yet beyond what Phase 2's minimal proof-of-concept emission covers. | A styled `div()` — background color, border, rounded corners, box shadow, in one example — reconciles, emits, and renders byte-exact against the legacy renderer for the same style, not just against Phase 6.3's synthetic shadow/underline test fixtures. |
 | **7** | `wgpui-devtools` extraction (move, don't rewrite, the flamegraph/replay/inspector system onto a small hook trait `wgpui-core` exposes). File breakup of what remains monolithic in `wgpui-core`'s own modules (target: no file over ~1,000 lines). Can run in parallel with 1–6 — it's orthogonal risk — sequenced last here only because it's cheapest once most call sites have already been touched by the phases above. | `wgpui-core` compiles and runs with `wgpui-devtools` absent entirely (feature-gated), proving the dependency is genuinely one-directional. |
 | **8** | Build the legacy alias crate (§3.7) — a real adapter presenting `gpui-ce`'s exact public API over `2.0`'s internals, per-type re-export or remap as each one's structural fit actually turns out to be, decided here rather than guessed at earlier. Parity checklist (§7) passes at the exact bar stated there: every example in the repository's `[[example]]` list runs unmodified with the crate name as the only permitted source change, plus the pinned real-app snapshot where available. `wgpui-core` becomes the default; root `gpui-ce` becomes that alias crate. Legacy immediate-mode paths, `AnyView::cached`'s replay mechanism, and the `WGPUI_*` flag ladder are deleted — this is R-N's own never-finished Phase 12, finally safe to do because there is no longer a CPU path underneath it that anything still depends on. | Every example, not most of them, compiles and runs with only its crate-name line changed, and its rendered output matches the legacy backend's for the same input. No known workload needs the legacy backend as anything but a documented rollback tag. |
@@ -1328,7 +1328,7 @@ default, and it's gated on parity being demonstrated, not scheduled.
 | **From Phase 6's manual-commit review**: a hardcoded, uncapability-checked `wgpu::PresentMode` (`Immediate`, chosen without consulting `SurfaceCapabilities::present_modes`) panics via `UnsupportedPresentMode` inside surface creation on any backend that doesn't support it — not a fallback, not a degraded mode, a hard panic. WebGPU exposes only `Fifo`. Caught by review before merge on this specific commit, but it's a generalizable pattern this project has been vigilant about elsewhere (indirect-draw feature negotiation, §5.3) and should stay vigilant about here: any device/surface capability consulted once and then assumed stable is a latent cross-platform crash | Fixed for present mode specifically (a capability-checked preference list, `render_context.rs`'s feature-negotiation pattern applied one level up to surface configuration). Worth a pass over `wgpui-wgpu`'s other surface/device configuration for the same class of unchecked assumption before Phase 8's cross-platform validation, not as its own phase. |
 | **From Phase 5.5**: the differential test proving rasterization matches the legacy renderer compares against a **transcription** of the legacy `rasterize_glyph`/`RenderGlyphParams` logic, not a live call to it — those types are `pub(crate)` in `gpui-ce` and unreachable from `wgpui-text` without editing frozen `src/`. A bug present identically in the legacy code and its transcription would not be caught by this differential; it only catches divergence between the two, not divergence from ground truth | Disclosed in the report rather than presented as stronger proof than it is. If `src/`'s relevant types are ever made `pub` (or a cutover makes the legacy path unreachable anyway, removing the need for the comparison), replace the transcription with a live call for a strictly stronger guarantee. Not urgent — the transcription is still real signal, just bounded signal. |
 | **From Phase 5.5, deliberate, not a bug left in by accident**: at 2× display scale, the legacy sub-pixel-offset binning aliases four requested variants down to three distinct rasters — this looks wrong and was reproduced exactly rather than fixed, because matching legacy output is the actual goal while both backends coexist and a "fix" here would break the very differential that proves parity | Revisit once legacy parity stops being the governing constraint — plausibly at or after Phase 8's cutover, once nothing compares 2.0's output against the old renderer's anymore. Named explicitly so "why does this look wrong" has an answer already written down instead of getting re-investigated from scratch. |
-| **Confirmed by Phase 6.2, not assumed: `.with_animation()` and everything under it don't exist in `2.0`.** `widgets/animation.rs` and `window/animation.rs` are both the original 3-line Phase 0 stubs. This is not scoped to images — GIF frames now decode correctly with real per-frame delay data and have nothing that advances them, but the same missing mechanism blocks the `animation` example directly and likely `smooth_scrolling`/`karaoke_*`, since `.with_animation()` is frontend-frozen, documented public API (§7), not an internal detail | Given its own phase, 6.5 (§8), rather than left to be discovered piecemeal by whichever later phase happens to need animated content first — GIF advancement folds into it rather than getting a separate one-off fix. |
+| **Closed by Phase 6.5:** `.with_animation()` support, easing/timeline sampling, frame-request coalescing, and GIF frame timing now exist in `2.0`. Full frontend `Window`/`Render` assembly and example cutover remain later work, so platform consumption of the request queue is still pending. | Folded into Phase 6.5, with ordinary `Description` diffs rather than a renderer-specific animation path. |
 | **Confirmed by Phase 6.2**: image scaling uses nearest-neighbor sampling where the legacy renderer interpolates — a real, disclosed fidelity gap (not caught by the differential gate, which tests natural-size rendering only) for any example or real usage that displays a scaled image | Not yet mitigated — a bilinear/interpolated sampling mode is the fix, scoped to whichever phase or follow-up actually needs scaled-image parity; the differential gate should grow a scaled-image case at the same time so the fix is provable, not assumed. |
 | **Discovered by Phase 6.3, falsifying its own claim in the process — occlusion currently cannot cull across primitive kinds.** Culling dispatches per `PrimitiveKind`, so a `Quad` occluder painted over a `Shadow` or `GlyphRun` in a *different* kind's dispatch is invisible to that kind's occlusion pass and can never cull it — proven by deliberately removing `Shadow`'s occlusion-participation code and watching every test, including the byte-exact gate, keep passing regardless. Not a bug in what's built (occlusion is correct for what it culls today: same-kind coverage within a layer), but a real gap in what it claims to cover, now that a second kind (`Shadow`) exists specifically to have this checked | Not yet mitigated, and correctly not attempted opportunistically inside Phase 6.3 — cross-kind occlusion is a real design question (does a `Quad` occluder need to poison every other kind's dispatch, or only kinds it's plausible to actually cover?) deserving its own scoped pass, not a fix bolted onto the phase that happened to notice it. Address before or during Phase 8's cross-platform/parity validation, where an occlusion undercount would first become visible as a real performance gap rather than a correctness one (culling less than possible is safe, just not free). |
 | **A pattern, not a one-off: shader-file "moved as-is" doc comments have now been wrong three times** (`mono_sprites.wgsl`, Phase 5.6; `shadows.wgsl`/`underlines.wgsl`, Phase 6.3) — every one was a bare placeholder despite claiming otherwise | Phase 6.4 has been told explicitly not to trust the same comment on `paths.wgsl`/`backdrop_blur.wgsl` without checking first. Worth a mechanical sweep of every remaining `wgpui-wgpu/src/render/shaders/*.wgsl` file's actual content vs. its doc comment's claim before Phase 8, rather than discovering the pattern a fifth time mid-phase. |
@@ -1454,3 +1454,106 @@ next steps, in order:
    to finish (unmodified by any 2.0 branch per every phase's `git diff`,
    but "very likely pre-existing" and "confirmed" remain different
    things) — let it run to completion once, unhurried.
+
+---
+
+## 12. Phase 9 — release-candidate correctness and retention audit
+
+Phase 9 is the final verification phase after the Phase 8 compatibility
+cutover. It is not a cosmetic cleanup pass and it is not allowed to make a
+failing test pass by weakening its oracle. The phase may fix defects, remove
+unnecessary dependencies or dead content, and improve organization, but every
+behavioral correction must add or strengthen a regression test.
+
+### 12.1 Dependency and download hygiene
+
+- Resolve with `--locked` and `--offline` after a cold registry/cache audit.
+- Compare the final dependency graph with the approved graph and flag every
+  new package, feature, target-specific edge, build script, and transitive
+  download.
+- Confirm that dev-only differential dependencies do not enter production
+  targets, and that optional platform features remain optional.
+- Verify reproducible builds from a clean target directory and record the
+  exact commands and package graph.
+
+### 12.2 Source, shader, and file integrity
+
+- Enumerate every tracked source, shader, generated file, fixture, and asset
+  referenced by the workspace; fail on missing, empty, placeholder, duplicate,
+  or orphaned content where the module contract requires real implementation.
+- Compile every WGSL module on every available backend and validate bindings,
+  alignment, interpolation qualifiers, storage usage, and feature guards.
+- Check that comments, reports, execution-ledger entries, and file maps agree
+  with the code. No “ported as-is” claim is accepted without a direct diff or
+  compiled differential.
+- Run formatting, documentation-link, forbidden-pattern, and repository diff
+  checks without mutating user files implicitly.
+
+### 12.3 Rendering correctness and cleanliness
+
+- Repeat byte-exact legacy differentials for every primitive and every supported
+  draw mode, including mixed primitive scenes, clipping, opacity, gradients,
+  paths, blur, text, images, shadows, underlines, and surfaces.
+- Add independent CPU or legacy-renderer oracles where a copied/transcribed
+  oracle could reproduce the same bug as the implementation.
+- Test transparent, translucent, opaque, empty, degenerate, NaN/Infinity,
+  boundary, scale-factor, resize, and device-loss cases explicitly.
+- Verify that presentation contains no uninitialized pixels, magenta debug
+  clears, stale frames, frame tearing caused by ownership errors, or accidental
+  overdraw visible outside the intended content.
+- Compare indirect, direct, and CPU-fallback paths for identical output and
+  equivalent error handling.
+
+### 12.4 Retention, invalidation, and cache correctness
+
+- Prove unchanged trees retain layout nodes, element instances, primitive
+  slots, atlas entries, tile layers, and draw plans without unnecessary work.
+- Prove each invalidation axis (`LAYOUT`, `DISPLAY`, `TRANSFORM`, `CHILDREN`,
+  and compositing) touches exactly the dependent stages and no others.
+- Prove a single changed primitive produces a single stride-sized delta upload,
+  while relocation, insertion, removal, atlas eviction, and resize upload only
+  the required ranges.
+- Prove `.boundary()` retains and recomposites its texture correctly, and the
+  explicit uncache wrapper rebuilds only its subtree while preserving state and
+  surrounding retention.
+- Exercise tile panning in both axes, reveal/refill, LRU eviction, oversized
+  content, zoom/scale changes, boundary destruction, and repeated create/drop
+  cycles; assert no stale layer, slab, atlas, or GPU resource remains.
+- Run long-lived stress tests with allocation, upload, draw, cache-hit, and
+  eviction counters plus leak detection or resource-lifetime assertions.
+
+### 12.5 API and example correctness
+
+- Compile every declared example against the legacy-compatible façade with the
+  crate-name change as the only source difference.
+- Run every example that can run in CI and record platform-specific exclusions
+  with explicit reasons; no silent skips.
+- Exercise the public `App`, `Application`, `Window`, `Entity`, `Context`,
+  `Render`, `RenderOnce`, element, styling, action, event, asset, canvas,
+  platform, and devtools APIs through compatibility tests, not only through
+  type re-exports.
+- Compare representative legacy and 2.0 behavior at cold start, steady state,
+  interaction, animation, image loading, resize, close, and shutdown.
+
+### 12.6 Determinism, stress, and cross-platform validation
+
+- Render identical scripted input repeatedly and compare scene snapshots,
+  patch streams, upload plans, indirect arguments, and final pixels.
+- Run randomized reconciliation/invalidation sequences against a reference
+  model, including interruption, reordering, deletion, and re-insertion.
+- Validate native backends available on the machine and compile/test WASM
+  fallback paths; record adapter capabilities instead of assuming them.
+- Run cold `cargo check`, targeted tests, release tests, and strict clippy with
+  `--deny warnings`; the legacy warning baseline must not be attributed to the
+  new backend or silently inherited as a new suppression.
+
+### 12.7 Phase 9 exit gate
+
+Phase 9 is complete only when the dependency graph is approved, all required
+files and shaders contain verified implementations, the complete compatibility
+matrix passes, rendering and fallback differentials are exact for their stated
+coverage, retention and delta-upload invariants hold under stress, and no new
+warnings, leaks, unexplained skips, or unnecessary downloads remain. Any
+unsupported platform or deliberately preserved legacy quirk must be named in
+the release report with a test demonstrating the behavior and a documented
+follow-up decision.

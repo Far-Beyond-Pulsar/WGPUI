@@ -453,7 +453,10 @@ mod tests {
             Ok(range) => range,
             Err(error) => panic!("allocation failed: {error:?}"),
         };
-        assert_eq!(quad.base, run.base, "each kind numbers its own slots from 0");
+        assert_eq!(
+            quad.base, run.base,
+            "each kind numbers its own slots from 0"
+        );
         assert_eq!(allocator.arena_slot_capacity(QUAD), MIN_CLASS as u64 * 2);
         assert_eq!(
             allocator.arena_slot_capacity(PrimitiveKind::GlyphRun),

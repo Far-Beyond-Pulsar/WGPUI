@@ -17,6 +17,8 @@ pub mod measure;
 pub mod regular;
 pub mod taffy_tree;
 
+pub use measure::{IntrinsicSize, LayoutSize as MeasureSize, Measure};
+
 pub use taffy_tree::{
     AvailableSpace, Dimension, Display, FlexDirection, LayoutError, LayoutFrameStats, LayoutNodeId,
     LayoutRect, LayoutSize, LayoutStyle, LayoutTree, definite,

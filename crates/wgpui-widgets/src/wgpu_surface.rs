@@ -44,13 +44,13 @@
 //! `div` would") measured against a live control rather than an asserted
 //! constant.
 
+use std::any::Any;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::patch::primitive::Quad;
 use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_layout::taffy_tree::{Dimension, LayoutRect, LayoutSize, LayoutStyle};
-use std::any::Any;
 
 /// A handle to an externally-produced surface.
 ///
@@ -443,10 +443,10 @@ mod tests {
         let signals = FrameSignals::new();
 
         let draw = |description: Description,
-                        reconciler: &mut Reconciler,
-                        layout: &mut LayoutTree,
-                        emitter: &mut Emitter,
-                        scene: &mut Scene|
+                    reconciler: &mut Reconciler,
+                    layout: &mut LayoutTree,
+                    emitter: &mut Emitter,
+                    scene: &mut Scene|
          -> Result<(usize, u64), Box<dyn std::error::Error>> {
             let plan = reconciler.reconcile(description, layout)?;
             let root = plan.nodes().first().map(|node| node.layout_node);

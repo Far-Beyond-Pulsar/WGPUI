@@ -115,7 +115,10 @@ mod tests {
     #[test]
     fn calt_reports_absent_enabled_and_disabled_distinctly() {
         assert_eq!(FontFeatures::default().is_calt_enabled(), None);
-        assert_eq!(FontFeatures::disable_ligatures().is_calt_enabled(), Some(false));
+        assert_eq!(
+            FontFeatures::disable_ligatures().is_calt_enabled(),
+            Some(false)
+        );
         assert_eq!(
             FontFeatures::from_pairs(vec![("calt".into(), 1)]).is_calt_enabled(),
             Some(true)

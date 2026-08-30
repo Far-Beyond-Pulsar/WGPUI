@@ -185,10 +185,15 @@ mod tests {
         let mut store = ElementStateStore::new();
         let key = StateKey::new::<ScrollOffset>(scope("panel"));
         assert_eq!(
-            store.with_state(key, 0, || ScrollOffset(0.0), |offset| {
-                offset.0 = 12.0;
-                offset.0
-            }),
+            store.with_state(
+                key,
+                0,
+                || ScrollOffset(0.0),
+                |offset| {
+                    offset.0 = 12.0;
+                    offset.0
+                }
+            ),
             Some(12.0)
         );
         assert_eq!(store.sweep(0), 0);

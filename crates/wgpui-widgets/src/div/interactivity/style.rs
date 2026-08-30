@@ -170,7 +170,7 @@ pub struct BoxShadow {
 /// See this module's doc for why this is a resolved style rather than a
 /// refinement, and why the layout and paint halves sit side by side rather than
 /// merged.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DivStyle {
     /// The Taffy style this element's layout node is created with.
     pub layout: LayoutStyle,
@@ -179,15 +179,99 @@ pub struct DivStyle {
     /// the author never asked for one, and only the author's answer survives a
     /// future cascade.
     pub background: Option<[f32; 4]>,
+    /// A retained linear background gradient. The quad pipeline currently
+    /// consumes solid quads, so [`DivStyle::paint`] lowers this to stable
+    /// horizontal or vertical bands; this keeps the gradient in the retained
+    /// display list and avoids repainting unrelated elements.
+    pub background_gradient: Option<LinearGradient>,
+    /// A retained procedural pattern lowered to stable display-list bands.
+    pub background_pattern: Option<Pattern>,
     /// Border colour. `None` disables the border quad however wide the edges
     /// are, matching `Style::is_border_visible`.
     pub border_color: Option<[f32; 4]>,
     /// Per-side border widths.
     pub border_widths: Edges,
+    /// Whether the border uses the repeating dash-gap pattern.
+    pub border_dashed: bool,
+    /// Opacity applied to every primitive emitted by this element, including
+    /// shadows and borders.
+    pub opacity: f32,
     /// Per-corner radii, before [`Corners::clamped_for`].
     pub corner_radii: Corners,
     /// `box-shadow` layers, painted in order, all *behind* the element.
     pub box_shadow: Vec<BoxShadow>,
+    pub text_color: Option<[f32; 4]>,
+    pub text_size: Option<f32>,
+    pub text_line_height: Option<f32>,
+    pub text_weight: Option<wgpui_text::shaping::FontWeight>,
+    pub text_italic: bool,
+    pub text_alignment: u8,
+    pub text_line_through: bool,
+    pub text_gradient: Option<Vec<([f32; 4], f32)>>,
+    pub text_gradient_angle: Option<f32>,
+    pub cursor: CursorStyle,
+}
+
+impl Default for DivStyle {
+    fn default() -> Self {
+        Self {
+            layout: LayoutStyle::default(),
+            background: None,
+            background_gradient: None,
+            background_pattern: None,
+            border_color: None,
+            border_widths: Edges::default(),
+            border_dashed: false,
+            opacity: 1.0,
+            corner_radii: Corners::default(),
+            box_shadow: Vec::new(),
+            text_color: None,
+            text_size: None,
+            text_line_height: None,
+            text_weight: None,
+            text_italic: false,
+            text_alignment: 0,
+            text_line_through: false,
+            text_gradient: None,
+            text_gradient_angle: None,
+            cursor: CursorStyle::default(),
+        }
+    }
+}
+
+/// A linear gradient expressed in normalized element coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearGradient {
+    pub stops: Vec<crate::styled::LinearColorStop>,
+    /// Angle in degrees, where zero points right and 90 points down.
+    pub angle: f32,
+}
+
+/// A small, deterministic pattern vocabulary that can be retained without a
+/// CPU paint callback. More elaborate patterns belong in the GPU material
+/// system; these cover the style surface used by the native examples.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pattern {
+    Checker {
+        first: [f32; 4],
+        second: [f32; 4],
+        cell: f32,
+    },
+    Stripes {
+        first: [f32; 4],
+        second: [f32; 4],
+        width: f32,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CursorStyle {
+    #[default]
+    Default,
+    Pointer,
+    Grab,
+    Crosshair,
+    NotAllowed,
 }
 
 impl DivStyle {
@@ -204,6 +288,11 @@ impl DivStyle {
     /// `Style::paint`'s `background_color.is_some_and(|color| !color.is_transparent())`.
     pub fn is_background_visible(&self) -> bool {
         self.background.is_some_and(|color| color[3] > 0.0)
+            || self
+                .background_gradient
+                .as_ref()
+                .is_some_and(|gradient| gradient.stops.iter().any(|stop| stop.color[3] > 0.0))
+            || self.background_pattern.is_some()
     }
 
     /// Write this style's primitives for an element resolved to `bounds`.
@@ -249,11 +338,18 @@ impl DivStyle {
         let corner_radii = self.corner_radii.clamped_for(size);
 
         for shadow in &self.box_shadow {
-            emission.shadow(self.shadow_primitive(shadow, origin, size, corner_radii));
+            let mut primitive = self.shadow_primitive(shadow, origin, size, corner_radii);
+            primitive.color[3] *= self.opacity;
+            emission.shadow(primitive);
         }
 
-        if self.is_background_visible() {
-            let background = self.background.unwrap_or([0.0; 4]);
+        if let Some(gradient) = &self.background_gradient {
+            emit_gradient(gradient, bounds, self.opacity, emission);
+        } else if let Some(pattern) = &self.background_pattern {
+            emit_pattern(pattern, bounds, self.opacity, emission);
+        } else if self.is_background_visible() {
+            let mut background = self.background.unwrap_or([0.0; 4]);
+            background[3] *= self.opacity;
             // The legacy background quad carries a border colour that is its own
             // background with the alpha zeroed. That is not decoration: the
             // fragment shader still evaluates `over(background, border_color)`
@@ -272,8 +368,9 @@ impl DivStyle {
             });
         }
 
-        if self.is_border_visible() {
-            let border_color = self.border_color.unwrap_or([0.0; 4]);
+        if self.is_border_visible() && !self.border_dashed {
+            let mut border_color = self.border_color.unwrap_or([0.0; 4]);
+            border_color[3] *= self.opacity;
             let mut background = border_color;
             background[3] = 0.0;
             emission.quad(Quad {
@@ -284,6 +381,10 @@ impl DivStyle {
                 corner_radii: corner_radii.to_array(),
                 border_widths: self.border_widths.to_array(),
             });
+        } else if self.is_border_visible() {
+            let mut color = self.border_color.unwrap_or([0.0; 4]);
+            color[3] *= self.opacity;
+            emit_dashed_border(bounds, color, self.border_widths, emission);
         }
     }
 
@@ -330,8 +431,174 @@ impl DivStyle {
     /// appearing or disappearing is a structural change rather than a value one.
     pub fn primitive_count(&self) -> usize {
         self.box_shadow.len()
-            + usize::from(self.is_background_visible())
+            + if self.background_gradient.is_some() {
+                gradient_band_count()
+            } else if self.background_pattern.is_some() {
+                pattern_band_count()
+            } else {
+                usize::from(self.is_background_visible())
+            }
             + usize::from(self.is_border_visible())
+    }
+}
+
+const fn gradient_band_count() -> usize {
+    32
+}
+const fn pattern_band_count() -> usize {
+    32
+}
+
+fn interpolate_stops(stops: &[crate::styled::LinearColorStop], position: f32) -> [f32; 4] {
+    let Some(first) = stops.first() else {
+        return [0.0; 4];
+    };
+    if position <= first.position {
+        return first.color;
+    }
+    for pair in stops.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        if position <= right.position {
+            let span = (right.position - left.position).max(f32::EPSILON);
+            let amount = ((position - left.position) / span).clamp(0.0, 1.0);
+            return std::array::from_fn(|index| {
+                left.color[index] + (right.color[index] - left.color[index]) * amount
+            });
+        }
+    }
+    stops.last().map_or([0.0; 4], |stop| stop.color)
+}
+
+fn emit_gradient(
+    gradient: &LinearGradient,
+    bounds: LayoutRect,
+    opacity: f32,
+    emission: &mut Emission,
+) {
+    let vertical = gradient.angle.sin().abs() > gradient.angle.cos().abs();
+    let bands = gradient_band_count() as f32;
+    for index in 0..gradient_band_count() {
+        let start = index as f32 / bands;
+        let end = (index + 1) as f32 / bands;
+        let mut color = interpolate_stops(&gradient.stops, (start + end) * 0.5);
+        color[3] *= opacity;
+        let (origin, size) = if vertical {
+            (
+                [bounds.x, bounds.y + bounds.height * start],
+                [bounds.width, bounds.height * (end - start)],
+            )
+        } else {
+            (
+                [bounds.x + bounds.width * start, bounds.y],
+                [bounds.width * (end - start), bounds.height],
+            )
+        };
+        emission.quad(Quad {
+            origin,
+            size,
+            background: color,
+            border_color: [0.0; 4],
+            corner_radii: [0.0; 4],
+            border_widths: [0.0; 4],
+        });
+    }
+}
+
+fn emit_pattern(pattern: &Pattern, bounds: LayoutRect, opacity: f32, emission: &mut Emission) {
+    match pattern {
+        Pattern::Checker {
+            first,
+            second,
+            cell,
+        } => {
+            let cell = cell.max(1.0);
+            let columns = (bounds.width / cell).ceil().max(1.0) as usize;
+            let rows = (bounds.height / cell).ceil().max(1.0) as usize;
+            for row in 0..rows {
+                for column in 0..columns {
+                    let mut color = if (row + column) % 2 == 0 {
+                        *first
+                    } else {
+                        *second
+                    };
+                    color[3] *= opacity;
+                    let origin = [
+                        bounds.x + column as f32 * cell,
+                        bounds.y + row as f32 * cell,
+                    ];
+                    let size = [
+                        (bounds.x + bounds.width - origin[0]).min(cell),
+                        (bounds.y + bounds.height - origin[1]).min(cell),
+                    ];
+                    emission.quad(Quad {
+                        origin,
+                        size,
+                        background: color,
+                        border_color: [0.0; 4],
+                        corner_radii: [0.0; 4],
+                        border_widths: [0.0; 4],
+                    });
+                }
+            }
+        }
+        Pattern::Stripes {
+            first,
+            second,
+            width,
+        } => {
+            let width = width.max(1.0);
+            let count = (bounds.width / width).ceil().max(1.0) as usize;
+            for index in 0..count {
+                let mut color = if index % 2 == 0 { *first } else { *second };
+                color[3] *= opacity;
+                let x = bounds.x + index as f32 * width;
+                emission.quad(Quad {
+                    origin: [x, bounds.y],
+                    size: [(bounds.x + bounds.width - x).min(width), bounds.height],
+                    background: color,
+                    border_color: [0.0; 4],
+                    corner_radii: [0.0; 4],
+                    border_widths: [0.0; 4],
+                });
+            }
+        }
+    }
+}
+
+fn emit_dashed_border(bounds: LayoutRect, color: [f32; 4], widths: Edges, emission: &mut Emission) {
+    let width = bounds.width;
+    let height = bounds.height;
+    let dash_gap = |side: f32| (side * 3.0).max(1.0);
+    let mut emit = |origin: [f32; 2], size: [f32; 2]| {
+        emission.quad(Quad {
+            origin,
+            size,
+            background: color,
+            border_color: [0.0; 4],
+            corner_radii: [0.0; 4],
+            border_widths: [0.0; 4],
+        });
+    };
+    let mut cursor = 0.0;
+    while cursor < width {
+        let length = (width - cursor).min(dash_gap(widths.top) * 2.0);
+        emit([bounds.x + cursor, bounds.y], [length, widths.top]);
+        emit(
+            [bounds.x + cursor, bounds.y + height - widths.bottom],
+            [length, widths.bottom],
+        );
+        cursor += dash_gap(widths.top);
+    }
+    cursor = 0.0;
+    while cursor < height {
+        let length = (height - cursor).min(dash_gap(widths.left) * 2.0);
+        emit([bounds.x, bounds.y + cursor], [widths.left, length]);
+        emit(
+            [bounds.x + width - widths.right, bounds.y + cursor],
+            [widths.right, length],
+        );
+        cursor += dash_gap(widths.left);
     }
 }
 
@@ -357,8 +624,12 @@ pub fn classify_style_change(current: &DivStyle, previous: &DivStyle) -> Invalid
     if current.background != previous.background
         || current.border_color != previous.border_color
         || current.border_widths != previous.border_widths
+        || current.border_dashed != previous.border_dashed
         || current.corner_radii != previous.corner_radii
         || current.box_shadow != previous.box_shadow
+        || current.background_gradient != previous.background_gradient
+        || current.background_pattern != previous.background_pattern
+        || current.opacity != previous.opacity
     {
         axes |= Invalidation::DISPLAY;
     }
@@ -569,5 +840,54 @@ mod tests {
             Invalidation::empty(),
             "an unchanged style must report nothing stale"
         );
+    }
+
+    #[test]
+    fn opacity_is_a_display_change_and_applies_to_every_paint_layer() {
+        let mut style = styled();
+        style.box_shadow = vec![BoxShadow {
+            color: [0.0, 0.0, 0.0, 0.8],
+            offset: [0.0, 0.0],
+            blur_radius: 2.0,
+            spread_radius: 0.0,
+        }];
+        style.opacity = 0.25;
+        let mut emission = Emission::new();
+        style.paint(bounds(), &mut emission);
+        assert_eq!(emission.shadows()[0].color[3], 0.2);
+        assert_eq!(emission.quads()[0].background[3], 0.25);
+        assert_eq!(emission.quads()[1].border_color[3], 0.25);
+        assert_eq!(classify_style_change(&style, &styled()), Invalidation::DISPLAY);
+    }
+
+    #[test]
+    fn gradient_and_pattern_are_retained_as_nonempty_gpu_primitive_emissions() {
+        let gradient = DivStyle {
+            background_gradient: Some(LinearGradient {
+                stops: vec![
+                    crate::styled::LinearColorStop { color: [1.0, 0.0, 0.0, 1.0], position: 0.0 },
+                    crate::styled::LinearColorStop { color: [0.0, 0.0, 1.0, 1.0], position: 1.0 },
+                ],
+                angle: 0.0,
+            }),
+            ..DivStyle::default()
+        };
+        let mut emission = Emission::new();
+        gradient.paint(bounds(), &mut emission);
+        assert_eq!(emission.quads().len(), 32);
+        assert_eq!(gradient.primitive_count(), emission.quads().len());
+
+        let pattern = DivStyle {
+            background_pattern: Some(Pattern::Stripes {
+                first: [1.0, 0.0, 0.0, 1.0],
+                second: [0.0, 0.0, 1.0, 1.0],
+                width: 10.0,
+            }),
+            ..DivStyle::default()
+        };
+        let mut pattern_emission = Emission::new();
+        pattern.paint(bounds(), &mut pattern_emission);
+        assert!(!pattern_emission.quads().is_empty());
+        assert_eq!(classify_style_change(&gradient, &DivStyle::default()), Invalidation::DISPLAY);
     }
 }

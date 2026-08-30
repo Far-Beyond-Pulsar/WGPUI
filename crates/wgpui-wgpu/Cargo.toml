@@ -10,6 +10,7 @@ path = "src/wgpui_wgpu.rs"
 doctest = false
 
 [dependencies]
+ wgpui-devtools = { path = "../wgpui-devtools", optional = true }
 # Phase 3's compute passes dispatch shader source and consume input encodings
 # that wgpui-core owns (§3.1: "shader source as text, buffer/binding layout
 # descriptors as plain Rust structs"). The edge runs one way only — wgpui-core
@@ -29,6 +30,7 @@ wgpu = { version = "30", default-features = false, features = [
     "vulkan",
     "wgsl",
 ] }
+
 pollster = "0.4.0"
 # The bin-packing allocator behind `render/atlas.rs`, at the same version the
 # root crate pins — the legacy atlas (`src/platform/cross/atlas.rs`) uses the
@@ -79,6 +81,10 @@ rand = "0.10"
 # here because this is where the device is.
 wgpui-text = { path = "../wgpui-text" }
 lyon = "1.0"
+
+[features]
+default = []
+devtools = ["dep:wgpui-devtools", "wgpui-devtools/render-stats"]
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }

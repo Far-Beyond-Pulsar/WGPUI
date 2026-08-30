@@ -18,9 +18,9 @@
 use crate::line_wrapper::{WrapBoundary, wrap_boundaries};
 use crate::patch::{RunPlacement, glyph_runs as convert};
 use crate::shaping::{ShapedLine, ShapedRun};
+use std::sync::Arc;
 use wgpui_core::patch::primitive::GlyphRun;
 use wgpui_core::scene::atlas::GlyphTileSource;
-use std::sync::Arc;
 
 /// A shaped line together with where it wraps.
 #[derive(Clone, Debug)]
@@ -317,6 +317,9 @@ mod tests {
             .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.position[1]))
             .collect();
         assert!(ys.contains(&0.0));
-        assert!(ys.contains(&20.0), "the wrapped fragment must move down: {ys:?}");
+        assert!(
+            ys.contains(&20.0),
+            "the wrapped fragment must move down: {ys:?}"
+        );
     }
 }

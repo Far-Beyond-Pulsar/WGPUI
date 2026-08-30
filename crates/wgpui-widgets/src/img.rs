@@ -309,11 +309,24 @@ impl ImageEngine {
         Some(self.cache.frame(source, frame_index)?.size)
     }
 
+    /// Return the looping frame selected by the decoded delays.
+    pub fn frame_index_at(
+        &self,
+        source: ImageSourceId,
+        elapsed: std::time::Duration,
+    ) -> Option<u32> {
+        Some(self.cache.get(source)?.frame_index_at(elapsed))
+    }
+
     /// The tile holding one frame, allocating and uploading it if needed.
     ///
     /// `None` means the sprite draws nothing this frame — the source is not
     /// decoded, or the atlas refused it — which is ordinary and not an error.
-    fn tile_for(&mut self, source: ImageSourceId, frame_index: u32) -> Option<TilePlacementOfFrame> {
+    fn tile_for(
+        &mut self,
+        source: ImageSourceId,
+        frame_index: u32,
+    ) -> Option<TilePlacementOfFrame> {
         let key = ImageRasterKey {
             source: source.as_raw(),
             frame_index,
@@ -427,6 +440,18 @@ impl Img {
     pub fn frame_index(mut self, frame_index: u32) -> Self {
         self.frame_index = frame_index;
         self
+    }
+
+    /// Select the frame visible at `now - started` and return this image for
+    /// the next ordinary description pass.
+    pub fn frame_at(self, started: std::time::Instant, now: std::time::Instant) -> Self {
+        let elapsed = now.saturating_duration_since(started);
+        let frame_index = self
+            .engine
+            .borrow()
+            .frame_index_at(self.source, elapsed)
+            .unwrap_or(0);
+        self.frame_index(frame_index)
     }
 
     /// Record which of the three renderings is active this frame.
@@ -546,7 +571,9 @@ impl Img {
         emission.poly_sprite(PolySprite {
             origin: [drawn[0], drawn[1]],
             size: [drawn[2], drawn[3]],
-            atlas_origin: placement.map(|tile| tile.atlas_origin).unwrap_or([0.0, 0.0]),
+            atlas_origin: placement
+                .map(|tile| tile.atlas_origin)
+                .unwrap_or([0.0, 0.0]),
             atlas_size: placement.map(|tile| tile.atlas_size).unwrap_or([0.0, 0.0]),
             corner_radius: self.style.corner_radius,
             opacity: self.style.opacity,
@@ -708,6 +735,7 @@ mod tests {
                 },
                 layer: LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT)),
                 boundary: BoundaryId::ROOT,
+                clip: None,
             },
             &mut emission,
         );
@@ -814,7 +842,11 @@ mod tests {
                 },
                 Invalidation::DISPLAY,
             ),
-            ("a new animation frame", base().frame_index(3), Invalidation::DISPLAY),
+            (
+                "a new animation frame",
+                base().frame_index(3),
+                Invalidation::DISPLAY,
+            ),
             (
                 "a load transition",
                 base().load_state(ImageLoadState::Failed),

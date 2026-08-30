@@ -421,7 +421,10 @@ mod tests {
     fn a_layer_starts_at_the_identity_transform() {
         let mut table = LayerTable::new();
         let id = table.insert(LayerKey::untiled(BoundaryId::ROOT));
-        assert_eq!(table.get(id).map(Layer::transform), Some(LayerTransform::IDENTITY));
+        assert_eq!(
+            table.get(id).map(Layer::transform),
+            Some(LayerTransform::IDENTITY)
+        );
         assert!(LayerTransform::IDENTITY.is_identity());
     }
 

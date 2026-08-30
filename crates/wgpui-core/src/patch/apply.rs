@@ -98,7 +98,7 @@ impl ScenePatch {
             + self.quads.len()
             + self.underlines.len()
             + self.glyph_runs.len()
-        + self.poly_sprites.len()
+            + self.poly_sprites.len()
             + self.paths.len()
             + self.backdrop_filters.len()
             + self.layout_inputs.len()
@@ -236,11 +236,9 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     scene
         .paths
         .apply(&patch.paths, &mut scene.allocator, &mut entries)?;
-    scene.backdrop_filters.apply(
-        &patch.backdrop_filters,
-        &mut scene.allocator,
-        &mut entries,
-    )?;
+    scene
+        .backdrop_filters
+        .apply(&patch.backdrop_filters, &mut scene.allocator, &mut entries)?;
     scene.layout_inputs.apply(&patch.layout_inputs)?;
     scene.hitboxes.apply(&patch.hitboxes)?;
     scene.dispatch_nodes.apply(&patch.dispatch_nodes)?;
@@ -351,32 +349,24 @@ pub fn compare_to_rebuild(patched: &Scene, rebuilt: &Scene) -> Option<ResidencyM
         if let Some(mismatch) = compare_store(&patched.shadows, &rebuilt.shadows, layer) {
             return Some(mismatch);
         }
-        if let Some(mismatch) =
-            compare_store(&patched.quads, &rebuilt.quads, layer)
-        {
+        if let Some(mismatch) = compare_store(&patched.quads, &rebuilt.quads, layer) {
             return Some(mismatch);
         }
         if let Some(mismatch) = compare_store(&patched.underlines, &rebuilt.underlines, layer) {
             return Some(mismatch);
         }
-        if let Some(mismatch) =
-            compare_store(&patched.glyph_runs, &rebuilt.glyph_runs, layer)
-        {
+        if let Some(mismatch) = compare_store(&patched.glyph_runs, &rebuilt.glyph_runs, layer) {
             return Some(mismatch);
         }
-        if let Some(mismatch) =
-            compare_store(&patched.poly_sprites, &rebuilt.poly_sprites, layer)
-        {
+        if let Some(mismatch) = compare_store(&patched.poly_sprites, &rebuilt.poly_sprites, layer) {
             return Some(mismatch);
         }
         if let Some(mismatch) = compare_store(&patched.paths, &rebuilt.paths, layer) {
             return Some(mismatch);
         }
-        if let Some(mismatch) = compare_store(
-            &patched.backdrop_filters,
-            &rebuilt.backdrop_filters,
-            layer,
-        ) {
+        if let Some(mismatch) =
+            compare_store(&patched.backdrop_filters, &rebuilt.backdrop_filters, layer)
+        {
             return Some(mismatch);
         }
     }
@@ -709,7 +699,11 @@ mod tests {
         edit.quads.update(layer, target, quad(-1.0));
         let plan = apply(&mut scene, &edit)?;
 
-        assert_eq!(plan.len(), 1, "one changed primitive, one write_buffer call");
+        assert_eq!(
+            plan.len(),
+            1,
+            "one changed primitive, one write_buffer call"
+        );
         assert_eq!(
             plan.byte_count(),
             Quad::SLOT_STRIDE as u64,
@@ -848,14 +842,17 @@ mod tests {
         assert_eq!(scene.hitboxes.len(layer), 1);
         assert_eq!(scene.dispatch_nodes.len(layer), 1);
 
-        let axes = scene.layers.get(layer).map(crate::scene::Layer::invalidation);
+        let axes = scene
+            .layers
+            .get(layer)
+            .map(crate::scene::Layer::invalidation);
         assert_eq!(axes, Some(Invalidation::all()));
         Ok(())
     }
 
     #[test]
-    fn invalidation_axes_follow_the_categories_a_frame_actually_touched()
-    -> Result<(), PatchError> {
+    fn invalidation_axes_follow_the_categories_a_frame_actually_touched() -> Result<(), PatchError>
+    {
         let (mut scene, layers) = scene_with_layers(1);
         let layer = layers[0];
         let mut seed = ScenePatch::new();
@@ -867,7 +864,10 @@ mod tests {
         display_only.quads.update(layer, key(1), quad(2.0));
         apply(&mut scene, &display_only)?;
         assert_eq!(
-            scene.layers.get(layer).map(crate::scene::Layer::invalidation),
+            scene
+                .layers
+                .get(layer)
+                .map(crate::scene::Layer::invalidation),
             Some(Invalidation::DISPLAY),
             "a colour change must not claim layout or hit geometry moved"
         );
@@ -892,7 +892,10 @@ mod tests {
             record.map(|layer| layer.slab(GlyphRun::KIND)),
             Some(scene.glyph_runs.slab(layer))
         );
-        assert_ne!(record.map(|layer| layer.slab(Quad::KIND)), Some(SlabRange::EMPTY));
+        assert_ne!(
+            record.map(|layer| layer.slab(Quad::KIND)),
+            Some(SlabRange::EMPTY)
+        );
         Ok(())
     }
 
@@ -920,7 +923,10 @@ mod tests {
         let plan = apply(&mut scene, &patch)?;
         assert_eq!(scene.shadows.len(layer), 2);
         assert_eq!(
-            scene.layers.get(layer).map(|layer| layer.slab(Shadow::KIND)),
+            scene
+                .layers
+                .get(layer)
+                .map(|layer| layer.slab(Shadow::KIND)),
             Some(scene.shadows.slab(layer)),
             "the layer table must learn a shadow reservation like any other"
         );

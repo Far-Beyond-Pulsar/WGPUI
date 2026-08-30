@@ -48,12 +48,12 @@ use wgpui_core::scene::atlas::{
 use wgpui_layout::taffy_tree::{
     Dimension, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
 };
+use wgpui_text::shaping::{FontWeight, SharedString, TextShaper, font};
 use wgpui_widgets::image_cache::{DecodedFrame, DecodedImage, ImageCache};
 use wgpui_widgets::img::{ImageEngine, ImageSourceId, Img, SharedImageEngine};
 use wgpui_widgets::styled_text::{
     HighlightStyle, Highlights, SharedTextEngine, StyledText, TextEngine, TextStyle,
 };
-use wgpui_text::shaping::{FontWeight, SharedString, TextShaper, font};
 
 /// Rows in the scene. Enough that a per-row cost is visible against measurement
 /// noise, and in the range a real list actually keeps resident.
@@ -149,11 +149,7 @@ fn style() -> TextStyle {
     }
 }
 
-fn row(
-    content: &RowContent,
-    engine: &SharedTextEngine,
-    images: &SharedImageEngine,
-) -> Description {
+fn row(content: &RowContent, engine: &SharedTextEngine, images: &SharedImageEngine) -> Description {
     Description::new::<Row>()
         .diff_key(RowKey(0))
         .style(LayoutStyle {
@@ -194,7 +190,11 @@ fn list(
             flex_direction: FlexDirection::Column,
             ..LayoutStyle::default()
         })
-        .children(content.iter().map(|row_content| row(row_content, engine, images)))
+        .children(
+            content
+                .iter()
+                .map(|row_content| row(row_content, engine, images)),
+        )
 }
 
 /// Assert no node in the tree is a compositing boundary.
@@ -354,7 +354,11 @@ fn gate_unchanged_rows_cost_no_shaping_under_ambient_reconciliation()
     let content = content();
     let mut harness = Harness::new();
 
-    let first = harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
+    let first = harness.frame(list(
+        &content,
+        &harness.engine.clone(),
+        &harness.images.clone(),
+    ))?;
     // Two text elements per row, each shaped once. If this is not what the
     // first frame costs, the second frame's zero means nothing.
     assert_eq!(
@@ -362,10 +366,18 @@ fn gate_unchanged_rows_cost_no_shaping_under_ambient_reconciliation()
         (ROWS * 2) as u64,
         "the first frame must actually do the work the second frame skips"
     );
-    assert_eq!(first.nodes_emitted, ROWS * 3, "one Img and two texts per row");
+    assert_eq!(
+        first.nodes_emitted,
+        ROWS * 3,
+        "one Img and two texts per row"
+    );
     assert!(first.upload_bytes > 0);
 
-    let second = harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
+    let second = harness.frame(list(
+        &content,
+        &harness.engine.clone(),
+        &harness.images.clone(),
+    ))?;
     assert_eq!(
         second.lines_shaped, 0,
         "an unchanged row must not reach cosmic-text at all"
@@ -384,7 +396,11 @@ fn gate_unchanged_rows_cost_no_shaping_under_ambient_reconciliation()
 
     // A third identical frame, because "costs nothing once" and "costs nothing
     // every frame" are different claims and only the second one is useful.
-    let third = harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
+    let third = harness.frame(list(
+        &content,
+        &harness.engine.clone(),
+        &harness.images.clone(),
+    ))?;
     assert_eq!(third, second);
     Ok(())
 }
@@ -395,13 +411,25 @@ fn gate_unchanged_rows_cost_no_shaping_under_ambient_reconciliation()
 fn one_changed_row_reshapes_exactly_one_line() -> Result<(), Box<dyn std::error::Error>> {
     let mut content = content();
     let mut harness = Harness::new();
-    harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
-    harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
+    harness.frame(list(
+        &content,
+        &harness.engine.clone(),
+        &harness.images.clone(),
+    ))?;
+    harness.frame(list(
+        &content,
+        &harness.engine.clone(),
+        &harness.images.clone(),
+    ))?;
 
     if let Some(row) = content.get_mut(7) {
         row.title = SharedString::from("Row 7 — edited in place");
     }
-    let after = harness.frame(list(&content, &harness.engine.clone(), &harness.images.clone()))?;
+    let after = harness.frame(list(
+        &content,
+        &harness.engine.clone(),
+        &harness.images.clone(),
+    ))?;
 
     assert_eq!(
         after.lines_shaped, 1,
@@ -500,18 +528,34 @@ fn without_reconciliation_the_cache_alone_is_measurably_weaker()
 -> Result<(), Box<dyn std::error::Error>> {
     let content = content();
     let mut reconciled = Harness::new();
-    reconciled.frame(list(&content, &reconciled.engine.clone(), &reconciled.images.clone()))?;
-    let with_reconciliation = reconciled.frame(list(&content, &reconciled.engine.clone(), &reconciled.images.clone()))?;
+    reconciled.frame(list(
+        &content,
+        &reconciled.engine.clone(),
+        &reconciled.images.clone(),
+    ))?;
+    let with_reconciliation = reconciled.frame(list(
+        &content,
+        &reconciled.engine.clone(),
+        &reconciled.images.clone(),
+    ))?;
 
     let mut cache_only = Harness::new();
-    cache_only.frame(list(&content, &cache_only.engine.clone(), &cache_only.images.clone()))?;
+    cache_only.frame(list(
+        &content,
+        &cache_only.engine.clone(),
+        &cache_only.images.clone(),
+    ))?;
     // A fresh reconciler and scene: every element is a new instance, so nothing
     // is reused and the shaping cache is the only thing left standing.
     cache_only.reconciler = Reconciler::new();
     cache_only.layout = LayoutTree::new();
     cache_only.emitter = Emitter::new();
     cache_only.scene = Scene::new();
-    let without_reconciliation = cache_only.frame(list(&content, &cache_only.engine.clone(), &cache_only.images.clone()))?;
+    let without_reconciliation = cache_only.frame(list(
+        &content,
+        &cache_only.engine.clone(),
+        &cache_only.images.clone(),
+    ))?;
 
     assert_eq!(with_reconciliation.lines_shaped, 0);
     assert_eq!(without_reconciliation.lines_shaped, 0, "the cache holds");
@@ -599,8 +643,5 @@ fn no_row_is_ever_named() {
     // And positional identity is stable: the same slot path addresses the same
     // instance across frames without anything opting in.
     let path = [ElementId::Slot(0), ElementId::Slot(7), ElementId::Slot(1)];
-    assert_eq!(
-        InstanceKey::from_path(&path),
-        InstanceKey::from_path(&path)
-    );
+    assert_eq!(InstanceKey::from_path(&path), InstanceKey::from_path(&path));
 }

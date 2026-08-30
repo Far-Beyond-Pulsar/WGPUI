@@ -53,7 +53,7 @@ pub mod scroll_state;
 use crate::div::diff::DivDiffKey;
 use crate::div::interactivity::style::DivStyle;
 use crate::styled::Styled;
-use wgpui_core::patch::emit::{EmitContext, Emission};
+use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::reconcile::description::{Description, ElementId};
 
 /// Anything that can become one node of a description tree.
@@ -74,6 +74,24 @@ impl IntoDescription for Description {
     }
 }
 
+impl IntoDescription for String {
+    fn into_description(self) -> Description {
+        Description::new::<String>()
+    }
+}
+
+impl IntoDescription for wgpui_text::shaping::SharedString {
+    fn into_description(self) -> Description {
+        Description::new::<wgpui_text::shaping::SharedString>()
+    }
+}
+
+impl IntoDescription for &str {
+    fn into_description(self) -> Description {
+        Description::new::<&'static str>()
+    }
+}
+
 /// A styled, laid-out box with children — `div()`.
 pub struct Div {
     element_id: Option<ElementId>,
@@ -82,6 +100,7 @@ pub struct Div {
     boundary: bool,
     uncached: bool,
     scroll_offset: [f32; 2],
+    estimated_size: Option<[f32; 2]>,
 }
 
 /// A new, unstyled, childless `div`.
@@ -96,6 +115,7 @@ pub fn div() -> Div {
         boundary: false,
         uncached: false,
         scroll_offset: [0.0, 0.0],
+        estimated_size: None,
     }
 }
 
@@ -155,6 +175,19 @@ impl Div {
         self
     }
 
+    /// Supply a cheap intrinsic estimate for unresolved dimensions. The
+    /// estimate is used only for dimensions that remain `auto`; explicit
+    /// author sizing always wins. Keeping it on the description makes the
+    /// fallback deterministic and avoids invoking a content measurer twice.
+    pub fn estimated_size(mut self, size: [f32; 2]) -> Self {
+        self.estimated_size = Some([size[0].max(0.0), size[1].max(0.0)]);
+        self
+    }
+
+    pub fn intrinsic_size(&self) -> Option<[f32; 2]> {
+        self.estimated_size
+    }
+
     /// This `div`'s resolved style, for tests and for an inspector.
     pub fn div_style(&self) -> &DivStyle {
         &self.style
@@ -167,7 +200,11 @@ impl Div {
 
     /// This frame's fingerprint.
     pub fn diff_key(&self) -> DivDiffKey {
-        DivDiffKey::new(self.style.clone(), self.children.len())
+        DivDiffKey::with_estimate(
+            self.style.clone(),
+            self.children.len(),
+            self.estimated_size,
+        )
     }
 
     /// The per-frame description of this `div` and its subtree.
@@ -179,17 +216,39 @@ impl Div {
             boundary,
             uncached,
             scroll_offset,
+            estimated_size,
         } = self;
 
-        let key = DivDiffKey::new(style.clone(), children.len());
-        let layout_style = style.layout.clone();
+        let key = DivDiffKey::with_estimate(style.clone(), children.len(), estimated_size);
+        let mut layout_style = style.layout.clone();
+        if let Some([width, height]) = estimated_size {
+            if layout_style.size.width == wgpui_layout::taffy_tree::Dimension::auto() {
+                layout_style.size.width = wgpui_layout::taffy_tree::Dimension::length(width);
+            }
+            if layout_style.size.height == wgpui_layout::taffy_tree::Dimension::auto() {
+                layout_style.size.height = wgpui_layout::taffy_tree::Dimension::length(height);
+            }
+        }
         let paint = style;
+        let clips_children = matches!(
+            layout_style.overflow.x,
+            wgpui_layout::taffy_tree::Overflow::Hidden
+                | wgpui_layout::taffy_tree::Overflow::Scroll
+        ) || matches!(
+            layout_style.overflow.y,
+            wgpui_layout::taffy_tree::Overflow::Hidden
+                | wgpui_layout::taffy_tree::Overflow::Scroll
+        );
 
         let mut description = Description::new::<Div>()
             .diff_key(key)
             .style(layout_style)
             .scroll_offset(scroll_offset)
             .children(children);
+
+        if clips_children {
+            description = description.clip_children();
+        }
 
         if let Some(element_id) = element_id {
             description = description.id(element_id);
@@ -234,8 +293,8 @@ mod tests {
     use wgpui_core::invalidation::request::FrameSignals;
     use wgpui_core::patch::apply::apply;
     use wgpui_core::patch::emit::{EmitError, Emitter};
-    use wgpui_core::reconcile::plan::NodeOutcome;
     use wgpui_core::reconcile::instance::InstanceKey;
+    use wgpui_core::reconcile::plan::NodeOutcome;
     use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
     use wgpui_core::scene::Scene;
     use wgpui_core::scene::layer::{BoundaryId, LayerId, LayerKey};
@@ -392,12 +451,14 @@ mod tests {
     }
 
     #[test]
-    fn an_identical_second_frame_reuses_everything_and_uploads_nothing()
-    -> Result<(), FrameError> {
+    fn an_identical_second_frame_reuses_everything_and_uploads_nothing() -> Result<(), FrameError> {
         let mut window = Window::new();
         window.draw(card())?;
         let settled = window.draw(card())?;
-        assert_eq!(settled.outcome_at(&[ElementId::Slot(0)]), Some(NodeOutcome::Reused));
+        assert_eq!(
+            settled.outcome_at(&[ElementId::Slot(0)]),
+            Some(NodeOutcome::Reused)
+        );
         assert_eq!(settled.emitted, 0, "a clean, unmoved div must not re-emit");
         assert_eq!(settled.inserted, 0);
         assert_eq!(settled.updated, 0);
@@ -420,16 +481,12 @@ mod tests {
             keys,
             "a stable emission order means stable per-primitive addresses (§5.0)"
         );
-        assert_eq!(
-            quads(&window)[0].background,
-            [1.0, 0.0, 0.0, 1.0]
-        );
+        assert_eq!(quads(&window)[0].background, [1.0, 0.0, 0.0, 1.0]);
         Ok(())
     }
 
     #[test]
-    fn adding_a_background_inserts_a_record_rather_than_updating_one()
-    -> Result<(), FrameError> {
+    fn adding_a_background_inserts_a_record_rather_than_updating_one() -> Result<(), FrameError> {
         let mut window = Window::new();
         let bare = || div().w(200.0).h(120.0).border_color([1.0; 4]).border_1();
         window.draw(bare())?;

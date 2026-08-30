@@ -196,7 +196,8 @@ impl Scene {
         self.glyph_runs.remove_layer(layer, &mut self.allocator);
         self.poly_sprites.remove_layer(layer, &mut self.allocator);
         self.paths.remove_layer(layer, &mut self.allocator);
-        self.backdrop_filters.remove_layer(layer, &mut self.allocator);
+        self.backdrop_filters
+            .remove_layer(layer, &mut self.allocator);
         self.layout_inputs.remove_layer(layer);
         self.hitboxes.remove_layer(layer);
         self.dispatch_nodes.remove_layer(layer);
@@ -235,9 +236,12 @@ mod tests {
 
         let mut patch = ScenePatch::new();
         for index in 0..3u32 {
-            patch
-                .quads
-                .append(populated, crate::patch::RecordKey::from_raw(index as u64 + 1), index, Quad::ZERO);
+            patch.quads.append(
+                populated,
+                crate::patch::RecordKey::from_raw(index as u64 + 1),
+                index,
+                Quad::ZERO,
+            );
         }
         patch.glyph_runs.insert(
             populated,
@@ -290,9 +294,12 @@ mod tests {
                 let layer = scene.layer(LayerKey::untiled(BoundaryId::from_raw(boundary + 1)));
                 for index in 0..per_layer {
                     key += 1;
-                    patch
-                        .quads
-                        .append(layer, crate::patch::RecordKey::from_raw(key), index, Quad::ZERO);
+                    patch.quads.append(
+                        layer,
+                        crate::patch::RecordKey::from_raw(key),
+                        index,
+                        Quad::ZERO,
+                    );
                 }
             }
             apply(&mut scene, &patch)?;
@@ -325,8 +332,8 @@ mod tests {
     }
 
     #[test]
-    fn slots_name_a_reservation_and_never_an_instance_count()
-    -> Result<(), crate::patch::PatchError> {
+    fn slots_name_a_reservation_and_never_an_instance_count() -> Result<(), crate::patch::PatchError>
+    {
         use crate::patch::apply::{ScenePatch, apply};
 
         let mut scene = Scene::new();
@@ -380,12 +387,7 @@ mod tests {
         let mut scene = Scene::new();
         let layer = scene.layer(LayerKey::untiled(BoundaryId::ROOT));
         let mut quads = PatchList::new();
-        quads.insert(
-            layer,
-            crate::patch::RecordKey::from_raw(1),
-            0,
-            Quad::ZERO,
-        );
+        quads.insert(layer, crate::patch::RecordKey::from_raw(1), 0, Quad::ZERO);
         let mut uploads = Vec::new();
         scene
             .quads

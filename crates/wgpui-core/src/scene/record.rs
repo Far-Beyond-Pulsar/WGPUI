@@ -285,10 +285,7 @@ mod tests {
             .insert(layer, key(1), 1, hitbox(2.0));
         assert_eq!(
             store.apply(&list),
-            Err(PatchError::DuplicateKey {
-                layer,
-                key: key(1)
-            })
+            Err(PatchError::DuplicateKey { layer, key: key(1) })
         );
     }
 
@@ -320,20 +317,14 @@ mod tests {
         update.update(layer, key(9), hitbox(9.0));
         assert_eq!(
             store.apply(&update),
-            Err(PatchError::UnknownKey {
-                layer,
-                key: key(9)
-            })
+            Err(PatchError::UnknownKey { layer, key: key(9) })
         );
 
         let mut remove = PatchList::new();
         remove.remove(layer, key(9));
         assert_eq!(
             store.apply(&remove),
-            Err(PatchError::UnknownKey {
-                layer,
-                key: key(9)
-            })
+            Err(PatchError::UnknownKey { layer, key: key(9) })
         );
     }
 

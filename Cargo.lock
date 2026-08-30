@@ -1972,7 +1972,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui-ce"
+name = "gpui-ce-legacy"
 version = "1.0.0"
 dependencies = [
  "anyhow",
@@ -6738,9 +6738,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpui"
+version = "0.1.0"
+dependencies = [
+ "wgpui-core",
+ "wgpui-layout",
+ "wgpui-text",
+ "wgpui-wgpu",
+ "wgpui-widgets",
+]
+
+[[package]]
+name = "wgpui-compat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "env_logger",
+ "futures",
+ "glam",
+ "helio",
+ "helio-default-graphs",
+ "log",
+ "ordered-float",
+ "rand 0.10.0",
+ "smol",
+ "unicode-segmentation",
+ "wgpu",
+ "wgpui-compat-macros",
+ "wgpui-core",
+ "wgpui-layout",
+ "wgpui-text",
+ "wgpui-wgpu",
+ "wgpui-widgets",
+]
+
+[[package]]
+name = "wgpui-compat-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "wgpui-core"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "lyon",
  "wgpui-layout",
 ]
@@ -6748,6 +6794,9 @@ dependencies = [
 [[package]]
 name = "wgpui-devtools"
 version = "0.1.0"
+dependencies = [
+ "wgpui-core",
+]
 
 [[package]]
 name = "wgpui-layout"
@@ -6777,6 +6826,7 @@ dependencies = [
  "rand 0.10.0",
  "wgpu",
  "wgpui-core",
+ "wgpui-devtools",
  "wgpui-layout",
  "wgpui-text",
  "wgpui-widgets",

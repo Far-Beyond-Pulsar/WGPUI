@@ -86,6 +86,8 @@ pub struct EmitContext {
     pub layer: LayerId,
     /// The compositing boundary owning that layer.
     pub boundary: BoundaryId,
+    /// The accumulated rectangular clip from ancestors, if any.
+    pub clip: Option<LayoutRect>,
 }
 
 /// What one element contributes to the scene this frame.
@@ -221,6 +223,27 @@ impl Emission {
         self.poly_sprites.clear();
         self.paths.clear();
         self.backdrop_filters.clear();
+    }
+
+    /// Retain primitive slots while applying an inherited rectangular clip.
+    /// Zeroing an outside quad rather than removing it keeps record ordinals
+    /// stable, so scrolling across a clip boundary remains a value update.
+    pub fn clip_quads_to(&mut self, clip: LayoutRect) {
+        for quad in &mut self.quads {
+            let left = quad.origin[0].max(clip.x);
+            let top = quad.origin[1].max(clip.y);
+            let right = (quad.origin[0] + quad.size[0]).min(clip.x + clip.width);
+            let bottom = (quad.origin[1] + quad.size[1]).min(clip.y + clip.height);
+            if right <= left || bottom <= top {
+                quad.origin = [left, top];
+                quad.size = [0.0, 0.0];
+                quad.background[3] = 0.0;
+                quad.border_color[3] = 0.0;
+            } else {
+                quad.origin = [left, top];
+                quad.size = [right - left, bottom - top];
+            }
+        }
     }
 }
 
@@ -388,6 +411,21 @@ struct WalkFrame {
     /// Displacement applied to this node's children's positions. Zero unless
     /// this node scrolls and could not hand that displacement to a layer.
     content_offset: [f32; 2],
+    clip: Option<LayoutRect>,
+}
+
+fn intersect_layout_rect(clip: Option<LayoutRect>, bounds: LayoutRect) -> LayoutRect {
+    let Some(clip) = clip else { return bounds };
+    let left = clip.x.max(bounds.x);
+    let top = clip.y.max(bounds.y);
+    let right = (clip.x + clip.width).min(bounds.x + bounds.width);
+    let bottom = (clip.y + clip.height).min(bounds.y + bounds.height);
+    LayoutRect {
+        x: left,
+        y: top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    }
 }
 
 /// One kind's pending operations, kept apart so removals can be emitted before
@@ -435,11 +473,7 @@ impl<P: Primitive> KindOperations<P> {
     /// index computed against the layer's post-removal length is the index the
     /// scene will actually see. `store` supplies each layer's starting length;
     /// nothing here mutates the scene.
-    fn into_patch_list(
-        self,
-        store: &PrimitiveStore<P>,
-        stats: &mut EmissionStats,
-    ) -> PatchList<P> {
+    fn into_patch_list(self, store: &PrimitiveStore<P>, stats: &mut EmissionStats) -> PatchList<P> {
         let mut list = PatchList::new();
         let mut lengths: HashMap<LayerId, u32> = HashMap::new();
 
@@ -548,6 +582,7 @@ impl Emitter {
             boundary: BoundaryId::ROOT,
             origin: [0.0, 0.0],
             content_offset: [0.0, 0.0],
+            clip: None,
         };
 
         for (index, node) in plan.nodes().iter().enumerate() {
@@ -640,9 +675,13 @@ impl Emitter {
                                 bounds,
                                 layer,
                                 boundary: node.boundary,
+                                clip: parent.clip,
                             },
                             &mut emission,
                         );
+                        if let Some(clip) = parent.clip {
+                            emission.clip_quads_to(clip);
+                        }
                         Self::reconcile_records(
                             node.address,
                             layer,
@@ -730,6 +769,11 @@ impl Emitter {
                 boundary: child_boundary,
                 origin,
                 content_offset,
+                clip: if node.clip_children {
+                    Some(intersect_layout_rect(parent.clip, bounds))
+                } else {
+                    parent.clip
+                },
             });
         }
 
@@ -880,11 +924,7 @@ impl Emitter {
         }
     }
 
-    fn retire_records(
-        address: InstanceKey,
-        record: EmittedNode,
-        pending: &mut PendingOperations,
-    ) {
+    fn retire_records(address: InstanceKey, record: EmittedNode, pending: &mut PendingOperations) {
         for ordinal in 0..record.shadows {
             pending
                 .shadows
@@ -1131,9 +1171,9 @@ mod tests {
             self.layout
                 .compute_layout(root, definite(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
                 .map_err(EmitError::from)?;
-            let emission =
-                self.emitter
-                    .emit(&plan, &self.layout, signals, &mut self.scene)?;
+            let emission = self
+                .emitter
+                .emit(&plan, &self.layout, signals, &mut self.scene)?;
             let uploads = apply(&mut self.scene, &emission.patch)?;
             Ok(Frame {
                 reconciled: plan.stats(),
@@ -1167,7 +1207,10 @@ mod tests {
         );
         assert!(!description.is_uncached());
         if let Some(policy) = description.boundary_policy() {
-            assert!(boundaried, "no boundary may appear in the unboundaried tree");
+            assert!(
+                boundaried,
+                "no boundary may appear in the unboundaried tree"
+            );
             assert_eq!(
                 policy,
                 BoundaryPolicy::default(),
@@ -1208,7 +1251,11 @@ mod tests {
             Some(Composite::Clean)
         );
         assert_eq!(
-            window.scene.layers.get(layer).map(|layer| layer.invalidation()),
+            window
+                .scene
+                .layers
+                .get(layer)
+                .map(|layer| layer.invalidation()),
             Some(Invalidation::empty()),
             "a settled frame leaves nothing stale — R-N §3.2's clean layer"
         );
@@ -1261,11 +1308,19 @@ mod tests {
 
         // And the scene agrees: the layer moved, its residency did not.
         assert_eq!(
-            window.scene.layers.get(layer).map(|layer| layer.transform()),
+            window
+                .scene
+                .layers
+                .get(layer)
+                .map(|layer| layer.transform()),
             Some(LayerTransform::translated(0.0, -ROW_HEIGHT * 3.0))
         );
         assert_eq!(
-            window.scene.layers.get(layer).map(|layer| layer.invalidation()),
+            window
+                .scene
+                .layers
+                .get(layer)
+                .map(|layer| layer.invalidation()),
             Some(Invalidation::TRANSFORM)
         );
         assert_eq!(window.scene.quads.len(layer), ROW_COUNT);
@@ -1281,8 +1336,8 @@ mod tests {
     /// where that gets proved *under* a boundary, by taking the boundary away
     /// and showing the reconciler's answer is bit-for-bit the same one.
     #[test]
-    fn gate_2_removing_the_boundary_costs_a_recomposite_and_not_a_rebuild()
-    -> Result<(), FrameError> {
+    fn gate_2_removing_the_boundary_costs_a_recomposite_and_not_a_rebuild() -> Result<(), FrameError>
+    {
         let mut boundaried = Window::new();
         let mut plain = Window::new();
         let boundary = boundary_of(&boundaried);
@@ -1312,7 +1367,10 @@ mod tests {
         assert_eq!(with.layout_nodes, without.layout_nodes);
         assert!(with.fully_reused && without.fully_reused);
         assert_eq!(without.reconciled.rebuilt, 0, "no element rebuilt");
-        assert_eq!(without.reconciled.layout_nodes_created, 0, "no node recreated");
+        assert_eq!(
+            without.reconciled.layout_nodes_created, 0,
+            "no node recreated"
+        );
         assert_eq!(without.reconciled.layout_nodes_swept, 0);
         assert_eq!(without.reconciled.instances_swept, 0);
         assert_eq!(
@@ -1330,7 +1388,10 @@ mod tests {
         assert_eq!(without.emission.stats.nodes_emitted, ROW_COUNT as usize);
         assert!(without.uploaded_bytes > 0);
         assert_eq!(
-            without.emission.composite_for(BoundaryId::ROOT).map(|c| c.composite),
+            without
+                .emission
+                .composite_for(BoundaryId::ROOT)
+                .map(|c| c.composite),
             Some(Composite::Redisplay)
         );
 
@@ -1365,8 +1426,8 @@ mod tests {
     }
 
     #[test]
-    fn a_boundary_that_was_not_told_this_was_a_scroll_folds_the_offset_in()
-    -> Result<(), FrameError> {
+    fn a_boundary_that_was_not_told_this_was_a_scroll_folds_the_offset_in() -> Result<(), FrameError>
+    {
         let mut window = Window::new();
         let boundary = boundary_of(&window);
         window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
@@ -1391,8 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn a_content_change_inside_a_scrolling_boundary_redisplays_it()
-    -> Result<(), FrameError> {
+    fn a_content_change_inside_a_scrolling_boundary_redisplays_it() -> Result<(), FrameError> {
         let mut window = Window::new();
         let boundary = boundary_of(&window);
         let layer = LayerId::from_key(LayerKey::untiled(boundary));
@@ -1409,7 +1469,10 @@ mod tests {
             "a scroll signal must never override a measured-dirty subtree"
         );
         assert_eq!(
-            frame.emission.composite_for(boundary).map(|c| c.invalidation),
+            frame
+                .emission
+                .composite_for(boundary)
+                .map(|c| c.invalidation),
             Some(Invalidation::DISPLAY)
         );
         Ok(())
@@ -1585,8 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn an_element_emitting_several_primitives_keeps_each_ones_address()
-    -> Result<(), FrameError> {
+    fn an_element_emitting_several_primitives_keeps_each_ones_address() -> Result<(), FrameError> {
         let mut window = Window::new();
         let root_layer = LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT));
         let describe = |tint: f32, revision: u32| {
@@ -1618,8 +1680,7 @@ mod tests {
 
         let second = window.draw(describe(0.5, 1), &FrameSignals::new())?;
         assert_eq!(
-            second.emission.stats.records_updated,
-            3,
+            second.emission.stats.records_updated, 3,
             "two quads and one glyph run, each addressed by its own ordinal"
         );
         assert_eq!(second.emission.stats.records_inserted, 0);
@@ -1633,8 +1694,8 @@ mod tests {
     }
 
     #[test]
-    fn an_emitter_is_never_run_for_an_element_that_did_not_move_or_change()
-    -> Result<(), FrameError> {
+    fn an_emitter_is_never_run_for_an_element_that_did_not_move_or_change() -> Result<(), FrameError>
+    {
         use std::cell::Cell;
         use std::rc::Rc;
 
@@ -1660,7 +1721,11 @@ mod tests {
         window.draw(describe(0, Rc::clone(&calls)), &FrameSignals::new())?;
         assert_eq!(calls.get(), 1);
         window.draw(describe(0, Rc::clone(&calls)), &FrameSignals::new())?;
-        assert_eq!(calls.get(), 1, "a clean, unmoved element must not be asked again");
+        assert_eq!(
+            calls.get(),
+            1,
+            "a clean, unmoved element must not be asked again"
+        );
         window.draw(describe(1, Rc::clone(&calls)), &FrameSignals::new())?;
         assert_eq!(calls.get(), 2);
         Ok(())
@@ -1676,6 +1741,7 @@ mod tests {
             declared_boundary: None,
             boundary_policy: None,
             scroll_offset: [0.0, 0.0],
+            clip_children: false,
             state: crate::reconcile::state::StateScope::from_path(&[]),
             layout_node: wgpui_layout::taffy_tree::LayoutNodeId::from_raw(0),
             depth: 0,

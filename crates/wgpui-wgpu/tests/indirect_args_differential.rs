@@ -22,9 +22,7 @@
 //! skippable; what is lost here is the WGSL/Rust agreement half.
 
 use wgpui_core::geometry::Rect;
-use wgpui_core::indirect::{
-    DrawSlot, FirstInstance, UNUSED_INSTANCE, encode_slots, indirect_args,
-};
+use wgpui_core::indirect::{DrawSlot, FirstInstance, UNUSED_INSTANCE, encode_slots, indirect_args};
 use wgpui_core::occlusion::{encode_coverage_items, encode_poison_regions};
 use wgpui_core::ordering::encode_ordering_items;
 use wgpui_core::patch::primitive::{PrimitiveKind, Quad};

@@ -108,8 +108,7 @@ pub fn closest_index_for_x(line: &ShapedLine, x: f32) -> usize {
             .map(|next| next.index)
             .unwrap_or(line.len);
 
-        for (candidate_x, candidate_index) in
-            [(placement.x, placement.index), (next_x, next_index)]
+        for (candidate_x, candidate_index) in [(placement.x, placement.index), (next_x, next_index)]
         {
             let distance = (candidate_x - x).abs();
             if distance < best_distance {

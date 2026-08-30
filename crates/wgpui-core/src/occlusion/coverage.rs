@@ -142,7 +142,11 @@ pub fn opaque_region(bounds: Rect, clip: Rect, style: &OccluderStyle) -> Option<
     }
 
     region = region.intersect(&clip);
-    if region.is_empty() { None } else { Some(region) }
+    if region.is_empty() {
+        None
+    } else {
+        Some(region)
+    }
 }
 
 /// Whether `target` is completely covered by `occluders`.

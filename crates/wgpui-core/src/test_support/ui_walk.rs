@@ -241,12 +241,7 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
     // --- Left tree panel: an opaque background with a taller-than-window list
     // of rows scrolled over it.
     quads.push(plain(
-        rect(
-            0.0,
-            content_top,
-            panel_width,
-            content_bottom - content_top,
-        ),
+        rect(0.0, content_top, panel_width, content_bottom - content_top),
         solid(0.13, 0.13, 0.16),
     ));
     let scale = spec.content_scale.clamp(0.02, 4.0);
@@ -320,16 +315,13 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
         let x = viewport.min_x
             + column as f32 * cell_width
             + jitter(node.wrapping_mul(3) + 1, cell_width * 0.3);
-        let y = viewport.min_y + 16.0 * scale + row as f32 * row_pitch
+        let y = viewport.min_y
+            + 16.0 * scale
+            + row as f32 * row_pitch
             + jitter(node.wrapping_mul(7) + 2, row_pitch * 0.2);
         // Drop shadow: translucent, so it can be culled but never occludes.
         quads.push(plain(
-            rect(
-                x + 3.0 * scale,
-                y + 3.0 * scale,
-                node_width,
-                node_height,
-            ),
+            rect(x + 3.0 * scale, y + 3.0 * scale, node_width, node_height),
             translucent(0.0, 0.0, 0.0, 0.35),
         ));
         // Body: opaque, rounded, with a translucent hairline border — so its
@@ -645,9 +637,7 @@ impl MultiLayerSceneDriver {
     pub fn new(layer_count: usize) -> MultiLayerSceneDriver {
         let mut scene = Scene::new();
         let layers: Vec<LayerId> = (0..layer_count.max(1))
-            .map(|index| {
-                scene.layer(LayerKey::untiled(BoundaryId::from_raw(index as u64 + 1)))
-            })
+            .map(|index| scene.layer(LayerKey::untiled(BoundaryId::from_raw(index as u64 + 1))))
             .collect();
         let resident = vec![0usize; layers.len()];
         MultiLayerSceneDriver {
@@ -878,9 +868,15 @@ impl NodeGraph {
             // reaches content and negative tile coordinates are ordinary rather
             // than an edge case.
             let x = (column as f32 - spec.columns as f32 * 0.5) * spec.column_pitch
-                + jitter(column.wrapping_mul(31).wrapping_add(row), spec.column_pitch * 0.25);
+                + jitter(
+                    column.wrapping_mul(31).wrapping_add(row),
+                    spec.column_pitch * 0.25,
+                );
             let y = (row as f32 - spec.rows as f32 * 0.5) * spec.row_pitch
-                + jitter(row.wrapping_mul(17).wrapping_add(column), spec.row_pitch * 0.2);
+                + jitter(
+                    row.wrapping_mul(17).wrapping_add(column),
+                    spec.row_pitch * 0.2,
+                );
             [x, y]
         };
 
@@ -1228,7 +1224,10 @@ mod tests {
         let repeat = driver
             .apply_frame(&frame.quads)
             .expect("second frame applies");
-        assert!(repeat.is_empty(), "an identical frame must upload zero bytes");
+        assert!(
+            repeat.is_empty(),
+            "an identical frame must upload zero bytes"
+        );
         assert_eq!(repeat.byte_count(), 0);
     }
 
@@ -1275,8 +1274,10 @@ mod tests {
             "no translucent primitive: the alpha rule is untested"
         );
         assert!(
-            frame.quads.iter().any(|quad| quad.max_corner_radius() > 0.0
-                && quad.background[3] >= 1.0),
+            frame
+                .quads
+                .iter()
+                .any(|quad| quad.max_corner_radius() > 0.0 && quad.background[3] >= 1.0),
             "no rounded opaque primitive: the corner-radius inset is untested"
         );
         assert!(
@@ -1338,7 +1339,10 @@ mod tests {
                 "step {step} re-rendered {} primitives for a pan",
                 stats.primitives_written
             );
-            assert_eq!(stats.upload_bytes, 0, "step {step} uploaded bytes for a pan");
+            assert_eq!(
+                stats.upload_bytes, 0,
+                "step {step} uploaded bytes for a pan"
+            );
             assert_eq!(stats.layers_created, 0);
             assert_eq!(
                 stats.display_layers,
@@ -1351,8 +1355,7 @@ mod tests {
                 "one TRANSFORM per visible tile, plus the overlay"
             );
             assert_eq!(
-                stats.transform_only_layers,
-                stats.transform_updates,
+                stats.transform_only_layers, stats.transform_updates,
                 "every layer this frame touched carries TRANSFORM and nothing else"
             );
             assert!(stats.is_transform_only());
@@ -1505,8 +1508,7 @@ mod tests {
         let viewport = rect(0.0, 0.0, 1024.0, 768.0);
         let policy = TiledCanvasDriver::tiled_policy(TileGrid::DEFAULT_EDGE, 1, 256);
 
-        let mut with_wires =
-            TiledCanvasDriver::new(&NodeGraphSpec::large(), viewport, policy);
+        let mut with_wires = TiledCanvasDriver::new(&NodeGraphSpec::large(), viewport, policy);
         with_wires.pan_to([0.0, 0.0])?;
 
         let mut without_wires = TiledCanvasDriver::new(
@@ -1545,8 +1547,7 @@ mod tests {
     /// the claim in `docs/phase-4.5-results.md` is about the distribution rather
     /// than about one lucky frame.
     #[test]
-    fn the_overlays_share_of_a_long_pans_work_is_small_but_not_zero()
-    -> Result<(), PatchError> {
+    fn the_overlays_share_of_a_long_pans_work_is_small_but_not_zero() -> Result<(), PatchError> {
         let mut canvas = canvas();
         canvas.pan_to([-8.0, -8.0])?;
         canvas.settle();
@@ -1582,8 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pan_far_enough_to_leave_the_grid_evicts_the_tiles_behind_it()
-    -> Result<(), PatchError> {
+    fn a_pan_far_enough_to_leave_the_grid_evicts_the_tiles_behind_it() -> Result<(), PatchError> {
         let mut canvas = TiledCanvasDriver::new(
             &NodeGraphSpec::large(),
             rect(0.0, 0.0, 1024.0, 768.0),

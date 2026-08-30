@@ -100,7 +100,10 @@ impl winit::application::ApplicationHandler for Probe {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&context.device, &configuration);
-        println!("configure: OK at {}x{}", configuration.width, configuration.height);
+        println!(
+            "configure: OK at {}x{}",
+            configuration.width, configuration.height
+        );
 
         for frame in 0..8u32 {
             let acquired = surface.get_current_texture();

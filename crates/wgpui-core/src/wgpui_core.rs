@@ -13,8 +13,11 @@
 #![allow(dead_code)]
 
 pub mod app;
+pub use app::{App, Context, Entity, EntityId, Subscription, Task, TaskError, WeakEntity};
+pub use app::entity::EntityError;
 pub mod boundary;
 pub mod geometry;
+pub mod hooks;
 pub mod indirect;
 pub mod invalidation;
 pub mod occlusion;

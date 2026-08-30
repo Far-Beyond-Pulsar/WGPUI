@@ -1,0 +1,19 @@
+[package]
+name = "wgpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/wgpui.rs"
+doctest = false
+
+[dependencies]
+wgpui-core = { path = "../wgpui-core" }
+wgpui-layout = { path = "../wgpui-layout" }
+wgpui-text = { path = "../wgpui-text" }
+wgpui-wgpu = { path = "../wgpui-wgpu" }
+wgpui-widgets = { path = "../wgpui-widgets" }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

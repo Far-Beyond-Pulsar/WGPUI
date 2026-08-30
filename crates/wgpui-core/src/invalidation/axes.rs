@@ -109,10 +109,12 @@ mod tests {
 
     #[test]
     fn transform_is_distinct_from_the_other_three() {
-        assert!(!Invalidation::TRANSFORM.intersects(
-            Invalidation::LAYOUT
-                .union(Invalidation::DISPLAY)
-                .union(Invalidation::HIT)
-        ));
+        assert!(
+            !Invalidation::TRANSFORM.intersects(
+                Invalidation::LAYOUT
+                    .union(Invalidation::DISPLAY)
+                    .union(Invalidation::HIT)
+            )
+        );
     }
 }

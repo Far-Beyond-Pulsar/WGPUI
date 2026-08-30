@@ -175,10 +175,7 @@ impl QuadPipeline {
             pipeline,
             frame_layout,
             slot_layout,
-            slot_stride: device
-                .limits()
-                .min_uniform_buffer_offset_alignment
-                .max(16),
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
         }
     }
 
@@ -479,7 +476,12 @@ impl BackdropPipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("backdrop filters slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, true)],
+            entries: &[uniform_entry(
+                0,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
+                16,
+                true,
+            )],
         });
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("backdrop filters texture"),
@@ -763,12 +765,7 @@ impl MonoSpritePipeline {
         let page_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mono sprites atlas page"),
             entries: &[
-                uniform_entry(
-                    0,
-                    wgpu::ShaderStages::VERTEX,
-                    Self::PAGE_PARAMS_SIZE,
-                    false,
-                ),
+                uniform_entry(0, wgpu::ShaderStages::VERTEX, Self::PAGE_PARAMS_SIZE, false),
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1069,7 +1066,12 @@ impl CompositePipeline {
         });
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("composite frame"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, false)],
+            entries: &[uniform_entry(
+                0,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
+                16,
+                false,
+            )],
         });
         let entry_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("composite entry"),
@@ -1145,7 +1147,11 @@ impl CompositePipeline {
     }
 
     /// The bind group holding this frame's globals.
-    pub fn frame_bind_group(&self, device: &wgpu::Device, globals: &wgpu::Buffer) -> wgpu::BindGroup {
+    pub fn frame_bind_group(
+        &self,
+        device: &wgpu::Device,
+        globals: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("composite frame"),
             layout: &self.frame_layout,
@@ -1269,8 +1275,7 @@ mod tests {
             3.0
         );
         assert!(
-            super::super::shaders::SHADOWS_WGSL
-                .contains("const BLUR_MARGIN_SIGMAS: f32 = 3.0;")
+            super::super::shaders::SHADOWS_WGSL.contains("const BLUR_MARGIN_SIGMAS: f32 = 3.0;")
         );
     }
 
