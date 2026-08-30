@@ -80,3 +80,25 @@ This document is not a waiver for missing functionality. The final native
 release requires the full examples matrix to compile, the interactive examples
 to run through real event dispatch, and the rendering results to be covered by
 the correctness and differential tests described in the architecture plan.
+
+## WGPUI 2.0 example-closure baseline
+
+The consolidated analyzer baseline contains 45 registered examples: 0 pass,
+45 fail, and 138 unique normalized error groups. Migration work may reduce
+only errors whose corresponding native API exists. Remaining failures must be
+classified as native capability gaps; examples must not gain no-op compatibility
+methods or backend edits to make the matrix green.
+
+The closure run reduced the matrix to 45 examples, 0 pass, 45 fail, and 121
+unique normalized error groups (138 → 121). The remaining groups are
+classified as follows: native element/closure migrations still pending in the
+copied corpus; interaction and focus traversal; scrolling and list widgets;
+window controls; image and SVG asset loading; custom canvas/path drawing; and
+the direct WGPU/Helio surface path. These are capability boundaries, not
+compatibility shims, and remain intentionally unimplemented in the example
+crate until their native backends exist.
+
+Launchable examples carry bounded frame metadata in
+`crates/wgpui-examples-2/examples/smoke-tests.toml`. A smoke entry records the
+intended bounded launch once the example compiles; it is not a runtime-tested
+claim by itself.

@@ -1,0 +1,30 @@
+# Bounded launch metadata for examples whose native window path is available.
+# The compile/analyze matrix remains authoritative for source compatibility.
+
+[[smoke_test]]
+name = "native_elements"
+frames = 1
+
+[[smoke_test]]
+name = "native_interaction"
+frames = 1
+
+[[smoke_test]]
+name = "hello_world"
+frames = 1
+
+[[smoke_test]]
+name = "tree"
+frames = 1
+
+[[smoke_test]]
+name = "emoji_display"
+frames = 1
+
+[[smoke_test]]
+name = "layout"
+frames = 1
+
+[[smoke_test]]
+name = "shadow"
+frames = 1

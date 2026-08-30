@@ -8,7 +8,7 @@ struct HelloWorld {
 }
 
 impl Render for HelloWorld {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -95,7 +95,7 @@ fn main() {
                 ..Default::default()
             },
             |_, cx| {
-                cx.new(|_| HelloWorld {
+                cx.new_entity(HelloWorld {
                     text: "World".into(),
                 })
             },

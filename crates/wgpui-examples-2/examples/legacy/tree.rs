@@ -17,7 +17,7 @@ static DEPTH: LazyLock<u64> = LazyLock::new(|| {
 });
 
 impl Render for Tree {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self) -> impl IntoElement {
         let mut depth = *DEPTH;
         static COLORS: [wgpui::Hsla; 4] =
             [wgpui::red(), wgpui::blue(), wgpui::green(), wgpui::yellow()];
@@ -40,7 +40,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Tree {}),
+            |_, cx| cx.new_entity(Tree {}),
         )
         .unwrap();
     });
