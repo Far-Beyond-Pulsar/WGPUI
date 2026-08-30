@@ -902,6 +902,16 @@ pub struct Path {
 impl Path {
     /// Bytes one tessellated vertex occupies in the GPU arena.
     pub const SLOT_STRIDE: usize = 48;
+    /// Byte offset of the position in the GPU vertex record.
+    pub const POSITION_OFFSET: usize = 0;
+    /// Byte offset of the curve coordinates in the GPU vertex record.
+    pub const ST_OFFSET: usize = 8;
+    /// Byte offset of the straight-alpha RGBA color in the GPU vertex record.
+    pub const COLOR_OFFSET: usize = 16;
+    /// Byte offset of the content-mask origin in the GPU vertex record.
+    pub const CLIP_ORIGIN_OFFSET: usize = 32;
+    /// Byte offset of the content-mask size in the GPU vertex record.
+    pub const CLIP_SIZE_OFFSET: usize = 40;
 
     /// Build a path from a flat vertex stream.
     pub fn new(vertices: Vec<PathVertex>, color: [f32; 4]) -> Self {
@@ -996,6 +1006,17 @@ pub struct BackdropFilter {
 }
 
 impl BackdropFilter {
+    /// Bytes one filter record occupies in the GPU arena.
+    pub const SLOT_STRIDE: usize = 64;
+    /// Byte offsets in the stable storage-buffer record.
+    pub const ORIGIN_OFFSET: usize = 0;
+    pub const SIZE_OFFSET: usize = 8;
+    pub const CLIP_ORIGIN_OFFSET: usize = 16;
+    pub const CLIP_SIZE_OFFSET: usize = 24;
+    pub const CORNER_RADII_OFFSET: usize = 32;
+    pub const BLUR_RADIUS_OFFSET: usize = 48;
+    pub const OPACITY_OFFSET: usize = 52;
+
     /// A transparent, empty filter.
     pub const ZERO: Self = Self {
         origin: [0.0; 2],
@@ -1010,7 +1031,7 @@ impl BackdropFilter {
 
 impl Primitive for BackdropFilter {
     const KIND: PrimitiveKind = PrimitiveKind::BackdropFilter;
-    const SLOT_STRIDE: usize = 64;
+    const SLOT_STRIDE: usize = Self::SLOT_STRIDE;
 
     fn slot_count(&self) -> u32 {
         1
@@ -1414,5 +1435,24 @@ mod tests {
             .is_ok()
         );
         assert_eq!(&bytes[40..44], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn path_and_backdrop_layouts_are_explicit_and_stable() {
+        assert_eq!(Path::SLOT_STRIDE, 48);
+        assert_eq!(Path::POSITION_OFFSET, 0);
+        assert_eq!(Path::ST_OFFSET, 8);
+        assert_eq!(Path::COLOR_OFFSET, 16);
+        assert_eq!(Path::CLIP_ORIGIN_OFFSET, 32);
+        assert_eq!(Path::CLIP_SIZE_OFFSET, 40);
+
+        assert_eq!(BackdropFilter::SLOT_STRIDE, 64);
+        assert_eq!(BackdropFilter::ORIGIN_OFFSET, 0);
+        assert_eq!(BackdropFilter::SIZE_OFFSET, 8);
+        assert_eq!(BackdropFilter::CLIP_ORIGIN_OFFSET, 16);
+        assert_eq!(BackdropFilter::CLIP_SIZE_OFFSET, 24);
+        assert_eq!(BackdropFilter::CORNER_RADII_OFFSET, 32);
+        assert_eq!(BackdropFilter::BLUR_RADIUS_OFFSET, 48);
+        assert_eq!(BackdropFilter::OPACITY_OFFSET, 52);
     }
 }
