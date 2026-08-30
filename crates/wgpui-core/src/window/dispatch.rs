@@ -15,6 +15,7 @@ struct Node {
 #[derive(Default)]
 pub struct DispatchTree {
     nodes: HashMap<DispatchNodeId, Node>,
+    hitbox_nodes: HashMap<HitboxId, DispatchNodeId>,
     next: u64,
     root: Option<DispatchNodeId>,
 }
@@ -45,6 +46,16 @@ impl DispatchTree {
             },
         );
         id
+    }
+    pub fn bind_hitbox(&mut self, hitbox: HitboxId, node: DispatchNodeId) -> bool {
+        if !self.nodes.contains_key(&node) {
+            return false;
+        }
+        self.hitbox_nodes.insert(hitbox, node);
+        true
+    }
+    pub fn unbind_hitbox(&mut self, hitbox: HitboxId) -> bool {
+        self.hitbox_nodes.remove(&hitbox).is_some()
     }
     pub fn on_action<A: Action>(
         &mut self,
@@ -88,7 +99,10 @@ impl DispatchTree {
         false
     }
     pub fn dispatch_input(&mut self, target: HitboxId, event: &InputEvent) -> bool {
-        for node_id in self.path(DispatchNodeId(target.as_raw())) {
+        let Some(node) = self.hitbox_nodes.get(&target).copied() else {
+            return false;
+        };
+        for node_id in self.path(node) {
             let Some(node) = self.nodes.get_mut(&node_id) else {
                 continue;
             };
@@ -121,6 +135,8 @@ mod tests {
         let mut tree = DispatchTree::new();
         let root = tree.root();
         let child = tree.new_node(Some(root));
+        let hitbox = HitboxId::from_raw(100);
+        assert!(tree.bind_hitbox(hitbox, child));
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let child_calls = calls.clone();
         tree.on_action(child, move |_: &Activate| {
@@ -133,6 +149,10 @@ mod tests {
             EventResult::HANDLED
         });
         assert!(tree.dispatch_action(child, &Activate));
+        assert!(!tree.dispatch_input(hitbox, &InputEvent::KeyUp(crate::window::KeyUpEvent {
+            key: "x".into(),
+            modifiers: crate::window::Modifiers::none(),
+        })));
         assert_eq!(&*calls.borrow(), &["child", "root"]);
     }
 }

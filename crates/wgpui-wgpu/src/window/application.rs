@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use wgpui_core::boundary::Pixels;
+use wgpui_core::app::App;
 use wgpui_core::boundary::compositor::CompositeEntry;
 use wgpui_core::element::IntoElement;
 use wgpui_core::geometry::{Bounds, Point, Size, WindowBounds, point, size};
@@ -325,6 +326,39 @@ where
         }
     }
 
+    /// Explicit name for the direct retained-window entry point.
+    ///
+    /// `Application::new()` is the legacy GPUI constructor shape, while this
+    /// crate's original direct constructor takes window options and a frame
+    /// builder. Rust does not support overloaded associated functions, so the
+    /// direct form remains available under this deliberate name.
+    pub fn with_window(options: WindowOptions, build: F) -> Self {
+        Self::new(options, build)
+    }
+
+    /// Run the direct window application after initializing a shared app.
+    ///
+    /// The initializer runs from Winit's `resumed` callback, before the first
+    /// redraw, and the same `App` is retained for the lifetime of the window.
+    /// Calling [`App::quit`] from the initializer or any retained callback
+    /// exits the real event loop after the current frame.
+    pub fn run_with_app(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
+        let event_loop = event_loop()?;
+        let mut handler = Handler {
+            options: self.options,
+            build: self.build,
+            max_frames: self.max_frames,
+            initialize: Some(Box::new(initialize)),
+            live: None,
+            failure: None,
+            marker: std::marker::PhantomData,
+        };
+        event_loop
+            .run_app(&mut handler)
+            .map_err(ApplicationError::from)?;
+        handler.failure.map_or(Ok(()), Err)
+    }
+
     /// Stop automatically after a number of presented frames.
     ///
     /// This is useful for deterministic behavioral gates and command-line
@@ -341,6 +375,7 @@ where
             options: self.options,
             build: self.build,
             max_frames: self.max_frames,
+            initialize: None,
             live: None,
             failure: None,
             marker: std::marker::PhantomData,
@@ -376,12 +411,14 @@ struct Live {
     mode: DrawMode,
     frames: u64,
     last_report: Option<FrameReport>,
+    app: App,
 }
 
 struct Handler<F, R> {
     options: WindowOptions,
     build: F,
     max_frames: Option<u64>,
+    initialize: Option<Box<dyn FnOnce(&mut App)>>,
     live: Option<Live>,
     failure: Option<ApplicationError>,
     marker: std::marker::PhantomData<fn() -> R>,
@@ -459,6 +496,7 @@ where
                 live.last_report = Some(report);
                 live.surface.present(&live.context.queue, texture);
                 if live.window.close_requested
+                    || live.app.quit_requested()
                     || self.max_frames.is_some_and(|limit| live.frames >= limit)
                 {
                     event_loop.exit();
@@ -551,7 +589,14 @@ where
             mode,
             frames: 0,
             last_report: None,
+            app: App::new(),
         });
+        if let Some(initialize) = self.initialize.take() {
+            if let Some(live) = self.live.as_mut() {
+                let mut app = live.app.clone();
+                initialize(&mut app);
+            }
+        }
         if let Some(live) = self.live.as_ref() {
             live.window.request_redraw();
         }
