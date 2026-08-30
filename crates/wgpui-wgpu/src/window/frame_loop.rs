@@ -30,7 +30,7 @@
 //! The resulting glyph runs still enter the ordinary retained patch protocol;
 //! no text-specific draw path bypasses reconciliation.
 
-use wgpui_core::boundary::compositor::CompositeEntry;
+use wgpui_core::boundary::compositor::{Composite, CompositeEntry};
 use wgpui_core::geometry::Rect;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::invalidation::request::FrameSignals;
@@ -42,16 +42,17 @@ use wgpui_core::reconcile::description::{Description, DescriptionInteraction, Ra
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
+use wgpui_core::reconcile::walk::shared_walk;
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::LayerId;
 use wgpui_layout::taffy_tree::{
     Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
 };
 
+use crate::debug::{DebugTile, PerformanceDebug};
 use crate::render::atlas::{AtlasTileSource, GlyphAtlas};
 use crate::render::atlas_upload::AtlasTextures;
 use crate::render::draw::DrawMode;
-use crate::debug::{DebugTile, PerformanceDebug};
 use crate::render::frame::{
     Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, RenderTarget,
 };
@@ -433,7 +434,11 @@ impl FrameLoop {
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
-        let interactions = self.collect_interactions(&mut plan)?;
+        let interactions = self.collect_interactions(
+            &mut plan,
+            input.signals,
+            Rect::from_origin_size([0.0, 0.0], [width, height]),
+        )?;
         let emission = self
             .emitter
             .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
@@ -446,6 +451,10 @@ impl FrameLoop {
             self.viewport_recomputes += 1;
         }
         let interaction_dirty_regions = self.interaction_dirty_regions.clone();
+        let transform_only = emission
+            .composites
+            .iter()
+            .any(|composite| composite.composite == Composite::TransformOnly);
         let debug_tiles = self.refresh_debug_tiles(
             &emission.patch,
             self.performance_debug.tile_refresh_flash(),
@@ -463,7 +472,7 @@ impl FrameLoop {
             scene: &self.scene,
             clip: Rect::from_origin_size([0.0, 0.0], [width, height]),
             poison: &[],
-            dirty: if viewport_changed {
+            dirty: if viewport_changed || transform_only {
                 Dirty::All
             } else {
                 Dirty::Some(&dirty_layers)
@@ -534,10 +543,7 @@ impl FrameLoop {
             self.tile_flash_frames
                 .insert(layer_id, flash.duration_frames.max(1));
         }
-        if flash.viewport_grid
-            && (viewport_changed
-                || !interaction_dirty_regions.is_empty())
-        {
+        if flash.viewport_grid && (viewport_changed || !interaction_dirty_regions.is_empty()) {
             self.viewport_flash_frames = flash.duration_frames.max(1);
         }
         if flash.viewport_grid && self.viewport_flash_frames > 0 {
@@ -547,7 +553,8 @@ impl FrameLoop {
             for y in 0..rows {
                 for x in 0..columns {
                     let width = flash.tile_size[0].min(viewport[0] - x as f32 * flash.tile_size[0]);
-                    let height = flash.tile_size[1].min(viewport[1] - y as f32 * flash.tile_size[1]);
+                    let height =
+                        flash.tile_size[1].min(viewport[1] - y as f32 * flash.tile_size[1]);
                     let tile_rect = Rect::from_origin_size(
                         [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1]],
                         [width, height],
@@ -559,7 +566,12 @@ impl FrameLoop {
                             .any(|region| tile_rect.intersects(region));
                     if width > 0.0 && height > 0.0 && region_matches {
                         tiles.push(DebugTile {
-                            origin_size: [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1], width, height],
+                            origin_size: [
+                                x as f32 * flash.tile_size[0],
+                                y as f32 * flash.tile_size[1],
+                                width,
+                                height,
+                            ],
                             color: flash.color,
                             border_width: 3.0,
                             _padding: [0.0; 7],
@@ -591,29 +603,19 @@ impl FrameLoop {
     fn collect_interactions(
         &self,
         plan: &mut wgpui_core::reconcile::plan::FramePlan,
+        signals: &FrameSignals,
+        viewport: Rect,
     ) -> Result<Vec<InteractionRegistration>, LoopError> {
-        let mut frames = Vec::<([f32; 2], [f32; 2], Option<Rect>)>::new();
+        let walked =
+            shared_walk(plan, &self.layout, signals, Some(viewport)).map_err(EmitError::from)?;
         let mut result = Vec::new();
         for index in 0..plan.nodes().len() {
             let node = plan.nodes()[index];
-            let rectangle = self
-                .layout
-                .layout_of(node.layout_node)
-                .map_err(EmitError::from)?;
-            frames.truncate(node.depth as usize);
-            let (parent_origin, parent_offset, parent_clip) = frames
-                .last()
-                .copied()
-                .unwrap_or(([0.0, 0.0], [0.0, 0.0], None));
-            let origin = [
-                parent_origin[0] + parent_offset[0] + rectangle.x,
-                parent_origin[1] + parent_offset[1] + rectangle.y,
-            ];
-            let bounds = Rect::from_origin_size(origin, [rectangle.width, rectangle.height]);
             if let Some(interaction) = plan.take_interaction(index) {
-                let visible_bounds = parent_clip.map_or(bounds, |clip| bounds.intersect(&clip));
+                let geometry = walked.get(index).ok_or(LoopError::NoRoot)?;
+                let visible_bounds = geometry.visible_bounds;
                 if !visible_bounds.is_empty() {
-                result.push(InteractionRegistration {
+                    result.push(InteractionRegistration {
                         address: node.address,
                         bounds: visible_bounds,
                         order: index as u64,
@@ -621,12 +623,6 @@ impl FrameLoop {
                     });
                 }
             }
-            let clip = if node.clip_children {
-                Some(parent_clip.map_or(bounds, |parent| bounds.intersect(&parent)))
-            } else {
-                parent_clip
-            };
-            frames.push((origin, node.scroll_offset, clip));
         }
         Ok(result)
     }
@@ -646,7 +642,9 @@ impl FrameLoop {
             let (local_size, local_color) = description.text_metrics_value();
             let font_size = local_size.or(inherited_size);
             let color = local_color.or(inherited_color);
-            let font_size = font_size.filter(|size| size.is_finite() && *size > 0.0).unwrap_or(14.0)
+            let font_size = font_size
+                .filter(|size| size.is_finite() && *size > 0.0)
+                .unwrap_or(14.0)
                 * self.scale_factor;
             let key = TextCacheKey {
                 value: Arc::clone(&value),

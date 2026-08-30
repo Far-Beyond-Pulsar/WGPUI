@@ -6,8 +6,7 @@ struct Globals {
 struct SlotBase {
     base: u32,
     padding_0: u32,
-    padding_1: u32,
-    padding_2: u32,
+    translation: vec2<f32>,
 }
 
 struct PathVertex {
@@ -32,10 +31,12 @@ struct VertexOutput {
 @vertex
 fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let vertex = paths[slot.base + vertex_index];
-    let device_position = vertex.position / globals.viewport
+    let screen_position = vertex.position + slot.translation;
+    let device_position = screen_position / globals.viewport
         * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
-    let top_left = vertex.position - vertex.clip_origin;
-    let bottom_right = vertex.clip_origin + vertex.clip_size - vertex.position;
+    let clip_origin = vertex.clip_origin + slot.translation;
+    let top_left = screen_position - clip_origin;
+    let bottom_right = clip_origin + vertex.clip_size - screen_position;
     return VertexOutput(
         vec4<f32>(device_position, 0.0, 1.0), vertex.color, vertex.st,
         vec4<f32>(top_left.x, bottom_right.x, top_left.y, bottom_right.y));

@@ -826,7 +826,6 @@ impl FrameRenderer {
             || paths_grew
             || backdrops_grew
             || self.uploaded_generation.is_none()
-            || matches!(input.dirty, Dirty::All)
         {
             self.shadow_arena.upload_all(device, queue, shadow_resident);
             self.arena.upload_all(device, queue, resident);
@@ -1365,49 +1364,49 @@ impl FrameRenderer {
         // changed contents but not residency reuses the buffer and the bind
         // group untouched. The clean frame the gate measures is exactly that
         // frame.
-        let shadow_plan = match self.shadow_plan.take() {
+        let mut shadow_plan = match self.shadow_plan.take() {
             Some(plan) if plan.slots() == shadow_slots.as_slice() => plan,
             _ => {
                 self.shadow_plan_builds += 1;
                 SlotBasePlan::for_shadows(device, queue, &self.shadows, &shadow_slots)
             }
         };
-        let quad_plan = match self.quad_plan.take() {
+        let mut quad_plan = match self.quad_plan.take() {
             Some(plan) if plan.slots() == quad_slots.as_slice() => plan,
             _ => {
                 self.quad_plan_builds += 1;
                 SlotBasePlan::for_quads(device, queue, &self.quads, &quad_slots)
             }
         };
-        let underline_plan = match self.underline_plan.take() {
+        let mut underline_plan = match self.underline_plan.take() {
             Some(plan) if plan.slots() == underline_slots.as_slice() => plan,
             _ => {
                 self.underline_plan_builds += 1;
                 SlotBasePlan::for_underlines(device, queue, &self.underlines, &underline_slots)
             }
         };
-        let glyph_plan = match self.glyph_plan.take() {
+        let mut glyph_plan = match self.glyph_plan.take() {
             Some(plan) if plan.slots() == glyph_slots.as_slice() => plan,
             _ => {
                 self.glyph_plan_builds += 1;
                 SlotBasePlan::for_glyphs(device, queue, &self.glyphs, &glyph_slots)
             }
         };
-        let sprite_plan = match self.sprite_plan.take() {
+        let mut sprite_plan = match self.sprite_plan.take() {
             Some(plan) if plan.slots() == sprite_slots.as_slice() => plan,
             _ => {
                 self.sprite_plan_builds += 1;
                 SlotBasePlan::for_poly_sprites(device, queue, &self.sprites, &sprite_slots)
             }
         };
-        let path_plan = match self.path_plan.take() {
+        let mut path_plan = match self.path_plan.take() {
             Some(plan) if plan.slots() == path_slots.as_slice() => plan,
             _ => {
                 self.path_plan_builds += 1;
                 SlotBasePlan::for_paths(device, queue, &self.paths, &path_slots)
             }
         };
-        let backdrop_plan = match self.backdrop_plan.take() {
+        let mut backdrop_plan = match self.backdrop_plan.take() {
             Some(plan) if plan.slots() == backdrop_slots.as_slice() => plan,
             _ => {
                 self.backdrop_plan_builds += 1;
@@ -1419,6 +1418,13 @@ impl FrameRenderer {
                 )
             }
         };
+        shadow_plan.sync_transforms(queue, &input.scene.layers);
+        quad_plan.sync_transforms(queue, &input.scene.layers);
+        underline_plan.sync_transforms(queue, &input.scene.layers);
+        glyph_plan.sync_transforms(queue, &input.scene.layers);
+        sprite_plan.sync_transforms(queue, &input.scene.layers);
+        path_plan.sync_transforms(queue, &input.scene.layers);
+        backdrop_plan.sync_transforms(queue, &input.scene.layers);
         let shadow_frame_group = self.shadows.frame_bind_group(
             device,
             &self.globals,
@@ -1745,6 +1751,7 @@ fn create_debug_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu:
 /// margin. Ordering a shadow by its unblurred rectangle would sort a wide soft
 /// shadow as though it were the small hard rectangle at its centre.
 fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    let translation = layer_translation(scene, layer);
     scene
         .shadows
         .keys(layer)
@@ -1752,7 +1759,7 @@ fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
         .filter_map(|key| scene.shadows.get(layer, key))
         .map(|shadow| {
             let (origin, size) = shadow.drawn_bounds();
-            Rect::from_origin_size(origin, size)
+            translate_rect(Rect::from_origin_size(origin, size), translation)
         })
         .collect()
 }
@@ -1764,21 +1771,30 @@ fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
 /// `origin`/`size`. That this function is the boring one is the finding — see
 /// [`layer_shadow_bounds`], which is the same function and is not.
 fn layer_underline_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    let translation = layer_translation(scene, layer);
     scene
         .underlines
         .keys(layer)
         .into_iter()
         .filter_map(|key| scene.underlines.get(layer, key))
-        .map(|underline| Rect::from_origin_size(underline.origin, underline.size))
+        .map(|underline| {
+            translate_rect(Rect::from_origin_size(underline.origin, underline.size), translation)
+        })
         .collect()
 }
 
 fn layer_quads(scene: &Scene, layer: LayerId) -> Vec<Quad> {
+    let translation = layer_translation(scene, layer);
     scene
         .quads
         .keys(layer)
         .into_iter()
         .filter_map(|key| scene.quads.get(layer, key).copied())
+        .map(|mut quad| {
+            quad.origin[0] += translation[0];
+            quad.origin[1] += translation[1];
+            quad
+        })
         .collect()
 }
 
@@ -1797,6 +1813,7 @@ fn layer_quads(scene: &Scene, layer: LayerId) -> Vec<Quad> {
 /// `mono_sprites.wgsl` builds. A blank glyph is a zero-sized rectangle, which
 /// intersects nothing and orders under everything.
 fn layer_glyph_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    let translation = layer_translation(scene, layer);
     let mut bounds = Vec::new();
     for key in scene.glyph_runs.keys(layer) {
         let Some(run) = scene.glyph_runs.get(layer, key) else {
@@ -1805,7 +1822,12 @@ fn layer_glyph_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
         bounds.extend(
             run.glyphs
                 .iter()
-                .map(|glyph| Rect::from_origin_size(glyph.position, glyph.atlas_size)),
+                .map(|glyph| {
+                    translate_rect(
+                        Rect::from_origin_size(glyph.position, glyph.atlas_size),
+                        translation,
+                    )
+                }),
         );
     }
     bounds
@@ -1821,13 +1843,32 @@ fn layer_glyph_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
 /// decoded is still a real rectangle with a real position; it draws nothing
 /// because its tile is `NONE`, not because its bounds are empty.
 fn layer_sprite_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    let translation = layer_translation(scene, layer);
     scene
         .poly_sprites
         .keys(layer)
         .into_iter()
         .filter_map(|key| scene.poly_sprites.get(layer, key))
-        .map(|sprite| Rect::from_origin_size(sprite.origin, sprite.size))
+        .map(|sprite| {
+            translate_rect(Rect::from_origin_size(sprite.origin, sprite.size), translation)
+        })
         .collect()
+}
+
+fn layer_translation(scene: &Scene, layer: LayerId) -> [f32; 2] {
+    scene
+        .layers
+        .get(layer)
+        .map_or([0.0, 0.0], |layer| layer.transform().translation)
+}
+
+fn translate_rect(rectangle: Rect, translation: [f32; 2]) -> Rect {
+    Rect {
+        min_x: rectangle.min_x + translation[0],
+        min_y: rectangle.min_y + translation[1],
+        max_x: rectangle.max_x + translation[0],
+        max_y: rectangle.max_y + translation[1],
+    }
 }
 
 /// The upload instructions addressed to one kind's arena.

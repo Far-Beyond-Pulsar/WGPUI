@@ -27,6 +27,7 @@ use wgpui_core::boundary::compositor::{CompositeEntry, CompositeSource, External
 use wgpui_core::geometry::Rect;
 use wgpui_core::patch::primitive::{PrimitiveKind, Quad};
 use wgpui_core::scene::layer::BoundaryId;
+use wgpui_core::scene::layer::LayerTransform;
 use wgpui_core::test_support::ui_walk::{MultiLayerSceneDriver, UiSceneSpec, build_frame};
 use wgpui_wgpu::render::device::{ComputeContext, context_or_report};
 use wgpui_wgpu::render::draw::DrawMode;
@@ -190,6 +191,60 @@ fn every_draw_mode_renders_the_same_picture() {
             }
         }
     }
+}
+
+#[test]
+fn a_layer_transform_moves_native_pixels_without_scene_uploads() {
+    let Some(context) = context_or_report("layer_transform") else {
+        return;
+    };
+    let spec = UiSceneSpec::small();
+    let frame = build_frame("layer_transform", &spec);
+    let mut scene = MultiLayerSceneDriver::new(1);
+    scene.apply_frame(&frame).expect("the frame applies");
+    let layer = scene
+        .scene
+        .layers
+        .ids()
+        .first()
+        .copied()
+        .expect("the test scene has one layer");
+    let mut renderer = FrameRenderer::new(&context.device);
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, initial) = render(&context, &mut renderer, &target, &input);
+
+    assert!(scene
+        .scene
+        .layers
+        .set_transform(layer, LayerTransform::translated(32.0, 0.0)));
+    let translated_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (output, translated) = render(&context, &mut renderer, &target, &translated_input);
+
+    assert!(first_difference(&initial, &translated).is_some());
+    assert_eq!(output.scene_upload_bytes, 0);
 }
 
 /// **Gate 1**: a clean window's CPU-side draw-issuing work is O(layer slots),
