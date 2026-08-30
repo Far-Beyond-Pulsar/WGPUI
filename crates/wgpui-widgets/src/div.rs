@@ -393,6 +393,9 @@ impl Div {
         if uncached {
             description = description.uncached();
         }
+        if let Some(interaction) = interaction.into_description_interaction() {
+            description = description.interaction(interaction);
+        }
 
         // An element that paints nothing gets no emitter at all rather than one
         // that writes an empty emission. The distinction is load-bearing:

@@ -19,7 +19,7 @@ use wgpui_core::window::{
 
 use crate::render::draw::DrawMode;
 use crate::render::frame::RenderTarget;
-use crate::window::frame_loop::{FrameLoop, LoopInput};
+use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
 use crate::window::{Acquired, WindowError, WindowSurface};
 
@@ -54,6 +54,10 @@ pub struct Window {
     interaction_modifiers: Modifiers,
     mouse_buttons: MouseButtonState,
     cursor: [Pixels; 2],
+    interactions: Vec<InteractionRegistration>,
+    hovered_interaction: Option<usize>,
+    pressed_interaction: Option<usize>,
+    pressed_event: Option<MouseDownEvent>,
 }
 
 /// A clonable handle for scheduling work on a native window.
@@ -160,6 +164,91 @@ impl Window {
     }
     pub fn handle_input(&mut self, event: InputEvent) -> bool {
         self.interaction.handle_input(event)
+    }
+    pub fn handle_input_with_app(&mut self, event: InputEvent, app: &mut App) -> bool {
+        if self.interactions.is_empty() {
+            return self.interaction.handle_input(event);
+        }
+        match &event {
+            InputEvent::MouseMove(mouse) => {
+                let hit = self.hit_interaction(mouse.position);
+                let mut handled = false;
+                if self.hovered_interaction != hit {
+                    if let Some(previous) = self.hovered_interaction {
+                        handled |= self.dispatch_interaction(previous, &InputEvent::MouseLeave(*mouse), app);
+                    }
+                    if let Some(current) = hit {
+                        handled |= self.dispatch_interaction(current, &InputEvent::MouseEnter(*mouse), app);
+                    }
+                    self.hovered_interaction = hit;
+                }
+                if let Some(current) = hit {
+                    handled |= self.dispatch_interaction(current, &event, app);
+                }
+                handled
+            }
+            InputEvent::MouseDown(mouse) => {
+                self.pressed_interaction = self.hit_interaction(mouse.position);
+                self.pressed_event = Some(*mouse);
+                self.pressed_interaction
+                    .is_some_and(|index| self.dispatch_interaction(index, &event, app))
+            }
+            InputEvent::MouseUp(mouse) => {
+                let pressed = self.pressed_interaction.take();
+                let down = self.pressed_event.take().unwrap_or(MouseDownEvent {
+                    button: mouse.button,
+                    position: mouse.position,
+                    modifiers: mouse.modifiers,
+                    click_count: mouse.click_count,
+                });
+                let Some(index) = pressed else { return false };
+                let mut handled = self.dispatch_interaction(index, &event, app);
+                if self.hit_interaction(mouse.position) == Some(index) {
+                    handled |= self.dispatch_interaction(index, &InputEvent::Click(
+                        wgpui_core::window::ClickEvent::Mouse(
+                            wgpui_core::window::MouseClickEvent {
+                                down,
+                                up: *mouse,
+                            },
+                        ),
+                    ), app);
+                }
+                handled
+            }
+            _ => self.interaction.handle_input(event),
+        }
+    }
+    fn hit_interaction(&self, position: [Pixels; 2]) -> Option<usize> {
+        let point = [
+            position[0].value() * self.scale_factor as f32,
+            position[1].value() * self.scale_factor as f32,
+        ];
+        self.interactions
+            .iter()
+            .enumerate()
+            .filter(|(_, registration)| {
+                let bounds = registration.bounds;
+                point[0] >= bounds.min_x
+                    && point[0] < bounds.max_x
+                    && point[1] >= bounds.min_y
+                    && point[1] < bounds.max_y
+            })
+            .max_by_key(|(_, registration)| registration.order)
+            .map(|(index, _)| index)
+    }
+    fn dispatch_interaction(&mut self, index: usize, event: &InputEvent, app: &mut App) -> bool {
+        let mut interactions = std::mem::take(&mut self.interactions);
+        let handled = interactions
+            .get_mut(index)
+            .is_some_and(|registration| registration.interaction.dispatch(event, &mut self.interaction, app).handled);
+        self.interactions = interactions;
+        handled
+    }
+    fn set_interactions(&mut self, interactions: Vec<InteractionRegistration>) {
+        self.interactions = interactions;
+        self.hovered_interaction = None;
+        self.pressed_interaction = None;
+        self.pressed_event = None;
     }
     pub fn cursor_position(&self) -> [Pixels; 2] {
         self.cursor
@@ -498,6 +587,10 @@ impl Handler {
             interaction_modifiers: Modifiers::default(),
             mouse_buttons: MouseButtonState::default(),
             cursor: [Pixels::ZERO, Pixels::ZERO],
+            interactions: Vec::new(),
+            hovered_interaction: None,
+            pressed_interaction: None,
+            pressed_event: None,
         };
         self.live.push(Live {
             frame_loop: FrameLoop::new(&context.device),
@@ -609,6 +702,7 @@ impl Handler {
         );
         match result {
             Ok(frame) => {
+                live.window.set_interactions(frame.interactions);
                 live.frames += 1;
                 let report = FrameReport {
                     frame_number: live.frames,
@@ -716,6 +810,10 @@ impl winit::application::ApplicationHandler for Handler {
             interaction_modifiers: Modifiers::default(),
             mouse_buttons: MouseButtonState::default(),
             cursor: [Pixels::ZERO, Pixels::ZERO],
+            interactions: Vec::new(),
+            hovered_interaction: None,
+            pressed_interaction: None,
+            pressed_event: None,
         };
         self.live = Some(Live {
             frame_loop: FrameLoop::new(&context.device),
@@ -788,7 +886,7 @@ impl winit::application::ApplicationHandler for Handler {
                         modifiers: live.window.modifiers(),
                     })
                 };
-                if live.window.handle_input(input) {
+                if live.window.handle_input_with_app(input, &mut live.app) {
                     live.window.request_redraw();
                 }
             }
@@ -801,7 +899,7 @@ impl winit::application::ApplicationHandler for Handler {
                     modifiers: live.window.modifiers(),
                     buttons: live.window.mouse_buttons,
                 });
-                if live.window.handle_input(event) {
+                if live.window.handle_input_with_app(event, &mut live.app) {
                     live.window.request_redraw();
                 }
             }
@@ -825,7 +923,7 @@ impl winit::application::ApplicationHandler for Handler {
                         click_count: 1,
                     })
                 };
-                if live.window.handle_input(event) {
+                if live.window.handle_input_with_app(event, &mut live.app) {
                     live.window.request_redraw();
                 }
             }
@@ -841,7 +939,7 @@ impl winit::application::ApplicationHandler for Handler {
                     delta,
                     modifiers: live.window.modifiers(),
                 });
-                if live.window.handle_input(event) {
+                if live.window.handle_input_with_app(event, &mut live.app) {
                     live.window.request_redraw();
                 }
             }

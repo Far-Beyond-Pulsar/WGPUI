@@ -38,7 +38,7 @@ use wgpui_core::patch::PatchError;
 use wgpui_core::patch::apply::apply;
 use wgpui_core::patch::emit::{Emission, Emit, EmitContext, EmitError, Emitter, FrameEmission};
 use wgpui_core::patch::primitive::{Glyph, GlyphRun, Material, Quad};
-use wgpui_core::reconcile::description::{Description, RawText};
+use wgpui_core::reconcile::description::{Description, DescriptionInteraction, RawText};
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
@@ -120,7 +120,7 @@ impl From<FrameError> for LoopError {
 }
 
 /// What one driven frame did, on both sides of §2's seam.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LoopFrame {
     /// The reconciliation half: what was reused and what was rebuilt.
     pub reconciled: FrameStats,
@@ -139,6 +139,14 @@ pub struct LoopFrame {
     pub viewport_changed: bool,
     /// The GPU half.
     pub frame: FrameOutput,
+    pub interactions: Vec<InteractionRegistration>,
+}
+
+#[derive(Debug)]
+pub struct InteractionRegistration {
+    pub bounds: Rect,
+    pub order: u64,
+    pub interaction: DescriptionInteraction,
 }
 
 impl LoopFrame {
@@ -378,7 +386,7 @@ impl FrameLoop {
     ) -> Result<LoopFrame, LoopError> {
         let mut description = description;
         self.materialize_raw_text(&mut description)?;
-        let plan = self.reconciler.reconcile(description, &mut self.layout)?;
+        let mut plan = self.reconciler.reconcile(description, &mut self.layout)?;
         let root = plan
             .root()
             .map(|node| node.layout_node)
@@ -388,6 +396,7 @@ impl FrameLoop {
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
+        let interactions = self.collect_interactions(&mut plan)?;
         let emission = self
             .emitter
             .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
@@ -432,7 +441,32 @@ impl FrameLoop {
             uploaded_bytes: uploads.byte_count(),
             viewport_changed,
             frame,
+            interactions,
         })
+    }
+
+    fn collect_interactions(
+        &self,
+        plan: &mut wgpui_core::reconcile::plan::FramePlan,
+    ) -> Result<Vec<InteractionRegistration>, LoopError> {
+        let mut origins = Vec::<[f32; 2]>::new();
+        let mut result = Vec::new();
+        for index in 0..plan.nodes().len() {
+            let node = plan.nodes()[index];
+            let rectangle = self.layout.layout_of(node.layout_node).map_err(EmitError::from)?;
+            origins.truncate(node.depth as usize);
+            let parent = origins.last().copied().unwrap_or([0.0, 0.0]);
+            let origin = [parent[0] + rectangle.x, parent[1] + rectangle.y];
+            origins.push(origin);
+            if let Some(interaction) = plan.take_interaction(index) {
+                result.push(InteractionRegistration {
+                    bounds: Rect::from_origin_size(origin, [rectangle.width, rectangle.height]),
+                    order: index as u64,
+                    interaction,
+                });
+            }
+        }
+        Ok(result)
     }
 
     fn materialize_raw_text(&mut self, description: &mut Description) -> Result<(), LoopError> {

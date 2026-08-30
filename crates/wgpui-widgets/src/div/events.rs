@@ -7,6 +7,7 @@
 
 use wgpui_core::app::App;
 use wgpui_core::window::{ClickEvent, EventResult, InputEvent, MouseButton, Window};
+use wgpui_core::reconcile::description::DescriptionInteraction;
 
 type ClickHandler = Box<dyn FnMut(&ClickEvent, &mut Window, &mut App) -> EventResult>;
 type MouseDownHandler = Box<dyn FnMut(&InputEvent, &mut Window, &mut App) -> EventResult>;
@@ -147,6 +148,16 @@ impl InteractionState {
             }
             _ => EventResult::IGNORED,
         }
+    }
+
+    pub fn into_description_interaction(self) -> Option<DescriptionInteraction> {
+        if self.click.is_empty() && self.mouse_down.is_empty() && self.hover.is_empty() {
+            return None;
+        }
+        let mut state = self;
+        Some(DescriptionInteraction::new(move |event, window, app| {
+            state.handle_input(event, window, app)
+        }))
     }
 }
 
