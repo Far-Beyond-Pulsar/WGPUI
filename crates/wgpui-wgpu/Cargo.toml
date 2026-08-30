@@ -21,6 +21,10 @@ wgpui-core = { path = "../wgpui-core" }
 # `wgpui-core` already depends on this crate for exactly that type; naming it
 # here adds no edge to the graph, only the ability to say `LayoutTree` out loud.
 wgpui-layout = { path = "../wgpui-layout" }
+# Raw string descriptions are materialized here, at the renderer boundary:
+# this crate owns the persistent atlas and is the only production crate allowed
+# to combine shaping output with device-backed atlas pages.
+wgpui-text = { path = "../wgpui-text" }
 # The only crate that touches a live wgpu::Device (docs/gpu-native-architecture.md
 # §3.5) — this dependency is genuinely needed even at the Phase 0 stub stage
 # because the Phase 0 spike harnesses (benches/) live here and open a real
@@ -73,12 +77,8 @@ image = { version = "0.25.1", default-features = false, features = [
     "webp",
 ] }
 rand = "0.10"
-# Dev-only, and the production edge still runs one way: nothing under `src/`
-# names `wgpui-text`, and `AtlasTileSource` takes its rasteriser as a closure
-# precisely so it does not have to. `tests/glyph_atlas_upload.rs` needs both
-# halves of the path in one process — shape and rasterise on one side, pack and
-# upload on the other — and neither crate can host that test alone. It lives
-# here because this is where the device is.
+# Retained for the device-backed differential tests, which exercise shaping and
+# rasterization alongside the production renderer in one process.
 wgpui-text = { path = "../wgpui-text" }
 lyon = "1.0"
 

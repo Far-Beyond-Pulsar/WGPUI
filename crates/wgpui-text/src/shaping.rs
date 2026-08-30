@@ -478,7 +478,7 @@ pub struct TextShaper {
 
 impl Element for SharedString {
     fn into_description(self) -> Description {
-        Description::new::<Self>()
+        Description::raw_text(Arc::from(self.as_str()))
     }
 }
 

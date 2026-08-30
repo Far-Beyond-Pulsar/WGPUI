@@ -45,6 +45,66 @@ pub enum ElementId {
     Slot(u32),
 }
 
+/// Text content produced by a raw string child.
+///
+/// The content remains renderer-independent in `wgpui-core`; the renderer
+/// that owns fonts and atlas pages resolves it into glyph primitives before
+/// layout. Keeping the string here gives every backend the same frontend
+/// contract without making the core crate depend on a text implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawText {
+    value: Arc<str>,
+}
+
+impl RawText {
+    /// Construct raw text from an owned or borrowed string.
+    pub fn new(value: impl Into<Arc<str>>) -> Self {
+        Self {
+            value: value.into(),
+        }
+    }
+
+    /// The UTF-8 contents of this text node.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Share the text without copying it.
+    pub fn shared_value(&self) -> Arc<str> {
+        Arc::clone(&self.value)
+    }
+}
+
+/// Stable fingerprint for a raw string's content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawTextKey {
+    value: Arc<str>,
+}
+
+impl RawTextKey {
+    fn new(value: Arc<str>) -> Self {
+        Self { value }
+    }
+}
+
+impl crate::reconcile::diff_key::ReconcileKey for RawTextKey {
+    fn compare(
+        &self,
+        previous: &dyn crate::reconcile::diff_key::ReconcileKey,
+    ) -> crate::invalidation::axes::Invalidation {
+        crate::reconcile::diff_key::compare_by_equality(
+            self,
+            previous,
+            crate::invalidation::axes::Invalidation::LAYOUT
+                | crate::invalidation::axes::Invalidation::DISPLAY,
+        )
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl From<&str> for ElementId {
     fn from(name: &str) -> Self {
         ElementId::Name(Arc::from(name))
@@ -98,6 +158,7 @@ pub struct Description {
     pub(crate) layout_style: LayoutStyle,
     pub(crate) children: Vec<Description>,
     pub(crate) clip_children: bool,
+    pub(crate) raw_text: Option<RawText>,
 }
 
 impl std::fmt::Debug for Description {
@@ -139,6 +200,7 @@ impl Description {
             layout_style: LayoutStyle::default(),
             children: Vec::new(),
             clip_children: false,
+            raw_text: None,
         }
     }
 
@@ -219,6 +281,40 @@ impl Description {
     pub fn emit(mut self, emitter: impl Emit) -> Self {
         self.emitter = Some(Box::new(emitter));
         self
+    }
+
+    /// Make this description a raw text node.
+    pub fn raw_text(value: impl Into<Arc<str>>) -> Self {
+        let value = value.into();
+        Self::new::<RawText>()
+            .diff_key(RawTextKey::new(Arc::clone(&value)))
+            .with_raw_text(RawText::new(value))
+    }
+
+    fn with_raw_text(mut self, raw_text: RawText) -> Self {
+        self.raw_text = Some(raw_text);
+        self
+    }
+
+    /// Take unresolved raw text so a renderer can materialize it.
+    pub fn take_raw_text(&mut self) -> Option<RawText> {
+        self.raw_text.take()
+    }
+
+    /// Replace automatic dimensions with measured text dimensions.
+    pub fn set_intrinsic_size(&mut self, width: f32, height: f32) {
+        if self.layout_style.size.width == wgpui_layout::taffy_tree::Dimension::auto() {
+            self.layout_style.size.width = wgpui_layout::taffy_tree::Dimension::length(width);
+        }
+        if self.layout_style.size.height == wgpui_layout::taffy_tree::Dimension::auto() {
+            self.layout_style.size.height = wgpui_layout::taffy_tree::Dimension::length(height);
+        }
+    }
+
+    /// Attach the renderer-produced text emitter after raw text has been
+    /// shaped and its glyphs have been assigned atlas tiles.
+    pub fn set_text_emitter(&mut self, emitter: impl Emit) {
+        self.emitter = Some(Box::new(emitter));
     }
 
     /// Set the style this element's layout node is laid out with.
@@ -309,6 +405,11 @@ impl Description {
     /// This element's children, in order.
     pub fn child_descriptions(&self) -> &[Description] {
         &self.children
+    }
+
+    /// Mutable children for a backend materialization pass.
+    pub fn child_descriptions_mut(&mut self) -> &mut [Description] {
+        &mut self.children
     }
 
     /// Total nodes in this description subtree, including this one.

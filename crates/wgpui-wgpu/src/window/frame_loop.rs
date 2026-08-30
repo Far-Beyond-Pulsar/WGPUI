@@ -22,14 +22,13 @@
 //! Phase 1's report recorded six such deviations, Phase 2's two, Phase 3's four,
 //! Phase 4's one. This is Phase 6's, in the same shape.
 //!
-//! # What this is not
+//! # Text materialization
 //!
-//! It does not shape text. `wgpui-text` is a dev-dependency of this crate on
-//! purpose (§3.3, and `Cargo.toml`'s note on it): the production edge runs one
-//! way, and `AtlasTileSource` takes its rasteriser as a closure precisely so
-//! the render crate never names the text crate. A caller shapes and rasterises,
-//! and hands this loop `GlyphRun`s through an ordinary [`Emit`]. Phase 6's
-//! example does exactly that.
+//! The loop also owns the renderer-side text service. Raw string descriptions
+//! stay renderer-independent until this boundary, where cached shaping,
+//! rasterization, atlas allocation, and atlas texture uploads are performed.
+//! The resulting glyph runs still enter the ordinary retained patch protocol;
+//! no text-specific draw path bypasses reconciliation.
 
 use wgpui_core::boundary::compositor::CompositeEntry;
 use wgpui_core::geometry::Rect;
@@ -39,7 +38,7 @@ use wgpui_core::patch::PatchError;
 use wgpui_core::patch::apply::apply;
 use wgpui_core::patch::emit::{Emission, Emit, EmitContext, EmitError, Emitter, FrameEmission};
 use wgpui_core::patch::primitive::{Glyph, GlyphRun, Quad};
-use wgpui_core::reconcile::description::Description;
+use wgpui_core::reconcile::description::{Description, RawText};
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
@@ -50,10 +49,17 @@ use wgpui_layout::taffy_tree::{
 };
 
 use crate::render::atlas_upload::AtlasTextures;
+use crate::render::atlas::{AtlasTileSource, GlyphAtlas};
 use crate::render::draw::DrawMode;
 use crate::render::frame::{
     Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, RenderTarget,
 };
+use std::collections::HashMap;
+use std::sync::Arc;
+use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
+use wgpui_text::patch::{glyph_runs, RunPlacement};
+use wgpui_text::raster::GlyphRasterizer;
+use wgpui_text::shaping::{FontRun, SharedString, TextShaper};
 
 /// Why a frame could not be produced.
 #[derive(Debug)]
@@ -66,6 +72,8 @@ pub enum LoopError {
     Patch(PatchError),
     /// The GPU frame failed.
     Frame(FrameError),
+    /// Text shaping failed before a frame could be emitted.
+    Text(String),
     /// The plan had no root, so there is no layout node to size the frame
     /// against. Only reachable from a `Description` that produced no nodes at
     /// all.
@@ -79,6 +87,7 @@ impl std::fmt::Display for LoopError {
             LoopError::Emit(error) => write!(formatter, "emit: {error}"),
             LoopError::Patch(error) => write!(formatter, "patch: {error}"),
             LoopError::Frame(error) => write!(formatter, "frame: {error}"),
+            LoopError::Text(error) => write!(formatter, "text: {error}"),
             LoopError::NoRoot => write!(formatter, "the frame plan has no root node"),
         }
     }
@@ -191,9 +200,22 @@ pub struct FrameLoop {
     emitter: Emitter,
     scene: Scene,
     renderer: FrameRenderer,
+    text_shaper: TextShaper,
+    text_rasterizer: GlyphRasterizer,
+    text_atlas: GlyphAtlas,
+    atlas_textures: AtlasTextures,
+    prepared_text: HashMap<Arc<str>, PreparedText>,
     frames: u64,
     last_viewport: Option<[f32; 2]>,
     viewport_recomputes: u64,
+}
+
+#[derive(Clone)]
+struct PreparedText {
+    width: f32,
+    height: f32,
+    baseline: f32,
+    runs: Arc<Vec<CoreGlyphRun>>,
 }
 
 impl FrameLoop {
@@ -205,6 +227,11 @@ impl FrameLoop {
             emitter: Emitter::new(),
             scene: Scene::new(),
             renderer: FrameRenderer::new(device),
+            text_shaper: TextShaper::new(),
+            text_rasterizer: GlyphRasterizer::new(),
+            text_atlas: GlyphAtlas::default(),
+            atlas_textures: AtlasTextures::new(GlyphAtlas::default().page_size()),
+            prepared_text: HashMap::new(),
             frames: 0,
             last_viewport: None,
             viewport_recomputes: 0,
@@ -232,6 +259,11 @@ impl FrameLoop {
     /// The same counter for the glyph pipeline.
     pub fn glyph_plan_builds(&self) -> u64 {
         self.renderer.glyph_plan_builds()
+    }
+
+    /// Number of distinct raw strings retained by the text materializer.
+    pub fn prepared_text_count(&self) -> usize {
+        self.prepared_text.len()
     }
 
     /// How many frames were recomputed in full because the viewport changed
@@ -338,6 +370,8 @@ impl FrameLoop {
         description: Description,
         input: &LoopInput<'_>,
     ) -> Result<LoopFrame, LoopError> {
+        let mut description = description;
+        self.materialize_raw_text(&mut description)?;
         let plan = self.reconciler.reconcile(description, &mut self.layout)?;
         let root = plan
             .root()
@@ -361,6 +395,9 @@ impl FrameLoop {
             self.viewport_recomputes += 1;
         }
 
+        self.atlas_textures
+            .sync(device, queue, &mut self.text_atlas);
+        let owned_atlas = Some(&self.atlas_textures);
         let frame_input = FrameInput {
             scene: &self.scene,
             clip: Rect::from_origin_size([0.0, 0.0], [width, height]),
@@ -373,7 +410,7 @@ impl FrameLoop {
             uploads: uploads.entries(),
             composites: input.composites,
             registry: None,
-            atlas: input.atlas,
+            atlas: input.atlas.or(owned_atlas),
             viewport: [width, height],
             mode: input.mode,
         };
@@ -390,6 +427,67 @@ impl FrameLoop {
             viewport_changed,
             frame,
         })
+    }
+
+    fn materialize_raw_text(&mut self, description: &mut Description) -> Result<(), LoopError> {
+        if let Some(raw) = description.take_raw_text() {
+            let value = raw.shared_value();
+            let prepared = match self.prepared_text.get(&value).cloned() {
+                Some(prepared) => prepared,
+                None => self.prepare_text(raw)?,
+            };
+            let runs = Arc::clone(&prepared.runs);
+            let baseline = prepared.baseline;
+            description.set_intrinsic_size(prepared.width, prepared.height);
+            description.set_text_emitter(move |context: &EmitContext, emission: &mut Emission| {
+                for run in runs.iter() {
+                    let mut positioned = run.clone();
+                    for glyph in &mut positioned.glyphs {
+                        glyph.position[0] += context.bounds.x;
+                        glyph.position[1] += context.bounds.y + baseline;
+                    }
+                    emission.glyph_run(positioned);
+                }
+            });
+        }
+        for child in description.child_descriptions_mut() {
+            self.materialize_raw_text(child)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_text(&mut self, raw: RawText) -> Result<PreparedText, LoopError> {
+        let value = raw.shared_value();
+        let shared = SharedString::from(value.as_ref());
+        let font = wgpui_text::shaping::font("sans-serif");
+        let font_id = self
+            .text_shaper
+            .resolve_font(&font)
+            .map_err(|error| LoopError::Text(error.to_string()))?;
+        let font_runs = vec![FontRun::new(shared.len(), font_id)];
+        let line = self
+            .text_shaper
+            .shape_line(&shared, 14.0, &font_runs)
+            .map_err(|error| LoopError::Text(error.to_string()))?;
+        let placement = RunPlacement {
+            color: [1.0, 1.0, 1.0, 1.0],
+            ..RunPlacement::default()
+        };
+        let mut source = AtlasTileSource::new(&mut self.text_atlas, |key| {
+            self.text_rasterizer
+                .rasterize(&mut self.text_shaper, key)
+                .ok()
+        });
+        let (converted, _) = glyph_runs(&line, placement, &mut source);
+        let height = 20.0_f32.max(line.ascent + line.descent);
+        let prepared = PreparedText {
+            width: line.width,
+            height,
+            baseline: (height - line.ascent - line.descent) * 0.5 + line.ascent,
+            runs: Arc::new(converted),
+        };
+        self.prepared_text.insert(value, prepared.clone());
+        Ok(prepared)
     }
 }
 
