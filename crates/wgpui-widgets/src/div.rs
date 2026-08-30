@@ -53,6 +53,7 @@ pub mod scroll_state;
 use crate::div::diff::DivDiffKey;
 use crate::div::interactivity::style::DivStyle;
 use crate::styled::Styled;
+use wgpui_core::element::Element;
 use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::reconcile::description::{Description, ElementId};
 
@@ -68,27 +69,12 @@ pub trait IntoDescription {
     fn into_description(self) -> Description;
 }
 
-impl IntoDescription for Description {
+impl<T> IntoDescription for T
+where
+    T: wgpui_core::element::IntoElement,
+{
     fn into_description(self) -> Description {
-        self
-    }
-}
-
-impl IntoDescription for String {
-    fn into_description(self) -> Description {
-        Description::new::<String>()
-    }
-}
-
-impl IntoDescription for wgpui_text::shaping::SharedString {
-    fn into_description(self) -> Description {
-        Description::new::<wgpui_text::shaping::SharedString>()
-    }
-}
-
-impl IntoDescription for &str {
-    fn into_description(self) -> Description {
-        Description::new::<&'static str>()
+        wgpui_core::element::IntoElement::into_description(self)
     }
 }
 
@@ -200,11 +186,7 @@ impl Div {
 
     /// This frame's fingerprint.
     pub fn diff_key(&self) -> DivDiffKey {
-        DivDiffKey::with_estimate(
-            self.style.clone(),
-            self.children.len(),
-            self.estimated_size,
-        )
+        DivDiffKey::with_estimate(self.style.clone(), self.children.len(), self.estimated_size)
     }
 
     /// The per-frame description of this `div` and its subtree.
@@ -232,12 +214,10 @@ impl Div {
         let paint = style;
         let clips_children = matches!(
             layout_style.overflow.x,
-            wgpui_layout::taffy_tree::Overflow::Hidden
-                | wgpui_layout::taffy_tree::Overflow::Scroll
+            wgpui_layout::taffy_tree::Overflow::Hidden | wgpui_layout::taffy_tree::Overflow::Scroll
         ) || matches!(
             layout_style.overflow.y,
-            wgpui_layout::taffy_tree::Overflow::Hidden
-                | wgpui_layout::taffy_tree::Overflow::Scroll
+            wgpui_layout::taffy_tree::Overflow::Hidden | wgpui_layout::taffy_tree::Overflow::Scroll
         );
 
         let mut description = Description::new::<Div>()
@@ -274,7 +254,7 @@ impl Div {
     }
 }
 
-impl IntoDescription for Div {
+impl Element for Div {
     fn into_description(self) -> Description {
         self.describe()
     }

@@ -13,9 +13,18 @@
 #![allow(dead_code)]
 
 pub mod app;
-pub use app::{App, Context, Entity, EntityId, Subscription, Task, TaskError, WeakEntity};
 pub use app::entity::EntityError;
+pub use app::{App, Context, Entity, EntityId, Subscription, Task, TaskError, WeakEntity};
+pub use window::{
+    ClickEvent, CloseState, DispatchNodeId, EventResult, FocusHandle, FocusId, FocusManager,
+    FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId, InputEvent, KeyBinding,
+    KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu,
+    MenuItem, Modifiers, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TimerHandle, TimerId, TimerState,
+};
 pub mod boundary;
+pub mod color;
+pub mod element;
 pub mod geometry;
 pub mod hooks;
 pub mod indirect;
@@ -28,3 +37,8 @@ pub mod scene;
 pub mod shaders;
 pub mod test_support;
 pub mod window;
+pub use element::{
+    Component, Element, IntoElement, Render, RenderOnce, Stateful, render_description,
+};
+pub mod action;
+pub use action::Action;

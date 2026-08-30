@@ -6743,6 +6743,7 @@ version = "0.1.0"
 dependencies = [
  "wgpui-core",
  "wgpui-layout",
+ "wgpui-macros",
  "wgpui-text",
  "wgpui-wgpu",
  "wgpui-widgets",
@@ -6788,6 +6789,8 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "lyon",
+ "serde",
+ "serde_json",
  "wgpui-layout",
 ]
 
@@ -6799,10 +6802,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpui-examples-2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "futures",
+ "glam",
+ "lyon",
+ "rand 0.10.0",
+ "smol",
+ "unicode-segmentation",
+ "wgpui",
+]
+
+[[package]]
 name = "wgpui-layout"
 version = "0.1.0"
 dependencies = [
  "taffy",
+]
+
+[[package]]
+name = "wgpui-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

@@ -46,6 +46,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::patch::primitive::Underline;
@@ -673,6 +674,12 @@ fn log_shape_error(error: &ShapeError) {
     panic!("shaping failed during emission: {error}");
     #[cfg(not(test))]
     let _unreported = error;
+}
+
+impl Element for StyledText {
+    fn into_description(self) -> Description {
+        self.describe()
+    }
 }
 
 #[cfg(test)]

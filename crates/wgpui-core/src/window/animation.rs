@@ -2,6 +2,9 @@
 
 use std::time::{Duration, Instant};
 
+pub use super::timer::{TimerHandle, TimerState};
+use super::timer::{TimerId, TimerScheduler};
+
 /// A coalescing request queue for a window's next animation frame.
 #[derive(Debug, Default)]
 pub struct AnimationScheduler {
@@ -32,6 +35,27 @@ impl AnimationScheduler {
 /// Return a safe deadline for a frame paced at `frame_rate`.
 pub fn next_frame_deadline(now: Instant, frame_rate: u32) -> Instant {
     now + Duration::from_secs_f64(1.0 / f64::from(frame_rate.max(1)))
+}
+
+#[derive(Debug, Default)]
+pub struct WindowTimers(TimerScheduler);
+
+impl WindowTimers {
+    pub fn schedule(&mut self, now: Instant, delay: Duration) -> TimerHandle {
+        self.0.schedule(now, delay)
+    }
+    pub fn cancel(&mut self, timer: TimerHandle) -> bool {
+        self.0.cancel(timer)
+    }
+    pub fn due(&mut self, now: Instant) -> Vec<TimerId> {
+        self.0.take_due(now)
+    }
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.0.next_deadline()
+    }
+    pub fn state(&self, timer: TimerHandle) -> Option<TimerState> {
+        self.0.state(timer)
+    }
 }
 
 #[cfg(test)]

@@ -34,6 +34,8 @@
 //! is the fields beside it, and [`DivStyle::paint`] cannot see the layout half
 //! at all because it takes only the resolved rectangle.
 
+use wgpui_core::color::{ColorSpace, GradientStop, Hsla, LinearColorStop};
+use wgpui_core::geometry::{Pixels, Point};
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::Emission;
 use wgpui_core::patch::primitive::{Quad, Shadow};
@@ -153,16 +155,16 @@ impl Edges {
 /// dropped for the same reason `wgpui-core` never grew them.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BoxShadow {
-    /// Straight-alpha RGBA.
-    pub color: [f32; 4],
+    /// Shadow color in the public color space.
+    pub color: Hsla,
     /// Displacement from the element's own rectangle.
-    pub offset: [f32; 2],
+    pub offset: Point<Pixels>,
     /// Gaussian sigma.
-    pub blur_radius: f32,
+    pub blur_radius: Pixels,
     /// How far the shadow's rectangle grows past the element's on every side
     /// before the blur is applied. Negative values shrink it, which is what
     /// every multi-layer Tailwind shadow uses for its second layer.
-    pub spread_radius: f32,
+    pub spread_radius: Pixels,
 }
 
 /// Everything a `div()` needs to lay itself out and to paint itself.
@@ -184,6 +186,7 @@ pub struct DivStyle {
     /// horizontal or vertical bands; this keeps the gradient in the retained
     /// display list and avoids repainting unrelated elements.
     pub background_gradient: Option<LinearGradient>,
+    pub background_radial_gradient: Option<RadialGradient>,
     /// A retained procedural pattern lowered to stable display-list bands.
     pub background_pattern: Option<Pattern>,
     /// Border colour. `None` disables the border quad however wide the edges
@@ -218,6 +221,7 @@ impl Default for DivStyle {
             layout: LayoutStyle::default(),
             background: None,
             background_gradient: None,
+            background_radial_gradient: None,
             background_pattern: None,
             border_color: None,
             border_widths: Edges::default(),
@@ -242,9 +246,19 @@ impl Default for DivStyle {
 /// A linear gradient expressed in normalized element coordinates.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearGradient {
-    pub stops: Vec<crate::styled::LinearColorStop>,
+    pub stops: Vec<LinearColorStop>,
     /// Angle in degrees, where zero points right and 90 points down.
     pub angle: f32,
+    pub color_space: ColorSpace,
+}
+
+/// A retained radial gradient lowered to the existing quad representation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RadialGradient {
+    pub center: [f32; 2],
+    pub radius: [f32; 2],
+    pub stops: [GradientStop; 2],
+    pub color_space: ColorSpace,
 }
 
 /// A small, deterministic pattern vocabulary that can be retained without a
@@ -261,6 +275,11 @@ pub enum Pattern {
         first: [f32; 4],
         second: [f32; 4],
         width: f32,
+    },
+    Slash {
+        color: [f32; 4],
+        width: f32,
+        interval: f32,
     },
 }
 
@@ -291,7 +310,11 @@ impl DivStyle {
             || self
                 .background_gradient
                 .as_ref()
-                .is_some_and(|gradient| gradient.stops.iter().any(|stop| stop.color[3] > 0.0))
+                .is_some_and(|gradient| gradient.stops.iter().any(|stop| stop.color.a > 0.0))
+            || self
+                .background_radial_gradient
+                .as_ref()
+                .is_some_and(|gradient| gradient.stops.iter().any(|stop| stop.color.a > 0.0))
             || self.background_pattern.is_some()
     }
 
@@ -345,6 +368,8 @@ impl DivStyle {
 
         if let Some(gradient) = &self.background_gradient {
             emit_gradient(gradient, bounds, self.opacity, emission);
+        } else if let Some(gradient) = &self.background_radial_gradient {
+            emit_radial_gradient(gradient, bounds, self.opacity, emission);
         } else if let Some(pattern) = &self.background_pattern {
             emit_pattern(pattern, bounds, self.opacity, emission);
         } else if self.is_background_visible() {
@@ -405,14 +430,14 @@ impl DivStyle {
     ) -> Shadow {
         Shadow {
             origin: [
-                origin[0] + shadow.offset[0] - shadow.spread_radius,
-                origin[1] + shadow.offset[1] - shadow.spread_radius,
+                origin[0] + shadow.offset.x.value() - shadow.spread_radius.value(),
+                origin[1] + shadow.offset.y.value() - shadow.spread_radius.value(),
             ],
             size: [
-                size[0] + 2.0 * shadow.spread_radius,
-                size[1] + 2.0 * shadow.spread_radius,
+                size[0] + 2.0 * shadow.spread_radius.value(),
+                size[1] + 2.0 * shadow.spread_radius.value(),
             ],
-            color: shadow.color,
+            color: shadow.color.into(),
             // The *unspread* box's clamped radii, which is what
             // `Window::paint_shadows` is handed: `Style::paint` computes
             // `corner_radii` once against `bounds.size` and passes the same
@@ -420,7 +445,7 @@ impl DivStyle {
             // moved its rectangle. Recomputing the clamp against the spread
             // rectangle here would be more principled and would not match.
             corner_radii: corner_radii.to_array(),
-            blur_radius: shadow.blur_radius,
+            blur_radius: shadow.blur_radius.value(),
         }
     }
 
@@ -431,7 +456,7 @@ impl DivStyle {
     /// appearing or disappearing is a structural change rather than a value one.
     pub fn primitive_count(&self) -> usize {
         self.box_shadow.len()
-            + if self.background_gradient.is_some() {
+            + if self.background_gradient.is_some() || self.background_radial_gradient.is_some() {
                 gradient_band_count()
             } else if self.background_pattern.is_some() {
                 pattern_band_count()
@@ -449,25 +474,27 @@ const fn pattern_band_count() -> usize {
     32
 }
 
-fn interpolate_stops(stops: &[crate::styled::LinearColorStop], position: f32) -> [f32; 4] {
+fn interpolate_stops(
+    stops: &[LinearColorStop],
+    position: f32,
+    color_space: ColorSpace,
+) -> [f32; 4] {
     let Some(first) = stops.first() else {
         return [0.0; 4];
     };
-    if position <= first.position {
-        return first.color;
+    if position <= first.percentage {
+        return first.color.into();
     }
     for pair in stops.windows(2) {
         let left = &pair[0];
         let right = &pair[1];
-        if position <= right.position {
-            let span = (right.position - left.position).max(f32::EPSILON);
-            let amount = ((position - left.position) / span).clamp(0.0, 1.0);
-            return std::array::from_fn(|index| {
-                left.color[index] + (right.color[index] - left.color[index]) * amount
-            });
+        if position <= right.percentage {
+            let span = (right.percentage - left.percentage).max(f32::EPSILON);
+            let amount = ((position - left.percentage) / span).clamp(0.0, 1.0);
+            return interpolate_colors(left.color.into(), right.color.into(), amount, color_space);
         }
     }
-    stops.last().map_or([0.0; 4], |stop| stop.color)
+    stops.last().map_or([0.0; 4], |stop| stop.color.into())
 }
 
 fn emit_gradient(
@@ -476,12 +503,14 @@ fn emit_gradient(
     opacity: f32,
     emission: &mut Emission,
 ) {
-    let vertical = gradient.angle.sin().abs() > gradient.angle.cos().abs();
+    let angle = gradient.angle.to_radians();
+    let vertical = angle.sin().abs() > angle.cos().abs();
     let bands = gradient_band_count() as f32;
     for index in 0..gradient_band_count() {
         let start = index as f32 / bands;
         let end = (index + 1) as f32 / bands;
-        let mut color = interpolate_stops(&gradient.stops, (start + end) * 0.5);
+        let mut color =
+            interpolate_stops(&gradient.stops, (start + end) * 0.5, gradient.color_space);
         color[3] *= opacity;
         let (origin, size) = if vertical {
             (
@@ -503,6 +532,118 @@ fn emit_gradient(
             border_widths: [0.0; 4],
         });
     }
+}
+
+fn emit_radial_gradient(
+    gradient: &RadialGradient,
+    bounds: LayoutRect,
+    opacity: f32,
+    emission: &mut Emission,
+) {
+    let center = [
+        bounds.x + bounds.width * gradient.center[0],
+        bounds.y + bounds.height * gradient.center[1],
+    ];
+    let bands = gradient_band_count() as f32;
+    for index in 0..gradient_band_count() {
+        let outer = 1.0 - index as f32 / bands;
+        let inner = 1.0 - (index + 1) as f32 / bands;
+        let mut color = interpolate_gradient_stops(
+            &gradient.stops,
+            (outer + inner) * 0.5,
+            gradient.color_space,
+        );
+        color[3] *= opacity;
+        let extent = [
+            bounds.width * gradient.radius[0] * outer,
+            bounds.height * gradient.radius[1] * outer,
+        ];
+        emission.quad(Quad {
+            origin: [center[0] - extent[0], center[1] - extent[1]],
+            size: [extent[0] * 2.0, extent[1] * 2.0],
+            background: color,
+            border_color: [0.0; 4],
+            corner_radii: [extent[0].min(extent[1]); 4],
+            border_widths: [0.0; 4],
+        });
+    }
+}
+
+fn interpolate_gradient_stops(
+    stops: &[GradientStop; 2],
+    position: f32,
+    color_space: ColorSpace,
+) -> [f32; 4] {
+    let left = stops[0];
+    let right = stops[1];
+    let span = (right.position - left.position).max(f32::EPSILON);
+    let amount = ((position - left.position) / span).clamp(0.0, 1.0);
+    interpolate_colors(left.color.into(), right.color.into(), amount, color_space)
+}
+
+fn interpolate_colors(
+    left: [f32; 4],
+    right: [f32; 4],
+    amount: f32,
+    color_space: ColorSpace,
+) -> [f32; 4] {
+    match color_space {
+        ColorSpace::Srgb => {
+            std::array::from_fn(|index| left[index] + (right[index] - left[index]) * amount)
+        }
+        ColorSpace::Oklab => {
+            let left = srgb_to_oklab(left);
+            let right = srgb_to_oklab(right);
+            let mut result = [0.0; 4];
+            for index in 0..3 {
+                result[index] = left[index] + (right[index] - left[index]) * amount;
+            }
+            result[3] = left[3] + (right[3] - left[3]) * amount;
+            oklab_to_srgb(result)
+        }
+    }
+}
+
+#[allow(clippy::excessive_precision)]
+fn srgb_to_oklab(color: [f32; 4]) -> [f32; 4] {
+    let linear = |value: f32| {
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let [red, green, blue] = [linear(color[0]), linear(color[1]), linear(color[2])];
+    let l = (0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue).cbrt();
+    let m = (0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue).cbrt();
+    let s = (0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue).cbrt();
+    [
+        0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+        color[3],
+    ]
+}
+
+#[allow(clippy::excessive_precision)]
+fn oklab_to_srgb(color: [f32; 4]) -> [f32; 4] {
+    let l = color[0] + 0.3963377774 * color[1] + 0.2158037573 * color[2];
+    let m = color[0] - 0.1055613458 * color[1] - 0.0638541728 * color[2];
+    let s = color[0] - 0.0894841775 * color[1] - 1.291485548 * color[2];
+    let nonlinear = |value: f32| {
+        let value = value * value * value;
+        if value <= 0.0031308 {
+            12.92 * value
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        }
+    };
+    [
+        nonlinear(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s).clamp(0.0, 1.0),
+        nonlinear(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s).clamp(0.0, 1.0),
+        nonlinear(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s).clamp(0.0, 1.0),
+        color[3],
+    ]
 }
 
 fn emit_pattern(pattern: &Pattern, bounds: LayoutRect, opacity: f32, emission: &mut Emission) {
@@ -556,6 +697,29 @@ fn emit_pattern(pattern: &Pattern, bounds: LayoutRect, opacity: f32, emission: &
                 emission.quad(Quad {
                     origin: [x, bounds.y],
                     size: [(bounds.x + bounds.width - x).min(width), bounds.height],
+                    background: color,
+                    border_color: [0.0; 4],
+                    corner_radii: [0.0; 4],
+                    border_widths: [0.0; 4],
+                });
+            }
+        }
+        Pattern::Slash {
+            color,
+            width,
+            interval,
+        } => {
+            let width = width.max(1.0);
+            let interval = interval.max(1.0);
+            let period = width + interval;
+            let count = ((bounds.width + bounds.height) / period).ceil().max(1.0) as usize;
+            for index in 0..count {
+                let x = bounds.x + index as f32 * period - bounds.height;
+                let mut color = *color;
+                color[3] *= opacity;
+                emission.quad(Quad {
+                    origin: [x, bounds.y],
+                    size: [width, bounds.height],
                     background: color,
                     border_color: [0.0; 4],
                     corner_radii: [0.0; 4],
@@ -628,6 +792,7 @@ pub fn classify_style_change(current: &DivStyle, previous: &DivStyle) -> Invalid
         || current.corner_radii != previous.corner_radii
         || current.box_shadow != previous.box_shadow
         || current.background_gradient != previous.background_gradient
+        || current.background_radial_gradient != previous.background_radial_gradient
         || current.background_pattern != previous.background_pattern
         || current.opacity != previous.opacity
     {
@@ -639,6 +804,7 @@ pub fn classify_style_change(current: &DivStyle, previous: &DivStyle) -> Invalid
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wgpui_core::color::{blue, red};
     use wgpui_layout::taffy_tree::{Dimension, LayoutSize};
 
     fn bounds() -> LayoutRect {
@@ -736,10 +902,15 @@ mod tests {
     fn a_shadow_layer_is_offset_then_dilated_by_its_spread() {
         let style = DivStyle {
             box_shadow: vec![BoxShadow {
-                color: [0.0, 0.0, 0.0, 0.25],
-                offset: [0.0, 4.0],
-                blur_radius: 6.0,
-                spread_radius: -1.0,
+                color: Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 0.0,
+                    a: 0.25,
+                },
+                offset: Point::new(Pixels(0.0), Pixels(4.0)),
+                blur_radius: Pixels(6.0),
+                spread_radius: Pixels(-1.0),
             }],
             ..styled()
         };
@@ -761,10 +932,15 @@ mod tests {
     #[test]
     fn shadows_come_before_the_quads_and_keep_their_declared_order() {
         let layer = |alpha: f32| BoxShadow {
-            color: [0.0, 0.0, 0.0, alpha],
-            offset: [0.0, 0.0],
-            blur_radius: 4.0,
-            spread_radius: 0.0,
+            color: Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: alpha,
+            },
+            offset: Point::new(Pixels(0.0), Pixels(0.0)),
+            blur_radius: Pixels(4.0),
+            spread_radius: Pixels(0.0),
         };
         let style = DivStyle {
             box_shadow: vec![layer(0.1), layer(0.2)],
@@ -846,10 +1022,15 @@ mod tests {
     fn opacity_is_a_display_change_and_applies_to_every_paint_layer() {
         let mut style = styled();
         style.box_shadow = vec![BoxShadow {
-            color: [0.0, 0.0, 0.0, 0.8],
-            offset: [0.0, 0.0],
-            blur_radius: 2.0,
-            spread_radius: 0.0,
+            color: Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 0.8,
+            },
+            offset: Point::new(Pixels(0.0), Pixels(0.0)),
+            blur_radius: Pixels(2.0),
+            spread_radius: Pixels(0.0),
         }];
         style.opacity = 0.25;
         let mut emission = Emission::new();
@@ -857,7 +1038,10 @@ mod tests {
         assert_eq!(emission.shadows()[0].color[3], 0.2);
         assert_eq!(emission.quads()[0].background[3], 0.25);
         assert_eq!(emission.quads()[1].border_color[3], 0.25);
-        assert_eq!(classify_style_change(&style, &styled()), Invalidation::DISPLAY);
+        assert_eq!(
+            classify_style_change(&style, &styled()),
+            Invalidation::DISPLAY
+        );
     }
 
     #[test]
@@ -865,10 +1049,17 @@ mod tests {
         let gradient = DivStyle {
             background_gradient: Some(LinearGradient {
                 stops: vec![
-                    crate::styled::LinearColorStop { color: [1.0, 0.0, 0.0, 1.0], position: 0.0 },
-                    crate::styled::LinearColorStop { color: [0.0, 0.0, 1.0, 1.0], position: 1.0 },
+                    LinearColorStop {
+                        color: red(),
+                        percentage: 0.0,
+                    },
+                    LinearColorStop {
+                        color: blue(),
+                        percentage: 1.0,
+                    },
                 ],
                 angle: 0.0,
+                color_space: ColorSpace::Srgb,
             }),
             ..DivStyle::default()
         };
@@ -888,6 +1079,40 @@ mod tests {
         let mut pattern_emission = Emission::new();
         pattern.paint(bounds(), &mut pattern_emission);
         assert!(!pattern_emission.quads().is_empty());
-        assert_eq!(classify_style_change(&gradient, &DivStyle::default()), Invalidation::DISPLAY);
+        assert_eq!(
+            classify_style_change(&gradient, &DivStyle::default()),
+            Invalidation::DISPLAY
+        );
+    }
+
+    #[test]
+    fn linear_gradient_angles_are_public_degrees() {
+        let gradient = DivStyle {
+            background_gradient: Some(LinearGradient {
+                stops: vec![
+                    LinearColorStop {
+                        color: red(),
+                        percentage: 0.0,
+                    },
+                    LinearColorStop {
+                        color: blue(),
+                        percentage: 1.0,
+                    },
+                ],
+                angle: 30.0,
+                color_space: ColorSpace::Srgb,
+            }),
+            ..DivStyle::default()
+        };
+        let mut emission = Emission::new();
+        gradient.paint(bounds(), &mut emission);
+
+        let first = emission
+            .quads()
+            .first()
+            .expect("gradient emits a first band");
+        assert_eq!(first.origin[0], 10.0);
+        assert_eq!(first.origin[1], 20.0);
+        assert!(first.size[0] < first.size[1]);
     }
 }

@@ -5,11 +5,11 @@
 //! The missing legacy lifecycle and frontend symbols remain compile failures
 //! in the probe instead of becoming behaviorless placeholders.
 
+use std::any::TypeId;
 use std::cell::RefCell;
 use std::future::Future;
-use std::rc::Rc;
-use std::any::TypeId;
 use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 
 pub use smol::Timer;
 pub use wgpui_compat_macros::IntoElement;
@@ -22,10 +22,10 @@ pub use wgpui_core::reconcile::diff_key::ReconcileKey;
 pub use wgpui_core::reconcile::instance::{ElementInstance, InstanceKey, InstanceTable};
 pub use wgpui_layout::taffy_tree::LayoutNodeId;
 pub use wgpui_text::shaping::{Font, FontId, FontStyle, FontWeight, SharedString};
-pub use wgpui_widgets::div::{Div, IntoDescription, div};
 pub use wgpui_widgets::div::interactivity::style::BoxShadow as ResolvedBoxShadow;
-pub use wgpui_widgets::styled::Styled;
+pub use wgpui_widgets::div::{Div, IntoDescription, div};
 pub use wgpui_widgets::styled::LinearColorStop;
+pub use wgpui_widgets::styled::Styled;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers;
@@ -51,39 +51,93 @@ pub struct MouseDownEvent;
 pub struct MouseUpEvent;
 
 impl MouseMoveEvent {
-    pub fn dragging(&self) -> bool { self.pressed_button == Some(MouseButton::Left) }
+    pub fn dragging(&self) -> bool {
+        self.pressed_button == Some(MouseButton::Left)
+    }
 }
 
-pub trait Half { fn half(&self) -> Self; }
-impl Half for Pixels { fn half(&self) -> Self { (*self).half() } }
-impl Half for f32 { fn half(&self) -> Self { *self / 2.0 } }
-impl Half for i32 { fn half(&self) -> Self { *self / 2 } }
+pub trait Half {
+    fn half(&self) -> Self;
+}
+impl Half for Pixels {
+    fn half(&self) -> Self {
+        (*self).half()
+    }
+}
+impl Half for f32 {
+    fn half(&self) -> Self {
+        *self / 2.0
+    }
+}
+impl Half for i32 {
+    fn half(&self) -> Self {
+        *self / 2
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StyleRefinement;
 impl StyleRefinement {
-    pub fn bg(self, _color: impl Into<[f32; 4]>) -> Self { self }
-    pub fn border_color(self, _color: impl Into<[f32; 4]>) -> Self { self }
-    pub fn opacity(self, _value: f32) -> Self { self }
+    pub fn bg(self, _color: impl Into<[f32; 4]>) -> Self {
+        self
+    }
+    pub fn border_color(self, _color: impl Into<[f32; 4]>) -> Self {
+        self
+    }
+    pub fn opacity(self, _value: f32) -> Self {
+        self
+    }
 }
 
 pub trait InteractiveElement: Sized {
-    fn hover(self, _style: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self { self }
-    fn active(self, _style: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self { self }
+    fn hover(self, _style: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self {
+        self
+    }
+    fn active(self, _style: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self {
+        self
+    }
     fn on_hover<T, F>(self, _handler: F) -> Self
-    where F: Fn(&mut T, &bool, &mut Window, &mut Context<T>) + 'static { self }
+    where
+        F: Fn(&mut T, &bool, &mut Window, &mut Context<T>) + 'static,
+    {
+        self
+    }
     fn on_click<T, F>(self, _handler: F) -> Self
-    where F: Fn(&mut T, &ClickEvent, &mut Window, &mut Context<T>) + 'static { self }
+    where
+        F: Fn(&mut T, &ClickEvent, &mut Window, &mut Context<T>) + 'static,
+    {
+        self
+    }
     fn on_mouse_down<T, F>(self, _button: MouseButton, _handler: F) -> Self
-    where F: Fn(&mut T, &MouseDownEvent, &mut Window, &mut Context<T>) + 'static { self }
+    where
+        F: Fn(&mut T, &MouseDownEvent, &mut Window, &mut Context<T>) + 'static,
+    {
+        self
+    }
     fn on_mouse_up<T, F>(self, _button: MouseButton, _handler: F) -> Self
-    where F: Fn(&mut T, &MouseUpEvent, &mut Window, &mut Context<T>) + 'static { self }
+    where
+        F: Fn(&mut T, &MouseUpEvent, &mut Window, &mut Context<T>) + 'static,
+    {
+        self
+    }
     fn on_mouse_move<T, F>(self, _handler: F) -> Self
-    where F: Fn(&mut T, &MouseMoveEvent, &mut Window, &mut Context<T>) + 'static { self }
+    where
+        F: Fn(&mut T, &MouseMoveEvent, &mut Window, &mut Context<T>) + 'static,
+    {
+        self
+    }
     fn on_drag<D, R, F>(self, _data: D, _handler: F) -> Self
-    where F: Fn(&D, Point<Pixels>, &mut Window, &mut App) -> R + 'static { self }
+    where
+        F: Fn(&D, Point<Pixels>, &mut Window, &mut App) -> R + 'static,
+    {
+        self
+    }
     fn on_drop<D, T, F>(self, _handler: F) -> Self
-    where F: Fn(&mut T, &D, &mut Window, &mut Context<T>) + 'static { self }
+    where
+        F: Fn(&mut T, &D, &mut Window, &mut Context<T>) + 'static,
+    {
+        self
+    }
 }
 impl InteractiveElement for Div {}
 
@@ -111,12 +165,17 @@ pub struct Bounds<T> {
     pub size: Size<T>,
 }
 impl<T> Bounds<T> {
-    pub fn new(origin: Point<T>, size: Size<T>) -> Self { Self { origin, size } }
+    pub fn new(origin: Point<T>, size: Size<T>) -> Self {
+        Self { origin, size }
+    }
 }
 
 impl Size<Pixels> {
     pub fn center(self) -> Point<Pixels> {
-        Point { x: Pixels(self.width.value() / 2.0), y: Pixels(self.height.value() / 2.0) }
+        Point {
+            x: Pixels(self.width.value() / 2.0),
+            y: Pixels(self.height.value() / 2.0),
+        }
     }
 }
 
@@ -193,7 +252,17 @@ pub fn hsla(h: f32, s: f32, l: f32, a: f32) -> Hsla {
 }
 
 pub fn linear_color_stop(color: impl Into<[f32; 4]>, position: f32) -> LinearColorStop {
-    LinearColorStop { color: color.into(), position }
+    let [red, green, blue, alpha] = color.into();
+    LinearColorStop {
+        color: wgpui_core::color::Rgba {
+            r: red,
+            g: green,
+            b: blue,
+            a: alpha,
+        }
+        .into(),
+        percentage: position,
+    }
 }
 impl From<Rgba> for [f32; 4] {
     fn from(value: Rgba) -> Self {
@@ -237,25 +306,64 @@ impl From<Hsla> for [f32; 4] {
     }
 }
 pub const fn red() -> Hsla {
-    Hsla { h: 0.0, s: 1.0, l: 0.5, a: 1.0 }
+    Hsla {
+        h: 0.0,
+        s: 1.0,
+        l: 0.5,
+        a: 1.0,
+    }
 }
 pub const fn green() -> Hsla {
-    Hsla { h: 1.0 / 3.0, s: 1.0, l: 0.5, a: 1.0 }
+    Hsla {
+        h: 1.0 / 3.0,
+        s: 1.0,
+        l: 0.5,
+        a: 1.0,
+    }
 }
 pub const fn blue() -> Hsla {
-    Hsla { h: 2.0 / 3.0, s: 1.0, l: 0.5, a: 1.0 }
+    Hsla {
+        h: 2.0 / 3.0,
+        s: 1.0,
+        l: 0.5,
+        a: 1.0,
+    }
 }
 pub const fn black() -> Hsla {
-    Hsla { h: 0.0, s: 0.0, l: 0.0, a: 1.0 }
+    Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 0.0,
+        a: 1.0,
+    }
 }
 pub const fn white() -> Hsla {
-    Hsla { h: 0.0, s: 0.0, l: 1.0, a: 1.0 }
+    Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 1.0,
+        a: 1.0,
+    }
 }
 pub const fn yellow() -> Hsla {
-    Hsla { h: 1.0 / 6.0, s: 1.0, l: 0.5, a: 1.0 }
+    Hsla {
+        h: 1.0 / 6.0,
+        s: 1.0,
+        l: 0.5,
+        a: 1.0,
+    }
 }
-pub fn transparent_black() -> Rgba { Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }
-pub fn relative(value: f32) -> f32 { value * 16.0 }
+pub fn transparent_black() -> Rgba {
+    Rgba {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+    }
+}
+pub fn relative(value: f32) -> f32 {
+    value * 16.0
+}
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BoxShadow {
@@ -268,39 +376,89 @@ pub struct BoxShadow {
 impl From<BoxShadow> for ResolvedBoxShadow {
     fn from(value: BoxShadow) -> Self {
         Self {
-            color: value.color.into(),
-            offset: value.offset.into(),
-            blur_radius: value.blur_radius.value(),
-            spread_radius: value.spread_radius.value(),
+            color: wgpui_core::color::Hsla {
+                h: value.color.h,
+                s: value.color.s,
+                l: value.color.l,
+                a: value.color.a,
+            },
+            offset: wgpui_core::geometry::Point {
+                x: value.offset.x,
+                y: value.offset.y,
+            },
+            blur_radius: value.blur_radius,
+            spread_radius: value.spread_radius,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Colors {
-    pub text: Rgba, pub text_muted: Rgba, pub selected_text: Rgba,
-    pub background: Rgba, pub surface: Rgba, pub surface_hover: Rgba,
-    pub disabled: Rgba, pub selected: Rgba, pub border: Rgba, pub separator: Rgba,
-    pub container: Rgba, pub accent: Rgba, pub accent_hover: Rgba,
-    pub accent_active: Rgba, pub success: Rgba, pub success_hover: Rgba,
-    pub warning: Rgba, pub warning_hover: Rgba, pub error: Rgba, pub error_hover: Rgba,
+    pub text: Rgba,
+    pub text_muted: Rgba,
+    pub selected_text: Rgba,
+    pub background: Rgba,
+    pub surface: Rgba,
+    pub surface_hover: Rgba,
+    pub disabled: Rgba,
+    pub selected: Rgba,
+    pub border: Rgba,
+    pub separator: Rgba,
+    pub container: Rgba,
+    pub accent: Rgba,
+    pub accent_hover: Rgba,
+    pub accent_active: Rgba,
+    pub success: Rgba,
+    pub success_hover: Rgba,
+    pub warning: Rgba,
+    pub warning_hover: Rgba,
+    pub error: Rgba,
+    pub error_hover: Rgba,
 }
 impl Colors {
-    pub fn light() -> Self { Self::from_palette(0xffffff, 0xf5f5f5, 0x007aff) }
-    pub fn dark() -> Self { Self::from_palette(0xffffff, 0x1e1e1e, 0x0a84ff) }
+    pub fn light() -> Self {
+        Self::from_palette(0xffffff, 0xf5f5f5, 0x007aff)
+    }
+    pub fn dark() -> Self {
+        Self::from_palette(0xffffff, 0x1e1e1e, 0x0a84ff)
+    }
     fn from_palette(text: u32, background: u32, accent: u32) -> Self {
-        let text = rgb(text); let background = rgb(background); let accent = rgb(accent);
-        Self { text, text_muted: rgb(0x888888), selected_text: rgb(0xffffff), background,
-            surface: rgb(0x2d2d2d), surface_hover: rgb(0x3d3d3d), disabled: rgb(0x666666),
-            selected: accent, border: rgb(0x777777), separator: rgb(0x777777),
-            container: background, accent, accent_hover: accent, accent_active: accent,
-            success: rgb(0x28cd41), success_hover: rgb(0x28cd41), warning: rgb(0xffcc00),
-            warning_hover: rgb(0xffcc00), error: rgb(0xff3b30), error_hover: rgb(0xff3b30) }
+        let text = rgb(text);
+        let background = rgb(background);
+        let accent = rgb(accent);
+        Self {
+            text,
+            text_muted: rgb(0x888888),
+            selected_text: rgb(0xffffff),
+            background,
+            surface: rgb(0x2d2d2d),
+            surface_hover: rgb(0x3d3d3d),
+            disabled: rgb(0x666666),
+            selected: accent,
+            border: rgb(0x777777),
+            separator: rgb(0x777777),
+            container: background,
+            accent,
+            accent_hover: accent,
+            accent_active: accent,
+            success: rgb(0x28cd41),
+            success_hover: rgb(0x28cd41),
+            warning: rgb(0xffcc00),
+            warning_hover: rgb(0xffcc00),
+            error: rgb(0xff3b30),
+            error_hover: rgb(0xff3b30),
+        }
     }
 }
-impl Default for Colors { fn default() -> Self { Self::light() } }
+impl Default for Colors {
+    fn default() -> Self {
+        Self::light()
+    }
+}
 impl Colors {
-    pub fn for_appearance<C>(_window: &C) -> Self { Self::default() }
+    pub fn for_appearance<C>(_window: &C) -> Self {
+        Self::default()
+    }
 }
 impl From<Rgba> for Hsla {
     fn from(color: Rgba) -> Self {
@@ -308,7 +466,12 @@ impl From<Rgba> for Hsla {
         let min = color.r.min(color.g).min(color.b);
         let lightness = (max + min) / 2.0;
         if (max - min).abs() < f32::EPSILON {
-            return Hsla { h: 0.0, s: 0.0, l: lightness, a: color.a };
+            return Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: lightness,
+                a: color.a,
+            };
         }
         let delta = max - min;
         let saturation = delta / (1.0 - (2.0 * lightness - 1.0).abs());
@@ -319,7 +482,12 @@ impl From<Rgba> for Hsla {
         } else {
             (color.r - color.g) / delta + 4.0
         } / 6.0;
-        Hsla { h: hue, s: saturation, l: lightness, a: color.a }
+        Hsla {
+            h: hue,
+            s: saturation,
+            l: lightness,
+            a: color.a,
+        }
     }
 }
 
@@ -332,7 +500,9 @@ impl<T> Task<T> {
 }
 
 pub trait Action: 'static + Send + Sync {
-    fn name() -> &'static str where Self: Sized;
+    fn name() -> &'static str
+    where
+        Self: Sized;
 }
 
 #[macro_export]
@@ -360,17 +530,36 @@ macro_rules! actions {
 }
 
 #[derive(Clone)]
-pub struct KeyBinding { pub keystrokes: SharedString, pub action: &'static str, pub context: Option<SharedString> }
+pub struct KeyBinding {
+    pub keystrokes: SharedString,
+    pub action: &'static str,
+    pub context: Option<SharedString>,
+}
 impl KeyBinding {
     pub fn new<A: Action>(keystrokes: &str, _action: A, context: Option<&str>) -> Self {
-        Self { keystrokes: keystrokes.into(), action: A::name(), context: context.map(Into::into) }
+        Self {
+            keystrokes: keystrokes.into(),
+            action: A::name(),
+            context: context.map(Into::into),
+        }
     }
 }
-pub struct Menu { pub name: SharedString, pub items: Vec<MenuItem> }
-pub enum MenuItem { Action { name: SharedString, action: &'static str } }
+pub struct Menu {
+    pub name: SharedString,
+    pub items: Vec<MenuItem>,
+}
+pub enum MenuItem {
+    Action {
+        name: SharedString,
+        action: &'static str,
+    },
+}
 impl MenuItem {
     pub fn action<A: Action>(name: impl Into<SharedString>, _action: A) -> Self {
-        Self::Action { name: name.into(), action: A::name() }
+        Self::Action {
+            name: name.into(),
+            action: A::name(),
+        }
     }
 }
 impl<T> Future for Task<T> {
@@ -404,7 +593,9 @@ impl<T> Entity<T> {
         })
     }
     pub fn update<C, R>(&self, cx: &mut C, update: impl FnOnce(&mut T, &mut C) -> R) -> R
-    where C: EntityContext<T> {
+    where
+        C: EntityContext<T>,
+    {
         let mut value = self.0.borrow_mut();
         update(value.as_mut().expect("entity is initialized"), cx)
     }
@@ -424,8 +615,14 @@ impl<T> Clone for WeakEntity<T> {
     }
 }
 impl<T> WeakEntity<T> {
-    pub fn update<C, R>(&self, cx: &mut C, update: impl FnOnce(&mut T, &mut C) -> R) -> Result<R, EntityError>
-    where C: EntityContext<T> {
+    pub fn update<C, R>(
+        &self,
+        cx: &mut C,
+        update: impl FnOnce(&mut T, &mut C) -> R,
+    ) -> Result<R, EntityError>
+    where
+        C: EntityContext<T>,
+    {
         let entity = self.0.upgrade().ok_or(EntityError)?;
         let mut value = entity.borrow_mut();
         let value = value.as_mut().ok_or(EntityError)?;
@@ -494,7 +691,9 @@ impl<T> Context<T> {
     }
 }
 impl<T> EntityContext<T> for Context<T> {
-    fn notify(&mut self) { Context::notify(self); }
+    fn notify(&mut self) {
+        Context::notify(self);
+    }
 }
 
 pub struct App {
@@ -548,10 +747,9 @@ impl App {
             &mut Context::from_entity(context_entity, Rc::clone(&self.notifications)),
         );
         let mut context = Context::from_entity(root_entity.clone(), Rc::clone(&self.notifications));
-        let description =
-            root_entity.update(&mut context, |root, cx| {
-                IntoDescription::into_description(root.render(&mut window, cx))
-            });
+        let description = root_entity.update(&mut context, |root, cx| {
+            IntoDescription::into_description(root.render(&mut window, cx))
+        });
         self.descriptions.push(description);
         Ok(WindowHandle)
     }
@@ -564,13 +762,22 @@ impl App {
     pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
         self.key_bindings.extend(bindings);
     }
-    pub fn set_menus(&mut self, menus: Vec<Menu>) { self.menus = menus; }
-    pub fn on_window_closed(&mut self, handler: impl FnMut(&mut App, WindowHandle) + 'static) -> Task<()> {
+    pub fn set_menus(&mut self, menus: Vec<Menu>) {
+        self.menus = menus;
+    }
+    pub fn on_window_closed(
+        &mut self,
+        handler: impl FnMut(&mut App, WindowHandle) + 'static,
+    ) -> Task<()> {
         self.window_closed_handlers.push(Box::new(handler));
         Task::ready(())
     }
-    pub fn quit(&mut self) { self.quit_requested = true; }
-    pub fn windows(&self) -> &[WindowHandle] { &[] }
+    pub fn quit(&mut self) {
+        self.quit_requested = true;
+    }
+    pub fn windows(&self) -> &[WindowHandle] {
+        &[]
+    }
     pub fn descriptions(&self) -> &[Description] {
         &self.descriptions
     }
@@ -600,14 +807,20 @@ pub struct WindowHandle;
 type WindowClosedHandler = Box<dyn FnMut(&mut App, WindowHandle)>;
 
 impl Window {
-    pub fn use_state<T>(&mut self, cx: &mut App, build: impl FnOnce(&mut Window, &mut App) -> T) -> Entity<T> {
+    pub fn use_state<T>(
+        &mut self,
+        cx: &mut App,
+        build: impl FnOnce(&mut Window, &mut App) -> T,
+    ) -> Entity<T> {
         let value = build(self, cx);
         cx.new_entity(|_| value)
     }
 }
 
 impl<T> EntityContext<T> for App {
-    fn notify(&mut self) { App::notify(self); }
+    fn notify(&mut self) {
+        App::notify(self);
+    }
 }
 #[derive(Default)]
 pub struct WindowOptions {
@@ -641,10 +854,16 @@ pub trait FocusHandleBuilder: Sized {
 }
 impl FocusHandleBuilder for FocusHandle {
     fn tab_index(self, index: usize) -> Self {
-        Self { tab_index: index, ..self }
+        Self {
+            tab_index: index,
+            ..self
+        }
     }
     fn tab_stop(self, enabled: bool) -> Self {
-        Self { tab_stop: enabled, ..self }
+        Self {
+            tab_stop: enabled,
+            ..self
+        }
     }
 }
 
@@ -667,20 +886,30 @@ pub struct ClickEvent {
     count: usize,
 }
 impl ClickEvent {
-    pub fn click_count(&self) -> usize { self.count.max(1) }
+    pub fn click_count(&self) -> usize {
+        self.count.max(1)
+    }
 }
 
 impl<T> Stateful<T> {
     pub fn new(element: T) -> Self {
-        Self { element, focus: None, event_bindings: 0 }
+        Self {
+            element,
+            focus: None,
+            event_bindings: 0,
+        }
     }
 }
 impl<T> Deref for Stateful<T> {
     type Target = T;
-    fn deref(&self) -> &Self::Target { &self.element }
+    fn deref(&self) -> &Self::Target {
+        &self.element
+    }
 }
 impl<T> DerefMut for Stateful<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.element }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.element
+    }
 }
 impl Stateful<Div> {
     pub fn track_focus(mut self, handle: &FocusHandle) -> Self {
@@ -695,7 +924,10 @@ impl Stateful<Div> {
         self.element = style(self.element);
         self
     }
-    pub fn on_action<F>(mut self, _handler: F) -> Self where F: 'static {
+    pub fn on_action<F>(mut self, _handler: F) -> Self
+    where
+        F: 'static,
+    {
         self.event_bindings += 1;
         self
     }
@@ -707,7 +939,10 @@ impl Stateful<Div> {
         self
     }
     pub fn map(self, transform: impl FnOnce(Div) -> Div) -> Self {
-        Self { element: transform(self.element), ..self }
+        Self {
+            element: transform(self.element),
+            ..self
+        }
     }
     pub fn tab_index(mut self, index: usize) -> Self {
         self.focus = Some(self.focus.unwrap_or_default().tab_index(index));
@@ -724,7 +959,11 @@ pub trait StatefulElement: Sized {
 }
 impl StatefulElement for Div {
     fn track_focus(self, handle: &FocusHandle) -> Stateful<Self> {
-        Stateful { element: self, focus: Some(handle.clone()), event_bindings: 0 }
+        Stateful {
+            element: self,
+            focus: Some(handle.clone()),
+            event_bindings: 0,
+        }
     }
 }
 
@@ -788,8 +1027,8 @@ pub mod widgets {
 
 pub mod prelude {
     pub use crate::{
-        div, linear_color_stop, Div, IntoDescription, IntoElement, ReconcileKey, Render,
-        RenderOnce, Stateful, StatefulElement, Styled, FocusHandleBuilder, FocusStyle,
-        InteractiveElement, Half,
+        Div, FocusHandleBuilder, FocusStyle, Half, InteractiveElement, IntoDescription,
+        IntoElement, ReconcileKey, Render, RenderOnce, Stateful, StatefulElement, Styled, div,
+        linear_color_stop,
     };
 }

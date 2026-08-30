@@ -6,6 +6,7 @@
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+use wgpui_core::element::Element;
 use wgpui_core::reconcile::description::{Description, ElementId};
 use wgpui_core::window::animation::AnimationScheduler;
 
@@ -199,7 +200,7 @@ impl<E: crate::div::IntoDescription> AnimationElement<E> {
     }
 }
 
-impl<E: crate::div::IntoDescription> crate::div::IntoDescription for AnimationElement<E> {
+impl<E: crate::div::IntoDescription + 'static> Element for AnimationElement<E> {
     fn into_description(self) -> Description {
         self.describe_at(Instant::now())
     }

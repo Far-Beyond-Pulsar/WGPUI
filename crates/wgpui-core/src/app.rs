@@ -1,9 +1,12 @@
 //! `App`/`Context<T>` root context assembly. See
 //! docs/gpu-native-architecture.md §1, §3.1.
+use std::any::TypeId;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::action::Action;
+use crate::window::{KeyBinding, KeyDownEvent, Keymap, Menu};
 use futures::channel::oneshot;
 use futures::future::{AbortHandle, Abortable};
 use futures::task::LocalSpawnExt;
@@ -12,11 +15,18 @@ pub use context::Context;
 pub use entity::{Entity, EntityError, EntityId, WeakEntity};
 
 type Observer = Rc<dyn Fn(EntityId)>;
+type ActionHandler = Rc<RefCell<dyn FnMut(&dyn Action, &mut App)>>;
 
 struct AppState {
     observers: HashMap<EntityId, Vec<(u64, Observer)>>,
     next_observer: u64,
     next_entity: u64,
+    keymap: Keymap,
+    action_handlers: HashMap<TypeId, Vec<ActionHandler>>,
+    propagate_actions: bool,
+    active: bool,
+    quit_requested: bool,
+    menus: Vec<Menu>,
 }
 
 /// The foreground application context. It owns entity identity and delivers
@@ -40,6 +50,12 @@ impl App {
                 observers: HashMap::new(),
                 next_observer: 0,
                 next_entity: 0,
+                keymap: Keymap::default(),
+                action_handlers: HashMap::new(),
+                propagate_actions: false,
+                active: false,
+                quit_requested: false,
+                menus: Vec::new(),
             })),
             foreground: Rc::new(RefCell::new(futures::executor::LocalPool::new())),
         }
@@ -82,6 +98,95 @@ impl App {
 
     pub fn run_pending_tasks(&self) {
         self.foreground.borrow_mut().run_until_stalled();
+    }
+
+    pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
+        self.state.borrow_mut().keymap.add_all(bindings);
+    }
+
+    pub fn clear_key_bindings(&mut self) {
+        self.state.borrow_mut().keymap.clear();
+    }
+
+    pub fn keymap(&self) -> std::cell::Ref<'_, Keymap> {
+        std::cell::Ref::map(self.state.borrow(), |state| &state.keymap)
+    }
+
+    pub fn on_action<A: Action>(
+        &mut self,
+        mut listener: impl FnMut(&A, &mut Self) + 'static,
+    ) -> &mut Self {
+        let handler: ActionHandler =
+            Rc::new(RefCell::new(move |action: &dyn Action, app: &mut App| {
+                if let Some(action) = action.as_any().downcast_ref::<A>() {
+                    listener(action, app);
+                }
+            }));
+        self.state
+            .borrow_mut()
+            .action_handlers
+            .entry(TypeId::of::<A>())
+            .or_default()
+            .push(handler);
+        self
+    }
+
+    pub fn dispatch_action(&mut self, action: &dyn Action) -> bool {
+        self.state.borrow_mut().propagate_actions = false;
+        let handlers = self
+            .state
+            .borrow()
+            .action_handlers
+            .get(&action.as_any().type_id())
+            .cloned()
+            .unwrap_or_default();
+        let mut handled = false;
+        for handler in handlers {
+            handler.borrow_mut()(action, self);
+            handled = true;
+            if !self.state.borrow().propagate_actions {
+                break;
+            }
+        }
+        handled
+    }
+
+    pub fn dispatch_key(&mut self, event: &KeyDownEvent) -> bool {
+        let action = self
+            .state
+            .borrow()
+            .keymap
+            .resolve(event, None)
+            .map(Action::boxed_clone);
+        action.is_some_and(|action| self.dispatch_action(&*action))
+    }
+
+    pub fn propagate(&mut self) {
+        self.state.borrow_mut().propagate_actions = true;
+    }
+
+    pub fn activate(&mut self, _ignoring_other_apps: bool) {
+        self.state.borrow_mut().active = true;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.state.borrow().active
+    }
+
+    pub fn quit(&mut self) {
+        self.state.borrow_mut().quit_requested = true;
+    }
+
+    pub fn quit_requested(&self) -> bool {
+        self.state.borrow().quit_requested
+    }
+
+    pub fn set_menus(&mut self, menus: impl IntoIterator<Item = Menu>) {
+        self.state.borrow_mut().menus = menus.into_iter().collect();
+    }
+
+    pub fn menus(&self) -> std::cell::Ref<'_, [Menu]> {
+        std::cell::Ref::map(self.state.borrow(), |state| state.menus.as_slice())
     }
 
     pub fn spawn<Fut, T>(&self, future: Fut) -> Task<T>
@@ -213,9 +318,12 @@ impl Drop for Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window::MenuItem;
     use std::cell::Cell;
     use std::future::pending;
     use std::rc::Rc;
+
+    crate::actions!(app_test, [Activate]);
 
     #[test]
     fn entity_identity_and_state_survive_high_frequency_updates() {
@@ -274,10 +382,51 @@ mod tests {
     fn window_state_uses_the_same_retained_scope_across_frames() {
         let mut window = crate::window::Window::new();
         let scope = crate::reconcile::StateScope::from_path(&[]);
-        assert_eq!(window.use_state(scope, || 0_u32, |value| { *value = 9; *value }), Some(9));
+        assert_eq!(
+            window.use_state(
+                scope,
+                || 0_u32,
+                |value| {
+                    *value = 9;
+                    *value
+                }
+            ),
+            Some(9)
+        );
         window.next_frame();
         assert_eq!(window.use_state(scope, || 0_u32, |value| *value), Some(9));
         assert_eq!(window.state_len(), 1);
+    }
+
+    #[test]
+    fn actions_route_in_registration_order_and_can_propagate() {
+        let mut app = App::new();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let first_calls = calls.clone();
+        app.on_action(move |_: &Activate, app| {
+            first_calls.borrow_mut().push("first");
+            app.propagate();
+        });
+        let second_calls = calls.clone();
+        app.on_action(move |_: &Activate, _| second_calls.borrow_mut().push("second"));
+        assert!(app.dispatch_action(&Activate));
+        assert_eq!(&*calls.borrow(), &["first", "second"]);
+    }
+
+    #[test]
+    fn activation_quit_and_menus_update_shared_application_state() {
+        let mut app = App::new();
+        assert!(!app.is_active());
+        assert!(!app.quit_requested());
+        assert!(app.menus().is_empty());
+
+        app.activate(true);
+        app.set_menus([Menu::new("File", vec![MenuItem::separator()])]);
+        app.quit();
+
+        assert!(app.is_active());
+        assert!(app.quit_requested());
+        assert_eq!(app.menus()[0].name, "File");
     }
 }
 
