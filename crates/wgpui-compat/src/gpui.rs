@@ -44,6 +44,11 @@ pub struct MouseMoveEvent {
     pub modifiers: Modifiers,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MouseDownEvent;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MouseUpEvent;
+
 impl MouseMoveEvent {
     pub fn dragging(&self) -> bool { self.pressed_button == Some(MouseButton::Left) }
 }
@@ -64,13 +69,20 @@ impl StyleRefinement {
 pub trait InteractiveElement: Sized {
     fn hover(self, _style: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self { self }
     fn active(self, _style: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self { self }
-    fn on_hover<F: 'static>(self, _handler: F) -> Self { self }
-    fn on_click<F: 'static>(self, _handler: F) -> Self { self }
-    fn on_mouse_down<F: 'static>(self, _button: MouseButton, _handler: F) -> Self { self }
-    fn on_mouse_up<F: 'static>(self, _button: MouseButton, _handler: F) -> Self { self }
-    fn on_mouse_move<F: 'static>(self, _handler: F) -> Self { self }
-    fn on_drag<F: 'static>(self, _handler: F) -> Self { self }
-    fn on_drop<F: 'static>(self, _handler: F) -> Self { self }
+    fn on_hover<T, F>(self, _handler: F) -> Self
+    where F: Fn(&mut T, &bool, &mut Window, &mut Context<T>) + 'static { self }
+    fn on_click<T, F>(self, _handler: F) -> Self
+    where F: Fn(&mut T, &ClickEvent, &mut Window, &mut Context<T>) + 'static { self }
+    fn on_mouse_down<T, F>(self, _button: MouseButton, _handler: F) -> Self
+    where F: Fn(&mut T, &MouseDownEvent, &mut Window, &mut Context<T>) + 'static { self }
+    fn on_mouse_up<T, F>(self, _button: MouseButton, _handler: F) -> Self
+    where F: Fn(&mut T, &MouseUpEvent, &mut Window, &mut Context<T>) + 'static { self }
+    fn on_mouse_move<T, F>(self, _handler: F) -> Self
+    where F: Fn(&mut T, &MouseMoveEvent, &mut Window, &mut Context<T>) + 'static { self }
+    fn on_drag<D, R, F>(self, _data: D, _handler: F) -> Self
+    where F: Fn(&D, Point<Pixels>, &mut Window, &mut App) -> R + 'static { self }
+    fn on_drop<D, T, F>(self, _handler: F) -> Self
+    where F: Fn(&mut T, &D, &mut Window, &mut Context<T>) + 'static { self }
 }
 impl InteractiveElement for Div {}
 
@@ -487,7 +499,7 @@ pub struct App {
     window_closed_handlers: Vec<WindowClosedHandler>,
 }
 impl App {
-    pub fn new() -> Self {
+    pub fn create() -> Self {
         Self {
             notifications: Rc::new(RefCell::new(0)),
             descriptions: Vec::new(),
@@ -508,6 +520,9 @@ impl App {
         };
         entity.initialize(build(&mut context));
         entity
+    }
+    pub fn new<T>(&mut self, build: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
+        self.new_entity(build)
     }
     pub fn open_window<T: Render>(
         &mut self,
@@ -551,7 +566,7 @@ impl App {
 pub struct Application;
 impl Default for App {
     fn default() -> Self {
-        Self::new()
+        Self::create()
     }
 }
 impl Default for Application {
@@ -564,7 +579,7 @@ impl Application {
         Self
     }
     pub fn run(self, callback: impl FnOnce(&mut App)) {
-        let mut app = App::new();
+        let mut app = App::create();
         callback(&mut app);
     }
 }
