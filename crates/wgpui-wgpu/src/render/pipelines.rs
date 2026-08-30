@@ -73,7 +73,7 @@ pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Straight-alpha `over`, the blend the legacy renderer's instanced pipelines
 /// use.
-const ALPHA_OVER: wgpu::BlendState = wgpu::BlendState {
+pub(crate) const ALPHA_OVER: wgpu::BlendState = wgpu::BlendState {
     color: wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::SrcAlpha,
         dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,

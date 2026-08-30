@@ -698,7 +698,7 @@ impl Harness {
             .count();
         self.check(
             first_frame.frame.primitives_resident > 0
-                && first_frame.emission.patch.len() > 0
+                && !first_frame.emission.patch.is_empty()
                 && first_frame.uploaded_bytes > 0,
             format!(
                 "a raw string has intrinsic layout and emits resident glyphs: {} primitives, {} patch ops, {} uploaded bytes",

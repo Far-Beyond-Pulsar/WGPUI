@@ -235,6 +235,7 @@ fn tile_grid(layer: usize, count: u32) -> Vec<Quad> {
                 border_color: [0.0, 0.0, 0.0, 1.0],
                 corner_radii: [2.0; 4],
                 border_widths: [1.0; 4],
+                ..Quad::ZERO
             }
         })
         .collect()

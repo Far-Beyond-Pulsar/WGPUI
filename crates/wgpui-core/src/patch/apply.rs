@@ -73,6 +73,30 @@ pub struct ScenePatch {
 }
 
 impl ScenePatch {
+    /// Layers whose retained drawable content changed in this patch.
+    ///
+    /// Layout, hitbox, and dispatch records can change without changing any
+    /// pixels. Keeping this distinction here prevents a tile-refresh
+    /// diagnostic from reporting input-only work or a scroll transform as a
+    /// content repaint.
+    pub fn content_layers(&self) -> Vec<LayerId> {
+        let mut layers = Vec::new();
+        let mut seen = HashSet::new();
+        let mut add = |layer: LayerId| {
+            if seen.insert(layer) {
+                layers.push(layer);
+            }
+        };
+        for patch in self.shadows.patches() { add(patch.layer); }
+        for patch in self.quads.patches() { add(patch.layer); }
+        for patch in self.underlines.patches() { add(patch.layer); }
+        for patch in self.glyph_runs.patches() { add(patch.layer); }
+        for patch in self.poly_sprites.patches() { add(patch.layer); }
+        for patch in self.paths.patches() { add(patch.layer); }
+        for patch in self.backdrop_filters.patches() { add(patch.layer); }
+        layers.sort_unstable();
+        layers
+    }
     /// An empty patch. Applying it changes nothing and uploads zero bytes —
     /// §5.0's third case, reached by the trivial path.
     pub fn new() -> Self {

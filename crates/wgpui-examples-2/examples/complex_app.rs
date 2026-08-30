@@ -11,6 +11,7 @@ fn main() -> Result<(), ApplicationError> {
     let selected_for_button = Rc::clone(&selected);
 
     NativeApplication::new(WindowOptions::default(), move |window| {
+        window.performance_debug().flash_tile_refreshes();
         let _ = window.interaction();
         let selected = selected.get();
         let button_color = if selected == 0 {

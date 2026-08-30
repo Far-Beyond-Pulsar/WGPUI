@@ -51,6 +51,7 @@ use wgpui_layout::taffy_tree::{
 use crate::render::atlas::{AtlasTileSource, GlyphAtlas};
 use crate::render::atlas_upload::AtlasTextures;
 use crate::render::draw::DrawMode;
+use crate::debug::{DebugTile, PerformanceDebug};
 use crate::render::frame::{
     Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, RenderTarget,
 };
@@ -216,6 +217,9 @@ pub struct FrameLoop {
     frames: u64,
     last_viewport: Option<[f32; 2]>,
     viewport_recomputes: u64,
+    tile_flash_frames: HashMap<LayerId, u32>,
+    performance_debug: PerformanceDebug,
+    scale_factor: f32,
 }
 
 #[derive(Clone)]
@@ -249,6 +253,9 @@ impl FrameLoop {
             frames: 0,
             last_viewport: None,
             viewport_recomputes: 0,
+            tile_flash_frames: HashMap::new(),
+            performance_debug: PerformanceDebug::default(),
+            scale_factor: 1.0,
         }
     }
 
@@ -288,6 +295,25 @@ impl FrameLoop {
     /// a still one must not.
     pub fn viewport_recomputes(&self) -> u64 {
         self.viewport_recomputes
+    }
+
+    /// Update the opt-in diagnostics used by subsequent frames.
+    pub fn set_performance_debug(&mut self, debug: PerformanceDebug) {
+        self.performance_debug = debug;
+    }
+
+    /// Set the native display scale used when shaping and rasterising text.
+    /// Layout and the render target are expressed in physical pixels, so
+    /// keeping this conversion at the renderer boundary prevents glyphs from
+    /// being laid out at logical size and then squeezed into a physical frame.
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        if scale_factor.is_finite() && scale_factor > 0.0 {
+            let scale_factor = scale_factor as f32;
+            if self.scale_factor.to_bits() != scale_factor.to_bits() {
+                self.scale_factor = scale_factor;
+                self.prepared_text.clear();
+            }
+        }
     }
 
     /// Every quad resident in the scene, in paint order, across every layer.
@@ -402,6 +428,11 @@ impl FrameLoop {
             .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
         let uploads = apply(&mut self.scene, &emission.patch)?;
         let dirty_layers = emission.patch.layers();
+        let debug_tiles = self.refresh_debug_tiles(
+            &emission.patch,
+            self.performance_debug.tile_refresh_flash(),
+        );
+        self.renderer.set_debug_tiles(debug_tiles);
 
         let viewport = [width, height];
         let viewport_changed = self.last_viewport != Some(viewport);
@@ -445,6 +476,46 @@ impl FrameLoop {
         })
     }
 
+    fn refresh_debug_tiles(
+        &mut self,
+        patch: &wgpui_core::patch::apply::ScenePatch,
+        flash: crate::debug::TileRefreshFlash,
+    ) -> Vec<DebugTile> {
+        if !flash.enabled {
+            self.tile_flash_frames.clear();
+            return Vec::new();
+        }
+        self.tile_flash_frames.retain(|_, frames| {
+            *frames = frames.saturating_sub(1);
+            *frames > 0
+        });
+        for layer_id in patch.content_layers() {
+            let Some(layer) = self.scene.layers.get(layer_id) else {
+                continue;
+            };
+            let Some(_tile) = layer.key().tile else {
+                continue;
+            };
+            self.tile_flash_frames
+                .insert(layer_id, flash.duration_frames.max(1));
+        }
+        self.tile_flash_frames
+            .keys()
+            .filter_map(|layer_id| {
+                let layer = self.scene.layers.get(*layer_id)?;
+                let tile = layer.key().tile?;
+                let origin = [
+                    tile.x as f32 * flash.tile_size[0] + layer.transform().translation[0],
+                    tile.y as f32 * flash.tile_size[1] + layer.transform().translation[1],
+                ];
+                Some(DebugTile {
+                    origin_size: [origin[0], origin[1], flash.tile_size[0], flash.tile_size[1]],
+                    color: flash.color,
+                })
+            })
+            .collect()
+    }
+
     fn collect_interactions(
         &self,
         plan: &mut wgpui_core::reconcile::plan::FramePlan,
@@ -484,7 +555,8 @@ impl FrameLoop {
             let (local_size, local_color) = description.text_metrics_value();
             let font_size = local_size.or(inherited_size);
             let color = local_color.or(inherited_color);
-            let font_size = font_size.filter(|size| size.is_finite() && *size > 0.0).unwrap_or(14.0);
+            let font_size = font_size.filter(|size| size.is_finite() && *size > 0.0).unwrap_or(14.0)
+                * self.scale_factor;
             let key = TextCacheKey {
                 value: Arc::clone(&value),
                 font_size_bits: font_size.to_bits(),

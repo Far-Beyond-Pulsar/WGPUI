@@ -18,6 +18,7 @@ use wgpui_core::window::{
 };
 
 use crate::render::draw::DrawMode;
+use crate::debug::PerformanceDebug;
 use crate::render::frame::RenderTarget;
 use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
@@ -58,6 +59,7 @@ pub struct Window {
     hovered_interaction: Option<usize>,
     pressed_interaction: Option<usize>,
     pressed_event: Option<MouseDownEvent>,
+    performance_debug: PerformanceDebug,
 }
 
 /// A clonable handle for scheduling work on a native window.
@@ -102,6 +104,10 @@ impl Window {
     }
     pub fn request_redraw(&self) {
         self.native.request_redraw();
+    }
+    /// Access opt-in visual performance diagnostics for this window.
+    pub fn performance_debug(&mut self) -> &mut PerformanceDebug {
+        &mut self.performance_debug
     }
     pub fn set_title(&self, title: &str) {
         self.native.set_title(title);
@@ -591,6 +597,7 @@ impl Handler {
             hovered_interaction: None,
             pressed_interaction: None,
             pressed_event: None,
+            performance_debug: PerformanceDebug::default(),
         };
         self.live.push(Live {
             frame_loop: FrameLoop::new(&context.device),
@@ -680,6 +687,9 @@ impl Handler {
         live.window.begin_frame();
         let description = (live.build)(&mut live.window);
         live.window.end_frame();
+        live.frame_loop
+            .set_performance_debug(*live.window.performance_debug());
+        live.frame_loop.set_scale_factor(live.window.scale_factor);
         let target = RenderTarget {
             view: &view,
             width,
@@ -814,6 +824,7 @@ impl winit::application::ApplicationHandler for Handler {
             hovered_interaction: None,
             pressed_interaction: None,
             pressed_event: None,
+            performance_debug: PerformanceDebug::default(),
         };
         self.live = Some(Live {
             frame_loop: FrameLoop::new(&context.device),

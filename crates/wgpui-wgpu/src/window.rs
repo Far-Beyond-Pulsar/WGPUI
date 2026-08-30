@@ -42,6 +42,7 @@
 //! preferring it agrees with the legacy choice rather than merely happening to.
 //!
 pub mod application;
+pub use crate::debug::{PerformanceDebug, TileRefreshFlash};
 pub mod frame_loop;
 pub mod resize_detector;
 

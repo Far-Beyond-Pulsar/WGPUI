@@ -6,4 +6,5 @@
 //! `examples/adapter_probe.rs`, since they need a real device to compare
 //! against the CPU reference paths in the legacy backend.
 pub mod render;
+pub mod debug;
 pub mod window;
