@@ -293,6 +293,18 @@ pub trait Styled: Sized {
         self
     }
 
+    fn flex_col_reverse(mut self) -> Self {
+        self.layout_style().display = Display::Flex;
+        self.layout_style().flex_direction = FlexDirection::ColumnReverse;
+        self
+    }
+
+    fn flex_row_reverse(mut self) -> Self {
+        self.layout_style().display = Display::Flex;
+        self.layout_style().flex_direction = FlexDirection::RowReverse;
+        self
+    }
+
     /// `flex-wrap: wrap`.
     fn flex_wrap(mut self) -> Self {
         self.layout_style().flex_wrap = FlexWrap::Wrap;
@@ -334,6 +346,11 @@ pub trait Styled: Sized {
     /// `flex-shrink: 0`.
     fn flex_shrink_0(mut self) -> Self {
         self.layout_style().flex_shrink = 0.0;
+        self
+    }
+
+    fn flex_grow_0(mut self) -> Self {
+        self.layout_style().flex_grow = 0.0;
         self
     }
 
@@ -417,6 +434,11 @@ pub trait Styled: Sized {
         self
     }
 
+    fn overflow_x_scroll(mut self) -> Self {
+        self.layout_style().overflow.x = Overflow::Scroll;
+        self
+    }
+
     // ---- alignment --------------------------------------------------------
 
     /// `align-items: center`.
@@ -439,6 +461,11 @@ pub trait Styled: Sized {
 
     fn items_baseline(mut self) -> Self {
         self.layout_style().align_items = Some(AlignItems::Baseline);
+        self
+    }
+
+    fn items_stretch(mut self) -> Self {
+        self.layout_style().align_items = Some(AlignItems::Stretch);
         self
     }
 
@@ -481,8 +508,53 @@ pub trait Styled: Sized {
         self
     }
 
+    fn content_start(mut self) -> Self {
+        self.layout_style().align_content = Some(AlignContent::FlexStart);
+        self
+    }
+
+    fn content_end(mut self) -> Self {
+        self.layout_style().align_content = Some(AlignContent::FlexEnd);
+        self
+    }
+
+    fn content_between(mut self) -> Self {
+        self.layout_style().align_content = Some(AlignContent::SpaceBetween);
+        self
+    }
+
+    fn content_around(mut self) -> Self {
+        self.layout_style().align_content = Some(AlignContent::SpaceAround);
+        self
+    }
+
+    fn content_evenly(mut self) -> Self {
+        self.layout_style().align_content = Some(AlignContent::SpaceEvenly);
+        self
+    }
+
+    fn content_stretch(mut self) -> Self {
+        self.layout_style().align_content = Some(AlignContent::Stretch);
+        self
+    }
+
     fn self_center(mut self) -> Self {
         self.layout_style().align_self = Some(AlignItems::Center);
+        self
+    }
+
+    fn self_start(mut self) -> Self {
+        self.layout_style().align_self = Some(AlignItems::FlexStart);
+        self
+    }
+
+    fn self_end(mut self) -> Self {
+        self.layout_style().align_self = Some(AlignItems::FlexEnd);
+        self
+    }
+
+    fn self_stretch(mut self) -> Self {
+        self.layout_style().align_self = Some(AlignItems::Stretch);
         self
     }
 
@@ -551,6 +623,19 @@ pub trait Styled: Sized {
         self
     }
 
+    fn min_width(self, pixels: impl IntoStyleDimension) -> Self {
+        self.min_w(pixels)
+    }
+    fn min_height(self, pixels: impl IntoStyleDimension) -> Self {
+        self.min_h(pixels)
+    }
+    fn max_width(self, pixels: impl IntoStyleDimension) -> Self {
+        self.max_w(pixels)
+    }
+    fn max_height(self, pixels: impl IntoStyleDimension) -> Self {
+        self.max_h(pixels)
+    }
+
     // ---- spacing ----------------------------------------------------------
 
     /// `padding: <pixels>px` on every side.
@@ -575,6 +660,10 @@ pub trait Styled: Sized {
         padding.top = LengthPercentage::length(pixels);
         padding.bottom = LengthPercentage::length(pixels);
         self
+    }
+
+    fn padding(self, pixels: impl IntoStylePixels) -> Self {
+        self.p(pixels)
     }
 
     fn m_t(mut self, pixels: impl IntoStylePixels) -> Self {
@@ -638,6 +727,10 @@ pub trait Styled: Sized {
             left: LengthPercentageAuto::length(pixels),
         };
         self
+    }
+
+    fn margin(self, pixels: impl IntoStylePixels) -> Self {
+        self.m(pixels)
     }
 
     /// `gap: <pixels>px` on both axes.
@@ -1083,8 +1176,116 @@ pub trait Styled: Sized {
     }
     fn line_through(mut self) -> Self {
         self.style().text_line_through = true;
+        self.style().text_strikethrough = Some(crate::styled_text::StrikethroughStyle {
+            thickness: 1.0,
+            color: None,
+        });
         self
     }
+
+    fn not_italic(mut self) -> Self {
+        self.style().text_italic = false;
+        self
+    }
+
+    fn whitespace_nowrap(mut self) -> Self {
+        self.style().text_white_space_nowrap = true;
+        self
+    }
+
+    fn text_ellipsis(mut self) -> Self {
+        self.style().text_ellipsis = true;
+        self
+    }
+
+    fn truncate(self) -> Self {
+        self.overflow_hidden().whitespace_nowrap().text_ellipsis()
+    }
+
+    fn line_clamp(mut self, lines: usize) -> Self {
+        self.style().text_line_clamp = Some(lines);
+        self.overflow_hidden()
+    }
+
+    fn tracking(mut self, spacing: f32) -> Self {
+        self.style().text_letter_spacing = Some(spacing);
+        self
+    }
+
+    fn tracking_tighter(self) -> Self {
+        self.tracking(-0.05)
+    }
+    fn tracking_tight(self) -> Self {
+        self.tracking(-0.025)
+    }
+    fn tracking_normal(self) -> Self {
+        self.tracking(0.0)
+    }
+    fn tracking_wide(self) -> Self {
+        self.tracking(0.025)
+    }
+    fn tracking_wider(self) -> Self {
+        self.tracking(0.05)
+    }
+    fn tracking_widest(self) -> Self {
+        self.tracking(0.1)
+    }
+
+    fn underline(mut self) -> Self {
+        self.style().text_underline = Some(crate::styled_text::UnderlineStyle {
+            thickness: 1.0,
+            color: None,
+            wavy: false,
+        });
+        self
+    }
+
+    fn text_decoration_none(mut self) -> Self {
+        self.style().text_underline = None;
+        self.style().text_strikethrough = None;
+        self.style().text_line_through = false;
+        self
+    }
+
+    fn text_decoration_color(mut self, color: impl IntoStyleColor) -> Self {
+        let color = color.into_style_color();
+        self.style().text_decoration_color = Some(color);
+        if let Some(underline) = &mut self.style().text_underline {
+            underline.color = Some(color);
+        }
+        self
+    }
+
+    fn text_decoration_solid(mut self) -> Self {
+        self.style().text_decoration_wavy = false;
+        if let Some(underline) = &mut self.style().text_underline {
+            underline.wavy = false;
+        }
+        self
+    }
+
+    fn text_decoration_wavy(mut self) -> Self {
+        self.style().text_decoration_wavy = true;
+        if let Some(underline) = &mut self.style().text_underline {
+            underline.wavy = true;
+        }
+        self
+    }
+
+    fn text_decoration_thickness(mut self, thickness: impl IntoStylePixels) -> Self {
+        let thickness = thickness.into_style_pixels();
+        self.style().text_decoration_thickness = Some(thickness);
+        if let Some(underline) = &mut self.style().text_underline {
+            underline.thickness = thickness;
+        }
+        self
+    }
+
+    fn text_decoration_0(self) -> Self { self.text_decoration_thickness(0.0) }
+    fn text_decoration_1(self) -> Self { self.text_decoration_thickness(1.0) }
+    fn text_decoration_2(self) -> Self { self.text_decoration_thickness(2.0) }
+    fn text_decoration_4(self) -> Self { self.text_decoration_thickness(4.0) }
+    fn text_decoration_8(self) -> Self { self.text_decoration_thickness(8.0) }
 
     fn p_0p5(self) -> Self {
         self.p(2.0)
@@ -1149,6 +1350,9 @@ pub trait Styled: Sized {
     fn size_10(self) -> Self {
         self.size(40.0)
     }
+    fn size_12(self) -> Self {
+        self.size(48.0)
+    }
     fn h_6(self) -> Self {
         self.h(24.0)
     }
@@ -1176,6 +1380,9 @@ pub trait Styled: Sized {
     fn top_6(self) -> Self {
         self.top(24.0)
     }
+    fn top_8(self) -> Self {
+        self.top(32.0)
+    }
     fn left_2(self) -> Self {
         self.left(8.0)
     }
@@ -1193,6 +1400,9 @@ pub trait Styled: Sized {
     }
     fn right_4(self) -> Self {
         self.right(16.0)
+    }
+    fn right_8(self) -> Self {
+        self.right(32.0)
     }
     fn bottom_0(self) -> Self {
         self.bottom(0.0)
@@ -1290,6 +1500,12 @@ pub trait Styled: Sized {
             Some(value) => then(self, value),
             None => self,
         }
+    }
+}
+
+impl Styled for DivStyle {
+    fn style(&mut self) -> &mut DivStyle {
+        self
     }
 }
 
@@ -1538,5 +1754,51 @@ mod tests {
         assert_eq!(styled.0.layout.border.bottom, LengthPercentage::length(1.0));
         assert_eq!(styled.0.text_size, Some(20.0));
         assert_eq!(styled.0.text_color, Some([0.1, 0.2, 0.3, 1.0]));
+    }
+
+    #[test]
+    fn text_overflow_decoration_and_tracking_write_resolved_fields() {
+        let styled = Styleable::default()
+            .truncate()
+            .line_clamp(3)
+            .tracking_wider()
+            .underline()
+            .text_decoration_wavy()
+            .text_decoration_thickness(2.0)
+            .text_decoration_color([1.0, 0.0, 0.0, 1.0])
+            .line_through();
+
+        assert!(styled.0.text_white_space_nowrap);
+        assert!(styled.0.text_ellipsis);
+        assert_eq!(styled.0.text_line_clamp, Some(3));
+        assert_eq!(styled.0.text_letter_spacing, Some(0.05));
+        assert_eq!(styled.0.text_decoration_thickness, Some(2.0));
+        assert!(styled.0.text_decoration_wavy);
+        assert_eq!(
+            styled.0.text_underline.map(|underline| underline.color),
+            Some(Some([1.0, 0.0, 0.0, 1.0]))
+        );
+        assert!(styled.0.text_strikethrough.is_some());
+        assert_eq!(styled.0.layout.overflow.x, Overflow::Hidden);
+    }
+
+    #[test]
+    fn reverse_and_stretch_aliases_resolve_to_taffy_values() {
+        let styled = Styleable::default()
+            .flex_row_reverse()
+            .items_stretch()
+            .self_end()
+            .content_between()
+            .overflow_x_scroll()
+            .min_width(20.0)
+            .max_height(80.0);
+
+        assert_eq!(styled.0.layout.flex_direction, FlexDirection::RowReverse);
+        assert_eq!(styled.0.layout.align_items, Some(AlignItems::Stretch));
+        assert_eq!(styled.0.layout.align_self, Some(AlignItems::FlexEnd));
+        assert_eq!(styled.0.layout.align_content, Some(AlignContent::SpaceBetween));
+        assert_eq!(styled.0.layout.overflow.x, Overflow::Scroll);
+        assert_eq!(styled.0.layout.min_size.width, Dimension::length(20.0));
+        assert_eq!(styled.0.layout.max_size.height, Dimension::length(80.0));
     }
 }

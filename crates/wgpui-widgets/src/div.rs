@@ -90,6 +90,12 @@ pub struct Div {
     interaction: events::InteractionState,
     focus_handle: Option<wgpui_core::window::FocusHandle>,
     scroll_handle: Option<scroll_state::ScrollHandle>,
+    hover_style: Option<DivStyle>,
+    active_style: Option<DivStyle>,
+    focus_style: Option<DivStyle>,
+    focus_visible_style: Option<DivStyle>,
+    group_name: Option<wgpui_text::shaping::SharedString>,
+    group_hover_style: Option<(wgpui_text::shaping::SharedString, DivStyle)>,
 }
 
 /// A new, unstyled, childless `div`.
@@ -108,6 +114,12 @@ pub fn div() -> Div {
         interaction: events::InteractionState::new(),
         focus_handle: None,
         scroll_handle: None,
+        hover_style: None,
+        active_style: None,
+        focus_style: None,
+        focus_visible_style: None,
+        group_name: None,
+        group_hover_style: None,
     }
 }
 
@@ -120,7 +132,12 @@ impl Default for Div {
 impl Div {
     pub fn on_click<R: events::IntoEventResult + 'static>(
         mut self,
-        handler: impl FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R + 'static,
+        handler: impl FnMut(
+            &wgpui_core::window::ClickEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+        + 'static,
     ) -> Self {
         self.interaction.on_click(handler);
         self
@@ -129,7 +146,12 @@ impl Div {
     pub fn on_mouse_down<R: events::IntoEventResult + 'static>(
         mut self,
         button: wgpui_core::window::MouseButton,
-        handler: impl FnMut(&wgpui_core::window::InputEvent, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R + 'static,
+        handler: impl FnMut(
+            &wgpui_core::window::InputEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+        + 'static,
     ) -> Self {
         self.interaction.on_mouse_down(button, handler);
         self
@@ -137,9 +159,23 @@ impl Div {
 
     pub fn on_hover<R: events::IntoEventResult + 'static>(
         mut self,
-        handler: impl FnMut(bool, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R + 'static,
+        handler: impl FnMut(bool, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R
+        + 'static,
     ) -> Self {
         self.interaction.on_hover(handler);
+        self
+    }
+
+    pub fn on_scroll<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::ScrollWheelEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+        + 'static,
+    ) -> Self {
+        self.interaction.on_scroll(handler);
         self
     }
 
@@ -148,9 +184,52 @@ impl Div {
         self
     }
 
-    pub fn is_hovered(&self) -> bool { self.interaction.is_hovered() }
-    pub fn is_active(&self) -> bool { self.interaction.is_active() }
-    pub fn is_focused(&self) -> bool { self.interaction.is_focused() }
+    /// Resolve a hover style against the element's current resolved style.
+    pub fn hover(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
+        self.hover_style = Some(apply(self.style.clone()));
+        self
+    }
+
+    pub fn active(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
+        self.active_style = Some(apply(self.style.clone()));
+        self
+    }
+
+    /// Mark this element as a member of a named hover group.
+    pub fn group(mut self, name: impl Into<wgpui_text::shaping::SharedString>) -> Self {
+        self.group_name = Some(name.into());
+        self
+    }
+
+    /// Retain a style to use when a member of `name` is hovered.
+    pub fn group_hover(
+        mut self,
+        name: impl Into<wgpui_text::shaping::SharedString>,
+        apply: impl FnOnce(DivStyle) -> DivStyle,
+    ) -> Self {
+        self.group_hover_style = Some((name.into(), apply(self.style.clone())));
+        self
+    }
+
+    pub fn focus(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
+        self.focus_style = Some(apply(self.style.clone()));
+        self
+    }
+
+    pub fn focus_visible(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
+        self.focus_visible_style = Some(apply(self.style.clone()));
+        self
+    }
+
+    pub fn is_hovered(&self) -> bool {
+        self.interaction.is_hovered()
+    }
+    pub fn is_active(&self) -> bool {
+        self.interaction.is_active()
+    }
+    pub fn is_focused(&self) -> bool {
+        self.interaction.is_focused()
+    }
 
     pub fn handle_input(
         &mut self,
@@ -263,9 +342,27 @@ impl Div {
             scroll_offset,
             estimated_size,
             scroll_handle,
+            hover_style,
+            active_style,
+            focus_style,
+            focus_visible_style,
+            group_name: _,
+            group_hover_style,
+            interaction,
             ..
         } = self;
 
+        let style = if interaction.is_focused() {
+            focus_style.or(focus_visible_style).unwrap_or(style)
+        } else if interaction.is_active() {
+            active_style.unwrap_or(style)
+        } else if interaction.is_hovered() {
+            hover_style
+                .or_else(|| group_hover_style.map(|(_, style)| style))
+                .unwrap_or(style)
+        } else {
+            style
+        };
         let key = DivDiffKey::with_estimate(style.clone(), children.len(), estimated_size);
         let mut layout_style = style.layout.clone();
         if let Some([width, height]) = estimated_size {
@@ -292,6 +389,7 @@ impl Div {
         let mut description = Description::new::<Div>()
             .diff_key(key)
             .style(layout_style)
+            .text_metrics(paint.text_size, paint.text_color)
             .scroll_offset(scroll_offset)
             .children(children);
 
@@ -307,6 +405,9 @@ impl Div {
         }
         if uncached {
             description = description.uncached();
+        }
+        if let Some(interaction) = interaction.into_description_interaction() {
+            description = description.interaction(interaction);
         }
 
         // An element that paints nothing gets no emitter at all rather than one

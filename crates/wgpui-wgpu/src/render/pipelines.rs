@@ -73,7 +73,7 @@ pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Straight-alpha `over`, the blend the legacy renderer's instanced pipelines
 /// use.
-const ALPHA_OVER: wgpu::BlendState = wgpu::BlendState {
+pub(crate) const ALPHA_OVER: wgpu::BlendState = wgpu::BlendState {
     color: wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::SrcAlpha,
         dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
@@ -902,6 +902,9 @@ pub struct PolySpritePipeline {
     pub page_layout: wgpu::BindGroupLayout,
     /// Byte stride between two slots' entries in the slot-base buffer.
     pub slot_stride: u32,
+    /// Linear sampler used only for sprites whose drawn size differs from the
+    /// resident bitmap size.
+    pub sampler: wgpu::Sampler,
 }
 
 impl PolySpritePipeline {
@@ -935,13 +938,16 @@ impl PolySpritePipeline {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        // Not filterable, and no sampler: the shader reads texels
-                        // at integer addresses. See `shaders/poly_sprites.wgsl`,
-                        // which also records what that costs for scaled images.
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -986,6 +992,12 @@ impl PolySpritePipeline {
             slot_layout,
             page_layout,
             slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("poly sprite filtering"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
         }
     }
 
@@ -1029,6 +1041,10 @@ impl PolySpritePipeline {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
         })
@@ -1232,21 +1248,26 @@ mod tests {
 
     #[test]
     fn the_shaders_agree_with_the_protocol_about_a_quad_slot() {
-        // `quads.wgsl`'s `QuadSlot` is five `vec4<f32>` since Phase 6.6 grew
+        // `quads.wgsl`'s `QuadSlot` is nine `vec4<f32>` since the material path
         // `Quad` to per-corner radii and per-side border widths. If
         // `Quad::SLOT_STRIDE` ever changes without the shader changing with it,
         // every instance past the first reads the wrong bytes and renders
         // plausible garbage — so the agreement is asserted rather than left to
         // a comment.
-        assert_eq!(QuadPipeline::arena_slot_stride(), 5 * 16);
+        assert_eq!(QuadPipeline::arena_slot_stride(), 9 * 16);
         let shader = super::super::shaders::QUADS_WGSL;
         assert!(shader.contains("struct QuadSlot"));
+        assert!(shader.contains("material_kind: vec4<u32>"));
         for field in [
             "origin_size",
             "background",
             "border_color",
             "corner_radii",
             "border_widths",
+            "material_kind",
+            "material_first",
+            "material_second",
+            "material_parameters",
         ] {
             assert!(shader.contains(field), "the shader dropped `{field}`");
         }

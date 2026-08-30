@@ -1,12 +1,12 @@
 use wgpui::{
-    Application, ApplicationError, DispatchNodeId, EventResult, InputEvent, KeyBinding, Rect,
+    ApplicationError, DispatchNodeId, EventResult, InputEvent, KeyBinding, NativeApplication, Rect,
     Styled, WindowOptions, actions, div, rgb,
 };
 
 actions!(demo, [Activate]);
 
 fn main() -> Result<(), ApplicationError> {
-    Application::new(WindowOptions::default(), |window| {
+    NativeApplication::new(WindowOptions::default(), |window| {
         let interaction = window.interaction();
         let button = interaction
             .hit_test()

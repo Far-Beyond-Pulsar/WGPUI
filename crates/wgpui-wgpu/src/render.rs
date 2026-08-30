@@ -1,7 +1,5 @@
 //! Device/queue creation, pipelines, compute dispatch, atlas, textures,
 //! draw issuance. See docs/gpu-native-architecture.md §3.5.
-#![allow(dead_code)]
-
 pub mod atlas;
 pub mod atlas_upload;
 pub mod buffers;

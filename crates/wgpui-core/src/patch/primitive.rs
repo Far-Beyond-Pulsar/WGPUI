@@ -169,20 +169,25 @@ pub trait Primitive: Clone + PartialEq + 'static {
 
 /// A primitive was handed a destination buffer of the wrong size.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct EncodeError {
-    /// Bytes the value needs: `slot_count() * SLOT_STRIDE`.
-    pub expected: usize,
-    /// Bytes the caller actually provided.
-    pub actual: usize,
+pub enum EncodeError {
+    /// Bytes the value needs and the caller provided.
+    DestinationSize { expected: usize, actual: usize },
+    /// The material cannot be represented without producing undefined shader
+    /// arithmetic. Rejecting it at the protocol boundary keeps every backend
+    /// on the same deterministic fallback/error path.
+    InvalidMaterial,
 }
 
 impl std::fmt::Display for EncodeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "primitive encode destination is {} bytes, expected {}",
-            self.actual, self.expected
-        )
+        match *self {
+            Self::DestinationSize { expected, actual } => write!(
+                formatter,
+                "primitive encode destination is {} bytes, expected {}",
+                actual, expected
+            ),
+            Self::InvalidMaterial => formatter.write_str("quad material is invalid"),
+        }
     }
 }
 
@@ -224,7 +229,7 @@ impl<'a> SlotWriter<'a> {
     /// Advance over `count` bytes of explicit padding, zeroing them so two
     /// encodings of equal values always produce equal bytes.
     fn write_padding(&mut self, count: usize) -> Result<(), EncodeError> {
-        let end = self.offset.checked_add(count).ok_or(EncodeError {
+        let end = self.offset.checked_add(count).ok_or(EncodeError::DestinationSize {
             expected: usize::MAX,
             actual: self.destination.len(),
         })?;
@@ -232,7 +237,7 @@ impl<'a> SlotWriter<'a> {
         let slice = self
             .destination
             .get_mut(self.offset..end)
-            .ok_or(EncodeError {
+            .ok_or(EncodeError::DestinationSize {
                 expected: end,
                 actual: available,
             })?;
@@ -242,7 +247,7 @@ impl<'a> SlotWriter<'a> {
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
-        let end = self.offset.checked_add(bytes.len()).ok_or(EncodeError {
+        let end = self.offset.checked_add(bytes.len()).ok_or(EncodeError::DestinationSize {
             expected: usize::MAX,
             actual: self.destination.len(),
         })?;
@@ -250,7 +255,7 @@ impl<'a> SlotWriter<'a> {
         let slice = self
             .destination
             .get_mut(self.offset..end)
-            .ok_or(EncodeError {
+            .ok_or(EncodeError::DestinationSize {
                 expected: end,
                 actual: available,
             })?;
@@ -264,7 +269,7 @@ impl<'a> SlotWriter<'a> {
         if self.offset == self.destination.len() {
             Ok(())
         } else {
-            Err(EncodeError {
+            Err(EncodeError::DestinationSize {
                 expected: self.offset,
                 actual: self.destination.len(),
             })
@@ -288,8 +293,7 @@ impl<'a> SlotWriter<'a> {
 /// fake one rounded side — is not what the legacy renderer draws, so it could
 /// never be byte-exact against it.
 ///
-/// What is still deliberately absent, and named rather than implied: a gradient
-/// or pattern background (2.0's `background` is one solid straight-alpha RGBA),
+/// What is still deliberately absent, and named rather than implied:
 /// a border style (the legacy dashed-border branch), a content mask (§5.2 sends
 /// the clip to the occlusion pass instead), and an element-opacity field
 /// (folded into the colours by whoever builds the quad, exactly as
@@ -314,6 +318,9 @@ pub struct Quad {
     pub corner_radii: [f32; 4],
     /// Border widths, in the legacy `Edges` order: top, right, bottom, left.
     pub border_widths: [f32; 4],
+    /// Procedural background material. `Solid` preserves the original
+    /// `background` field; the other variants are evaluated per fragment.
+    pub material: Material,
 }
 
 impl Quad {
@@ -344,6 +351,7 @@ impl Quad {
         border_color: [0.0, 0.0, 0.0, 0.0],
         corner_radii: [0.0; 4],
         border_widths: [0.0; 4],
+        material: Material::Solid,
     };
 
     /// The largest of the four corner radii.
@@ -364,17 +372,20 @@ impl Quad {
 impl Primitive for Quad {
     const KIND: PrimitiveKind = PrimitiveKind::Quad;
 
-    // 80 bytes of payload, which is already a multiple of 16 and so needs no
+    // 144 bytes of payload, which is already a multiple of 16 and so needs no
     // tail padding — the reason Phase 1's 56-byte payload was padded to 64.
     // Phase 6.6 grew it from 64 by replacing two scalars with two `vec4<f32>`s;
     // the shader reads the same five 16-byte rows it always did, plus one more.
-    const SLOT_STRIDE: usize = 80;
+    const SLOT_STRIDE: usize = 144;
 
     fn slot_count(&self) -> u32 {
         1
     }
 
     fn encode(&self, destination: &mut [u8]) -> Result<(), EncodeError> {
+        if !self.material.is_valid() {
+            return Err(EncodeError::InvalidMaterial);
+        }
         let mut writer = SlotWriter::new(destination);
         writer.write_f32_array(self.origin)?;
         writer.write_f32_array(self.size)?;
@@ -382,7 +393,113 @@ impl Primitive for Quad {
         writer.write_f32_array(self.border_color)?;
         writer.write_f32_array(self.corner_radii)?;
         writer.write_f32_array(self.border_widths)?;
+        self.material.encode(&mut writer)?;
         writer.finish()
+    }
+}
+
+/// A fixed-layout background material carried by a [`Quad`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Material {
+    /// Use the quad's straight-alpha background colour.
+    Solid,
+    /// Interpolate `colors[0]` to `colors[1]` along the unit-space direction.
+    Linear {
+        direction: [f32; 2],
+        colors: [[f32; 4]; 2],
+    },
+    /// Interpolate `colors[0]` to `colors[1]` from the normalized center.
+    Radial {
+        center: [f32; 2],
+        radius: [f32; 2],
+        colors: [[f32; 4]; 2],
+    },
+    /// Repeat a slash pattern in local pixel coordinates.
+    Slash {
+        color: [f32; 4],
+        width: f32,
+        interval: f32,
+    },
+    Checker {
+        colors: [[f32; 4]; 2],
+        cell: f32,
+    },
+    Stripes {
+        colors: [[f32; 4]; 2],
+        width: f32,
+    },
+}
+
+impl Material {
+    /// Returns whether this material has finite parameters and non-degenerate
+    /// pattern geometry. The check is shared by every encoder and keeps NaN,
+    /// infinity, and divide-by-zero behavior out of GPU command streams.
+    pub fn is_valid(&self) -> bool {
+        let finite = |values: &[f32]| values.iter().all(|value| value.is_finite());
+        match *self {
+            Self::Solid => true,
+            Self::Linear { direction, colors } => {
+                finite(&direction) && finite(&colors[0]) && finite(&colors[1])
+                    && direction[0].hypot(direction[1]) > f32::EPSILON
+            }
+            Self::Radial { center, radius, colors } => {
+                finite(&center) && finite(&radius) && finite(&colors[0]) && finite(&colors[1])
+                    && radius[0] > f32::EPSILON && radius[1] > f32::EPSILON
+            }
+            Self::Slash { color, width, interval } => {
+                finite(&color) && width.is_finite() && interval.is_finite()
+                    && width > f32::EPSILON && interval >= width
+            }
+            Self::Checker { colors, cell } => {
+                finite(&colors[0]) && finite(&colors[1]) && cell.is_finite()
+                    && cell > f32::EPSILON
+            }
+            Self::Stripes { colors, width } => {
+                finite(&colors[0]) && finite(&colors[1]) && width.is_finite()
+                    && width > f32::EPSILON
+            }
+        }
+    }
+
+    fn encode(&self, writer: &mut SlotWriter<'_>) -> Result<(), EncodeError> {
+        let (kind, first, second, parameters) = match *self {
+            Self::Solid => (0u32, [0.0; 4], [0.0; 4], [0.0; 4]),
+            Self::Linear { direction, colors } => (
+                1,
+                colors[0],
+                colors[1],
+                [direction[0], direction[1], 0.0, 0.0],
+            ),
+            Self::Radial { center, radius, colors } => (
+                2,
+                colors[0],
+                colors[1],
+                [center[0], center[1], radius[0], radius[1]],
+            ),
+            Self::Slash { color, width, interval } => (
+                3,
+                color,
+                [0.0; 4],
+                [width, interval, 0.0, 0.0],
+            ),
+            Self::Checker { colors, cell } => (
+                4,
+                colors[0],
+                colors[1],
+                [cell, 0.0, 0.0, 0.0],
+            ),
+            Self::Stripes { colors, width } => (
+                5,
+                colors[0],
+                colors[1],
+                [width, 0.0, 0.0, 0.0],
+            ),
+        };
+        writer.write_u32(kind)?;
+        writer.write_padding(12)?;
+        writer.write_f32_array(first)?;
+        writer.write_f32_array(second)?;
+        writer.write_f32_array(parameters)
     }
 }
 
@@ -902,6 +1019,16 @@ pub struct Path {
 impl Path {
     /// Bytes one tessellated vertex occupies in the GPU arena.
     pub const SLOT_STRIDE: usize = 48;
+    /// Byte offset of the position in the GPU vertex record.
+    pub const POSITION_OFFSET: usize = 0;
+    /// Byte offset of the curve coordinates in the GPU vertex record.
+    pub const ST_OFFSET: usize = 8;
+    /// Byte offset of the straight-alpha RGBA color in the GPU vertex record.
+    pub const COLOR_OFFSET: usize = 16;
+    /// Byte offset of the content-mask origin in the GPU vertex record.
+    pub const CLIP_ORIGIN_OFFSET: usize = 32;
+    /// Byte offset of the content-mask size in the GPU vertex record.
+    pub const CLIP_SIZE_OFFSET: usize = 40;
 
     /// Build a path from a flat vertex stream.
     pub fn new(vertices: Vec<PathVertex>, color: [f32; 4]) -> Self {
@@ -996,6 +1123,17 @@ pub struct BackdropFilter {
 }
 
 impl BackdropFilter {
+    /// Bytes one filter record occupies in the GPU arena.
+    pub const SLOT_STRIDE: usize = 64;
+    /// Byte offsets in the stable storage-buffer record.
+    pub const ORIGIN_OFFSET: usize = 0;
+    pub const SIZE_OFFSET: usize = 8;
+    pub const CLIP_ORIGIN_OFFSET: usize = 16;
+    pub const CLIP_SIZE_OFFSET: usize = 24;
+    pub const CORNER_RADII_OFFSET: usize = 32;
+    pub const BLUR_RADIUS_OFFSET: usize = 48;
+    pub const OPACITY_OFFSET: usize = 52;
+
     /// A transparent, empty filter.
     pub const ZERO: Self = Self {
         origin: [0.0; 2],
@@ -1010,7 +1148,7 @@ impl BackdropFilter {
 
 impl Primitive for BackdropFilter {
     const KIND: PrimitiveKind = PrimitiveKind::BackdropFilter;
-    const SLOT_STRIDE: usize = 64;
+    const SLOT_STRIDE: usize = Self::SLOT_STRIDE;
 
     fn slot_count(&self) -> u32 {
         1
@@ -1059,6 +1197,7 @@ mod tests {
             border_color: [0.0, 0.0, 0.0, 1.0],
             corner_radii: [5.0, 6.0, 7.0, 8.0],
             border_widths: [1.5, 2.5, 3.5, 4.5],
+            material: Material::Solid,
         };
         assert_eq!(quad.slot_count(), 1);
         assert!(quad.encode(&mut bytes).is_ok());
@@ -1083,6 +1222,63 @@ mod tests {
         assert!(Quad::ZERO.encode(&mut too_small).is_err());
         let mut too_large = vec![0u8; Quad::SLOT_STRIDE + 1];
         assert!(Quad::ZERO.encode(&mut too_large).is_err());
+    }
+
+    #[test]
+    fn materials_use_stable_integer_tags_and_reject_undefined_parameters() {
+        let materials = [
+            Material::Solid,
+            Material::Linear {
+                direction: [1.0, 0.0],
+                colors: [[0.0; 4], [1.0; 4]],
+            },
+            Material::Radial {
+                center: [0.5, 0.5],
+                radius: [0.5, 0.5],
+                colors: [[0.0; 4], [1.0; 4]],
+            },
+            Material::Slash {
+                color: [1.0; 4],
+                width: 2.0,
+                interval: 4.0,
+            },
+            Material::Checker {
+                colors: [[0.0; 4], [1.0; 4]],
+                cell: 4.0,
+            },
+            Material::Stripes {
+                colors: [[0.0; 4], [1.0; 4]],
+                width: 4.0,
+            },
+        ];
+        for (kind, material) in materials.into_iter().enumerate() {
+            assert!(material.is_valid());
+            let mut bytes = vec![0u8; Quad::SLOT_STRIDE];
+            Quad {
+                material,
+                ..Quad::ZERO
+            }
+            .encode(&mut bytes)
+            .expect("valid material has a stable slot encoding");
+            assert_eq!(
+                u32::from_le_bytes(bytes[80..84].try_into().expect("tag bytes")),
+                kind as u32
+            );
+        }
+        for material in [
+            Material::Linear {
+                direction: [0.0, 0.0],
+                colors: [[0.0; 4], [1.0; 4]],
+            },
+            Material::Checker {
+                colors: [[0.0; 4], [1.0; 4]],
+                cell: f32::NAN,
+            },
+        ] {
+            assert!(!material.is_valid());
+            let mut bytes = [0u8; Quad::SLOT_STRIDE];
+            assert!(Quad { material, ..Quad::ZERO }.encode(&mut bytes).is_err());
+        }
     }
 
     #[test]
@@ -1414,5 +1610,24 @@ mod tests {
             .is_ok()
         );
         assert_eq!(&bytes[40..44], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn path_and_backdrop_layouts_are_explicit_and_stable() {
+        assert_eq!(Path::SLOT_STRIDE, 48);
+        assert_eq!(Path::POSITION_OFFSET, 0);
+        assert_eq!(Path::ST_OFFSET, 8);
+        assert_eq!(Path::COLOR_OFFSET, 16);
+        assert_eq!(Path::CLIP_ORIGIN_OFFSET, 32);
+        assert_eq!(Path::CLIP_SIZE_OFFSET, 40);
+
+        assert_eq!(BackdropFilter::SLOT_STRIDE, 64);
+        assert_eq!(BackdropFilter::ORIGIN_OFFSET, 0);
+        assert_eq!(BackdropFilter::SIZE_OFFSET, 8);
+        assert_eq!(BackdropFilter::CLIP_ORIGIN_OFFSET, 16);
+        assert_eq!(BackdropFilter::CLIP_SIZE_OFFSET, 24);
+        assert_eq!(BackdropFilter::CORNER_RADII_OFFSET, 32);
+        assert_eq!(BackdropFilter::BLUR_RADIUS_OFFSET, 48);
+        assert_eq!(BackdropFilter::OPACITY_OFFSET, 52);
     }
 }

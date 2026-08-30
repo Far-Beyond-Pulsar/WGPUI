@@ -39,6 +39,7 @@ use crate::scene::layer::LayerId;
 use crate::scene::record::{DispatchNode, Hitbox, LayoutInput};
 use crate::scene::slab_range::{UploadRange, coalesce_uploads, uploaded_byte_count};
 use crate::scene::{PrimitiveStore, Scene};
+use std::collections::HashSet;
 
 /// One frame's patches, across every record category §2 names.
 ///
@@ -72,6 +73,30 @@ pub struct ScenePatch {
 }
 
 impl ScenePatch {
+    /// Layers whose retained drawable content changed in this patch.
+    ///
+    /// Layout, hitbox, and dispatch records can change without changing any
+    /// pixels. Keeping this distinction here prevents a tile-refresh
+    /// diagnostic from reporting input-only work or a scroll transform as a
+    /// content repaint.
+    pub fn content_layers(&self) -> Vec<LayerId> {
+        let mut layers = Vec::new();
+        let mut seen = HashSet::new();
+        let mut add = |layer: LayerId| {
+            if seen.insert(layer) {
+                layers.push(layer);
+            }
+        };
+        for patch in self.shadows.patches() { add(patch.layer); }
+        for patch in self.quads.patches() { add(patch.layer); }
+        for patch in self.underlines.patches() { add(patch.layer); }
+        for patch in self.glyph_runs.patches() { add(patch.layer); }
+        for patch in self.poly_sprites.patches() { add(patch.layer); }
+        for patch in self.paths.patches() { add(patch.layer); }
+        for patch in self.backdrop_filters.patches() { add(patch.layer); }
+        layers.sort_unstable();
+        layers
+    }
     /// An empty patch. Applying it changes nothing and uploads zero bytes —
     /// §5.0's third case, reached by the trivial path.
     pub fn new() -> Self {
@@ -123,8 +148,9 @@ impl ScenePatch {
     /// Every layer this patch names, deduplicated, in ascending handle order.
     pub fn layers(&self) -> Vec<LayerId> {
         let mut layers: Vec<LayerId> = Vec::new();
+        let mut seen = HashSet::new();
         let mut note = |layer: LayerId| {
-            if !layers.contains(&layer) {
+            if seen.insert(layer) {
                 layers.push(layer);
             }
         };
@@ -427,6 +453,7 @@ mod tests {
             border_color: [0.0, 0.0, 0.0, 1.0],
             corner_radii: [4.0; 4],
             border_widths: [1.0; 4],
+            material: crate::patch::primitive::Material::Solid,
         }
     }
 

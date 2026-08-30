@@ -21,12 +21,24 @@ struct ScrollState {
 pub struct ScrollHandle(Rc<RefCell<ScrollState>>);
 
 impl ScrollHandle {
-    pub fn new() -> Self { Self::default() }
-    pub fn offset(&self) -> Point<Pixels> { self.0.borrow().offset }
-    pub fn max_offset(&self) -> Size<Pixels> { self.0.borrow().max_offset }
-    pub fn bounds(&self) -> Bounds<Pixels> { self.0.borrow().viewport }
-    pub fn content_size(&self) -> Size<Pixels> { self.0.borrow().content_size }
-    pub fn revision(&self) -> u64 { self.0.borrow().revision }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn offset(&self) -> Point<Pixels> {
+        self.0.borrow().offset
+    }
+    pub fn max_offset(&self) -> Size<Pixels> {
+        self.0.borrow().max_offset
+    }
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        self.0.borrow().viewport
+    }
+    pub fn content_size(&self) -> Size<Pixels> {
+        self.0.borrow().content_size
+    }
+    pub fn revision(&self) -> u64 {
+        self.0.borrow().revision
+    }
 
     pub fn set_offset(&self, offset: Point<Pixels>) -> bool {
         let mut state = self.0.borrow_mut();
@@ -34,7 +46,9 @@ impl ScrollHandle {
             x: offset.x.clamp(-state.max_offset.width, Pixels::ZERO),
             y: offset.y.clamp(-state.max_offset.height, Pixels::ZERO),
         };
-        if state.offset == clamped { return false; }
+        if state.offset == clamped {
+            return false;
+        }
         state.offset = clamped;
         state.pending = None;
         state.revision = state.revision.wrapping_add(1);
@@ -45,7 +59,9 @@ impl ScrollHandle {
         let offset = self.offset();
         self.set_offset(point(offset.x + delta.x, offset.y + delta.y))
     }
-    pub fn scroll_to_top(&self) -> bool { self.set_offset(Point::default()) }
+    pub fn scroll_to_top(&self) -> bool {
+        self.set_offset(Point::default())
+    }
     pub fn scroll_to_bottom(&self) -> bool {
         let max = self.max_offset();
         self.set_offset(point(-max.width, -max.height))
@@ -76,7 +92,9 @@ impl ScrollHandle {
         changed
     }
 
-    pub fn request_scroll_to(&self, offset: Point<Pixels>) { self.0.borrow_mut().pending = Some(offset); }
+    pub fn request_scroll_to(&self, offset: Point<Pixels>) {
+        self.0.borrow_mut().pending = Some(offset);
+    }
     pub fn take_pending_scroll(&self) -> Option<Point<Pixels>> {
         let pending = self.0.borrow_mut().pending.take();
         pending.map(|offset| {
@@ -84,7 +102,9 @@ impl ScrollHandle {
             self.offset()
         })
     }
-    pub fn logical_scroll_top(&self) -> (usize, Pixels) { (0, -self.offset().y) }
+    pub fn logical_scroll_top(&self) -> (usize, Pixels) {
+        (0, -self.offset().y)
+    }
 }
 
 #[cfg(test)]

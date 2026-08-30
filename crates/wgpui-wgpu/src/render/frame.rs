@@ -53,6 +53,7 @@ use wgpui_core::scene::atlas::AtlasKind;
 use wgpui_core::scene::layer::LayerId;
 use wgpui_core::scene::{Scene, UploadRange};
 
+use crate::debug::DebugTile;
 use crate::render::atlas_upload::AtlasTextures;
 use crate::render::buffers::slab_buffers::SlabBuffer;
 use crate::render::compute::indirect_args_pass::{
@@ -89,6 +90,8 @@ pub enum FrameError {
     /// A backdrop filter needs the target texture so the renderer can take the
     /// legacy-style snapshot between render passes.
     BackdropSourceUnavailable,
+    /// The optional diagnostic overlay could not be prepared.
+    DebugOverlayUnavailable,
 }
 
 impl std::fmt::Display for FrameError {
@@ -102,6 +105,8 @@ impl std::fmt::Display for FrameError {
                 formatter,
                 "backdrop filtering requires a copyable render-target texture"
             ),
+            FrameError::DebugOverlayUnavailable =>
+                write!(formatter, "tile refresh diagnostics could not be prepared"),
         }
     }
 }
@@ -218,6 +223,13 @@ pub struct FrameOutput {
     /// carried so a report cannot quote a draw count without the count it is
     /// supposed to be independent of.
     pub primitives_resident: u32,
+    /// Scene-arena `write_buffer` calls issued by this frame. A clean retained
+    /// frame must report zero here.
+    pub scene_upload_calls: u32,
+    /// Scene-arena bytes written by this frame.
+    pub scene_upload_bytes: u64,
+    /// Slot-base plans built by this frame. A steady frame must report zero.
+    pub plan_builds: u32,
 }
 
 /// An offscreen colour target plus the readback its comparisons need.
@@ -400,11 +412,19 @@ pub struct FrameRenderer {
     backdrop_snapshot: Option<wgpu::Texture>,
     backdrop_snapshot_view: Option<wgpu::TextureView>,
     backdrop_sampler: wgpu::Sampler,
+    debug_pipeline: wgpu::RenderPipeline,
+    debug_bind_group_layout: wgpu::BindGroupLayout,
+    debug_buffer: wgpu::Buffer,
+    debug_buffer_capacity: u64,
+    debug_bind_group: Option<wgpu::BindGroup>,
+    debug_tiles: Vec<DebugTile>,
 }
 
 impl FrameRenderer {
     /// Build every pipeline once.
     pub fn new(device: &wgpu::Device) -> FrameRenderer {
+        let (debug_bind_group_layout, debug_pipeline) = create_debug_pipeline(device);
+        let debug_buffer_capacity = std::mem::size_of::<DebugTile>() as u64;
         FrameRenderer {
             ordering: OrderingPass::new(device),
             occlusion: OcclusionPass::new(device),
@@ -466,7 +486,23 @@ impl FrameRenderer {
                 mipmap_filter: wgpu::MipmapFilterMode::Nearest,
                 ..Default::default()
             }),
+            debug_pipeline,
+            debug_bind_group_layout,
+            debug_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tile refresh diagnostics"),
+                size: debug_buffer_capacity,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            debug_buffer_capacity,
+            debug_bind_group: None,
+            debug_tiles: Vec::new(),
         }
+    }
+
+    /// Set transient diagnostic rectangles for the next render.
+    pub fn set_debug_tiles(&mut self, tiles: Vec<DebugTile>) {
+        self.debug_tiles = tiles;
     }
 
     fn ensure_backdrop_snapshot(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -493,6 +529,47 @@ impl FrameRenderer {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.backdrop_snapshot = Some(texture);
         self.backdrop_snapshot_view = Some(view);
+    }
+
+    fn prepare_debug_tiles(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tiles: &[DebugTile],
+    ) -> Option<&wgpu::BindGroup> {
+        if tiles.is_empty() {
+            return None;
+        }
+        let bytes = bytemuck::cast_slice(tiles);
+        let required = bytes.len() as u64;
+        if required > self.debug_buffer_capacity {
+            self.debug_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tile refresh diagnostics"),
+                size: required.next_power_of_two(),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.debug_buffer_capacity = required.next_power_of_two();
+            self.debug_bind_group = None;
+        }
+        queue.write_buffer(&self.debug_buffer, 0, bytes);
+        if self.debug_bind_group.is_none() {
+            self.debug_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tile refresh diagnostics"),
+                layout: &self.debug_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.globals.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.debug_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
+        self.debug_bind_group.as_ref()
     }
 
     /// How many times the readback staging buffer has been allocated.
@@ -538,6 +615,38 @@ impl FrameRenderer {
     /// How many times the backdrop slot-base plan has been built.
     pub fn backdrop_plan_builds(&self) -> u64 {
         self.backdrop_plan_builds
+    }
+
+    /// Total scene-arena upload calls since renderer creation.
+    pub fn scene_upload_calls(&self) -> u64 {
+        self.shadow_arena.upload_calls()
+            + self.arena.upload_calls()
+            + self.underline_arena.upload_calls()
+            + self.glyph_arena.upload_calls()
+            + self.sprite_arena.upload_calls()
+            + self.path_arena.upload_calls()
+            + self.backdrop_arena.upload_calls()
+    }
+
+    /// Total scene-arena bytes written since renderer creation.
+    pub fn scene_upload_bytes(&self) -> u64 {
+        self.shadow_arena.uploaded_bytes()
+            + self.arena.uploaded_bytes()
+            + self.underline_arena.uploaded_bytes()
+            + self.glyph_arena.uploaded_bytes()
+            + self.sprite_arena.uploaded_bytes()
+            + self.path_arena.uploaded_bytes()
+            + self.backdrop_arena.uploaded_bytes()
+    }
+
+    fn plan_builds(&self) -> u64 {
+        self.shadow_plan_builds
+            + self.quad_plan_builds
+            + self.underline_plan_builds
+            + self.glyph_plan_builds
+            + self.sprite_plan_builds
+            + self.path_plan_builds
+            + self.backdrop_plan_builds
     }
 
     /// One bind group per live atlas page of `kind`, in ascending page order.
@@ -651,6 +760,9 @@ impl FrameRenderer {
         };
         self.textures.begin_frame();
         let mut timing = FrameTiming::default();
+        let upload_calls_before = self.scene_upload_calls();
+        let upload_bytes_before = self.scene_upload_bytes();
+        let plan_builds_before = self.plan_builds();
 
         let table = input.scene.draw_slots();
         let shadow_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Shadow).to_vec();
@@ -1371,6 +1483,10 @@ impl FrameRenderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
+        let debug_tiles = self.debug_tiles.clone();
+        let has_debug_tiles = self
+            .prepare_debug_tiles(device, queue, &debug_tiles)
+            .is_some();
         let mut stats;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1512,6 +1628,14 @@ impl FrameRenderer {
                 input.mode,
                 &composite_resolved,
             ));
+            if has_debug_tiles {
+                let Some(bind_group) = self.debug_bind_group.as_ref() else {
+                    return Err(FrameError::DebugOverlayUnavailable);
+                };
+                pass.set_pipeline(&self.debug_pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..4, 0..u32::try_from(debug_tiles.len()).unwrap_or(u32::MAX));
+            }
             timing.draw_issue = started.elapsed();
         }
         queue.submit(Some(encoder.finish()));
@@ -1528,8 +1652,86 @@ impl FrameRenderer {
             timing,
             layers_recomputed,
             primitives_resident,
+            scene_upload_calls: u32::try_from(
+                self.scene_upload_calls()
+                    .saturating_sub(upload_calls_before),
+            )
+            .unwrap_or(u32::MAX),
+            scene_upload_bytes: self
+                .scene_upload_bytes()
+                .saturating_sub(upload_bytes_before),
+            plan_builds: u32::try_from(self.plan_builds().saturating_sub(plan_builds_before))
+                .unwrap_or(u32::MAX),
         })
     }
+}
+
+fn create_debug_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("tile refresh diagnostics"),
+        source: wgpu::ShaderSource::Wgsl(crate::render::shaders::DEBUG_TILES_WGSL.into()),
+    });
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("tile refresh diagnostics"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: std::num::NonZeroU64::new(8),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: std::num::NonZeroU64::new(
+                        std::mem::size_of::<DebugTile>() as u64,
+                    ),
+                },
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("tile refresh diagnostics"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("tile refresh diagnostics"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vertex_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fragment_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: TARGET_FORMAT,
+                blend: Some(crate::render::pipelines::ALPHA_OVER),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    (bind_group_layout, pipeline)
 }
 
 /// One layer's shadows as the rectangles they actually paint into, in arena

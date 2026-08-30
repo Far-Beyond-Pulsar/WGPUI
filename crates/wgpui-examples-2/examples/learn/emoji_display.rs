@@ -15,7 +15,7 @@ use wgpui::{
 struct EmojiDisplay;
 
 impl Render for EmojiDisplay {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self) -> impl IntoElement {
         div()
             .size_full()
             .bg(rgb(0x111827))
@@ -56,7 +56,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| EmojiDisplay),
+            |_, cx| cx.new_entity(EmojiDisplay),
         )
         .expect("failed to open emoji display window");
     });

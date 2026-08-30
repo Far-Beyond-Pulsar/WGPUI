@@ -32,10 +32,13 @@ pub use wgpui_core::patch::primitive::{
     AtlasTileId, Glyph, GlyphRun, Path, PolySprite, Quad, Shadow, Underline,
 };
 pub use wgpui_core::reconcile;
-pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey, Reconciler};
 pub use wgpui_core::reconcile::description::{RawText, RawTextKey};
+pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey, Reconciler};
 pub use wgpui_core::reconcile::{StateKey, StateScope};
 pub use wgpui_core::scene;
+pub use wgpui_core::window::{
+    AnimationScheduler, DispatchTree, FocusManager, Keymap, WindowTimers,
+};
 pub use wgpui_core::{
     Action, App, ClickEvent, CloseState, Context, DispatchNodeId, Entity, EntityError, EntityId,
     EventResult, FocusHandle, FocusId, FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId,
@@ -57,7 +60,8 @@ pub use wgpui_text::shaping::{
     Font, FontId, FontRun, FontStyle, FontWeight, SharedString, TextMeasurement, TextShaper,
 };
 pub use wgpui_widgets::animation::{
-    Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline,
+    Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline, ease_in_out,
+    ease_out_quint, linear, quadratic,
 };
 pub use wgpui_widgets::div::interactivity::style::{
     BoxShadow, Corners, DivStyle, Edges, LinearGradient, Pattern, RadialGradient,
@@ -69,6 +73,8 @@ pub use wgpui_widgets::image_cache::{
 pub use wgpui_widgets::img::{
     ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img, ObjectFit, SharedImageEngine, img,
 };
+pub use wgpui_widgets::list;
+pub use wgpui_widgets::scroll::{ScrollHandle, ScrollPhysics, ScrollPhysicsMode};
 pub use wgpui_widgets::styled::{
     IntoStyleBackground, IntoStyleColor, IntoStyleDimension, IntoStylePixels, Styled,
 };
@@ -80,8 +86,10 @@ pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
 pub use wgpui_widgets::wgpu_surface::{WgpuSurface, WgpuSurfaceKey};
 
 pub use wgpui_wgpu::window::application::{
-    Application, ApplicationError, DisplayId, FrameReport, Window, WindowHandle, WindowOptions,
+    Application, ApplicationError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
+    WindowOptions,
 };
+pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 
 pub mod prelude {
     pub use crate::{

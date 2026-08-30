@@ -1,7 +1,7 @@
-use wgpui::{Application, ApplicationError, Styled, WindowOptions, div, rgb};
+use wgpui::{ApplicationError, NativeApplication, Styled, WindowOptions, div, rgb};
 
 fn main() -> Result<(), ApplicationError> {
-    Application::new(WindowOptions::default(), move |_window| {
+    NativeApplication::new(WindowOptions::default(), move |_window| {
         div()
             .id("root")
             .w(360.0)

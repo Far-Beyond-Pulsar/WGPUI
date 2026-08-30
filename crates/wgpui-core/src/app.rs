@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::action::Action;
-use crate::window::{KeyBinding, KeyDownEvent, Keymap, Menu};
+use crate::element::{IntoElement, Render};
+use crate::reconcile::description::Description;
+use crate::window::{KeyBinding, KeyDownEvent, Keymap, Menu, WindowOptions};
 use futures::channel::oneshot;
 use futures::future::{AbortHandle, Abortable};
 use futures::task::LocalSpawnExt;
@@ -16,6 +18,8 @@ pub use entity::{Entity, EntityError, EntityId, WeakEntity};
 
 type Observer = Rc<dyn Fn(EntityId)>;
 type ActionHandler = Rc<RefCell<dyn FnMut(&dyn Action, &mut App)>>;
+type WindowBuild = Box<dyn FnOnce(&mut crate::window::Window, &mut App) -> WindowRenderer>;
+type WindowRender = Box<dyn FnMut(&mut crate::window::Window, &mut App) -> Description>;
 
 struct AppState {
     observers: HashMap<EntityId, Vec<(u64, Observer)>>,
@@ -27,6 +31,16 @@ struct AppState {
     active: bool,
     quit_requested: bool,
     menus: Vec<Menu>,
+    pending_windows: Vec<WindowRequest>,
+}
+
+pub struct WindowRequest {
+    pub options: WindowOptions,
+    pub build: WindowBuild,
+}
+
+pub struct WindowRenderer {
+    pub render: WindowRender,
 }
 
 /// The foreground application context. It owns entity identity and delivers
@@ -56,6 +70,7 @@ impl App {
                 active: false,
                 quit_requested: false,
                 menus: Vec::new(),
+                pending_windows: Vec::new(),
             })),
             foreground: Rc::new(RefCell::new(futures::executor::LocalPool::new())),
         }
@@ -179,6 +194,34 @@ impl App {
 
     pub fn quit_requested(&self) -> bool {
         self.state.borrow().quit_requested
+    }
+
+    pub fn open_window<V: Render>(
+        &mut self,
+        options: WindowOptions,
+        build_root_view: impl FnOnce(&mut crate::window::Window, &mut App) -> Entity<V> + 'static,
+    ) -> Result<(), &'static str> {
+        if self.quit_requested() {
+            return Err("application is quitting");
+        }
+        self.state.borrow_mut().pending_windows.push(WindowRequest {
+            options,
+            build: Box::new(move |window, app| {
+                let entity = build_root_view(window, app);
+                WindowRenderer {
+                    render: Box::new(move |window, _app| {
+                        entity.update_in(window, |value, _window, _context| {
+                            value.render().into_description()
+                        })
+                    }),
+                }
+            }),
+        });
+        Ok(())
+    }
+
+    pub fn take_window_requests(&mut self) -> Vec<WindowRequest> {
+        std::mem::take(&mut self.state.borrow_mut().pending_windows)
     }
 
     pub fn set_menus(&mut self, menus: impl IntoIterator<Item = Menu>) {
@@ -427,6 +470,26 @@ mod tests {
         assert!(app.is_active());
         assert!(app.quit_requested());
         assert_eq!(app.menus()[0].name, "File");
+    }
+
+    struct TestRoot;
+
+    impl Render for TestRoot {
+        fn render(&mut self) -> impl IntoElement + 'static {
+            Description::new::<Self>()
+        }
+    }
+
+    #[test]
+    fn open_window_queues_each_root_and_rejects_new_windows_after_quit() {
+        let mut app = App::new();
+        app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot))
+            .expect("first window request should be accepted");
+        app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot))
+            .expect("second window request should be accepted");
+        assert_eq!(app.take_window_requests().len(), 2);
+        app.quit();
+        assert_eq!(app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot)), Err("application is quitting"));
     }
 }
 

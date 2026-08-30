@@ -23,6 +23,8 @@
 use crate::boundary::policy::BoundaryPolicy;
 use crate::patch::emit::Emit;
 use crate::reconcile::diff_key::ReconcileKey;
+use crate::app::App;
+use crate::window::{EventResult, InputEvent, Window};
 use std::any::TypeId;
 use std::sync::Arc;
 use wgpui_layout::taffy_tree::LayoutStyle;
@@ -79,6 +81,39 @@ impl RawText {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawTextKey {
     value: Arc<str>,
+}
+
+/// Input callbacks carried from an element description to the native window.
+/// The callback is deliberately stored beside the description until layout has
+/// produced the element's actual bounds; registering it earlier would make
+/// hit testing use stale geometry after a resize or a retained relayout.
+type InteractionCallback = Box<dyn FnMut(&InputEvent, &mut Window, &mut App) -> EventResult>;
+
+pub struct DescriptionInteraction {
+    callback: InteractionCallback,
+}
+
+impl std::fmt::Debug for DescriptionInteraction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DescriptionInteraction(..)")
+    }
+}
+
+impl DescriptionInteraction {
+    pub fn new(
+        callback: impl FnMut(&InputEvent, &mut Window, &mut App) -> EventResult + 'static,
+    ) -> Self {
+        Self { callback: Box::new(callback) }
+    }
+
+    pub fn dispatch(
+        &mut self,
+        event: &InputEvent,
+        window: &mut Window,
+        app: &mut App,
+    ) -> EventResult {
+        (self.callback)(event, window, app)
+    }
 }
 
 impl RawTextKey {
@@ -159,6 +194,9 @@ pub struct Description {
     pub(crate) children: Vec<Description>,
     pub(crate) clip_children: bool,
     pub(crate) raw_text: Option<RawText>,
+    pub(crate) text_size: Option<f32>,
+    pub(crate) text_color: Option<[f32; 4]>,
+    pub(crate) interaction: Option<DescriptionInteraction>,
 }
 
 impl std::fmt::Debug for Description {
@@ -201,6 +239,9 @@ impl Description {
             children: Vec::new(),
             clip_children: false,
             raw_text: None,
+            text_size: None,
+            text_color: None,
+            interaction: None,
         }
     }
 
@@ -315,6 +356,23 @@ impl Description {
     /// shaped and its glyphs have been assigned atlas tiles.
     pub fn set_text_emitter(&mut self, emitter: impl Emit) {
         self.emitter = Some(Box::new(emitter));
+    }
+
+    /// Carry the resolved inherited text metrics to a renderer-owned text
+    /// materializer without coupling the core description to a font system.
+    pub fn text_metrics(mut self, size: Option<f32>, color: Option<[f32; 4]>) -> Self {
+        self.text_size = size;
+        self.text_color = color;
+        self
+    }
+
+    pub fn text_metrics_value(&self) -> (Option<f32>, Option<[f32; 4]>) {
+        (self.text_size, self.text_color)
+    }
+
+    pub fn interaction(mut self, interaction: DescriptionInteraction) -> Self {
+        self.interaction = Some(interaction);
+        self
     }
 
     /// Set the style this element's layout node is laid out with.

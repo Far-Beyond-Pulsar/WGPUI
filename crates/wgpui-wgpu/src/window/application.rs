@@ -2,73 +2,46 @@
 
 use std::sync::Arc;
 
-use wgpui_core::boundary::Pixels;
 use wgpui_core::app::App;
+use wgpui_core::boundary::Pixels;
 use wgpui_core::boundary::compositor::CompositeEntry;
 use wgpui_core::element::IntoElement;
-use wgpui_core::geometry::{Bounds, Point, Size, WindowBounds, point, size};
+use wgpui_core::geometry::{Bounds, Point, Rect, Size, WindowBounds, point, size};
 use wgpui_core::invalidation::request::FrameSignals;
+use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
+pub use wgpui_core::window::WindowOptions;
 use wgpui_core::window::{
     InputEvent, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton as CoreMouseButton,
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
 };
 
 use crate::render::draw::DrawMode;
+use crate::debug::PerformanceDebug;
 use crate::render::frame::RenderTarget;
-use crate::window::frame_loop::{FrameLoop, LoopInput};
+use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
 use crate::window::{Acquired, WindowError, WindowSurface};
 
-/// Options used when creating the native window.
-#[derive(Clone, Debug)]
-pub struct WindowOptions {
-    pub title: String,
-    pub width: u32,
-    pub height: u32,
-    pub resizable: bool,
-    pub window_bounds: Option<WindowBounds>,
-    pub focus: bool,
-    pub show: bool,
-}
-
-impl Default for WindowOptions {
-    fn default() -> Self {
-        Self {
-            title: "WGPUI".to_string(),
-            width: 800,
-            height: 600,
-            resizable: true,
-            window_bounds: None,
-            focus: true,
-            show: true,
-        }
-    }
-}
-
-impl WindowOptions {
-    fn initial_bounds(&self) -> Bounds<Pixels> {
-        let fallback = size(Pixels(self.width as f32), Pixels(self.height as f32));
-        let Some(window_bounds) = self.window_bounds else {
-            return Bounds::new(point(Pixels::ZERO, Pixels::ZERO), fallback);
-        };
-        let bounds = window_bounds.get_bounds();
-        let size = if bounds.size.width.value() > 0.0 && bounds.size.height.value() > 0.0 {
-            bounds.size
-        } else {
-            fallback
-        };
-        Bounds::new(bounds.origin, size)
-    }
-
-    fn window_state(&self) -> Option<WindowBounds> {
-        self.window_bounds
-    }
+fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
+    let fallback = size(Pixels(options.width as f32), Pixels(options.height as f32));
+    let Some(window_bounds) = options.window_bounds else {
+        return Bounds::new(point(Pixels::ZERO, Pixels::ZERO), fallback);
+    };
+    let bounds = window_bounds.get_bounds();
+    let size = if bounds.size.width.value() > 0.0 && bounds.size.height.value() > 0.0 {
+        bounds.size
+    } else {
+        fallback
+    };
+    Bounds::new(bounds.origin, size)
 }
 
 /// A handle to the native window visible to the application callback.
 type CloseHandler = Box<dyn FnMut(&mut Window) -> bool>;
+type AppInitializer = Box<dyn FnOnce(&mut App)>;
+type WindowBuildCallback = Box<dyn FnMut(&mut Window) -> Description>;
 
 pub struct Window {
     native: Arc<winit::window::Window>,
@@ -82,6 +55,13 @@ pub struct Window {
     interaction_modifiers: Modifiers,
     mouse_buttons: MouseButtonState,
     cursor: [Pixels; 2],
+    cursor_inside: bool,
+    interactions: Vec<InteractionRegistration>,
+    hovered_interaction: Option<usize>,
+    pressed_interaction: Option<usize>,
+    pressed_event: Option<MouseDownEvent>,
+    hover_dirty_regions: Vec<Rect>,
+    performance_debug: PerformanceDebug,
 }
 
 /// A clonable handle for scheduling work on a native window.
@@ -126,6 +106,30 @@ impl Window {
     }
     pub fn request_redraw(&self) {
         self.native.request_redraw();
+    }
+
+    pub fn take_hover_dirty_regions(&mut self) -> Vec<Rect> {
+        std::mem::take(&mut self.hover_dirty_regions)
+    }
+
+    pub fn clear_hover_with_app(&mut self, app: &mut App) -> bool {
+        self.cursor_inside = false;
+        let Some(index) = self.hovered_interaction.take() else {
+            return false;
+        };
+        if let Some(interaction) = self.interactions.get(index) {
+            self.hover_dirty_regions.push(interaction.bounds);
+        }
+        let event = InputEvent::MouseLeave(MouseMoveEvent {
+            position: self.cursor,
+            modifiers: self.modifiers(),
+            buttons: self.mouse_buttons,
+        });
+        self.dispatch_interaction(index, &event, app)
+    }
+    /// Access opt-in visual performance diagnostics for this window.
+    pub fn performance_debug(&mut self) -> &mut PerformanceDebug {
+        &mut self.performance_debug
     }
     pub fn set_title(&self, title: &str) {
         self.native.set_title(title);
@@ -188,6 +192,161 @@ impl Window {
     }
     pub fn handle_input(&mut self, event: InputEvent) -> bool {
         self.interaction.handle_input(event)
+    }
+    pub fn handle_input_with_app(&mut self, event: InputEvent, app: &mut App) -> bool {
+        if self.interactions.is_empty() {
+            return self.interaction.handle_input(event);
+        }
+        match &event {
+            InputEvent::MouseMove(mouse) => {
+                self.cursor_inside = true;
+                let hit = self.hit_interaction(mouse.position);
+                let mut handled = false;
+                if self.hovered_interaction != hit {
+                    if let Some(previous) = self.hovered_interaction
+                        .and_then(|index| self.interactions.get(index))
+                    {
+                        self.hover_dirty_regions.push(previous.bounds);
+                    }
+                    if let Some(current) = hit.and_then(|index| self.interactions.get(index)) {
+                        self.hover_dirty_regions.push(current.bounds);
+                    }
+                    if let Some(previous) = self.hovered_interaction {
+                        handled |= self.dispatch_interaction(previous, &InputEvent::MouseLeave(*mouse), app);
+                    }
+                    if let Some(current) = hit {
+                        handled |= self.dispatch_interaction(current, &InputEvent::MouseEnter(*mouse), app);
+                    }
+                    self.hovered_interaction = hit;
+                }
+                if let Some(current) = hit {
+                    handled |= self.dispatch_interaction(current, &event, app);
+                }
+                handled
+            }
+            InputEvent::MouseDown(mouse) => {
+                self.pressed_interaction = self.hit_interaction(mouse.position);
+                self.pressed_event = Some(*mouse);
+                self.pressed_interaction
+                    .is_some_and(|index| self.dispatch_interaction(index, &event, app))
+            }
+            InputEvent::MouseUp(mouse) => {
+                let pressed = self.pressed_interaction.take();
+                let down = self.pressed_event.take().unwrap_or(MouseDownEvent {
+                    button: mouse.button,
+                    position: mouse.position,
+                    modifiers: mouse.modifiers,
+                    click_count: mouse.click_count,
+                });
+                let Some(index) = pressed else { return false };
+                let mut handled = self.dispatch_interaction(index, &event, app);
+                if self.hit_interaction(mouse.position) == Some(index) {
+                    handled |= self.dispatch_interaction(index, &InputEvent::Click(
+                        wgpui_core::window::ClickEvent::Mouse(
+                            wgpui_core::window::MouseClickEvent {
+                                down,
+                                up: *mouse,
+                            },
+                        ),
+                    ), app);
+                }
+                handled
+            }
+            InputEvent::Scroll(scroll) => {
+                let mut handled = false;
+                for index in self.hit_interactions(scroll.position) {
+                    let result = self.dispatch_interaction(index, &event, app);
+                    handled |= result;
+                    if result {
+                        break;
+                    }
+                }
+                handled
+            }
+            _ => self.interaction.handle_input(event),
+        }
+    }
+    fn hit_interactions(&self, position: [Pixels; 2]) -> Vec<usize> {
+        let point = [
+            position[0].value() * self.scale_factor as f32,
+            position[1].value() * self.scale_factor as f32,
+        ];
+        let mut hits: Vec<_> = self
+            .interactions
+            .iter()
+            .enumerate()
+            .filter(|(_, registration)| {
+                let bounds = registration.bounds;
+                point[0] >= bounds.min_x
+                    && point[0] < bounds.max_x
+                    && point[1] >= bounds.min_y
+                    && point[1] < bounds.max_y
+            })
+            .map(|(index, _)| index)
+            .collect();
+        hits.sort_unstable_by_key(|index| std::cmp::Reverse(self.interactions[*index].order));
+        hits
+    }
+    fn hit_interaction(&self, position: [Pixels; 2]) -> Option<usize> {
+        self.hit_interactions(position).into_iter().next()
+    }
+    fn dispatch_interaction(&mut self, index: usize, event: &InputEvent, app: &mut App) -> bool {
+        let mut interactions = std::mem::take(&mut self.interactions);
+        let handled = interactions
+            .get_mut(index)
+            .is_some_and(|registration| registration.interaction.dispatch(event, &mut self.interaction, app).handled);
+        self.interactions = interactions;
+        handled
+    }
+    fn set_interactions(&mut self, interactions: Vec<InteractionRegistration>, app: &mut App) {
+        let previous_address = self
+            .hovered_interaction
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        let previous_bounds = self
+            .hovered_interaction
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.bounds);
+        let previous_interactions = std::mem::replace(&mut self.interactions, interactions);
+        let hit = self.cursor_inside.then(|| self.hit_interaction(self.cursor)).flatten();
+        let hit_address = hit
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        if previous_address != hit_address {
+            if let Some(bounds) = previous_bounds {
+                self.hover_dirty_regions.push(bounds);
+            }
+            if let Some(index) = hit
+                && let Some(registration) = self.interactions.get(index)
+            {
+                self.hover_dirty_regions.push(registration.bounds);
+            }
+            let mouse = MouseMoveEvent {
+                position: self.cursor,
+                modifiers: self.modifiers(),
+                buttons: self.mouse_buttons,
+            };
+            if let Some(old_address) = previous_address
+                && let Some(old_index) = previous_interactions
+                    .iter()
+                    .position(|registration| registration.address == old_address)
+            {
+                let mut previous_interactions = previous_interactions;
+                if let Some(registration) = previous_interactions.get_mut(old_index) {
+                    registration.interaction.dispatch(
+                        &InputEvent::MouseLeave(mouse),
+                        &mut self.interaction,
+                        app,
+                    );
+                }
+            }
+            if let Some(index) = hit {
+                self.dispatch_interaction(index, &InputEvent::MouseEnter(mouse), app);
+            }
+        }
+        self.hovered_interaction = hit;
+        self.pressed_interaction = None;
+        self.pressed_event = None;
     }
     pub fn cursor_position(&self) -> [Pixels; 2] {
         self.cursor
@@ -305,14 +464,14 @@ impl From<WindowError> for ApplicationError {
 }
 
 /// The native retained application.
-pub struct Application<F, R> {
+pub struct NativeApplication<F, R> {
     options: WindowOptions,
     build: F,
     max_frames: Option<u64>,
     marker: std::marker::PhantomData<fn() -> R>,
 }
 
-impl<F, R> Application<F, R>
+impl<F, R> NativeApplication<F, R>
 where
     F: FnMut(&mut Window) -> R + 'static,
     R: IntoElement,
@@ -342,16 +501,21 @@ where
     /// redraw, and the same `App` is retained for the lifetime of the window.
     /// Calling [`App::quit`] from the initializer or any retained callback
     /// exits the real event loop after the current frame.
-    pub fn run_with_app(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
+    pub fn run_with_app(
+        mut self,
+        initialize: impl FnOnce(&mut App) + 'static,
+    ) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
-            options: self.options,
-            build: self.build,
+            initial: Some((
+                self.options,
+                Box::new(move |window| (self.build)(window).into_description()),
+            )),
             max_frames: self.max_frames,
             initialize: Some(Box::new(initialize)),
-            live: None,
+            live: Vec::new(),
             failure: None,
-            marker: std::marker::PhantomData,
+            app: App::new(),
         };
         event_loop
             .run_app(&mut handler)
@@ -369,21 +533,56 @@ where
         self
     }
 
-    pub fn run(self) -> Result<(), ApplicationError> {
+    pub fn run(mut self) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
-            options: self.options,
-            build: self.build,
+            initial: Some((
+                self.options,
+                Box::new(move |window| (self.build)(window).into_description()),
+            )),
             max_frames: self.max_frames,
             initialize: None,
-            live: None,
+            live: Vec::new(),
             failure: None,
-            marker: std::marker::PhantomData,
+            app: App::new(),
         };
         event_loop
             .run_app(&mut handler)
             .map_err(ApplicationError::from)?;
         handler.failure.map_or(Ok(()), Err)
+    }
+}
+
+pub struct Application;
+
+impl Application {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
+        let event_loop = event_loop()?;
+        let mut handler = Handler {
+            initial: Some((
+                WindowOptions::default(),
+                Box::new(|_| Description::new::<()>()),
+            )),
+            max_frames: None,
+            initialize: Some(Box::new(initialize)),
+            app: App::new(),
+            live: Vec::new(),
+            failure: None,
+        };
+        event_loop
+            .run_app(&mut handler)
+            .map_err(ApplicationError::from)?;
+        handler.failure.map_or(Ok(()), Err)
+    }
+}
+
+impl Default for Application {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -412,32 +611,152 @@ struct Live {
     frames: u64,
     last_report: Option<FrameReport>,
     app: App,
+    build: WindowBuildCallback,
 }
 
-struct Handler<F, R> {
-    options: WindowOptions,
-    build: F,
+struct Handler {
+    initial: Option<(WindowOptions, WindowBuildCallback)>,
     max_frames: Option<u64>,
-    initialize: Option<Box<dyn FnOnce(&mut App)>>,
-    live: Option<Live>,
+    initialize: Option<AppInitializer>,
+    live: Vec<Live>,
     failure: Option<ApplicationError>,
-    marker: std::marker::PhantomData<fn() -> R>,
+    app: App,
 }
 
-impl<F, R> Handler<F, R>
-where
-    F: FnMut(&mut Window) -> R + 'static,
-    R: IntoElement,
-{
+impl Handler {
     fn fail(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, error: ApplicationError) {
         self.failure = Some(error);
         event_loop.exit();
     }
 
-    fn draw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let Some(live) = self.live.as_mut() else {
+    fn create_window(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        options: WindowOptions,
+        build: WindowBuildCallback,
+    ) -> Result<(), ApplicationError> {
+        let attributes = winit::window::Window::default_attributes()
+            .with_title(options.title.clone())
+            .with_resizable(options.resizable)
+            .with_visible(options.show);
+        let bounds = initial_bounds(&options);
+        let mut attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(
+            bounds.size.width.value(),
+            bounds.size.height.value(),
+        ));
+        if options.window_bounds.is_some() {
+            attributes = attributes.with_position(winit::dpi::LogicalPosition::new(
+                bounds.origin.x.value(),
+                bounds.origin.y.value(),
+            ));
+        }
+        let native = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .map_err(|error| ApplicationError::CreateWindow(error.to_string()))?,
+        );
+        let scale_factor = native.scale_factor();
+        if let Some(window_bounds) = options.window_bounds {
+            match window_bounds {
+                WindowBounds::Windowed(_) => {}
+                WindowBounds::Maximized(_) => native.set_maximized(true),
+                WindowBounds::Fullscreen(_) => native.set_fullscreen(Some(
+                    winit::window::Fullscreen::Borderless(native.current_monitor()),
+                )),
+            }
+        }
+        if options.focus {
+            native.focus_window();
+        }
+        let (surface, context) = WindowSurface::new(Arc::clone(&native))?;
+        let (width, height) = surface.size();
+        let mut resizes = ResizeDetector::new();
+        resizes.seed(width, height);
+        let mode = DrawMode::best_available(context.indirect);
+        let window = Window {
+            native,
+            scale_factor,
+            close_requested: false,
+            last_frame: None,
+            state: ElementStateStore::new(),
+            state_frame: 0,
+            interaction: wgpui_core::window::Window::new(),
+            close_handler: None,
+            interaction_modifiers: Modifiers::default(),
+            mouse_buttons: MouseButtonState::default(),
+            cursor: [Pixels::ZERO, Pixels::ZERO],
+            cursor_inside: false,
+            interactions: Vec::new(),
+            hovered_interaction: None,
+            pressed_interaction: None,
+            pressed_event: None,
+            hover_dirty_regions: Vec::new(),
+            performance_debug: PerformanceDebug::default(),
+        };
+        self.live.push(Live {
+            frame_loop: FrameLoop::new(&context.device),
+            surface,
+            context,
+            window,
+            resizes,
+            mode,
+            frames: 0,
+            last_report: None,
+            app: self.app.clone(),
+            build,
+        });
+        if let Some(live) = self.live.last() {
+            live.window.request_redraw();
+        }
+        Ok(())
+    }
+
+    fn create_pending_windows(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        loop {
+            let requests = self.app.take_window_requests();
+            if requests.is_empty() {
+                break;
+            }
+            let mut first_error = None;
+            for request in requests {
+                let mut renderer =
+                    (request.build)(&mut wgpui_core::window::Window::new(), &mut self.app);
+                let mut app = self.app.clone();
+                let build = Box::new(move |window: &mut Window| {
+                    (renderer.render)(&mut window.interaction, &mut app)
+                });
+                if let Err(error) = self.create_window(event_loop, request.options, build)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            if let Some(error) = first_error {
+                self.fail(event_loop, error);
+                return;
+            }
+        }
+    }
+
+    fn draw(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+    ) {
+        let Some(index) = self
+            .live
+            .iter()
+            .position(|live| live.window.id() == window_id)
+        else {
             return;
         };
+        let all_other_windows_reached_limit = self.max_frames.is_some_and(|limit| {
+            self.live
+                .iter()
+                .enumerate()
+                .all(|(other_index, live)| other_index == index || live.frames >= limit)
+        });
+        let live = &mut self.live[index];
         if let Some((width, height)) = live.resizes.take_pending() {
             live.surface.resize(&live.context.device, width, height);
         }
@@ -460,8 +779,11 @@ where
             .create_view(&wgpu::TextureViewDescriptor::default());
         let (width, height) = live.surface.size();
         live.window.begin_frame();
-        let description = (self.build)(&mut live.window).into_description();
+        let description = (live.build)(&mut live.window);
         live.window.end_frame();
+        live.frame_loop
+            .set_performance_debug(*live.window.performance_debug());
+        live.frame_loop.set_scale_factor(live.window.scale_factor);
         let target = RenderTarget {
             view: &view,
             width,
@@ -484,6 +806,7 @@ where
         );
         match result {
             Ok(frame) => {
+                live.window.set_interactions(frame.interactions, &mut live.app);
                 live.frames += 1;
                 let report = FrameReport {
                     frame_number: live.frames,
@@ -495,9 +818,13 @@ where
                 live.window.last_frame = Some(report.clone());
                 live.last_report = Some(report);
                 live.surface.present(&live.context.queue, texture);
-                if live.window.close_requested
-                    || live.app.quit_requested()
-                    || self.max_frames.is_some_and(|limit| live.frames >= limit)
+                if live.window.close_requested || live.app.quit_requested() {
+                    self.live.remove(index);
+                    if self.live.is_empty() {
+                        event_loop.exit();
+                    }
+                } else if self.max_frames.is_some_and(|limit| live.frames >= limit)
+                    && all_other_windows_reached_limit
                 {
                     event_loop.exit();
                 } else {
@@ -509,20 +836,28 @@ where
     }
 }
 
-impl<F, R> winit::application::ApplicationHandler for Handler<F, R>
-where
-    F: FnMut(&mut Window) -> R + 'static,
-    R: IntoElement,
-{
+impl winit::application::ApplicationHandler for Handler {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if self.live.is_some() {
+        if !self.live.is_empty() {
             return;
         }
+        if let Some(initialize) = self.initialize.take() {
+            initialize(&mut self.app);
+        }
+        self.create_pending_windows(event_loop);
+        if let Some((options, build)) = self.initial.take()
+            && let Err(error) = self.create_window(event_loop, options, build)
+        {
+            self.fail(event_loop, error);
+        }
+    }
+
+    /*
         let attributes = winit::window::Window::default_attributes()
             .with_title(self.options.title.clone())
             .with_resizable(self.options.resizable)
             .with_visible(self.options.show);
-        let initial_bounds = self.options.initial_bounds();
+        let initial_bounds = initial_bounds(&self.options);
         let mut attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(
             initial_bounds.size.width.value(),
             initial_bounds.size.height.value(),
@@ -544,7 +879,7 @@ where
             }
         };
         let scale_factor = native.scale_factor();
-        if let Some(window_bounds) = self.options.window_state() {
+        if let Some(window_bounds) = self.options.window_bounds {
             match window_bounds {
                 WindowBounds::Windowed(_) => {}
                 WindowBounds::Maximized(_) => native.set_maximized(true),
@@ -579,6 +914,13 @@ where
             interaction_modifiers: Modifiers::default(),
             mouse_buttons: MouseButtonState::default(),
             cursor: [Pixels::ZERO, Pixels::ZERO],
+            cursor_inside: false,
+            interactions: Vec::new(),
+            hovered_interaction: None,
+            pressed_interaction: None,
+            pressed_event: None,
+            hover_dirty_regions: Vec::new(),
+            performance_debug: PerformanceDebug::default(),
         };
         self.live = Some(Live {
             frame_loop: FrameLoop::new(&context.device),
@@ -589,32 +931,41 @@ where
             mode,
             frames: 0,
             last_report: None,
-            app: App::new(),
+            app: self.app.clone(),
         });
-        if let Some(initialize) = self.initialize.take() {
-            if let Some(live) = self.live.as_mut() {
-                let mut app = live.app.clone();
-                initialize(&mut app);
-            }
+        if let Some(initialize) = self.initialize.take()
+            && let Some(live) = self.live.as_mut()
+        {
+            let mut app = live.app.clone();
+            initialize(&mut app);
         }
         if let Some(live) = self.live.as_ref() {
             live.window.request_redraw();
         }
     }
+    */
 
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
-        _window_id: winit::window::WindowId,
+        window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        let Some(live) = self.live.as_mut() else {
+        let Some(index) = self
+            .live
+            .iter()
+            .position(|live| live.window.id() == window_id)
+        else {
             return;
         };
+        let live = &mut self.live[index];
         match event {
             winit::event::WindowEvent::CloseRequested => {
                 if live.window.try_close() {
-                    event_loop.exit();
+                    self.live.remove(index);
+                    if self.live.is_empty() {
+                        event_loop.exit();
+                    }
                 }
             }
             winit::event::WindowEvent::Resized(size) => {
@@ -642,7 +993,7 @@ where
                         modifiers: live.window.modifiers(),
                     })
                 };
-                if live.window.handle_input(input) {
+                if live.window.handle_input_with_app(input, &mut live.app) {
                     live.window.request_redraw();
                 }
             }
@@ -655,7 +1006,12 @@ where
                     modifiers: live.window.modifiers(),
                     buttons: live.window.mouse_buttons,
                 });
-                if live.window.handle_input(event) {
+                let handled = live.window.handle_input_with_app(event, &mut live.app);
+                let hover_dirty_regions = live.window.take_hover_dirty_regions();
+                for region in hover_dirty_regions.iter().copied() {
+                    live.frame_loop.mark_interaction_dirty(region);
+                }
+                if handled || !hover_dirty_regions.is_empty() {
                     live.window.request_redraw();
                 }
             }
@@ -679,7 +1035,7 @@ where
                         click_count: 1,
                     })
                 };
-                if live.window.handle_input(event) {
+                if live.window.handle_input_with_app(event, &mut live.app) {
                     live.window.request_redraw();
                 }
             }
@@ -695,13 +1051,18 @@ where
                     delta,
                     modifiers: live.window.modifiers(),
                 });
-                if live.window.handle_input(event) {
+                if live.window.handle_input_with_app(event, &mut live.app) {
                     live.window.request_redraw();
                 }
             }
-            winit::event::WindowEvent::RedrawRequested => self.draw(event_loop),
+            winit::event::WindowEvent::RedrawRequested => self.draw(event_loop, window_id),
             winit::event::WindowEvent::CursorEntered { .. } => live.window.request_redraw(),
             winit::event::WindowEvent::CursorLeft { .. } => {
+                if live.window.clear_hover_with_app(&mut live.app) {
+                    for region in live.window.take_hover_dirty_regions() {
+                        live.frame_loop.mark_interaction_dirty(region);
+                    }
+                }
                 live.window.interaction.clear_hover();
                 live.window.request_redraw();
             }
@@ -709,8 +1070,9 @@ where
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        if let Some(live) = self.live.as_ref() {
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        self.create_pending_windows(event_loop);
+        for live in &self.live {
             live.window.request_redraw();
         }
     }
@@ -773,8 +1135,8 @@ mod tests {
             ))),
             ..WindowOptions::default()
         };
-        assert_eq!(options.initial_bounds().origin, point(px(120.0), px(80.0)));
-        assert_eq!(options.initial_bounds().size, size(px(640.0), px(480.0)));
+        assert_eq!(initial_bounds(&options).origin, point(px(120.0), px(80.0)));
+        assert_eq!(initial_bounds(&options).size, size(px(640.0), px(480.0)));
     }
 
     #[test]
@@ -785,6 +1147,6 @@ mod tests {
             window_bounds: Some(WindowBounds::Windowed(Bounds::default())),
             ..WindowOptions::default()
         };
-        assert_eq!(options.initial_bounds().size, size(px(320.0), px(240.0)));
+        assert_eq!(initial_bounds(&options).size, size(px(320.0), px(240.0)));
     }
 }

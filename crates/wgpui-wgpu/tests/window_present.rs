@@ -617,7 +617,8 @@ impl Harness {
         context: &ComputeContext,
     ) {
         if !surface.resize(&context.device, EXACT_WIDTH, EXACT_HEIGHT) {
-            self.report.note("raw text gate already at the exact-comparison size");
+            self.report
+                .note("raw text gate already at the exact-comparison size");
         }
         let mut frame_loop = FrameLoop::new(&context.device);
         let mode = DrawMode::best_available(context.indirect);
@@ -627,8 +628,9 @@ impl Harness {
 
         for frame_index in 0..2 {
             let Acquired::Frame(texture) = surface.acquire(&context.device) else {
-                self.report
-                    .fail(format!("raw text gate could not acquire frame {frame_index}"));
+                self.report.fail(format!(
+                    "raw text gate could not acquire frame {frame_index}"
+                ));
                 continue;
             };
             let view = texture
@@ -696,7 +698,7 @@ impl Harness {
             .count();
         self.check(
             first_frame.frame.primitives_resident > 0
-                && first_frame.emission.patch.len() > 0
+                && !first_frame.emission.patch.is_empty()
                 && first_frame.uploaded_bytes > 0,
             format!(
                 "a raw string has intrinsic layout and emits resident glyphs: {} primitives, {} patch ops, {} uploaded bytes",

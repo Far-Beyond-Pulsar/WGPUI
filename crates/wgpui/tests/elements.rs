@@ -1,6 +1,6 @@
 use wgpui::{
-    div, render_description, Component, Element, ElementId, IntoElement, Render, RenderOnce,
-    Stateful, Styled,
+    Component, Element, ElementId, IntoElement, Render, RenderOnce, Stateful, Styled, div,
+    render_description,
 };
 
 #[derive(IntoElement)]
@@ -52,9 +52,11 @@ fn render_and_derive_lower_nested_descriptions() {
         Some(&ElementId::Name("root".into()))
     );
     assert_eq!(description.child_descriptions().len(), 2);
-    assert!(description.child_descriptions()[0]
-        .type_name()
-        .ends_with("::Div"));
+    assert!(
+        description.child_descriptions()[0]
+            .type_name()
+            .ends_with("::Div")
+    );
     assert_eq!(
         description.child_descriptions()[0]
             .child_descriptions()
@@ -129,12 +131,16 @@ fn native_style_changes_report_display_invalidation_through_reconciliation() {
             &mut layout,
         )
         .expect("second frame should reconcile");
-    assert!(plan.nodes()[0]
-        .invalidation
-        .contains(wgpui::invalidation::axes::Invalidation::DISPLAY));
-    assert!(!plan.nodes()[0]
-        .invalidation
-        .contains(wgpui::invalidation::axes::Invalidation::LAYOUT));
+    assert!(
+        plan.nodes()[0]
+            .invalidation
+            .contains(wgpui::invalidation::axes::Invalidation::DISPLAY)
+    );
+    assert!(
+        !plan.nodes()[0]
+            .invalidation
+            .contains(wgpui::invalidation::axes::Invalidation::LAYOUT)
+    );
 }
 
 #[test]

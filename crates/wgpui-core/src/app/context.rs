@@ -54,7 +54,6 @@ impl<T> Context<T> {
     pub fn focus_handle(&self) -> FocusHandle {
         FocusHandle::new()
     }
-
 }
 
 impl<T: 'static> Context<T> {

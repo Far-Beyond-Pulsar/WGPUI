@@ -216,6 +216,7 @@ fn the_compute_passes_agree_with_a_hand_computed_answer() {
             border_color: [0.0, 0.0, 0.0, 1.0],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: wgpui_core::patch::primitive::Material::Solid,
         })
         .collect();
 

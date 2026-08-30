@@ -707,6 +707,7 @@ mod tests {
             border_color: [0.0, 0.0, 0.0, 1.0],
             corner_radii: [15.0; 4],
             border_widths: [0.0; 4],
+            material: crate::patch::primitive::Material::Solid,
         };
         let items = [
             CoverageItem::cullee(rect(0.0, 0.0, 100.0, 100.0)),
@@ -728,6 +729,7 @@ mod tests {
             border_color: [0.0, 0.0, 0.0, 1.0],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: crate::patch::primitive::Material::Solid,
         };
         let items = [
             CoverageItem::cullee(rect(0.0, 0.0, 100.0, 100.0)),
@@ -745,6 +747,7 @@ mod tests {
             border_color: [0.0, 0.0, 0.0, 1.0],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: crate::patch::primitive::Material::Solid,
         };
         let item = quad_coverage_item(&quad, unclipped(), false);
         assert_eq!(item.opaque, None);
@@ -759,6 +762,7 @@ mod tests {
             border_color: [0.0, 0.0, 0.0, 1.0],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: crate::patch::primitive::Material::Solid,
         };
         let item = quad_coverage_item(&quad, rect(25.0, 25.0, 25.0, 25.0), false);
         assert_eq!(item.visible, rect(25.0, 25.0, 25.0, 25.0));

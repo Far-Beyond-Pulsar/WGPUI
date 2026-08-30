@@ -30,6 +30,10 @@ const LEGACY_BACKDROP_WGSL: &str =
     include_str!("../../../old/src/platform/cross/shaders/backdrop_blur.wgsl");
 
 fn input(scene: &Scene, mode: DrawMode) -> FrameInput<'_> {
+    input_with_viewport(scene, mode, WIDTH, HEIGHT)
+}
+
+fn input_with_viewport(scene: &Scene, mode: DrawMode, width: u32, height: u32) -> FrameInput<'_> {
     FrameInput {
         scene,
         clip: UNCLIPPED,
@@ -39,7 +43,7 @@ fn input(scene: &Scene, mode: DrawMode) -> FrameInput<'_> {
         composites: &[],
         registry: None,
         atlas: None,
-        viewport: [WIDTH as f32, HEIGHT as f32],
+        viewport: [width as f32, height as f32],
         mode,
     }
 }
@@ -126,7 +130,10 @@ fn path_bytes(path: &Path) -> Vec<u8> {
         for value in vertex.st {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        let color: [f32; 4] = [0.0, 1.0, 0.5, 1.0];
+        // The legacy vertex contract is HSLA. The native path contract is
+        // straight RGBA, so this oracle uses the equivalent red hue while
+        // carrying the native alpha through unchanged.
+        let color: [f32; 4] = [0.0, 1.0, 0.5, path.color[3]];
         for value in color {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -140,7 +147,7 @@ fn path_bytes(path: &Path) -> Vec<u8> {
     bytes
 }
 
-fn render_legacy_path(context: &ComputeContext, path: &Path) -> Vec<u8> {
+fn render_legacy_path(context: &ComputeContext, path: &Path, width: u32, height: u32) -> Vec<u8> {
     let device = &context.device;
     let queue = &context.queue;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -148,8 +155,8 @@ fn render_legacy_path(context: &ComputeContext, path: &Path) -> Vec<u8> {
         source: wgpu::ShaderSource::Wgsl(LEGACY_PATHS_WGSL.into()),
     });
     let mut globals = [0u8; 16];
-    globals[0..4].copy_from_slice(&(WIDTH as f32).to_le_bytes());
-    globals[4..8].copy_from_slice(&(HEIGHT as f32).to_le_bytes());
+    globals[0..4].copy_from_slice(&(width as f32).to_le_bytes());
+    globals[4..8].copy_from_slice(&(height as f32).to_le_bytes());
     let globals_buffer = buffer_with(
         device,
         queue,
@@ -239,7 +246,7 @@ fn render_legacy_path(context: &ComputeContext, path: &Path) -> Vec<u8> {
             resource: vertex_buffer.as_entire_binding(),
         }],
     });
-    let target = OffscreenTarget::new(device, WIDTH, HEIGHT);
+    let target = OffscreenTarget::new(device, width, height);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("legacy path frame"),
     });
@@ -296,11 +303,67 @@ fn lyon_path_matches_the_compiled_legacy_shader_on_a_real_adapter() {
     };
     let path = lyon_triangle();
     let (ours, vertex_count) = render_path(&context, &path);
-    let legacy = render_legacy_path(&context, &path);
+    let legacy = render_legacy_path(&context, &path, WIDTH, HEIGHT);
     assert!(vertex_count >= 3, "Lyon must provide triangle vertices");
     assert_pixels_equal(&ours, &legacy, "Lyon path versus legacy path shader");
     assert_eq!(read_pixel(&ours, 12, 12), [255, 0, 0, 255]);
     assert_eq!(read_pixel(&ours, 48, 48), [0, 0, 0, 255]);
+}
+
+#[test]
+fn lyon_path_oracle_covers_transformed_clipped_and_translucent_edges() {
+    let Some(context) = context_or_report("phase 6.4 lyon path edge matrix") else {
+        return;
+    };
+    let cases = [
+        (0.0, 0.0, [0.0, 0.0], [WIDTH as f32, HEIGHT as f32]),
+        (12.0, 7.0, [16.0, 8.0], [35.0, 29.0]),
+        (28.0, 11.0, [30.0, 20.0], [18.0, 18.0]),
+    ];
+    for (translation_x, translation_y, clip_origin, clip_size) in cases {
+        let mut path = lyon_triangle();
+        for vertex in &mut path.vertices {
+            vertex.position[0] += translation_x;
+            vertex.position[1] += translation_y;
+        }
+        path = Path::new(path.vertices, [1.0, 0.0, 0.0, 0.5]).with_clip(clip_origin, clip_size);
+        let (native, _) = render_path(&context, &path);
+        let legacy = render_legacy_path(&context, &path, WIDTH, HEIGHT);
+        assert_pixels_equal(
+            &native,
+            &legacy,
+            "path edge/transform/clip/alpha differential",
+        );
+    }
+}
+
+#[test]
+fn lyon_path_oracle_survives_viewport_resize() {
+    let Some(context) = context_or_report("phase 6.4 lyon path resize") else {
+        return;
+    };
+    let path = lyon_triangle();
+    for (width, height) in [(80, 52), (128, 72)] {
+        let scene = path_scene(path.clone());
+        let target = OffscreenTarget::new(&context.device, width, height);
+        let mut renderer = FrameRenderer::new(&context.device);
+        renderer
+            .render_to(
+                &context.device,
+                &context.queue,
+                &input_with_viewport(&scene, DrawMode::PerSlotIndirect, width, height),
+                &target.target(),
+            )
+            .expect("the resized Lyon path must render");
+        let native = target
+            .read_pixels(&context.device, &context.queue)
+            .expect("reading the resized path target must succeed");
+        let legacy = render_legacy_path(&context, &path, width, height);
+        assert_eq!(
+            native, legacy,
+            "path differential after resize to {width}x{height}"
+        );
+    }
 }
 
 fn backdrop_filter() -> BackdropFilter {
@@ -316,6 +379,10 @@ fn backdrop_filter() -> BackdropFilter {
 }
 
 fn scene_with_backdrop(include_filter: bool) -> Scene {
+    scene_with_filter(include_filter, backdrop_filter())
+}
+
+fn scene_with_filter(include_filter: bool, filter: BackdropFilter) -> Scene {
     let mut scene = Scene::new();
     let layer = layer(&mut scene);
     let mut patch = ScenePatch::new();
@@ -330,12 +397,13 @@ fn scene_with_backdrop(include_filter: bool) -> Scene {
             border_color: [0.0; 4],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: wgpui_core::patch::primitive::Material::Solid,
         },
     );
     if include_filter {
         patch
             .backdrop_filters
-            .append(layer, RecordKey::from_raw(2), 0, backdrop_filter());
+            .append(layer, RecordKey::from_raw(2), 0, filter);
     }
     apply(&mut scene, &patch).expect("the backdrop patch must apply");
     scene
@@ -424,7 +492,11 @@ fn backdrop_bytes(filter: BackdropFilter) -> [u8; 64] {
     bytes
 }
 
-fn render_legacy_backdrop(context: &ComputeContext, target: &TestTarget) -> Vec<u8> {
+fn render_legacy_backdrop(
+    context: &ComputeContext,
+    target: &TestTarget,
+    filter: BackdropFilter,
+) -> Vec<u8> {
     let device = &context.device;
     let queue = &context.queue;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -446,7 +518,7 @@ fn render_legacy_backdrop(context: &ComputeContext, target: &TestTarget) -> Vec<
         queue,
         "legacy backdrop filters",
         wgpu::BufferUsages::STORAGE,
-        &backdrop_bytes(backdrop_filter()),
+        &backdrop_bytes(filter),
     );
     let snapshot = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("legacy backdrop snapshot"),
@@ -645,12 +717,44 @@ fn backdrop_filter_matches_the_compiled_legacy_shader_after_a_snapshot_copy() {
 
     let legacy_target = TestTarget::new(&context.device);
     render_base(&context, &legacy_target);
-    let legacy = render_legacy_backdrop(&context, &legacy_target);
+    let legacy = render_legacy_backdrop(&context, &legacy_target, backdrop_filter());
 
     assert_eq!(output.stats.backdrop_filters_drawn, 1);
     assert_pixels_equal(&ours, &legacy, "backdrop filter versus legacy shader");
     assert_ne!(read_pixel(&ours, 36, 32), [0, 0, 0, 255]);
     assert_eq!(read_pixel(&ours, 80, 32), [0, 0, 0, 255]);
+}
+
+#[test]
+fn backdrop_oracle_covers_rounded_edges_clip_and_opacity() {
+    let Some(context) = context_or_report("phase 6.4 backdrop edge matrix") else {
+        return;
+    };
+    let mut filter = backdrop_filter();
+    filter.origin = [4.0, 3.0];
+    filter.size = [58.0, 42.0];
+    filter.clip_origin = [10.0, 8.0];
+    filter.clip_size = [46.0, 34.0];
+    filter.corner_radii = [2.0, 9.0, 13.0, 5.0];
+    filter.opacity = 0.5;
+
+    let scene = scene_with_filter(true, filter);
+    let ours_target = TestTarget::new(&context.device);
+    let mut renderer = FrameRenderer::new(&context.device);
+    renderer
+        .render_to(
+            &context.device,
+            &context.queue,
+            &input(&scene, DrawMode::PerSlotIndirect),
+            &ours_target.render_target(),
+        )
+        .expect("the rounded clipped backdrop must render");
+    let ours = ours_target.read_pixels(&context.device, &context.queue);
+
+    let legacy_target = TestTarget::new(&context.device);
+    render_base(&context, &legacy_target);
+    let legacy = render_legacy_backdrop(&context, &legacy_target, filter);
+    assert_pixels_equal(&ours, &legacy, "backdrop edge/clip/opacity differential");
 }
 
 #[test]

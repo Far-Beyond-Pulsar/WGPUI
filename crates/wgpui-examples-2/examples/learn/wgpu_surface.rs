@@ -1,10 +1,10 @@
+use std::sync::{Arc, Mutex};
 /// Example: WgpuSurface with Helio Sky Renderer
 /// Demonstrates integration of helio's scene-driven renderer with a gpui WgpuSurface.
 use wgpui::{
     App, Application, Context, Render, WgpuSurfaceHandle, Window, WindowOptions, div, prelude::*,
     rgb, wgpu_surface,
 };
-use std::sync::{Arc, Mutex};
 
 use helio::{
     Camera, DebugCameraUniform, DebugDrawState, GpuLight, GpuMaterial, LightId, LightType,

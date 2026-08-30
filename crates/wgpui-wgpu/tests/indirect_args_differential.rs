@@ -401,6 +401,7 @@ fn a_fully_covered_layer_produces_a_zero_instance_record() {
             border_color: [0.0, 0.0, 0.0, 1.0],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: wgpui_core::patch::primitive::Material::Solid,
         })
         .collect();
     scene.clip = Rect::from_origin_size([0.0, 0.0], [512.0, 512.0]);

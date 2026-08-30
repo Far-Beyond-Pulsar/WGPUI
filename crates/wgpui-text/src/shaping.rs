@@ -42,8 +42,8 @@
 use crate::fonts::fallbacks::FontFallbacks;
 use crate::fonts::features::FontFeatures;
 use cosmic_text::{
-    fontdb, Attrs, AttrsList, Ellipsize, Family, Font as CosmicFont, FontSystem, Hinting,
-    ShapeBuffer, ShapeLine, Shaping, Wrap,
+    Attrs, AttrsList, Ellipsize, Family, Font as CosmicFont, FontSystem, Hinting, ShapeBuffer,
+    ShapeLine, Shaping, Wrap, fontdb,
 };
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

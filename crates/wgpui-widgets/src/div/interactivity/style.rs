@@ -34,11 +34,12 @@
 //! is the fields beside it, and [`DivStyle::paint`] cannot see the layout half
 //! at all because it takes only the resolved rectangle.
 
+use crate::styled_text::{StrikethroughStyle, UnderlineStyle};
 use wgpui_core::color::{ColorSpace, GradientStop, Hsla, LinearColorStop};
 use wgpui_core::geometry::{Pixels, Point};
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::Emission;
-use wgpui_core::patch::primitive::{Quad, Shadow};
+use wgpui_core::patch::primitive::{Material, Quad, Shadow};
 use wgpui_layout::taffy_tree::{LayoutRect, LayoutStyle};
 
 /// A per-corner value, in the legacy `Corners<T>` field order.
@@ -210,6 +211,15 @@ pub struct DivStyle {
     pub text_italic: bool,
     pub text_alignment: u8,
     pub text_line_through: bool,
+    pub text_white_space_nowrap: bool,
+    pub text_ellipsis: bool,
+    pub text_line_clamp: Option<usize>,
+    pub text_letter_spacing: Option<f32>,
+    pub text_underline: Option<UnderlineStyle>,
+    pub text_decoration_color: Option<[f32; 4]>,
+    pub text_decoration_thickness: Option<f32>,
+    pub text_decoration_wavy: bool,
+    pub text_strikethrough: Option<StrikethroughStyle>,
     pub text_gradient: Option<Vec<([f32; 4], f32)>>,
     pub text_gradient_angle: Option<f32>,
     pub cursor: CursorStyle,
@@ -236,6 +246,15 @@ impl Default for DivStyle {
             text_italic: false,
             text_alignment: 0,
             text_line_through: false,
+            text_white_space_nowrap: false,
+            text_ellipsis: false,
+            text_line_clamp: None,
+            text_letter_spacing: None,
+            text_underline: None,
+            text_decoration_color: None,
+            text_decoration_thickness: None,
+            text_decoration_wavy: false,
+            text_strikethrough: None,
             text_gradient: None,
             text_gradient_angle: None,
             cursor: CursorStyle::default(),
@@ -367,11 +386,11 @@ impl DivStyle {
         }
 
         if let Some(gradient) = &self.background_gradient {
-            emit_gradient(gradient, bounds, self.opacity, emission);
+            emission.quad(material_quad(origin, size, corner_radii, gradient_material(gradient, self.opacity)));
         } else if let Some(gradient) = &self.background_radial_gradient {
-            emit_radial_gradient(gradient, bounds, self.opacity, emission);
+            emission.quad(material_quad(origin, size, corner_radii, radial_material(gradient, self.opacity)));
         } else if let Some(pattern) = &self.background_pattern {
-            emit_pattern(pattern, bounds, self.opacity, emission);
+            emission.quad(material_quad(origin, size, corner_radii, pattern_material(pattern, self.opacity)));
         } else if self.is_background_visible() {
             let mut background = self.background.unwrap_or([0.0; 4]);
             background[3] *= self.opacity;
@@ -390,6 +409,7 @@ impl DivStyle {
                 border_color,
                 corner_radii: corner_radii.to_array(),
                 border_widths: [0.0; 4],
+                material: Material::Solid,
             });
         }
 
@@ -405,6 +425,7 @@ impl DivStyle {
                 border_color,
                 corner_radii: corner_radii.to_array(),
                 border_widths: self.border_widths.to_array(),
+                material: Material::Solid,
             });
         } else if self.is_border_visible() {
             let mut color = self.border_color.unwrap_or([0.0; 4]);
@@ -468,10 +489,71 @@ impl DivStyle {
 }
 
 const fn gradient_band_count() -> usize {
-    32
+    1
 }
 const fn pattern_band_count() -> usize {
-    32
+    1
+}
+
+fn material_quad(
+    origin: [f32; 2],
+    size: [f32; 2],
+    corner_radii: Corners,
+    material: Material,
+) -> Quad {
+    Quad {
+        origin,
+        size,
+        background: [0.0; 4],
+        border_color: [0.0; 4],
+        corner_radii: corner_radii.to_array(),
+        border_widths: [0.0; 4],
+        material,
+    }
+}
+
+fn gradient_material(gradient: &LinearGradient, opacity: f32) -> Material {
+    let angle = gradient.angle.to_radians();
+    let mut colors: [[f32; 4]; 2] = [gradient.stops[0].color.into(), gradient.stops[1].color.into()];
+    colors[0][3] *= opacity;
+    colors[1][3] *= opacity;
+    Material::Linear {
+        direction: [angle.cos(), angle.sin()],
+        colors,
+    }
+}
+
+fn radial_material(gradient: &RadialGradient, opacity: f32) -> Material {
+    let mut colors: [[f32; 4]; 2] = [gradient.stops[0].color.into(), gradient.stops[1].color.into()];
+    colors[0][3] *= opacity;
+    colors[1][3] *= opacity;
+    Material::Radial {
+        center: gradient.center,
+        radius: gradient.radius,
+        colors,
+    }
+}
+
+fn pattern_material(pattern: &Pattern, opacity: f32) -> Material {
+    match pattern {
+        Pattern::Slash { color, width, interval } => {
+            let mut color = *color;
+            color[3] *= opacity;
+            Material::Slash { color, width: *width, interval: *interval }
+        }
+        Pattern::Checker { first, second, cell } => {
+            let mut colors = [*first, *second];
+            colors[0][3] *= opacity;
+            colors[1][3] *= opacity;
+            Material::Checker { colors, cell: *cell }
+        }
+        Pattern::Stripes { first, second, width } => {
+            let mut colors = [*first, *second];
+            colors[0][3] *= opacity;
+            colors[1][3] *= opacity;
+            Material::Stripes { colors, width: *width }
+        }
+    }
 }
 
 fn interpolate_stops(
@@ -530,6 +612,7 @@ fn emit_gradient(
             border_color: [0.0; 4],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: Material::Solid,
         });
     }
 }
@@ -565,6 +648,7 @@ fn emit_radial_gradient(
             border_color: [0.0; 4],
             corner_radii: [extent[0].min(extent[1]); 4],
             border_widths: [0.0; 4],
+            material: Material::Solid,
         });
     }
 }
@@ -679,6 +763,7 @@ fn emit_pattern(pattern: &Pattern, bounds: LayoutRect, opacity: f32, emission: &
                         border_color: [0.0; 4],
                         corner_radii: [0.0; 4],
                         border_widths: [0.0; 4],
+                        material: Material::Solid,
                     });
                 }
             }
@@ -701,6 +786,7 @@ fn emit_pattern(pattern: &Pattern, bounds: LayoutRect, opacity: f32, emission: &
                     border_color: [0.0; 4],
                     corner_radii: [0.0; 4],
                     border_widths: [0.0; 4],
+                    material: Material::Solid,
                 });
             }
         }
@@ -724,6 +810,7 @@ fn emit_pattern(pattern: &Pattern, bounds: LayoutRect, opacity: f32, emission: &
                     border_color: [0.0; 4],
                     corner_radii: [0.0; 4],
                     border_widths: [0.0; 4],
+                    material: Material::Solid,
                 });
             }
         }
@@ -742,6 +829,7 @@ fn emit_dashed_border(bounds: LayoutRect, color: [f32; 4], widths: Edges, emissi
             border_color: [0.0; 4],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: Material::Solid,
         });
     };
     let mut cursor = 0.0;
@@ -1065,7 +1153,7 @@ mod tests {
         };
         let mut emission = Emission::new();
         gradient.paint(bounds(), &mut emission);
-        assert_eq!(emission.quads().len(), 32);
+        assert_eq!(emission.quads().len(), 1);
         assert_eq!(gradient.primitive_count(), emission.quads().len());
 
         let pattern = DivStyle {

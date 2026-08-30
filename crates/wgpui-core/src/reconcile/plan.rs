@@ -16,6 +16,7 @@ use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::axes::Invalidation;
 use crate::patch::emit::Emit;
 use crate::reconcile::instance::InstanceKey;
+use crate::reconcile::description::DescriptionInteraction;
 use crate::reconcile::state::StateScope;
 use crate::scene::layer::BoundaryId;
 use wgpui_layout::taffy_tree::LayoutNodeId;
@@ -168,6 +169,7 @@ pub struct FrameStats {
 pub struct FramePlan {
     nodes: Vec<PlannedNode>,
     emitters: Vec<Option<Box<dyn Emit>>>,
+    interactions: Vec<Option<DescriptionInteraction>>,
     stats: FrameStats,
 }
 
@@ -197,6 +199,7 @@ impl FramePlan {
         self.stats.visited += 1;
         self.nodes.push(node);
         self.emitters.push(None);
+        self.interactions.push(None);
         self.nodes.len() - 1
     }
 
@@ -212,6 +215,16 @@ impl FramePlan {
         if let Some(slot) = self.emitters.get_mut(index) {
             *slot = emitter;
         }
+    }
+
+    pub(crate) fn set_interaction(&mut self, index: usize, interaction: Option<DescriptionInteraction>) {
+        if let Some(slot) = self.interactions.get_mut(index) {
+            *slot = interaction;
+        }
+    }
+
+    pub fn take_interaction(&mut self, index: usize) -> Option<DescriptionInteraction> {
+        self.interactions.get_mut(index)?.take()
     }
 
     /// The emitter for the element at `index`, if it has one.

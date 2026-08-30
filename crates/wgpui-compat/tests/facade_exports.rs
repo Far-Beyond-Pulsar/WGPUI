@@ -1,4 +1,4 @@
-use gpui::{IntoElement, InteractiveElement, Render, Window, div};
+use gpui::{InteractiveElement, IntoElement, Render, Window, div};
 
 gpui::actions!(compatibility, [ProbeAction]);
 

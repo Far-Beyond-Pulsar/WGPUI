@@ -511,7 +511,7 @@ neighbour scaled images (Phase 6.2); GIFs decode but do not animate;
 `PrimitiveStore::reflow`'s O(n²) bulk-build cost; GPU occlusion's 1.30× loss on
 low-visibility scenes; the transcription-oracle limit on Phase 5.5's
 differential; the 2×-scale sub-pixel aliasing quirk; input plumbing
-(`keyboard.rs`, `dispatcher.rs`, `app_menu.rs`) still Phase 0 stubs; one machine
+native keyboard dispatch and application menus are not implemented; one machine
 / one driver / one backend for every number in every report so far; `gpui-ce`'s
 legacy test binary still not confirmed to finish.
 

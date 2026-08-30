@@ -1,11 +1,11 @@
+use std::sync::Arc;
+use wgpu::util::DeviceExt;
 /// Example: WgpuSurface with a spinning cube
 /// Demonstrates raw wgpu rendering within a gpui WgpuSurface — no third-party renderers.
 use wgpui::{
     App, Application, Context, Render, WgpuSurfaceHandle, Window, WindowOptions, div, prelude::*,
     rgb, wgpu_surface,
 };
-use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 const SHADER: &str = r#"
 struct Uniforms {

@@ -37,8 +37,8 @@ use wgpui_core::invalidation::request::FrameSignals;
 use wgpui_core::patch::PatchError;
 use wgpui_core::patch::apply::apply;
 use wgpui_core::patch::emit::{Emission, Emit, EmitContext, EmitError, Emitter, FrameEmission};
-use wgpui_core::patch::primitive::{Glyph, GlyphRun, Quad};
-use wgpui_core::reconcile::description::{Description, RawText};
+use wgpui_core::patch::primitive::{Glyph, GlyphRun, Material, Quad};
+use wgpui_core::reconcile::description::{Description, DescriptionInteraction, RawText};
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
@@ -48,16 +48,17 @@ use wgpui_layout::taffy_tree::{
     Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
 };
 
-use crate::render::atlas_upload::AtlasTextures;
 use crate::render::atlas::{AtlasTileSource, GlyphAtlas};
+use crate::render::atlas_upload::AtlasTextures;
 use crate::render::draw::DrawMode;
+use crate::debug::{DebugTile, PerformanceDebug};
 use crate::render::frame::{
     Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, RenderTarget,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
-use wgpui_text::patch::{glyph_runs, RunPlacement};
+use wgpui_text::patch::{RunPlacement, glyph_runs};
 use wgpui_text::raster::GlyphRasterizer;
 use wgpui_text::shaping::{FontRun, SharedString, TextShaper};
 
@@ -120,7 +121,7 @@ impl From<FrameError> for LoopError {
 }
 
 /// What one driven frame did, on both sides of §2's seam.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LoopFrame {
     /// The reconciliation half: what was reused and what was rebuilt.
     pub reconciled: FrameStats,
@@ -139,6 +140,15 @@ pub struct LoopFrame {
     pub viewport_changed: bool,
     /// The GPU half.
     pub frame: FrameOutput,
+    pub interactions: Vec<InteractionRegistration>,
+}
+
+#[derive(Debug)]
+pub struct InteractionRegistration {
+    pub address: wgpui_core::reconcile::instance::InstanceKey,
+    pub bounds: Rect,
+    pub order: u64,
+    pub interaction: DescriptionInteraction,
 }
 
 impl LoopFrame {
@@ -204,10 +214,15 @@ pub struct FrameLoop {
     text_rasterizer: GlyphRasterizer,
     text_atlas: GlyphAtlas,
     atlas_textures: AtlasTextures,
-    prepared_text: HashMap<Arc<str>, PreparedText>,
+    prepared_text: HashMap<TextCacheKey, PreparedText>,
     frames: u64,
     last_viewport: Option<[f32; 2]>,
     viewport_recomputes: u64,
+    tile_flash_frames: HashMap<LayerId, u32>,
+    viewport_flash_frames: u32,
+    interaction_dirty_regions: Vec<Rect>,
+    performance_debug: PerformanceDebug,
+    scale_factor: f32,
 }
 
 #[derive(Clone)]
@@ -216,6 +231,12 @@ struct PreparedText {
     height: f32,
     baseline: f32,
     runs: Arc<Vec<CoreGlyphRun>>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TextCacheKey {
+    value: Arc<str>,
+    font_size_bits: u32,
 }
 
 impl FrameLoop {
@@ -235,6 +256,11 @@ impl FrameLoop {
             frames: 0,
             last_viewport: None,
             viewport_recomputes: 0,
+            tile_flash_frames: HashMap::new(),
+            viewport_flash_frames: 0,
+            interaction_dirty_regions: Vec::new(),
+            performance_debug: PerformanceDebug::default(),
+            scale_factor: 1.0,
         }
     }
 
@@ -274,6 +300,31 @@ impl FrameLoop {
     /// a still one must not.
     pub fn viewport_recomputes(&self) -> u64 {
         self.viewport_recomputes
+    }
+
+    /// Update the opt-in diagnostics used by subsequent frames.
+    pub fn set_performance_debug(&mut self, debug: PerformanceDebug) {
+        self.performance_debug = debug;
+    }
+
+    /// Mark a hitbox region whose hover state changed. This is consumed by the
+    /// next frame as a dirty-region hint without invalidating unrelated tiles.
+    pub fn mark_interaction_dirty(&mut self, region: Rect) {
+        self.interaction_dirty_regions.push(region);
+    }
+
+    /// Set the native display scale used when shaping and rasterising text.
+    /// Layout and the render target are expressed in physical pixels, so
+    /// keeping this conversion at the renderer boundary prevents glyphs from
+    /// being laid out at logical size and then squeezed into a physical frame.
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        if scale_factor.is_finite() && scale_factor > 0.0 {
+            let scale_factor = scale_factor as f32;
+            if self.scale_factor.to_bits() != scale_factor.to_bits() {
+                self.scale_factor = scale_factor;
+                self.prepared_text.clear();
+            }
+        }
     }
 
     /// Every quad resident in the scene, in paint order, across every layer.
@@ -372,7 +423,7 @@ impl FrameLoop {
     ) -> Result<LoopFrame, LoopError> {
         let mut description = description;
         self.materialize_raw_text(&mut description)?;
-        let plan = self.reconciler.reconcile(description, &mut self.layout)?;
+        let mut plan = self.reconciler.reconcile(description, &mut self.layout)?;
         let root = plan
             .root()
             .map(|node| node.layout_node)
@@ -382,18 +433,28 @@ impl FrameLoop {
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
+        let interactions = self.collect_interactions(&mut plan)?;
         let emission = self
             .emitter
             .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
         let uploads = apply(&mut self.scene, &emission.patch)?;
         let dirty_layers = emission.patch.layers();
-
         let viewport = [width, height];
         let viewport_changed = self.last_viewport != Some(viewport);
         if viewport_changed {
             self.last_viewport = Some(viewport);
             self.viewport_recomputes += 1;
         }
+        let interaction_dirty_regions = self.interaction_dirty_regions.clone();
+        let debug_tiles = self.refresh_debug_tiles(
+            &emission.patch,
+            self.performance_debug.tile_refresh_flash(),
+            viewport,
+            viewport_changed,
+            &interaction_dirty_regions,
+        );
+        self.interaction_dirty_regions.clear();
+        self.renderer.set_debug_tiles(debug_tiles);
 
         self.atlas_textures
             .sync(device, queue, &mut self.text_atlas);
@@ -426,17 +487,187 @@ impl FrameLoop {
             uploaded_bytes: uploads.byte_count(),
             viewport_changed,
             frame,
+            interactions,
         })
     }
 
+    fn refresh_debug_tiles(
+        &mut self,
+        patch: &wgpui_core::patch::apply::ScenePatch,
+        flash: crate::debug::TileRefreshFlash,
+        viewport: [f32; 2],
+        viewport_changed: bool,
+        interaction_dirty_regions: &[Rect],
+    ) -> Vec<DebugTile> {
+        if !flash.enabled {
+            self.tile_flash_frames.clear();
+            self.viewport_flash_frames = 0;
+            return Vec::new();
+        }
+        self.tile_flash_frames.retain(|_, frames| {
+            *frames = frames.saturating_sub(1);
+            *frames > 0
+        });
+        self.viewport_flash_frames = self.viewport_flash_frames.saturating_sub(1);
+        let content_layers = patch.content_layers();
+        for layer_id in content_layers.iter().copied() {
+            let Some(layer) = self.scene.layers.get(layer_id) else {
+                continue;
+            };
+            let Some(tile) = layer.key().tile else {
+                continue;
+            };
+            let tile_rect = Rect::from_origin_size(
+                [
+                    tile.x as f32 * flash.tile_size[0] + layer.transform().translation[0],
+                    tile.y as f32 * flash.tile_size[1] + layer.transform().translation[1],
+                ],
+                flash.tile_size,
+            );
+            if !interaction_dirty_regions.is_empty()
+                && !interaction_dirty_regions
+                    .iter()
+                    .any(|region| tile_rect.intersects(region))
+            {
+                continue;
+            }
+            self.tile_flash_frames
+                .insert(layer_id, flash.duration_frames.max(1));
+        }
+        if flash.viewport_grid
+            && (viewport_changed
+                || !interaction_dirty_regions.is_empty())
+        {
+            self.viewport_flash_frames = flash.duration_frames.max(1);
+        }
+        if flash.viewport_grid && self.viewport_flash_frames > 0 {
+            let columns = (viewport[0] / flash.tile_size[0]).ceil().max(0.0) as i32;
+            let rows = (viewport[1] / flash.tile_size[1]).ceil().max(0.0) as i32;
+            let mut tiles = Vec::new();
+            for y in 0..rows {
+                for x in 0..columns {
+                    let width = flash.tile_size[0].min(viewport[0] - x as f32 * flash.tile_size[0]);
+                    let height = flash.tile_size[1].min(viewport[1] - y as f32 * flash.tile_size[1]);
+                    let tile_rect = Rect::from_origin_size(
+                        [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1]],
+                        [width, height],
+                    );
+                    let region_matches = viewport_changed
+                        || interaction_dirty_regions.is_empty()
+                        || interaction_dirty_regions
+                            .iter()
+                            .any(|region| tile_rect.intersects(region));
+                    if width > 0.0 && height > 0.0 && region_matches {
+                        tiles.push(DebugTile {
+                            origin_size: [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1], width, height],
+                            color: flash.color,
+                            border_width: 3.0,
+                            _padding: [0.0; 7],
+                        });
+                    }
+                }
+            }
+            return tiles;
+        }
+        self.tile_flash_frames
+            .keys()
+            .filter_map(|layer_id| {
+                let layer = self.scene.layers.get(*layer_id)?;
+                let tile = layer.key().tile?;
+                let origin = [
+                    tile.x as f32 * flash.tile_size[0] + layer.transform().translation[0],
+                    tile.y as f32 * flash.tile_size[1] + layer.transform().translation[1],
+                ];
+                Some(DebugTile {
+                    origin_size: [origin[0], origin[1], flash.tile_size[0], flash.tile_size[1]],
+                    color: flash.color,
+                    border_width: 3.0,
+                    _padding: [0.0; 7],
+                })
+            })
+            .collect()
+    }
+
+    fn collect_interactions(
+        &self,
+        plan: &mut wgpui_core::reconcile::plan::FramePlan,
+    ) -> Result<Vec<InteractionRegistration>, LoopError> {
+        let mut frames = Vec::<([f32; 2], [f32; 2], Option<Rect>)>::new();
+        let mut result = Vec::new();
+        for index in 0..plan.nodes().len() {
+            let node = plan.nodes()[index];
+            let rectangle = self
+                .layout
+                .layout_of(node.layout_node)
+                .map_err(EmitError::from)?;
+            frames.truncate(node.depth as usize);
+            let (parent_origin, parent_offset, parent_clip) = frames
+                .last()
+                .copied()
+                .unwrap_or(([0.0, 0.0], [0.0, 0.0], None));
+            let origin = [
+                parent_origin[0] + parent_offset[0] + rectangle.x,
+                parent_origin[1] + parent_offset[1] + rectangle.y,
+            ];
+            let bounds = Rect::from_origin_size(origin, [rectangle.width, rectangle.height]);
+            if let Some(interaction) = plan.take_interaction(index) {
+                let visible_bounds = parent_clip.map_or(bounds, |clip| bounds.intersect(&clip));
+                if !visible_bounds.is_empty() {
+                result.push(InteractionRegistration {
+                        address: node.address,
+                        bounds: visible_bounds,
+                        order: index as u64,
+                        interaction,
+                    });
+                }
+            }
+            let clip = if node.clip_children {
+                Some(parent_clip.map_or(bounds, |parent| bounds.intersect(&parent)))
+            } else {
+                parent_clip
+            };
+            frames.push((origin, node.scroll_offset, clip));
+        }
+        Ok(result)
+    }
+
     fn materialize_raw_text(&mut self, description: &mut Description) -> Result<(), LoopError> {
+        self.materialize_raw_text_with_metrics(description, None, None)
+    }
+
+    fn materialize_raw_text_with_metrics(
+        &mut self,
+        description: &mut Description,
+        inherited_size: Option<f32>,
+        inherited_color: Option<[f32; 4]>,
+    ) -> Result<(), LoopError> {
         if let Some(raw) = description.take_raw_text() {
             let value = raw.shared_value();
-            let prepared = match self.prepared_text.get(&value).cloned() {
-                Some(prepared) => prepared,
-                None => self.prepare_text(raw)?,
+            let (local_size, local_color) = description.text_metrics_value();
+            let font_size = local_size.or(inherited_size);
+            let color = local_color.or(inherited_color);
+            let font_size = font_size.filter(|size| size.is_finite() && *size > 0.0).unwrap_or(14.0)
+                * self.scale_factor;
+            let key = TextCacheKey {
+                value: Arc::clone(&value),
+                font_size_bits: font_size.to_bits(),
             };
-            let runs = Arc::clone(&prepared.runs);
+            let prepared = match self.prepared_text.get(&key).cloned() {
+                Some(prepared) => prepared,
+                None => self.prepare_text(raw, font_size)?,
+            };
+            let text_color = color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let runs = Arc::new(
+                prepared
+                    .runs
+                    .iter()
+                    .map(|run| {
+                        let mut run = run.clone();
+                        run.color = text_color;
+                        run
+                    })
+                    .collect::<Vec<_>>(),
+            );
             let baseline = prepared.baseline;
             description.set_intrinsic_size(prepared.width, prepared.height);
             description.set_text_emitter(move |context: &EmitContext, emission: &mut Emission| {
@@ -450,13 +681,16 @@ impl FrameLoop {
                 }
             });
         }
+        let (local_size, local_color) = description.text_metrics_value();
+        let effective_size = local_size.or(inherited_size);
+        let effective_color = local_color.or(inherited_color);
         for child in description.child_descriptions_mut() {
-            self.materialize_raw_text(child)?;
+            self.materialize_raw_text_with_metrics(child, effective_size, effective_color)?;
         }
         Ok(())
     }
 
-    fn prepare_text(&mut self, raw: RawText) -> Result<PreparedText, LoopError> {
+    fn prepare_text(&mut self, raw: RawText, font_size: f32) -> Result<PreparedText, LoopError> {
         let value = raw.shared_value();
         let shared = SharedString::from(value.as_ref());
         let font = wgpui_text::shaping::font("sans-serif");
@@ -467,7 +701,7 @@ impl FrameLoop {
         let font_runs = vec![FontRun::new(shared.len(), font_id)];
         let line = self
             .text_shaper
-            .shape_line(&shared, 14.0, &font_runs)
+            .shape_line(&shared, font_size, &font_runs)
             .map_err(|error| LoopError::Text(error.to_string()))?;
         let placement = RunPlacement {
             color: [1.0, 1.0, 1.0, 1.0],
@@ -486,7 +720,13 @@ impl FrameLoop {
             baseline: (height - line.ascent - line.descent) * 0.5 + line.ascent,
             runs: Arc::new(converted),
         };
-        self.prepared_text.insert(value, prepared.clone());
+        self.prepared_text.insert(
+            TextCacheKey {
+                value,
+                font_size_bits: font_size.to_bits(),
+            },
+            prepared.clone(),
+        );
         Ok(prepared)
     }
 }
@@ -687,6 +927,7 @@ impl Emit for SolidFill {
             border_color: [0.0, 0.0, 0.0, 0.0],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: Material::Solid,
         });
     }
 }

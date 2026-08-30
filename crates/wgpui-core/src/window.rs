@@ -8,7 +8,6 @@ pub mod hitbox;
 pub mod input;
 pub mod keymap;
 pub mod menu;
-pub mod prompts;
 pub mod timer;
 
 use crate::action::Action;
@@ -29,6 +28,31 @@ pub use input::{
 pub use keymap::{KeyBinding, KeyParseError, Keymap, Keystroke};
 pub use menu::{Menu, MenuItem};
 pub use timer::{TimerHandle, TimerId, TimerState};
+
+#[derive(Clone, Debug)]
+pub struct WindowOptions {
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub resizable: bool,
+    pub window_bounds: Option<crate::geometry::WindowBounds>,
+    pub focus: bool,
+    pub show: bool,
+}
+
+impl Default for WindowOptions {
+    fn default() -> Self {
+        Self {
+            title: "WGPUI".to_string(),
+            width: 800,
+            height: 600,
+            resizable: true,
+            window_bounds: None,
+            focus: true,
+            show: true,
+        }
+    }
+}
 
 pub struct Window {
     bounds: Bounds<Pixels>,
@@ -144,11 +168,18 @@ impl Window {
         &mut self.hit_test
     }
     pub fn register_hitbox(&mut self, hitbox: Hitbox, node: DispatchNodeId) {
-        self.hit_test.insert_with_id(hitbox.id, hitbox.bounds, hitbox.z_index);
+        self.hit_test
+            .insert_with_id(hitbox.id, hitbox.bounds, hitbox.z_index);
         self.dispatch.bind_hitbox(hitbox.id, node);
-        self.hit_test.set_hit_testable(hitbox.id, hitbox.hit_testable);
+        self.hit_test
+            .set_hit_testable(hitbox.id, hitbox.hit_testable);
     }
-    pub fn register_focus_hitbox(&mut self, hitbox: Hitbox, node: DispatchNodeId, focus: FocusHandle) {
+    pub fn register_focus_hitbox(
+        &mut self,
+        hitbox: Hitbox,
+        node: DispatchNodeId,
+        focus: FocusHandle,
+    ) {
         self.register_hitbox(hitbox, node);
         self.register_focus_handle(focus);
         self.focus_hitboxes.insert(hitbox.id, focus.id());
@@ -211,16 +242,14 @@ impl Window {
                 if previous != hit {
                     self.interaction_revision = self.interaction_revision.wrapping_add(1);
                     if let Some(id) = previous {
-                        handled |= self.dispatch.dispatch_input(
-                            id,
-                            &InputEvent::MouseLeave(*mouse),
-                        );
+                        handled |= self
+                            .dispatch
+                            .dispatch_input(id, &InputEvent::MouseLeave(*mouse));
                     }
                     if let Some(id) = hit {
-                        handled |= self.dispatch.dispatch_input(
-                            id,
-                            &InputEvent::MouseEnter(*mouse),
-                        );
+                        handled |= self
+                            .dispatch
+                            .dispatch_input(id, &InputEvent::MouseEnter(*mouse));
                     }
                 }
                 handled |= hit.is_some_and(|id| self.dispatch.dispatch_input(id, &event));
@@ -261,16 +290,18 @@ impl Window {
                 handled
             }
             InputEvent::Scroll(scroll) => {
-                let hit = self.hit_test.hit_test([
-                    scroll.position[0].value(),
-                    scroll.position[1].value(),
-                ]);
+                let hit = self
+                    .hit_test
+                    .hit_test([scroll.position[0].value(), scroll.position[1].value()]);
                 if hit.is_some() {
                     self.interaction_revision = self.interaction_revision.wrapping_add(1);
                 }
                 hit.is_some_and(|id| self.dispatch.dispatch_input(id, &event))
             }
-            InputEvent::KeyUp(_) | InputEvent::MouseEnter(_) | InputEvent::MouseLeave(_) | InputEvent::Click(_) => false,
+            InputEvent::KeyUp(_)
+            | InputEvent::MouseEnter(_)
+            | InputEvent::MouseLeave(_)
+            | InputEvent::Click(_) => false,
         }
     }
     pub fn schedule_timer(&mut self, delay: Duration) -> TimerHandle {
@@ -308,7 +339,7 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{point, px, size, Rect};
+    use crate::geometry::{Rect, point, px, size};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -388,7 +419,10 @@ mod tests {
             modifiers: Modifiers::none(),
             buttons: MouseButtonState::default(),
         })));
-        assert_eq!(&*events.borrow(), &["enter", "other", "down", "up", "click", "leave"]);
+        assert_eq!(
+            &*events.borrow(),
+            &["enter", "other", "down", "up", "click", "leave"]
+        );
         assert_eq!(window.hovered_hitbox(), None);
         assert_eq!(target.id, HitboxId::from_raw(1));
     }
@@ -412,7 +446,10 @@ mod tests {
         }));
         assert!(window.dispatch_tree().dispatch_input(
             HitboxId::from_raw(2),
-            &InputEvent::KeyUp(KeyUpEvent { key: "x".into(), modifiers: Modifiers::none() })
+            &InputEvent::KeyUp(KeyUpEvent {
+                key: "x".into(),
+                modifiers: Modifiers::none()
+            })
         ));
         assert_eq!(&*calls.borrow(), &["capture-root"]);
     }
@@ -426,12 +463,24 @@ mod tests {
         let first_node = window.dispatch_tree().new_node(Some(root));
         let second_node = window.dispatch_tree().new_node(Some(root));
         window.register_focus_hitbox(
-            Hitbox { id: HitboxId::from_raw(3), bounds: Rect::from_origin_size([0.0, 0.0], [20.0, 20.0]), z_index: 0, order: 0, hit_testable: true },
+            Hitbox {
+                id: HitboxId::from_raw(3),
+                bounds: Rect::from_origin_size([0.0, 0.0], [20.0, 20.0]),
+                z_index: 0,
+                order: 0,
+                hit_testable: true,
+            },
             first_node,
             first,
         );
         window.register_focus_hitbox(
-            Hitbox { id: HitboxId::from_raw(4), bounds: Rect::from_origin_size([30.0, 0.0], [20.0, 20.0]), z_index: 0, order: 0, hit_testable: true },
+            Hitbox {
+                id: HitboxId::from_raw(4),
+                bounds: Rect::from_origin_size([30.0, 0.0], [20.0, 20.0]),
+                z_index: 0,
+                order: 0,
+                hit_testable: true,
+            },
             second_node,
             second,
         );
@@ -442,9 +491,15 @@ mod tests {
             click_count: 1,
         })));
         assert_eq!(window.focused(), Some(first.id()));
-        assert!(window.handle_input(InputEvent::KeyDown(KeyDownEvent::new("Tab", Modifiers::none()))));
+        assert!(window.handle_input(InputEvent::KeyDown(KeyDownEvent::new(
+            "Tab",
+            Modifiers::none()
+        ))));
         assert_eq!(window.focused(), Some(second.id()));
-        assert!(window.handle_input(InputEvent::KeyDown(KeyDownEvent::new("Tab", Modifiers::none()))));
+        assert!(window.handle_input(InputEvent::KeyDown(KeyDownEvent::new(
+            "Tab",
+            Modifiers::none()
+        ))));
         assert_eq!(window.focused(), Some(first.id()));
     }
 
@@ -455,7 +510,11 @@ mod tests {
         let node = window.dispatch_tree().new_node(Some(root));
         let _target = hitbox(&mut window, 5, node);
         assert!(window.dispatch_tree().on_input(node, |event| {
-            if matches!(event, InputEvent::Scroll(_)) { EventResult::HANDLED } else { EventResult::IGNORED }
+            if matches!(event, InputEvent::Scroll(_)) {
+                EventResult::HANDLED
+            } else {
+                EventResult::IGNORED
+            }
         }));
         assert!(window.handle_input(InputEvent::Scroll(ScrollWheelEvent {
             position: [Pixels(4.0), Pixels(4.0)],
