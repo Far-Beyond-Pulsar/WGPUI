@@ -203,10 +203,10 @@ fn event_loop() -> Result<winit::event_loop::EventLoop<()>, ApplicationError> {
     #[cfg(target_os = "windows")]
     {
         use winit::platform::windows::EventLoopBuilderExtWindows;
-        return winit::event_loop::EventLoop::builder()
+        winit::event_loop::EventLoop::builder()
             .with_any_thread(true)
             .build()
-            .map_err(ApplicationError::from);
+            .map_err(ApplicationError::from)
     }
     #[cfg(not(target_os = "windows"))]
     {

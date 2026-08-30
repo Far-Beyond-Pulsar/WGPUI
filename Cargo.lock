@@ -6799,6 +6799,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpui-examples-2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "futures",
+ "glam",
+ "lyon",
+ "rand 0.10.0",
+ "smol",
+ "unicode-segmentation",
+ "wgpui",
+]
+
+[[package]]
 name = "wgpui-layout"
 version = "0.1.0"
 dependencies = [
