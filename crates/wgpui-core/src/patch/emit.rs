@@ -65,7 +65,7 @@ use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::request::FrameSignals;
 use crate::patch::apply::ScenePatch;
 use crate::patch::primitive::{
-    BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, Underline,
+    AtlasTileId, BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, Underline,
 };
 use crate::patch::{PatchList, RecordKey};
 use crate::reconcile::instance::InstanceKey;
@@ -245,6 +245,74 @@ impl Emission {
             }
         }
     }
+
+    /// Clip every primitive emitted by a child of a rectangular scroll/clip
+    /// container. Variable-size kinds keep their slots so retained addresses
+    /// do not churn while scrolling; fully outside instances become inert.
+    pub fn clip_to(&mut self, clip: LayoutRect) {
+        self.clip_quads_to(clip);
+        for run in &mut self.glyph_runs {
+            for glyph in &mut run.glyphs {
+                let bounds = LayoutRect {
+                    x: glyph.position[0],
+                    y: glyph.position[1],
+                    width: glyph.atlas_size[0],
+                    height: glyph.atlas_size[1],
+                };
+                if !rects_intersect(bounds, clip) {
+                    glyph.atlas_size = [0.0; 2];
+                    glyph.atlas_tile = AtlasTileId::NONE;
+                }
+            }
+        }
+        for sprite in &mut self.poly_sprites {
+            let bounds = LayoutRect {
+                x: sprite.origin[0],
+                y: sprite.origin[1],
+                width: sprite.size[0],
+                height: sprite.size[1],
+            };
+            if !rects_intersect(bounds, clip) {
+                sprite.size = [0.0; 2];
+                sprite.opacity = 0.0;
+                sprite.atlas_tile = AtlasTileId::NONE;
+            }
+        }
+        for underline in &mut self.underlines {
+            let bounds = LayoutRect {
+                x: underline.origin[0],
+                y: underline.origin[1],
+                width: underline.size[0],
+                height: underline.size[1],
+            };
+            if !rects_intersect(bounds, clip) {
+                underline.size = [0.0; 2];
+                underline.color[3] = 0.0;
+            }
+        }
+        for shadow in &mut self.shadows {
+            let (origin, size) = shadow.drawn_bounds();
+            if !rects_intersect(
+                LayoutRect {
+                    x: origin[0],
+                    y: origin[1],
+                    width: size[0],
+                    height: size[1],
+                },
+                clip,
+            ) {
+                shadow.size = [0.0; 2];
+                shadow.color[3] = 0.0;
+            }
+        }
+    }
+}
+
+fn rects_intersect(first: LayoutRect, second: LayoutRect) -> bool {
+    first.x < second.x + second.width
+        && first.x + first.width > second.x
+        && first.y < second.y + second.height
+        && first.y + first.height > second.y
 }
 
 /// An element's contribution to the scene, given where layout put it.
@@ -680,7 +748,7 @@ impl Emitter {
                             &mut emission,
                         );
                         if let Some(clip) = parent.clip {
-                            emission.clip_quads_to(clip);
+                            emission.clip_to(clip);
                         }
                         Self::reconcile_records(
                             node.address,
