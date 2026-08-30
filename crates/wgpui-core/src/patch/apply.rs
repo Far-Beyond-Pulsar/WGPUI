@@ -39,6 +39,7 @@ use crate::scene::layer::LayerId;
 use crate::scene::record::{DispatchNode, Hitbox, LayoutInput};
 use crate::scene::slab_range::{UploadRange, coalesce_uploads, uploaded_byte_count};
 use crate::scene::{PrimitiveStore, Scene};
+use std::collections::HashSet;
 
 /// One frame's patches, across every record category §2 names.
 ///
@@ -123,8 +124,9 @@ impl ScenePatch {
     /// Every layer this patch names, deduplicated, in ascending handle order.
     pub fn layers(&self) -> Vec<LayerId> {
         let mut layers: Vec<LayerId> = Vec::new();
+        let mut seen = HashSet::new();
         let mut note = |layer: LayerId| {
-            if !layers.contains(&layer) {
+            if seen.insert(layer) {
                 layers.push(layer);
             }
         };

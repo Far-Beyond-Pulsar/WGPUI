@@ -32,7 +32,7 @@ use crate::patch::{Patch, PatchError, PatchList, PatchOp, RecordKey};
 use crate::scene::layer::LayerId;
 use crate::scene::slab::SlabAllocator;
 use crate::scene::slab_range::{SlabRange, UploadRange};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One record's value and its placement inside its layer's slab.
 #[derive(Clone, Debug)]
@@ -113,6 +113,9 @@ impl<P: Primitive> PrimitiveStore<P> {
         allocator: &mut SlabAllocator,
         uploads: &mut Vec<UploadRange>,
     ) -> Result<(), PatchError> {
+        if self.can_bulk_append(list) {
+            return self.bulk_append(list, allocator, uploads);
+        }
         for Patch { layer, op } in list.patches() {
             match op {
                 PatchOp::Insert { key, index, value } => {
@@ -122,6 +125,154 @@ impl<P: Primitive> PrimitiveStore<P> {
                     self.update(*layer, *key, value.clone(), allocator, uploads)?;
                 }
                 PatchOp::Remove { key } => self.remove(*layer, *key, allocator, uploads)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn can_bulk_append(&self, list: &PatchList<P>) -> bool {
+        if list.is_empty() {
+            return false;
+        }
+        let mut lengths = HashMap::new();
+        let mut keys = HashSet::new();
+        for patch in list.patches() {
+            let PatchOp::Insert { key, index, .. } = &patch.op else {
+                return false;
+            };
+            let length = lengths.entry(patch.layer).or_insert_with(|| {
+                self.layers
+                    .get(&patch.layer)
+                    .map_or(0, |layer| layer.order.len())
+            });
+            if usize::try_from(*index).ok() != Some(*length)
+                || !keys.insert((patch.layer, *key))
+                || self
+                    .layers
+                    .get(&patch.layer)
+                    .is_some_and(|layer| layer.records.contains_key(key))
+            {
+                return false;
+            }
+            *length += 1;
+        }
+        true
+    }
+
+    /// Append a batch in one reservation and one encoding pass per layer.
+    ///
+    /// Appending one record at a time used to resize and re-encode the layer
+    /// for every operation. That made the common initial scene build
+    /// quadratic, especially when crossing allocator size classes. This path
+    /// is deliberately limited to validated append-only batches; arbitrary
+    /// edits retain the precise incremental behavior above.
+    fn bulk_append(
+        &mut self,
+        list: &PatchList<P>,
+        allocator: &mut SlabAllocator,
+        uploads: &mut Vec<UploadRange>,
+    ) -> Result<(), PatchError> {
+        let mut batches: HashMap<LayerId, Vec<(RecordKey, P)>> = HashMap::new();
+        for patch in list.patches() {
+            let PatchOp::Insert { key, value, .. } = &patch.op else {
+                return Ok(());
+            };
+            batches
+                .entry(patch.layer)
+                .or_default()
+                .push((*key, value.clone()));
+        }
+
+        for (layer, batch) in batches {
+            let primitives = self.layers.entry(layer).or_default();
+            let previous_count = primitives.order.len();
+            let previous_slots = primitives
+                .records
+                .values()
+                .map(|record| record.slot_count as u64)
+                .sum::<u64>();
+            let added_slots = batch
+                .iter()
+                .map(|(_, value)| value.slot_count() as u64)
+                .sum::<u64>();
+            let total_slots =
+                previous_slots
+                    .checked_add(added_slots)
+                    .ok_or(PatchError::SlabOverflow {
+                        kind: P::KIND,
+                        requested_slots: u64::MAX,
+                    })?;
+            let total_slots_u32 =
+                u32::try_from(total_slots).map_err(|_| PatchError::SlabOverflow {
+                    kind: P::KIND,
+                    requested_slots: total_slots,
+                })?;
+
+            primitives.order.reserve(batch.len());
+            primitives.records.reserve(batch.len());
+            let mut slot_offset = previous_slots;
+            for (key, value) in batch {
+                let slot_count = value.slot_count();
+                let slot_offset_u32 =
+                    u32::try_from(slot_offset).map_err(|_| PatchError::SlabOverflow {
+                        kind: P::KIND,
+                        requested_slots: slot_offset,
+                    })?;
+                primitives.order.push(key);
+                primitives.records.insert(
+                    key,
+                    StoredPrimitive {
+                        value,
+                        slot_offset: slot_offset_u32,
+                        slot_count,
+                    },
+                );
+                slot_offset += slot_count as u64;
+            }
+
+            let reallocation = allocator
+                .reallocate(P::KIND, primitives.range, total_slots_u32)
+                .map_err(|error| PatchError::SlabOverflow {
+                    kind: P::KIND,
+                    requested_slots: error.requested_slots,
+                })?;
+            primitives.range = reallocation.range();
+            let current = primitives.range;
+            let required = allocator.arena_slot_capacity(P::KIND) as usize * P::SLOT_STRIDE;
+            if self.resident.len() < required {
+                self.resident.resize(required, 0);
+            }
+            let rewrite_from = if reallocation.relocated() {
+                0
+            } else {
+                previous_count
+            };
+            let Some(first) = primitives.order.get(rewrite_from) else {
+                continue;
+            };
+            let start_slot = primitives
+                .records
+                .get(first)
+                .map(|stored| stored.slot_offset)
+                .ok_or(PatchError::UnknownKey { layer, key: *first })?;
+            for key in primitives.order.iter().skip(rewrite_from) {
+                let stored = primitives
+                    .records
+                    .get(key)
+                    .ok_or(PatchError::UnknownKey { layer, key: *key })?;
+                Self::write_record(&mut self.resident, current, stored, layer)?;
+            }
+            if let Some(span) = current.slot_byte_range(
+                start_slot,
+                current.count.saturating_sub(start_slot),
+                P::SLOT_STRIDE,
+            ) && span.end > span.start
+            {
+                uploads.push(UploadRange {
+                    kind: P::KIND,
+                    byte_offset: span.start,
+                    byte_length: span.end - span.start,
+                });
             }
         }
         Ok(())
@@ -772,6 +923,30 @@ mod tests {
             assert_eq!(span.start, expected, "record {index} is not contiguous");
             expected = span.end;
         }
+    }
+
+    #[test]
+    fn a_bulk_append_keeps_variable_records_packed() {
+        let mut harness: Harness<GlyphRun> = Harness::new();
+        let mut patch = PatchList::new();
+        patch.append(LAYER, key(1), 0, run(2));
+        patch.append(LAYER, key(2), 1, run(5));
+        patch.append(LAYER, key(3), 2, run(1));
+        assert_eq!(harness.apply(&patch), Ok(()));
+        let first = harness
+            .store
+            .record_byte_range(LAYER, key(1))
+            .expect("first run has an address");
+        let second = harness
+            .store
+            .record_byte_range(LAYER, key(2))
+            .expect("second run has an address");
+        let third = harness
+            .store
+            .record_byte_range(LAYER, key(3))
+            .expect("third run has an address");
+        assert_eq!(first.end, second.start);
+        assert_eq!(second.end, third.start);
     }
 
     #[test]

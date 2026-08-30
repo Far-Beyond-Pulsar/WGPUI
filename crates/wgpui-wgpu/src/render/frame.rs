@@ -218,6 +218,13 @@ pub struct FrameOutput {
     /// carried so a report cannot quote a draw count without the count it is
     /// supposed to be independent of.
     pub primitives_resident: u32,
+    /// Scene-arena `write_buffer` calls issued by this frame. A clean retained
+    /// frame must report zero here.
+    pub scene_upload_calls: u32,
+    /// Scene-arena bytes written by this frame.
+    pub scene_upload_bytes: u64,
+    /// Slot-base plans built by this frame. A steady frame must report zero.
+    pub plan_builds: u32,
 }
 
 /// An offscreen colour target plus the readback its comparisons need.
@@ -540,6 +547,38 @@ impl FrameRenderer {
         self.backdrop_plan_builds
     }
 
+    /// Total scene-arena upload calls since renderer creation.
+    pub fn scene_upload_calls(&self) -> u64 {
+        self.shadow_arena.upload_calls()
+            + self.arena.upload_calls()
+            + self.underline_arena.upload_calls()
+            + self.glyph_arena.upload_calls()
+            + self.sprite_arena.upload_calls()
+            + self.path_arena.upload_calls()
+            + self.backdrop_arena.upload_calls()
+    }
+
+    /// Total scene-arena bytes written since renderer creation.
+    pub fn scene_upload_bytes(&self) -> u64 {
+        self.shadow_arena.uploaded_bytes()
+            + self.arena.uploaded_bytes()
+            + self.underline_arena.uploaded_bytes()
+            + self.glyph_arena.uploaded_bytes()
+            + self.sprite_arena.uploaded_bytes()
+            + self.path_arena.uploaded_bytes()
+            + self.backdrop_arena.uploaded_bytes()
+    }
+
+    fn plan_builds(&self) -> u64 {
+        self.shadow_plan_builds
+            + self.quad_plan_builds
+            + self.underline_plan_builds
+            + self.glyph_plan_builds
+            + self.sprite_plan_builds
+            + self.path_plan_builds
+            + self.backdrop_plan_builds
+    }
+
     /// One bind group per live atlas page of `kind`, in ascending page order.
     ///
     /// **Pages are filtered by kind and not merely enumerated.** A coverage page
@@ -651,6 +690,9 @@ impl FrameRenderer {
         };
         self.textures.begin_frame();
         let mut timing = FrameTiming::default();
+        let upload_calls_before = self.scene_upload_calls();
+        let upload_bytes_before = self.scene_upload_bytes();
+        let plan_builds_before = self.plan_builds();
 
         let table = input.scene.draw_slots();
         let shadow_slots: Vec<DrawSlot> = table.kind_slots(PrimitiveKind::Shadow).to_vec();
@@ -1528,6 +1570,16 @@ impl FrameRenderer {
             timing,
             layers_recomputed,
             primitives_resident,
+            scene_upload_calls: u32::try_from(
+                self.scene_upload_calls()
+                    .saturating_sub(upload_calls_before),
+            )
+            .unwrap_or(u32::MAX),
+            scene_upload_bytes: self
+                .scene_upload_bytes()
+                .saturating_sub(upload_bytes_before),
+            plan_builds: u32::try_from(self.plan_builds().saturating_sub(plan_builds_before))
+                .unwrap_or(u32::MAX),
         })
     }
 }
