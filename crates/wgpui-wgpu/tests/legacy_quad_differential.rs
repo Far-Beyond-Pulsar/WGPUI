@@ -63,7 +63,7 @@
 use wgpui_core::geometry::Rect;
 use wgpui_core::patch::RecordKey;
 use wgpui_core::patch::apply::{ScenePatch, apply};
-use wgpui_core::patch::primitive::Quad;
+use wgpui_core::patch::primitive::{Material, Primitive, Quad};
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::{BoundaryId, LayerId, LayerKey};
 use wgpui_wgpu::render::device::{ComputeContext, context_or_report};
@@ -118,6 +118,85 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 
 /// A content mask that rejects nothing — see this module's doc, point 3.
 const UNCLIPPED: [f32; 4] = [-100_000.0, -100_000.0, 200_000.0, 200_000.0];
+
+#[test]
+fn quad_materials_use_the_three_final_protocol_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let materials = [
+        (Material::Solid, [0.0, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]),
+        (
+            Material::Linear {
+                direction: [0.25, 0.75],
+                colors: [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]],
+            },
+            [1.0, 0.0, 0.0, 0.0],
+            [0.1, 0.2, 0.3, 0.4],
+            [0.5, 0.6, 0.7, 0.8],
+            [0.25, 0.75, 0.0, 0.0],
+        ),
+        (
+            Material::Radial {
+                center: [0.2, 0.3],
+                radius: [0.4, 0.5],
+                colors: [[0.6, 0.7, 0.8, 0.9], [1.0, 0.9, 0.8, 0.7]],
+            },
+            [2.0, 0.0, 0.0, 0.0],
+            [0.6, 0.7, 0.8, 0.9],
+            [1.0, 0.9, 0.8, 0.7],
+            [0.2, 0.3, 0.4, 0.5],
+        ),
+        (
+            Material::Slash {
+                color: [0.9, 0.8, 0.7, 0.6],
+                width: 3.0,
+                interval: 4.0,
+            },
+            [3.0, 0.0, 0.0, 0.0],
+            [0.9, 0.8, 0.7, 0.6],
+            [0.0; 4],
+            [3.0, 4.0, 0.0, 0.0],
+        ),
+        (
+            Material::Checker {
+                colors: [[0.1, 0.3, 0.5, 0.7], [0.2, 0.4, 0.6, 0.8]],
+                cell: 5.0,
+            },
+            [4.0, 0.0, 0.0, 0.0],
+            [0.1, 0.3, 0.5, 0.7],
+            [0.2, 0.4, 0.6, 0.8],
+            [5.0, 0.0, 0.0, 0.0],
+        ),
+        (
+            Material::Stripes {
+                colors: [[0.3, 0.5, 0.7, 0.9], [0.4, 0.6, 0.8, 1.0]],
+                width: 6.0,
+            },
+            [5.0, 0.0, 0.0, 0.0],
+            [0.3, 0.5, 0.7, 0.9],
+            [0.4, 0.6, 0.8, 1.0],
+            [6.0, 0.0, 0.0, 0.0],
+        ),
+    ];
+
+    for (material, kind, first, second, parameters) in materials {
+        let quad = Quad {
+            material,
+            ..Quad::ZERO
+        };
+        let mut bytes = vec![0; Quad::SLOT_STRIDE];
+        quad.encode(&mut bytes)?;
+        let kind: [f32; 4] = kind;
+        let first: [f32; 4] = first;
+        let second: [f32; 4] = second;
+        let parameters: [f32; 4] = parameters;
+        assert_eq!(bytes.len(), 144);
+        assert_eq!(&bytes[80..84], &(kind[0] as u32).to_le_bytes());
+        assert_eq!(&bytes[84..96], &[0; 12]);
+        assert_eq!(&bytes[96..112], bytemuck::cast_slice(&first));
+        assert_eq!(&bytes[112..128], bytemuck::cast_slice(&second));
+        assert_eq!(&bytes[128..144], bytemuck::cast_slice(&parameters));
+    }
+    Ok(())
+}
 
 /// One comparison: the same quad expressed both ways.
 struct Case {

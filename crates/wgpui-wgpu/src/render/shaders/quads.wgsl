@@ -86,7 +86,7 @@ struct QuadSlot {
     // Border widths in the legacy `Edges` order: top, right, bottom, left.
     border_widths: vec4<f32>,
     // kind, padding, padding, padding; first color; second color; parameters.
-    material_kind: vec4<f32>,
+    material_kind: vec4<u32>,
     material_first: vec4<f32>,
     material_second: vec4<f32>,
     material_parameters: vec4<f32>,
@@ -194,26 +194,26 @@ fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
 
 fn material_color(quad: QuadSlot, local: vec2<f32>) -> vec4<f32> {
     let kind = quad.material_kind.x;
-    if kind < 0.5 {
+    if kind == 0u {
         return quad.background;
     }
     let unit = local / max(quad.origin_size.zw, vec2<f32>(0.000001));
     var amount = 0.0;
-    if kind < 1.5 {
+    if kind == 1u {
         amount = dot(unit - vec2<f32>(0.5), quad.material_parameters.xy) + 0.5;
-    } else if kind < 2.5 {
+    } else if kind == 2u {
         let delta = (unit - quad.material_parameters.xy) / max(quad.material_parameters.zw, vec2<f32>(0.000001));
         amount = length(delta);
-    } else if kind < 3.5 {
+    } else if kind == 3u {
         let interval = max(quad.material_parameters.y, 0.000001);
         let diagonal = (local.x + local.y) / interval;
         amount = select(0.0, 1.0, fract(diagonal) < quad.material_parameters.x / interval);
         return mix(quad.material_second, quad.material_first, amount);
-    } else if kind < 4.5 {
+    } else if kind == 4u {
         let cell = max(quad.material_parameters.x, 0.000001);
         let parity = (floor(local.x / cell) + floor(local.y / cell)) % 2.0;
         return mix(quad.material_second, quad.material_first, parity);
-    } else {
+    } else if kind == 5u {
         let width = max(quad.material_parameters.x, 0.000001);
         return mix(quad.material_second, quad.material_first,
             select(0.0, 1.0, fract(local.y / width) < 0.5));

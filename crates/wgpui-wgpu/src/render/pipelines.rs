@@ -1257,6 +1257,7 @@ mod tests {
         assert_eq!(QuadPipeline::arena_slot_stride(), 9 * 16);
         let shader = super::super::shaders::QUADS_WGSL;
         assert!(shader.contains("struct QuadSlot"));
+        assert!(shader.contains("material_kind: vec4<u32>"));
         for field in [
             "origin_size",
             "background",
