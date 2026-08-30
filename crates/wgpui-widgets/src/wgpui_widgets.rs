@@ -17,4 +17,6 @@ pub mod svg;
 pub mod text;
 pub mod wgpu_surface;
 
-pub use div::interactivity::style::{Corners, DivStyle, Edges, LinearGradient, Pattern};
+pub use div::interactivity::style::{
+    BoxShadow, Corners, DivStyle, Edges, LinearGradient, Pattern, RadialGradient,
+};

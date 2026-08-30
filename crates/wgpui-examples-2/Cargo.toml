@@ -32,6 +32,9 @@ path = "examples/text_gradients.rs"
 name = "native_elements"
 path = "examples/native_elements.rs"
 [[example]]
+name = "native_interaction"
+path = "examples/native_interaction.rs"
+[[example]]
 name = "interactive_elements"
 path = "examples/learn/interactive_elements.rs"
 [[example]]

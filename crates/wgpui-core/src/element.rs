@@ -221,17 +221,12 @@ mod tests {
         let description = render_description(&mut view);
         assert_eq!(description.type_id(), std::any::TypeId::of::<Panel>());
         assert_eq!(description.child_descriptions().len(), 1);
-        assert_eq!(
-            badge(9).element_id(),
-            Some(&ElementId::Integer(9))
-        );
+        assert_eq!(badge(9).element_id(), Some(&ElementId::Integer(9)));
     }
 
     #[test]
     fn component_children_are_reconciled_and_state_survives() {
-        let description = Description::new::<Panel>()
-            .child(badge(1))
-            .child(badge(2));
+        let description = Description::new::<Panel>().child(badge(1)).child(badge(2));
         let mut reconciler = Reconciler::new();
         let mut layout = LayoutTree::new();
         let first = reconciler
@@ -255,9 +250,7 @@ mod tests {
         );
         let second = reconciler
             .reconcile(
-                Description::new::<Panel>()
-                    .child(badge(1))
-                    .child(badge(2)),
+                Description::new::<Panel>().child(badge(1)).child(badge(2)),
                 &mut layout,
             )
             .expect("description should reconcile");

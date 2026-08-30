@@ -10,11 +10,21 @@ pub use wgpui_text as text;
 pub use wgpui_wgpu as gpu;
 pub use wgpui_widgets as widgets;
 
+pub use wgpui_core::actions;
 pub use wgpui_core::boundary;
-pub use wgpui_core::boundary::Size;
-pub use wgpui_core::boundary::{BoundaryPolicy, Buffering, Pixels, Retention};
+pub use wgpui_core::boundary::{BoundaryPolicy, Buffering, Retention};
+pub use wgpui_core::color::{
+    Background, ColorSpace, Colors, GradientStop, Hsla, LinearColorStop, Rgba, black, blue,
+    gradient_color_stop, green, hsla, linear_color_stop, linear_gradient, opaque_grey,
+    pattern_slash, radial_gradient, red, rgb, rgba, solid_background, transparent_black,
+    transparent_white, white, yellow,
+};
 pub use wgpui_core::geometry;
 pub use wgpui_core::geometry::Rect;
+pub use wgpui_core::geometry::{
+    AbsoluteLength, Bounds, DefiniteLength, Half, Length, Pixels, Point, Rems, Size, WindowBounds,
+    phi, point, px, relative, rems, size,
+};
 pub use wgpui_core::invalidation;
 pub use wgpui_core::patch;
 pub use wgpui_core::patch::emit::{Emit, EmitContext, Emitter, FrameEmission};
@@ -26,10 +36,15 @@ pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey,
 pub use wgpui_core::reconcile::{StateKey, StateScope};
 pub use wgpui_core::scene;
 pub use wgpui_core::{
-    Component, Element, IntoElement, Render, RenderOnce, Stateful, render_description,
+    Action, App, ClickEvent, CloseState, Context, DispatchNodeId, Entity, EntityError, EntityId,
+    EventResult, FocusHandle, FocusId, FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId,
+    InputEvent, KeyBinding, KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton,
+    KeyboardClickEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseButtonState,
+    MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Subscription,
+    Task, TaskError, TimerHandle, TimerId, TimerState, WeakEntity,
 };
 pub use wgpui_core::{
-    App, Context, Entity, EntityError, EntityId, Subscription, Task, TaskError, WeakEntity,
+    Component, Element, IntoElement, Render, RenderOnce, Stateful, render_description,
 };
 pub use wgpui_layout::{
     AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
@@ -44,7 +59,7 @@ pub use wgpui_widgets::animation::{
     Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline,
 };
 pub use wgpui_widgets::div::interactivity::style::{
-    Corners, DivStyle, Edges, LinearGradient, Pattern,
+    BoxShadow, Corners, DivStyle, Edges, LinearGradient, Pattern, RadialGradient,
 };
 pub use wgpui_widgets::div::{Div, div};
 pub use wgpui_widgets::image_cache::{
@@ -53,7 +68,9 @@ pub use wgpui_widgets::image_cache::{
 pub use wgpui_widgets::img::{
     ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img, ObjectFit, SharedImageEngine, img,
 };
-pub use wgpui_widgets::styled::{IntoStylePixels, LinearColorStop, Styled};
+pub use wgpui_widgets::styled::{
+    IntoStyleBackground, IntoStyleColor, IntoStyleDimension, IntoStylePixels, Styled,
+};
 pub use wgpui_widgets::styled_text::{
     Highlight, HighlightStyle, StrikethroughStyle, StyledText, TextEngine, TextStyle,
     UnderlineStyle,

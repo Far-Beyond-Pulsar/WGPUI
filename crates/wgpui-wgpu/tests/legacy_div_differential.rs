@@ -35,7 +35,9 @@
 //! builds one that is not, and measures the disagreement, so the limitation is a
 //! number in a report rather than a sentence in a comment.
 
-use wgpui_core::geometry::Rect;
+use wgpui_core::boundary::Pixels;
+use wgpui_core::color::Hsla;
+use wgpui_core::geometry::{point, Rect};
 use wgpui_core::patch::apply::apply;
 use wgpui_core::patch::primitive::{Quad, Shadow};
 use wgpui_core::scene::Scene;
@@ -743,10 +745,10 @@ fn card_tree() -> Div {
             .border(CARD_BORDER)
             .rounded(CARD_RADIUS)
             .shadow(vec![wgpui_widgets::div::interactivity::style::BoxShadow {
-                color: BLACK_QUARTER.1,
-                offset: [0.0, 6.0],
-                blur_radius: 10.0,
-                spread_radius: -2.0,
+                color: Hsla { h: 0.0, s: 0.0, l: 0.0, a: 0.25 },
+                offset: point(Pixels(0.0), Pixels(6.0)),
+                blur_radius: Pixels(10.0),
+                spread_radius: Pixels(-2.0),
             }])
             .children(rows),
     )
@@ -987,10 +989,10 @@ fn the_comparison_detects_a_misplaced_child_and_a_missing_one() {
                 .border(CARD_BORDER)
                 .rounded(CARD_RADIUS)
                 .shadow(vec![wgpui_widgets::div::interactivity::style::BoxShadow {
-                    color: BLACK_QUARTER.1,
-                    offset: [0.0, 6.0],
-                    blur_radius: 10.0,
-                    spread_radius: -2.0,
+                    color: Hsla { h: 0.0, s: 0.0, l: 0.0, a: 0.25 },
+                    offset: point(Pixels(0.0), Pixels(6.0)),
+                    blur_radius: Pixels(10.0),
+                    spread_radius: Pixels(-2.0),
                 }])
                 .children(rows),
         )

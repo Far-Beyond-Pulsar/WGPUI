@@ -49,7 +49,9 @@
 use crate::div::interactivity::style::{
     BoxShadow, Corners, CursorStyle, DivStyle, Edges, LinearGradient, Pattern,
 };
-use wgpui_core::boundary::policy::Pixels;
+pub use wgpui_core::color::LinearColorStop;
+use wgpui_core::color::{Background, ColorSpace, Hsla, Rgba};
+use wgpui_core::geometry::{DefiniteLength, Pixels, Rems, px};
 use wgpui_layout::taffy_tree::{
     AlignContent, AlignItems, Dimension, Display, FlexDirection, FlexWrap, LayoutStyle,
     LengthPercentage, LengthPercentageAuto, Overflow, Position,
@@ -65,12 +67,6 @@ use wgpui_text::shaping::FontWeight;
 /// the alias crate's problem, not this file's.
 pub const REM: f32 = 16.0;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct LinearColorStop {
-    pub color: [f32; 4],
-    pub position: f32,
-}
-
 pub trait IntoStylePixels {
     fn into_style_pixels(self) -> f32;
 }
@@ -84,6 +80,143 @@ impl IntoStylePixels for f32 {
 impl IntoStylePixels for Pixels {
     fn into_style_pixels(self) -> f32 {
         self.value()
+    }
+}
+
+impl IntoStylePixels for DefiniteLength {
+    fn into_style_pixels(self) -> f32 {
+        match self {
+            DefiniteLength::Absolute(absolute) => match absolute {
+                wgpui_core::geometry::AbsoluteLength::Pixels(pixels) => pixels.value(),
+                wgpui_core::geometry::AbsoluteLength::Rems(rems) => rems.0 * REM,
+            },
+            DefiniteLength::Fraction(fraction) => fraction * REM,
+        }
+    }
+}
+
+pub trait IntoStyleDimension {
+    fn into_style_dimension(self) -> Dimension;
+}
+
+impl IntoStyleDimension for f32 {
+    fn into_style_dimension(self) -> Dimension {
+        Dimension::length(self)
+    }
+}
+
+impl IntoStyleDimension for Pixels {
+    fn into_style_dimension(self) -> Dimension {
+        Dimension::length(self.value())
+    }
+}
+
+impl IntoStyleDimension for Rems {
+    fn into_style_dimension(self) -> Dimension {
+        Dimension::length(self.to_pixels(Pixels(REM)).value())
+    }
+}
+
+impl IntoStyleDimension for DefiniteLength {
+    fn into_style_dimension(self) -> Dimension {
+        match self {
+            DefiniteLength::Absolute(absolute) => match absolute {
+                wgpui_core::geometry::AbsoluteLength::Pixels(pixels) => {
+                    Dimension::length(pixels.value())
+                }
+                wgpui_core::geometry::AbsoluteLength::Rems(rems) => Dimension::length(rems.0 * REM),
+            },
+            DefiniteLength::Fraction(fraction) => Dimension::percent(fraction),
+        }
+    }
+}
+
+pub trait IntoStyleColor {
+    fn into_style_color(self) -> [f32; 4];
+}
+
+pub trait IntoStyleBackground {
+    fn apply_to(self, style: &mut DivStyle);
+}
+
+impl<T: IntoStyleColor> IntoStyleBackground for T {
+    fn apply_to(self, style: &mut DivStyle) {
+        style.background = Some(self.into_style_color());
+        style.background_gradient = None;
+        style.background_radial_gradient = None;
+        style.background_pattern = None;
+    }
+}
+
+impl IntoStyleBackground for Background {
+    fn apply_to(self, style: &mut DivStyle) {
+        style.background = None;
+        style.background_gradient = None;
+        style.background_radial_gradient = None;
+        style.background_pattern = None;
+        match self {
+            Background::Solid(color) => style.background = Some(color.into()),
+            Background::LinearGradient {
+                angle,
+                colors,
+                color_space,
+            } => {
+                style.background_gradient = Some(LinearGradient {
+                    stops: colors
+                        .into_iter()
+                        .map(|stop| LinearColorStop {
+                            color: stop.color,
+                            percentage: stop.position,
+                        })
+                        .collect(),
+                    angle,
+                    color_space,
+                });
+            }
+            Background::RadialGradient {
+                center,
+                radius,
+                colors,
+                color_space,
+            } => {
+                style.background_radial_gradient =
+                    Some(crate::div::interactivity::style::RadialGradient {
+                        center,
+                        radius,
+                        stops: colors,
+                        color_space,
+                    });
+            }
+            Background::PatternSlash {
+                color,
+                width,
+                interval,
+            } => {
+                style.background_pattern = Some(Pattern::Slash {
+                    color: color.into(),
+                    width,
+                    interval,
+                });
+            }
+        }
+    }
+}
+
+impl IntoStyleColor for [f32; 4] {
+    fn into_style_color(self) -> [f32; 4] {
+        self
+    }
+}
+
+impl IntoStyleColor for Rgba {
+    fn into_style_color(self) -> [f32; 4] {
+        self.into()
+    }
+}
+
+impl IntoStyleColor for Hsla {
+    fn into_style_color(self) -> [f32; 4] {
+        self.into()
     }
 }
 
@@ -312,28 +445,27 @@ pub trait Styled: Sized {
         self
     }
 
-    fn basis(mut self, pixels: impl IntoStylePixels) -> Self {
-        self.layout_style().flex_basis = Dimension::length(pixels.into_style_pixels());
+    fn basis(mut self, pixels: impl IntoStyleDimension) -> Self {
+        self.layout_style().flex_basis = pixels.into_style_dimension();
         self
     }
 
     // ---- size -------------------------------------------------------------
 
     /// `width: <pixels>px`.
-    fn w(mut self, pixels: impl IntoStylePixels) -> Self {
-        self.layout_style().size.width = Dimension::length(pixels.into_style_pixels());
+    fn w(mut self, pixels: impl IntoStyleDimension) -> Self {
+        self.layout_style().size.width = pixels.into_style_dimension();
         self
     }
 
     /// `height: <pixels>px`.
-    fn h(mut self, pixels: impl IntoStylePixels) -> Self {
-        self.layout_style().size.height = Dimension::length(pixels.into_style_pixels());
+    fn h(mut self, pixels: impl IntoStyleDimension) -> Self {
+        self.layout_style().size.height = pixels.into_style_dimension();
         self
     }
 
     /// Both dimensions, in pixels.
-    fn size(self, pixels: impl IntoStylePixels) -> Self {
-        let pixels = pixels.into_style_pixels();
+    fn size(self, pixels: impl IntoStyleDimension + Copy) -> Self {
         self.w(pixels).h(pixels)
     }
 
@@ -355,26 +487,26 @@ pub trait Styled: Sized {
     }
 
     /// `min-width: <pixels>px`.
-    fn min_w(mut self, pixels: impl IntoStylePixels) -> Self {
-        self.layout_style().min_size.width = Dimension::length(pixels.into_style_pixels());
+    fn min_w(mut self, pixels: impl IntoStyleDimension) -> Self {
+        self.layout_style().min_size.width = pixels.into_style_dimension();
         self
     }
 
     /// `min-height: <pixels>px`.
-    fn min_h(mut self, pixels: impl IntoStylePixels) -> Self {
-        self.layout_style().min_size.height = Dimension::length(pixels.into_style_pixels());
+    fn min_h(mut self, pixels: impl IntoStyleDimension) -> Self {
+        self.layout_style().min_size.height = pixels.into_style_dimension();
         self
     }
 
     /// `max-width: <pixels>px`.
-    fn max_w(mut self, pixels: impl IntoStylePixels) -> Self {
-        self.layout_style().max_size.width = Dimension::length(pixels.into_style_pixels());
+    fn max_w(mut self, pixels: impl IntoStyleDimension) -> Self {
+        self.layout_style().max_size.width = pixels.into_style_dimension();
         self
     }
 
     /// `max-height: <pixels>px`.
-    fn max_h(mut self, pixels: impl IntoStylePixels) -> Self {
-        self.layout_style().max_size.height = Dimension::length(pixels.into_style_pixels());
+    fn max_h(mut self, pixels: impl IntoStyleDimension) -> Self {
+        self.layout_style().max_size.height = pixels.into_style_dimension();
         self
     }
 
@@ -525,8 +657,8 @@ pub trait Styled: Sized {
 
     /// Fill colour, as straight-alpha RGBA. See this module's doc for why not
     /// `Hsla`.
-    fn bg(mut self, color: impl Into<[f32; 4]>) -> Self {
-        self.style().background = Some(color.into());
+    fn bg(mut self, background: impl IntoStyleBackground) -> Self {
+        background.apply_to(self.style());
         self
     }
 
@@ -544,8 +676,10 @@ pub trait Styled: Sized {
         self.style().background_gradient = Some(LinearGradient {
             stops: stops.into_iter().collect(),
             angle,
+            color_space: ColorSpace::default(),
         });
         self.style().background = None;
+        self.style().background_radial_gradient = None;
         self.style().background_pattern = None;
         self
     }
@@ -562,13 +696,14 @@ pub trait Styled: Sized {
         self.style().background_pattern = Some(pattern);
         self.style().background = None;
         self.style().background_gradient = None;
+        self.style().background_radial_gradient = None;
         self
     }
 
     /// Border colour, as straight-alpha RGBA. A border needs both a colour and
     /// a width to be painted at all.
-    fn border_color(mut self, color: impl Into<[f32; 4]>) -> Self {
-        self.style().border_color = Some(color.into());
+    fn border_color(mut self, color: impl IntoStyleColor) -> Self {
+        self.style().border_color = Some(color.into_style_color());
         self
     }
 
@@ -812,8 +947,8 @@ pub trait Styled: Sized {
         self.shadow(vec![black(0.25, [0.0, 25.0], 50.0, -12.0)])
     }
 
-    fn text_color(mut self, color: impl Into<[f32; 4]>) -> Self {
-        self.style().text_color = Some(color.into());
+    fn text_color(mut self, color: impl IntoStyleColor) -> Self {
+        self.style().text_color = Some(color.into_style_color());
         self
     }
 
@@ -835,15 +970,19 @@ pub trait Styled: Sized {
     }
 
     fn text_gradient_horizontal(mut self, from: LinearColorStop, to: LinearColorStop) -> Self {
-        self.style().text_gradient =
-            Some(vec![(from.color, from.position), (to.color, to.position)]);
+        self.style().text_gradient = Some(vec![
+            (from.color.into(), from.percentage),
+            (to.color.into(), to.percentage),
+        ]);
         self.style().text_gradient_angle = Some(90.0);
         self
     }
 
     fn text_gradient_vertical(mut self, from: LinearColorStop, to: LinearColorStop) -> Self {
-        self.style().text_gradient =
-            Some(vec![(from.color, from.position), (to.color, to.position)]);
+        self.style().text_gradient = Some(vec![
+            (from.color.into(), from.percentage),
+            (to.color.into(), to.percentage),
+        ]);
         self.style().text_gradient_angle = Some(180.0);
         self
     }
@@ -1102,10 +1241,15 @@ pub trait Styled: Sized {
 /// exactly, so the two backends agree on the byte without a colour-space step.
 const fn black(alpha: f32, offset: [f32; 2], blur_radius: f32, spread_radius: f32) -> BoxShadow {
     BoxShadow {
-        color: [0.0, 0.0, 0.0, alpha],
-        offset,
-        blur_radius,
-        spread_radius,
+        color: Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.0,
+            a: alpha,
+        },
+        offset: wgpui_core::geometry::point(px(offset[0]), px(offset[1])),
+        blur_radius: px(blur_radius),
+        spread_radius: px(spread_radius),
     }
 }
 
@@ -1121,6 +1265,8 @@ fn uniform_rect(pixels: f32) -> wgpui_layout::taffy_tree::LayoutSides<LengthPerc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wgpui_core::color::{blue, gradient_color_stop, linear_gradient, red};
+    use wgpui_core::geometry::{point, relative, rems};
 
     /// The smallest possible implementor, so these tests exercise the trait
     /// rather than `Div`.
@@ -1147,6 +1293,30 @@ mod tests {
             "a colour or a radius must not touch the layout style, or every \
              recolour re-runs Taffy"
         );
+    }
+
+    #[test]
+    fn native_colors_and_backgrounds_lower_into_retained_style_fields() {
+        let solid = Styleable::default().bg(red());
+        assert_eq!(solid.0.background, Some([1.0, 0.0, 0.0, 1.0]));
+
+        let gradient = Styleable::default().bg(linear_gradient(
+            45.0,
+            gradient_color_stop(red(), 0.0),
+            gradient_color_stop(blue(), 1.0),
+        )
+        .color_space(ColorSpace::Oklab));
+        let gradient = gradient.0.background_gradient.expect("retained gradient");
+        assert_eq!(gradient.angle, 45.0);
+        assert_eq!(gradient.color_space, ColorSpace::Oklab);
+        assert_eq!(gradient.stops[1].percentage, 1.0);
+    }
+
+    #[test]
+    fn relative_lengths_emit_taffy_percent_dimensions() {
+        let styled = Styleable::default().w(relative(0.5)).h(rems(2.0));
+        assert_eq!(styled.0.layout.size.width, Dimension::percent(0.5));
+        assert_eq!(styled.0.layout.size.height, Dimension::length(32.0));
     }
 
     #[test]
@@ -1190,16 +1360,26 @@ mod tests {
             styled.0.box_shadow,
             vec![
                 BoxShadow {
-                    color: [0.0, 0.0, 0.0, 0.1],
-                    offset: [0.0, 4.0],
-                    blur_radius: 6.0,
-                    spread_radius: -1.0,
+                    color: Hsla {
+                        h: 0.0,
+                        s: 0.0,
+                        l: 0.0,
+                        a: 0.1
+                    },
+                    offset: point(px(0.0), px(4.0)),
+                    blur_radius: px(6.0),
+                    spread_radius: px(-1.0),
                 },
                 BoxShadow {
-                    color: [0.0, 0.0, 0.0, 0.1],
-                    offset: [0.0, 2.0],
-                    blur_radius: 4.0,
-                    spread_radius: -2.0,
+                    color: Hsla {
+                        h: 0.0,
+                        s: 0.0,
+                        l: 0.0,
+                        a: 0.1
+                    },
+                    offset: point(px(0.0), px(2.0)),
+                    blur_radius: px(4.0),
+                    spread_radius: px(-2.0),
                 },
             ]
         );
