@@ -107,7 +107,7 @@ fn main() -> Result<(), ApplicationError> {
                                     .rounded_lg()
                                     .bg(button_color)
                                     .text_color(rgb(0xffffff))
-                                    .child("Rebuild visible tiles")
+                            .child(format!("Rebuild visible tiles ({selected})"))
                                     .on_click({
                                         let selected = Rc::clone(&selected_for_button);
                                         move |_, _, _| {
