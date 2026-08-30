@@ -1,12 +1,12 @@
 use wgpui::{
-    Application, DispatchNodeId, EventResult, InputEvent, KeyBinding, Rect, WindowOptions, actions,
-    div,
+    Application, ApplicationError, DispatchNodeId, EventResult, InputEvent, KeyBinding, Rect,
+    Styled, WindowOptions, actions, div, rgb,
 };
 
 actions!(demo, [Activate]);
 
-fn main() {
-    let application = Application::new(WindowOptions::default(), |window| {
+fn main() -> Result<(), ApplicationError> {
+    Application::new(WindowOptions::default(), |window| {
         let interaction = window.interaction();
         let button = interaction
             .hit_test()
@@ -21,7 +21,8 @@ fn main() {
         });
         interaction.bind_key(KeyBinding::new("ctrl-enter", Activate, None));
         let _ = interaction.focus_manager();
-        div().id("button").child("Activate")
-    });
-    let _ = application.with_frame_limit(1);
+        div().id("button").w(160.0).h(48.0).bg(rgb(0x2050a0))
+    })
+    .with_frame_limit(1_000_000)
+    .run()
 }

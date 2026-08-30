@@ -1,18 +1,9 @@
-use wgpui::{Application, IntoElement, Render, WindowOptions, div};
+use wgpui::{Application, ApplicationError, Styled, WindowOptions, div, rgb};
 
-struct NativeRoot;
-
-impl Render for NativeRoot {
-    fn render(&mut self) -> impl IntoElement + 'static {
-        div().id("root").child("native WGPUI")
-    }
-}
-
-fn main() {
-    let mut root = NativeRoot;
-    let _description = wgpui::render_description(&mut root);
-    let application = Application::new(WindowOptions::default(), move |_window| {
-        div().id("root").child("native WGPUI")
-    });
-    drop(application);
+fn main() -> Result<(), ApplicationError> {
+    Application::new(WindowOptions::default(), move |_window| {
+        div().id("root").w(360.0).h(160.0).bg(rgb(0x2050a0))
+    })
+    .with_frame_limit(1_000_000)
+    .run()
 }
