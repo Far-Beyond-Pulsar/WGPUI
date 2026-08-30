@@ -7,8 +7,10 @@ so compiler diagnostics describe native API gaps directly.
 
 ## Mapping
 
-The three root examples, twenty learn examples, five benchmark examples, and
-seventeen legacy examples are registered individually in the crate manifest.
+The four root examples, seventeen learn examples, five benchmark examples, and
+seventeen legacy examples are registered individually in the crate manifest
+(43 runnable examples total). The copied `prelude.rs` helper is retained as
+source support but is not a standalone runnable example.
 Assets are copied alongside the legacy examples, preserving paths based on
 `CARGO_MANIFEST_DIR`. The compile script invokes Cargo once per example and
 prints `PASS` or `FAIL` with the source path and a coarse diagnostic category.
