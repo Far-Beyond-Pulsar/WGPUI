@@ -25,9 +25,9 @@ const UNCLIPPED: Rect = Rect {
     max_x: 100_000.0,
     max_y: 100_000.0,
 };
-const LEGACY_PATHS_WGSL: &str = include_str!("../../../src/platform/cross/shaders/paths.wgsl");
+const LEGACY_PATHS_WGSL: &str = include_str!("../../../old/src/platform/cross/shaders/paths.wgsl");
 const LEGACY_BACKDROP_WGSL: &str =
-    include_str!("../../../src/platform/cross/shaders/backdrop_blur.wgsl");
+    include_str!("../../../old/src/platform/cross/shaders/backdrop_blur.wgsl");
 
 fn input(scene: &Scene, mode: DrawMode) -> FrameInput<'_> {
     FrameInput {

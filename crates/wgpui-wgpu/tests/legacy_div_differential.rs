@@ -47,8 +47,8 @@ use wgpui_wgpu::render::pipelines::TARGET_FORMAT;
 use wgpui_widgets::div::{Div, div};
 use wgpui_widgets::styled::Styled;
 
-const LEGACY_QUADS_WGSL: &str = include_str!("../../../src/platform/cross/shaders/quads.wgsl");
-const LEGACY_SHADOWS_WGSL: &str = include_str!("../../../src/platform/cross/shaders/shadows.wgsl");
+const LEGACY_QUADS_WGSL: &str = include_str!("../../../old/src/platform/cross/shaders/quads.wgsl");
+const LEGACY_SHADOWS_WGSL: &str = include_str!("../../../old/src/platform/cross/shaders/shadows.wgsl");
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 208;

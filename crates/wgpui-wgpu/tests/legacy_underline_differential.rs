@@ -36,7 +36,7 @@ use wgpui_wgpu::render::pipelines::TARGET_FORMAT;
 
 /// The legacy shader, byte for byte off disk.
 const LEGACY_UNDERLINES_WGSL: &str =
-    include_str!("../../../src/platform/cross/shaders/underlines.wgsl");
+    include_str!("../../../old/src/platform/cross/shaders/underlines.wgsl");
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 96;
