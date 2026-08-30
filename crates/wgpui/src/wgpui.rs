@@ -89,6 +89,7 @@ pub use wgpui_wgpu::window::application::{
     Application, ApplicationError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
     WindowOptions,
 };
+pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 
 pub mod prelude {
     pub use crate::{
