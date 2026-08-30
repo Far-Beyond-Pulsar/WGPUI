@@ -11,6 +11,12 @@ use std::time::Duration;
 pub struct DebugTile {
     pub origin_size: [f32; 4],
     pub color: [f32; 4],
+    /// Width of the outline in logical pixels. The inset between neighboring
+    /// tiles is intentional so adjacent refreshes remain individually legible.
+    pub border_width: f32,
+    /// Storage buffers use a 16-byte WGSL struct alignment. Keep the host
+    /// stride at 64 bytes even though the meaningful fields end at byte 36.
+    pub _padding: [f32; 7],
 }
 
 unsafe impl bytemuck::Zeroable for DebugTile {}

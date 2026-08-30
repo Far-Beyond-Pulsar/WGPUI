@@ -522,6 +522,8 @@ impl FrameLoop {
                         tiles.push(DebugTile {
                             origin_size: [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1], width, height],
                             color: flash.color,
+                            border_width: 3.0,
+                            _padding: [0.0; 7],
                         });
                     }
                 }
@@ -540,6 +542,8 @@ impl FrameLoop {
                 Some(DebugTile {
                     origin_size: [origin[0], origin[1], flash.tile_size[0], flash.tile_size[1]],
                     color: flash.color,
+                    border_width: 3.0,
+                    _padding: [0.0; 7],
                 })
             })
             .collect()
