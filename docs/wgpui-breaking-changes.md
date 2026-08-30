@@ -38,6 +38,16 @@ scrolling, lists, window controls, input handling, and close behavior must be
 implemented against the native retained/GPU pipeline. Examples that exercise
 these features are acceptance tests for behavior, not merely compile probes.
 
+### Application construction and window ownership
+
+The legacy application entry point is now `Application::new().run(|cx| { ... })`.
+`App::open_window` queues a real native window request and the WGPU event loop
+materializes it before rendering the root entity. The former direct retained
+constructor cannot share the zero-argument `Application::new` name in Rust, so
+it is deliberately preserved as `NativeApplication::new(options, builder)`.
+This is an approved WGPUI 2.0 source break; code using the direct constructor
+should migrate to `NativeApplication` (or `NativeApplication::with_window`).
+
 ## Migration rules
 
 1. Port example source to `wgpui` and native names before adding framework API.

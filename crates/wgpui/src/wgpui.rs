@@ -32,8 +32,8 @@ pub use wgpui_core::patch::primitive::{
     AtlasTileId, Glyph, GlyphRun, Path, PolySprite, Quad, Shadow, Underline,
 };
 pub use wgpui_core::reconcile;
-pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey, Reconciler};
 pub use wgpui_core::reconcile::description::{RawText, RawTextKey};
+pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey, Reconciler};
 pub use wgpui_core::reconcile::{StateKey, StateScope};
 pub use wgpui_core::scene;
 pub use wgpui_core::{
@@ -80,7 +80,8 @@ pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
 pub use wgpui_widgets::wgpu_surface::{WgpuSurface, WgpuSurfaceKey};
 
 pub use wgpui_wgpu::window::application::{
-    Application, ApplicationError, DisplayId, FrameReport, Window, WindowHandle, WindowOptions,
+    Application, ApplicationError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
+    WindowOptions,
 };
 
 pub mod prelude {

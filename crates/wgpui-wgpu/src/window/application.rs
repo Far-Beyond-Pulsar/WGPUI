@@ -2,14 +2,16 @@
 
 use std::sync::Arc;
 
-use wgpui_core::boundary::Pixels;
 use wgpui_core::app::App;
+use wgpui_core::boundary::Pixels;
 use wgpui_core::boundary::compositor::CompositeEntry;
 use wgpui_core::element::IntoElement;
 use wgpui_core::geometry::{Bounds, Point, Size, WindowBounds, point, size};
 use wgpui_core::invalidation::request::FrameSignals;
+use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
+pub use wgpui_core::window::WindowOptions;
 use wgpui_core::window::{
     InputEvent, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton as CoreMouseButton,
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
@@ -21,54 +23,23 @@ use crate::window::frame_loop::{FrameLoop, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
 use crate::window::{Acquired, WindowError, WindowSurface};
 
-/// Options used when creating the native window.
-#[derive(Clone, Debug)]
-pub struct WindowOptions {
-    pub title: String,
-    pub width: u32,
-    pub height: u32,
-    pub resizable: bool,
-    pub window_bounds: Option<WindowBounds>,
-    pub focus: bool,
-    pub show: bool,
-}
-
-impl Default for WindowOptions {
-    fn default() -> Self {
-        Self {
-            title: "WGPUI".to_string(),
-            width: 800,
-            height: 600,
-            resizable: true,
-            window_bounds: None,
-            focus: true,
-            show: true,
-        }
-    }
-}
-
-impl WindowOptions {
-    fn initial_bounds(&self) -> Bounds<Pixels> {
-        let fallback = size(Pixels(self.width as f32), Pixels(self.height as f32));
-        let Some(window_bounds) = self.window_bounds else {
-            return Bounds::new(point(Pixels::ZERO, Pixels::ZERO), fallback);
-        };
-        let bounds = window_bounds.get_bounds();
-        let size = if bounds.size.width.value() > 0.0 && bounds.size.height.value() > 0.0 {
-            bounds.size
-        } else {
-            fallback
-        };
-        Bounds::new(bounds.origin, size)
-    }
-
-    fn window_state(&self) -> Option<WindowBounds> {
-        self.window_bounds
-    }
+fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
+    let fallback = size(Pixels(options.width as f32), Pixels(options.height as f32));
+    let Some(window_bounds) = options.window_bounds else {
+        return Bounds::new(point(Pixels::ZERO, Pixels::ZERO), fallback);
+    };
+    let bounds = window_bounds.get_bounds();
+    let size = if bounds.size.width.value() > 0.0 && bounds.size.height.value() > 0.0 {
+        bounds.size
+    } else {
+        fallback
+    };
+    Bounds::new(bounds.origin, size)
 }
 
 /// A handle to the native window visible to the application callback.
 type CloseHandler = Box<dyn FnMut(&mut Window) -> bool>;
+type AppInitializer = Box<dyn FnOnce(&mut App)>;
 
 pub struct Window {
     native: Arc<winit::window::Window>,
@@ -305,14 +276,14 @@ impl From<WindowError> for ApplicationError {
 }
 
 /// The native retained application.
-pub struct Application<F, R> {
+pub struct NativeApplication<F, R> {
     options: WindowOptions,
     build: F,
     max_frames: Option<u64>,
     marker: std::marker::PhantomData<fn() -> R>,
 }
 
-impl<F, R> Application<F, R>
+impl<F, R> NativeApplication<F, R>
 where
     F: FnMut(&mut Window) -> R + 'static,
     R: IntoElement,
@@ -342,16 +313,19 @@ where
     /// redraw, and the same `App` is retained for the lifetime of the window.
     /// Calling [`App::quit`] from the initializer or any retained callback
     /// exits the real event loop after the current frame.
-    pub fn run_with_app(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
+    pub fn run_with_app(
+        mut self,
+        initialize: impl FnOnce(&mut App) + 'static,
+    ) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
             options: self.options,
-            build: self.build,
+            build: Box::new(move |window| (self.build)(window).into_description()),
             max_frames: self.max_frames,
             initialize: Some(Box::new(initialize)),
             live: None,
             failure: None,
-            marker: std::marker::PhantomData,
+            app: App::new(),
         };
         event_loop
             .run_app(&mut handler)
@@ -369,21 +343,52 @@ where
         self
     }
 
-    pub fn run(self) -> Result<(), ApplicationError> {
+    pub fn run(mut self) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
             options: self.options,
-            build: self.build,
+            build: Box::new(move |window| (self.build)(window).into_description()),
             max_frames: self.max_frames,
             initialize: None,
             live: None,
             failure: None,
-            marker: std::marker::PhantomData,
+            app: App::new(),
         };
         event_loop
             .run_app(&mut handler)
             .map_err(ApplicationError::from)?;
         handler.failure.map_or(Ok(()), Err)
+    }
+}
+
+pub struct Application;
+
+impl Application {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
+        let event_loop = event_loop()?;
+        let mut handler = Handler {
+            options: WindowOptions::default(),
+            build: Box::new(|_| Description::new::<()>()),
+            max_frames: None,
+            initialize: Some(Box::new(initialize)),
+            app: App::new(),
+            live: None,
+            failure: None,
+        };
+        event_loop
+            .run_app(&mut handler)
+            .map_err(ApplicationError::from)?;
+        handler.failure.map_or(Ok(()), Err)
+    }
+}
+
+impl Default for Application {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -414,21 +419,17 @@ struct Live {
     app: App,
 }
 
-struct Handler<F, R> {
+struct Handler {
     options: WindowOptions,
-    build: F,
+    build: Box<dyn FnMut(&mut Window) -> Description>,
     max_frames: Option<u64>,
-    initialize: Option<Box<dyn FnOnce(&mut App)>>,
+    initialize: Option<AppInitializer>,
     live: Option<Live>,
     failure: Option<ApplicationError>,
-    marker: std::marker::PhantomData<fn() -> R>,
+    app: App,
 }
 
-impl<F, R> Handler<F, R>
-where
-    F: FnMut(&mut Window) -> R + 'static,
-    R: IntoElement,
-{
+impl Handler {
     fn fail(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, error: ApplicationError) {
         self.failure = Some(error);
         event_loop.exit();
@@ -460,7 +461,7 @@ where
             .create_view(&wgpu::TextureViewDescriptor::default());
         let (width, height) = live.surface.size();
         live.window.begin_frame();
-        let description = (self.build)(&mut live.window).into_description();
+        let description = (self.build)(&mut live.window);
         live.window.end_frame();
         let target = RenderTarget {
             view: &view,
@@ -509,20 +510,27 @@ where
     }
 }
 
-impl<F, R> winit::application::ApplicationHandler for Handler<F, R>
-where
-    F: FnMut(&mut Window) -> R + 'static,
-    R: IntoElement,
-{
+impl winit::application::ApplicationHandler for Handler {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.live.is_some() {
             return;
+        }
+        if let Some(initialize) = self.initialize.take() {
+            initialize(&mut self.app);
+            if let Some(request) = self.app.take_window_requests().into_iter().next() {
+                self.options = request.options;
+                let mut renderer =
+                    (request.build)(&mut wgpui_core::window::Window::new(), &mut self.app);
+                let mut app = self.app.clone();
+                self.build =
+                    Box::new(move |window| (renderer.render)(&mut window.interaction, &mut app));
+            }
         }
         let attributes = winit::window::Window::default_attributes()
             .with_title(self.options.title.clone())
             .with_resizable(self.options.resizable)
             .with_visible(self.options.show);
-        let initial_bounds = self.options.initial_bounds();
+        let initial_bounds = initial_bounds(&self.options);
         let mut attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(
             initial_bounds.size.width.value(),
             initial_bounds.size.height.value(),
@@ -544,7 +552,7 @@ where
             }
         };
         let scale_factor = native.scale_factor();
-        if let Some(window_bounds) = self.options.window_state() {
+        if let Some(window_bounds) = self.options.window_bounds {
             match window_bounds {
                 WindowBounds::Windowed(_) => {}
                 WindowBounds::Maximized(_) => native.set_maximized(true),
@@ -589,13 +597,13 @@ where
             mode,
             frames: 0,
             last_report: None,
-            app: App::new(),
+            app: self.app.clone(),
         });
-        if let Some(initialize) = self.initialize.take() {
-            if let Some(live) = self.live.as_mut() {
-                let mut app = live.app.clone();
-                initialize(&mut app);
-            }
+        if let Some(initialize) = self.initialize.take()
+            && let Some(live) = self.live.as_mut()
+        {
+            let mut app = live.app.clone();
+            initialize(&mut app);
         }
         if let Some(live) = self.live.as_ref() {
             live.window.request_redraw();
@@ -773,8 +781,8 @@ mod tests {
             ))),
             ..WindowOptions::default()
         };
-        assert_eq!(options.initial_bounds().origin, point(px(120.0), px(80.0)));
-        assert_eq!(options.initial_bounds().size, size(px(640.0), px(480.0)));
+        assert_eq!(initial_bounds(&options).origin, point(px(120.0), px(80.0)));
+        assert_eq!(initial_bounds(&options).size, size(px(640.0), px(480.0)));
     }
 
     #[test]
@@ -785,6 +793,6 @@ mod tests {
             window_bounds: Some(WindowBounds::Windowed(Bounds::default())),
             ..WindowOptions::default()
         };
-        assert_eq!(options.initial_bounds().size, size(px(320.0), px(240.0)));
+        assert_eq!(initial_bounds(&options).size, size(px(320.0), px(240.0)));
     }
 }

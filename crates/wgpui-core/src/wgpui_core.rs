@@ -21,6 +21,7 @@ pub use window::{
     KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu,
     MenuItem, Modifiers, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TimerHandle, TimerId, TimerState,
+    WindowOptions,
 };
 pub mod boundary;
 pub mod color;
