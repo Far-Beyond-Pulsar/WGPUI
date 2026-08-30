@@ -604,6 +604,11 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Tailwind `pt-2`: 0.5rem of top padding.
+    fn pt_2(self) -> Self {
+        self.pt(spacing(2.0))
+    }
+
     /// Bottom padding.
     fn pb(mut self, pixels: impl IntoStylePixels) -> Self {
         self.layout_style().padding.bottom = LengthPercentage::length(pixels.into_style_pixels());
@@ -1132,6 +1137,9 @@ pub trait Styled: Sized {
     fn w_16(self) -> Self {
         self.w(64.0)
     }
+    fn w_40(self) -> Self {
+        self.w(160.0)
+    }
     fn size_16(self) -> Self {
         self.size(64.0)
     }
@@ -1505,5 +1513,30 @@ mod tests {
             styled.0.layout.inset.right,
             LengthPercentageAuto::length(2.0)
         );
+    }
+
+    #[test]
+    fn common_tailwind_aliases_write_their_resolved_layout_values() {
+        let styled = Styleable::default()
+            .flex()
+            .flex_1()
+            .absolute()
+            .size_full()
+            .pt_2()
+            .w_40()
+            .border_b_1()
+            .text_xl()
+            .text_color([0.1, 0.2, 0.3, 1.0]);
+
+        assert_eq!(styled.0.layout.display, Display::Flex);
+        assert_eq!(styled.0.layout.flex_grow, 1.0);
+        assert_eq!(styled.0.layout.flex_shrink, 1.0);
+        assert_eq!(styled.0.layout.position, Position::Absolute);
+        assert_eq!(styled.0.layout.size.width, Dimension::length(160.0));
+        assert_eq!(styled.0.layout.size.height, Dimension::percent(1.0));
+        assert_eq!(styled.0.layout.padding.top, LengthPercentage::length(8.0));
+        assert_eq!(styled.0.layout.border.bottom, LengthPercentage::length(1.0));
+        assert_eq!(styled.0.text_size, Some(20.0));
+        assert_eq!(styled.0.text_color, Some([0.1, 0.2, 0.3, 1.0]));
     }
 }
