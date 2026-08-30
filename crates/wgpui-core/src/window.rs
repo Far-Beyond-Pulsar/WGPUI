@@ -104,6 +104,12 @@ impl Window {
     pub fn focus_manager(&self) -> &FocusManager {
         &self.focus
     }
+    pub fn register_focus_handle(&mut self, handle: FocusHandle) {
+        self.focus.register(&handle, handle.tab_index_value());
+    }
+    pub fn unregister_focus_handle(&mut self, handle: FocusHandle) {
+        self.focus.unregister(handle.id());
+    }
     pub fn focus(&mut self, handle: &FocusHandle) -> bool {
         self.focus.register(handle, handle.tab_index_value());
         self.focus.focus(handle.id(), true)
@@ -123,11 +129,27 @@ impl Window {
     pub fn focus_previous(&mut self) -> Option<FocusId> {
         self.focus.next(true)
     }
+
     pub fn take_focus_transition(&mut self) -> Option<FocusTransition> {
         self.focus.take_transition()
     }
     pub fn hit_test(&mut self) -> &mut HitTestIndex {
         &mut self.hit_test
+    }
+    pub fn register_hitbox(&mut self, hitbox: Hitbox, node: DispatchNodeId) {
+        self.hit_test.insert_with_id(hitbox.id, hitbox.bounds, hitbox.z_index);
+        self.dispatch.bind_hitbox(hitbox.id, node);
+        self.hit_test.set_hit_testable(hitbox.id, hitbox.hit_testable);
+    }
+    pub fn unregister_hitbox(&mut self, id: HitboxId) {
+        self.hit_test.remove(id);
+        self.dispatch.unbind_hitbox(id);
+        if self.hovered == Some(id) {
+            self.hovered = None;
+        }
+        if self.pressed.is_some_and(|(pressed, _)| pressed == id) {
+            self.pressed = None;
+        }
     }
     pub fn dispatch_tree(&mut self) -> &mut DispatchTree {
         &mut self.dispatch

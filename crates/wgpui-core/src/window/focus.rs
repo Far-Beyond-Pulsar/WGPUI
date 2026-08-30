@@ -121,6 +121,9 @@ impl FocusManager {
         if reverse {
             stops.reverse();
         }
+        if stops.is_empty() {
+            return None;
+        }
         let next = match self
             .focused
             .and_then(|id| stops.iter().position(|(_, stop)| *stop == id))

@@ -3,6 +3,9 @@ use crate::geometry::Rect;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HitboxId(u64);
 impl HitboxId {
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
     pub const fn as_raw(self) -> u64 {
         self.0
     }
@@ -50,6 +53,7 @@ impl HitTestIndex {
         id
     }
     pub fn insert_with_id(&mut self, id: HitboxId, bounds: Rect, z_index: i32) {
+        self.entries.retain(|entry| entry.id != id);
         self.next_order = self.next_order.wrapping_add(1);
         self.entries.push(Hitbox {
             id,
@@ -80,6 +84,14 @@ impl HitTestIndex {
     }
     pub fn get(&self, id: HitboxId) -> Option<&Hitbox> {
         self.entries.iter().find(|entry| entry.id == id)
+    }
+    pub fn update(&mut self, id: HitboxId, bounds: Rect, z_index: i32) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        entry.bounds = bounds;
+        entry.z_index = z_index;
+        true
     }
     pub fn entries(&self) -> &[Hitbox] {
         &self.entries
