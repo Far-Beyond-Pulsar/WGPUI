@@ -475,6 +475,15 @@ pub struct FrameEmission {
     pub patch: ScenePatch,
     /// What each live boundary did, in ascending layer order.
     pub composites: Vec<BoundaryComposite>,
+    /// Tile visibility metadata for damage planning. Tiles are not scene
+    /// layers and do not own primitive records; they identify portions of the
+    /// retained presentation buffer that may need repainting.
+    pub tiled_visits: Vec<TiledVisit>,
+    /// Screen-space rectangles whose pixels no longer match the previous
+    /// presentation. This is presentation damage, not a second copy of the
+    /// scene: the GPU uses it to restrict rasterization while the retained
+    /// scene remains the only source of primitive data.
+    pub damage: Vec<Rect>,
     /// This frame's counters.
     pub stats: EmissionStats,
 }
@@ -506,6 +515,7 @@ struct EmittedNode {
     /// The inherited clip used when this node last emitted. A resize can
     /// change this without changing the node's own layout rectangle.
     clip: Option<LayoutRect>,
+    visible_bounds: Rect,
     shadows: u32,
     quads: u32,
     underlines: u32,
@@ -675,7 +685,9 @@ impl Emitter {
         let mut stats = EmissionStats::default();
         let mut pending = PendingOperations::default();
         let mut boundaries: HashMap<BoundaryId, BoundaryFrame> = HashMap::new();
-        let mut tiled_visits: HashMap<BoundaryId, TiledVisit> = HashMap::new();
+        let mut tiled_visits = Vec::new();
+        let mut damage = Vec::new();
+        let mut scroll_regions = HashMap::new();
         let mut emission = Emission::new();
         let effective_signals = self.infer_clean_scrolls(plan, signals);
 
@@ -713,6 +725,14 @@ impl Emitter {
                 let slides = effective_signals
                     .reason_for_layer(declared_layer)
                     .permits_transform_only();
+                if slides {
+                    scroll_regions.insert(
+                        declared,
+                        geometry
+                            .child_clip
+                            .unwrap_or(geometry.absolute_bounds),
+                    );
+                }
                 let transform = if slides {
                     LayerTransform {
                         translation: node.scroll_offset,
@@ -727,49 +747,13 @@ impl Emitter {
                     frame,
                     geometry.child_clip.unwrap_or(geometry.absolute_bounds),
                 ) {
-                    for tile in &visit.visible {
-                        let layer = scene.layer(LayerKey::tiled(declared, *tile));
-                        scene.layers.mark_clean(layer);
-                        scene.layers.set_transform(
-                            layer,
-                            LayerTransform::translated(
-                                geometry.accumulated_scroll[0] + node.scroll_offset[0],
-                                geometry.accumulated_scroll[1] + node.scroll_offset[1],
-                            ),
-                        );
-                    }
-                    tiled_visits.insert(declared, visit);
+                    tiled_visits.push(visit);
                 }
             }
 
             let previous = self.emitted.get(&node.address).copied();
             match plan.emitter(index) {
                 Some(emitter) => {
-                    let layer = tiled_visits.get(&node.boundary).map_or(layer, |visit| {
-                        let bounds = Rect::from_origin_size(
-                            [bounds.x, bounds.y],
-                            [bounds.width, bounds.height],
-                        );
-                        let crate::scene::tile::TilePlacement::Tile(tile) =
-                            visit.grid.placement(bounds)
-                        else {
-                            return layer;
-                        };
-                        let layer = LayerId::from_key(LayerKey::tiled(node.boundary, tile));
-                        let existing = scene.layers.contains(layer);
-                        scene.layer(LayerKey::tiled(node.boundary, tile));
-                        if existing {
-                            scene.layers.mark_clean(layer);
-                        }
-                        scene.layers.set_transform(
-                            layer,
-                            LayerTransform::translated(
-                                geometry.accumulated_scroll[0],
-                                geometry.accumulated_scroll[1],
-                            ),
-                        );
-                        layer
-                    });
                     let stale = previous.is_none_or(|record| {
                         record.bounds != bounds
                             || record.layer != layer
@@ -787,6 +771,10 @@ impl Emitter {
                             );
                         }
                     } else {
+                        if let Some(previous) = previous {
+                            damage.push(previous.visible_bounds);
+                        }
+                        damage.push(geometry.visible_bounds);
                         stats.nodes_emitted += 1;
                         emission.clear();
                         emitter.emit(
@@ -854,6 +842,7 @@ impl Emitter {
                             layer,
                             bounds,
                             clip: geometry.emission_clip,
+                            visible_bounds: geometry.visible_bounds,
                             shadows: u32::try_from(emission.shadows().len()).unwrap_or(u32::MAX),
                             quads: u32::try_from(emission.quads().len()).unwrap_or(u32::MAX),
                             underlines: u32::try_from(emission.underlines().len())
@@ -876,6 +865,7 @@ impl Emitter {
                     // with it, not leave them resident under an address nothing
                     // will address again.
                     if let Some(record) = previous {
+                        damage.push(record.visible_bounds);
                         Self::retire_records(node.address, record, &mut pending);
                         self.emitted.remove(&node.address);
                         Self::account(&mut boundaries, node.boundary, true, 0);
@@ -884,7 +874,7 @@ impl Emitter {
             }
         }
 
-        self.sweep_departed(frame, &mut pending, &mut boundaries);
+        self.sweep_departed(frame, &mut pending, &mut boundaries, &mut damage);
 
         let patch = ScenePatch {
             shadows: pending.shadows.into_patch_list(&scene.shadows, &mut stats),
@@ -920,6 +910,9 @@ impl Emitter {
             scene.layers.set_transform(state.layer, composite.transform);
             if composite.composite == Composite::TransformOnly {
                 stats.transform_only += 1;
+                if let Some(region) = scroll_regions.get(&boundary) {
+                    damage.push(*region);
+                }
             }
             composites.push(composite);
         }
@@ -931,6 +924,8 @@ impl Emitter {
         Ok(FrameEmission {
             patch,
             composites,
+            tiled_visits,
+            damage,
             stats,
         })
     }
@@ -1122,6 +1117,7 @@ impl Emitter {
         frame: u64,
         pending: &mut PendingOperations,
         boundaries: &mut HashMap<BoundaryId, BoundaryFrame>,
+        damage: &mut Vec<Rect>,
     ) {
         let departed: Vec<(InstanceKey, EmittedNode)> = self
             .emitted
@@ -1130,6 +1126,7 @@ impl Emitter {
             .map(|(address, record)| (*address, *record))
             .collect();
         for (address, record) in departed {
+            damage.push(record.visible_bounds);
             Self::retire_records(address, record, pending);
             self.emitted.remove(&address);
             for entry in boundaries.values_mut() {
@@ -1245,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn tiled_boundary_assigns_small_content_to_independent_tile_layers() -> Result<(), FrameError> {
+    fn tiled_boundary_reports_damage_tiles_without_promoting_them_to_layers() -> Result<(), FrameError> {
         let policy = BoundaryPolicy {
             buffering: Buffering::Tiled {
                 tile_size: Size::pixels(100.0, 100.0),
@@ -1271,11 +1268,11 @@ mod tests {
         let mut window = Window::new();
         let frame = window.draw(description, &FrameSignals::new())?;
         let boundary = boundary_of(&window);
-        let tile_layer =
-            LayerId::from_key(LayerKey::tiled(boundary, crate::scene::TileCoord::ORIGIN));
-        assert!(window.scene.layers.contains(tile_layer));
+        assert_eq!(frame.emission.tiled_visits.len(), 1);
+        assert_eq!(frame.emission.tiled_visits[0].boundary, boundary);
+        assert!(!frame.emission.tiled_visits[0].visible.is_empty());
         assert!(frame.emission.stats.records_inserted > 0);
-        assert!(window.scene.layers.ids().iter().any(|layer| {
+        assert!(!window.scene.layers.ids().iter().any(|layer| {
             window
                 .scene
                 .layers
@@ -1488,6 +1485,11 @@ mod tests {
             "every element that emits anything skipped emitting"
         );
         assert_eq!(scrolled.emission.stats.transform_only, 1);
+        assert_eq!(
+            scrolled.emission.damage,
+            vec![Rect::from_origin_size([0.0, 0.0], [VIEWPORT_WIDTH, VIEWPORT_HEIGHT])],
+            "a transform-only scroll damages only the scrolling boundary's viewport"
+        );
 
         // And the scene agrees: the layer moved, its residency did not.
         assert_eq!(

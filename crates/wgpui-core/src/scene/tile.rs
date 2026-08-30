@@ -2,14 +2,13 @@
 //! residency budget behind `Buffering::Tiled`.
 //! See docs/gpu-native-architecture.md §4.3.
 //!
-//! # A tile is a `Layer`, and that is the whole design
+//! # A tile is visibility metadata, not a render cache
 //!
-//! §4.3 opens with the observation this file is built on: "a tile is just a
-//! `Layer`, addressed one dimension further." Everything a tile needs — its own
-//! instance arena, its own slab, its own place in occlusion culling and indirect
-//! draw issuance — is what a [`crate::scene::layer::Layer`] already is, so
-//! nothing here is a parallel tile-specific residency structure. What is here is
-//! only what a `Layer` cannot answer for itself:
+//! A tile identifies a portion of a boundary's content plane. It is used to
+//! determine visibility, residency, and presentation damage; it does not own a
+//! scene layer, primitive slab, or second copy of rendered pixels. The retained
+//! boundary scene remains the source for rasterization. What is here is only
+//! what that scene cannot answer for itself:
 //!
 //! - **Where a tile sits on the content plane** ([`TileGrid`]), which is integer
 //!   arithmetic over a fixed edge length and nothing more.
@@ -486,10 +485,8 @@ impl TileResidency {
     /// were not resident before.
     ///
     /// Those are the newly-revealed tiles — §4.3's "crossing into a new tile
-    /// triggers `DISPLAY` for *that tile alone*". The caller turns each into a
-    /// `LayerKey::tiled` layer, and a brand-new layer starts fully invalidated
-    /// by [`crate::scene::layer::LayerTable::insert`]'s own rule, so nothing
-    /// here has to special-case a tile into being dirty.
+    /// triggers `DISPLAY` for *that tile alone*". The presentation planner uses
+    /// them as damage candidates; no tile layer or pixel cache is created.
     ///
     /// Returned sorted, so a frame's newly-revealed set is a reproducible list
     /// rather than a hash order.

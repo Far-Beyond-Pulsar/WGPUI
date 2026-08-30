@@ -250,7 +250,7 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // interpolation of a per-vertex value. Byte-exactness against the legacy
     // renderer is decided at the antialiased corner, where a one-ULP difference
     // in `point` is a different coverage value and a different byte.
-    let point = in.position.xy - quad.origin_size.xy;
+    let point = in.position.xy - quad.origin_size.xy - slot.translation;
     let center_to_point = point - half_size;
 
     let antialias_threshold = 0.5;
