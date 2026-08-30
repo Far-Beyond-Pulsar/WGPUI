@@ -259,7 +259,14 @@ impl Emission {
                     width: glyph.atlas_size[0],
                     height: glyph.atlas_size[1],
                 };
-                if !rects_intersect(bounds, clip) {
+                if let Some(cropped) = intersect_rect(bounds, clip) {
+                    let delta_x = cropped.x - bounds.x;
+                    let delta_y = cropped.y - bounds.y;
+                    glyph.atlas_origin[0] += delta_x;
+                    glyph.atlas_origin[1] += delta_y;
+                    glyph.position = [cropped.x, cropped.y];
+                    glyph.atlas_size = [cropped.width, cropped.height];
+                } else {
                     glyph.atlas_size = [0.0; 2];
                     glyph.atlas_tile = AtlasTileId::NONE;
                 }
@@ -269,10 +276,26 @@ impl Emission {
             let bounds = LayoutRect {
                 x: sprite.origin[0],
                 y: sprite.origin[1],
-                width: sprite.size[0],
-                height: sprite.size[1],
-            };
-            if !rects_intersect(bounds, clip) {
+                    width: sprite.size[0],
+                    height: sprite.size[1],
+                };
+            if let Some(cropped) = intersect_rect(bounds, clip) {
+                let scale_x = if sprite.size[0] > 0.0 {
+                    sprite.atlas_size[0] / sprite.size[0]
+                } else {
+                    0.0
+                };
+                let scale_y = if sprite.size[1] > 0.0 {
+                    sprite.atlas_size[1] / sprite.size[1]
+                } else {
+                    0.0
+                };
+                sprite.atlas_origin[0] += (cropped.x - bounds.x) * scale_x;
+                sprite.atlas_origin[1] += (cropped.y - bounds.y) * scale_y;
+                sprite.atlas_size = [cropped.width * scale_x, cropped.height * scale_y];
+                sprite.origin = [cropped.x, cropped.y];
+                sprite.size = [cropped.width, cropped.height];
+            } else {
                 sprite.size = [0.0; 2];
                 sprite.opacity = 0.0;
                 sprite.atlas_tile = AtlasTileId::NONE;
@@ -282,37 +305,75 @@ impl Emission {
             let bounds = LayoutRect {
                 x: underline.origin[0],
                 y: underline.origin[1],
-                width: underline.size[0],
-                height: underline.size[1],
-            };
-            if !rects_intersect(bounds, clip) {
+                    width: underline.size[0],
+                    height: underline.size[1],
+                };
+            if let Some(cropped) = intersect_rect(bounds, clip) {
+                underline.origin = [cropped.x, cropped.y];
+                underline.size = [cropped.width, cropped.height];
+            } else {
                 underline.size = [0.0; 2];
                 underline.color[3] = 0.0;
             }
         }
         for shadow in &mut self.shadows {
             let (origin, size) = shadow.drawn_bounds();
-            if !rects_intersect(
-                LayoutRect {
-                    x: origin[0],
-                    y: origin[1],
-                    width: size[0],
-                    height: size[1],
-                },
-                clip,
-            ) {
+            if !rects_intersect(LayoutRect {
+                x: origin[0],
+                y: origin[1],
+                width: size[0],
+                height: size[1],
+            }, clip) {
                 shadow.size = [0.0; 2];
                 shadow.color[3] = 0.0;
+            }
+        }
+        for path in &mut self.paths {
+            let path_clip = LayoutRect {
+                x: path.clip_origin[0],
+                y: path.clip_origin[1],
+                width: path.clip_size[0],
+                height: path.clip_size[1],
+            };
+            if let Some(cropped) = intersect_rect(path_clip, clip) {
+                path.clip_origin = [cropped.x, cropped.y];
+                path.clip_size = [cropped.width, cropped.height];
+            } else {
+                path.clip_size = [0.0; 2];
+            }
+        }
+        for filter in &mut self.backdrop_filters {
+            let filter_clip = LayoutRect {
+                x: filter.clip_origin[0],
+                y: filter.clip_origin[1],
+                width: filter.clip_size[0],
+                height: filter.clip_size[1],
+            };
+            if let Some(cropped) = intersect_rect(filter_clip, clip) {
+                filter.clip_origin = [cropped.x, cropped.y];
+                filter.clip_size = [cropped.width, cropped.height];
+            } else {
+                filter.clip_size = [0.0; 2];
             }
         }
     }
 }
 
 fn rects_intersect(first: LayoutRect, second: LayoutRect) -> bool {
-    first.x < second.x + second.width
-        && first.x + first.width > second.x
-        && first.y < second.y + second.height
-        && first.y + first.height > second.y
+    intersect_rect(first, second).is_some()
+}
+
+fn intersect_rect(first: LayoutRect, second: LayoutRect) -> Option<LayoutRect> {
+    let x = first.x.max(second.x);
+    let y = first.y.max(second.y);
+    let right = (first.x + first.width).min(second.x + second.width);
+    let bottom = (first.y + first.height).min(second.y + second.height);
+    (right > x && bottom > y).then_some(LayoutRect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    })
 }
 
 /// An element's contribution to the scene, given where layout put it.
@@ -1074,6 +1135,7 @@ mod tests {
     use crate::boundary::policy::Retention;
     use crate::invalidation::axes::Invalidation;
     use crate::patch::apply::apply;
+    use crate::patch::primitive::{Glyph, PathVertex};
     use crate::patch::{PatchError, PatchOp};
     use crate::reconcile::description::Description;
     use crate::reconcile::diff_key::{ReconcileKey, compare_by_equality};
@@ -1797,6 +1859,79 @@ mod tests {
         window.draw(describe(1, Rc::clone(&calls)), &FrameSignals::new())?;
         assert_eq!(calls.get(), 2);
         Ok(())
+    }
+
+    #[test]
+    fn clipping_crops_text_and_sprite_atlas_coordinates_instead_of_leaking() {
+        let mut emission = Emission::default();
+        emission.glyph_runs.push(GlyphRun {
+            color: [1.0; 4],
+            glyphs: vec![Glyph {
+                position: [8.0, 8.0],
+                atlas_origin: [40.0, 80.0],
+                atlas_size: [16.0, 12.0],
+                glyph_id: 7,
+                atlas_tile: AtlasTileId::new(2, 3).expect("test tile id is representable"),
+            }],
+        });
+        emission.poly_sprites.push(PolySprite {
+            origin: [8.0, 8.0],
+            size: [16.0, 12.0],
+            atlas_origin: [100.0, 200.0],
+            atlas_size: [32.0, 24.0],
+            ..PolySprite::ZERO
+        });
+
+        emission.clip_to(LayoutRect {
+            x: 12.0,
+            y: 10.0,
+            width: 8.0,
+            height: 8.0,
+        });
+
+        let glyph = &emission.glyph_runs[0].glyphs[0];
+        assert_eq!(glyph.position, [12.0, 10.0]);
+        assert_eq!(glyph.atlas_origin, [44.0, 82.0]);
+        assert_eq!(glyph.atlas_size, [8.0, 8.0]);
+        assert!(!glyph.atlas_tile.is_none());
+
+        let sprite = emission.poly_sprites[0];
+        assert_eq!(sprite.origin, [12.0, 10.0]);
+        assert_eq!(sprite.size, [8.0, 8.0]);
+        assert_eq!(sprite.atlas_origin, [108.0, 204.0]);
+        assert_eq!(sprite.atlas_size, [16.0, 16.0]);
+    }
+
+    #[test]
+    fn clipping_intersects_existing_path_and_backdrop_masks() {
+        let mut emission = Emission::default();
+        emission.paths.push(Path::new(
+            vec![
+                PathVertex { position: [0.0, 0.0], st: [0.0, 0.0] },
+                PathVertex { position: [20.0, 0.0], st: [1.0, 0.0] },
+                PathVertex { position: [0.0, 20.0], st: [0.0, 1.0] },
+            ],
+            [1.0; 4],
+        ));
+        emission.backdrop_filters.push(BackdropFilter {
+            origin: [0.0, 0.0],
+            size: [20.0, 20.0],
+            clip_origin: [2.0, 2.0],
+            clip_size: [16.0, 16.0],
+            ..BackdropFilter::ZERO
+        });
+
+        emission.clip_to(LayoutRect {
+            x: 10.0,
+            y: 10.0,
+            width: 20.0,
+            height: 20.0,
+        });
+
+        assert_eq!(emission.paths[0].clip_origin, [10.0, 10.0]);
+        assert_eq!(emission.paths[0].clip_size, [10.0, 10.0]);
+        assert_eq!(emission.backdrop_filters[0].clip_origin, [10.0, 10.0]);
+        assert_eq!(emission.backdrop_filters[0].clip_size, [8.0, 8.0]);
     }
 
     #[test]

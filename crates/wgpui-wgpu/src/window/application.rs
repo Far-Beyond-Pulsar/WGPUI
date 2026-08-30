@@ -6,7 +6,7 @@ use wgpui_core::app::App;
 use wgpui_core::boundary::Pixels;
 use wgpui_core::boundary::compositor::CompositeEntry;
 use wgpui_core::element::IntoElement;
-use wgpui_core::geometry::{Bounds, Point, Size, WindowBounds, point, size};
+use wgpui_core::geometry::{Bounds, Point, Rect, Size, WindowBounds, point, size};
 use wgpui_core::invalidation::request::FrameSignals;
 use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::plan::FrameStats;
@@ -59,6 +59,7 @@ pub struct Window {
     hovered_interaction: Option<usize>,
     pressed_interaction: Option<usize>,
     pressed_event: Option<MouseDownEvent>,
+    hover_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
 }
 
@@ -104,6 +105,25 @@ impl Window {
     }
     pub fn request_redraw(&self) {
         self.native.request_redraw();
+    }
+
+    pub fn take_hover_dirty_regions(&mut self) -> Vec<Rect> {
+        std::mem::take(&mut self.hover_dirty_regions)
+    }
+
+    pub fn clear_hover_with_app(&mut self, app: &mut App) -> bool {
+        let Some(index) = self.hovered_interaction.take() else {
+            return false;
+        };
+        if let Some(interaction) = self.interactions.get(index) {
+            self.hover_dirty_regions.push(interaction.bounds);
+        }
+        let event = InputEvent::MouseLeave(MouseMoveEvent {
+            position: self.cursor,
+            modifiers: self.modifiers(),
+            buttons: self.mouse_buttons,
+        });
+        self.dispatch_interaction(index, &event, app)
     }
     /// Access opt-in visual performance diagnostics for this window.
     pub fn performance_debug(&mut self) -> &mut PerformanceDebug {
@@ -180,6 +200,14 @@ impl Window {
                 let hit = self.hit_interaction(mouse.position);
                 let mut handled = false;
                 if self.hovered_interaction != hit {
+                    if let Some(previous) = self.hovered_interaction
+                        .and_then(|index| self.interactions.get(index))
+                    {
+                        self.hover_dirty_regions.push(previous.bounds);
+                    }
+                    if let Some(current) = hit.and_then(|index| self.interactions.get(index)) {
+                        self.hover_dirty_regions.push(current.bounds);
+                    }
                     if let Some(previous) = self.hovered_interaction {
                         handled |= self.dispatch_interaction(previous, &InputEvent::MouseLeave(*mouse), app);
                     }
@@ -252,7 +280,12 @@ impl Window {
     }
     fn set_interactions(&mut self, interactions: Vec<InteractionRegistration>) {
         self.interactions = interactions;
-        self.hovered_interaction = None;
+        if self
+            .hovered_interaction
+            .is_some_and(|index| index >= self.interactions.len())
+        {
+            self.hovered_interaction = None;
+        }
         self.pressed_interaction = None;
         self.pressed_event = None;
     }
@@ -597,6 +630,7 @@ impl Handler {
             hovered_interaction: None,
             pressed_interaction: None,
             pressed_event: None,
+            hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
         };
         self.live.push(Live {
@@ -824,6 +858,7 @@ impl winit::application::ApplicationHandler for Handler {
             hovered_interaction: None,
             pressed_interaction: None,
             pressed_event: None,
+            hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
         };
         self.live = Some(Live {
@@ -911,6 +946,9 @@ impl winit::application::ApplicationHandler for Handler {
                     buttons: live.window.mouse_buttons,
                 });
                 live.window.handle_input_with_app(event, &mut live.app);
+                for region in live.window.take_hover_dirty_regions() {
+                    live.frame_loop.mark_interaction_dirty(region);
+                }
                 live.window.request_redraw();
             }
             winit::event::WindowEvent::MouseInput { state, button, .. } => {
@@ -954,6 +992,11 @@ impl winit::application::ApplicationHandler for Handler {
             winit::event::WindowEvent::RedrawRequested => self.draw(event_loop, window_id),
             winit::event::WindowEvent::CursorEntered { .. } => live.window.request_redraw(),
             winit::event::WindowEvent::CursorLeft { .. } => {
+                if live.window.clear_hover_with_app(&mut live.app) {
+                    for region in live.window.take_hover_dirty_regions() {
+                        live.frame_loop.mark_interaction_dirty(region);
+                    }
+                }
                 live.window.interaction.clear_hover();
                 live.window.request_redraw();
             }

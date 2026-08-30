@@ -11,6 +11,9 @@ fn main() -> Result<(), ApplicationError> {
     let selected_for_button = Rc::clone(&selected);
     let inspected = Rc::new(Cell::new(false));
     let inspected_for_button = Rc::clone(&inspected);
+    let hovered_control = Rc::new(Cell::new(0_u8));
+    let hovered_control_for_first = Rc::clone(&hovered_control);
+    let hovered_control_for_second = Rc::clone(&hovered_control);
     let scroll_offset = Rc::new(Cell::new(0.0_f32));
     let scroll_offset_for_handler = Rc::clone(&scroll_offset);
 
@@ -24,11 +27,22 @@ fn main() -> Result<(), ApplicationError> {
         let _ = window.interaction();
         let selected = selected.get();
         let inspected = inspected.get();
+        let hovered_control = hovered_control.get();
         let scroll_offset = scroll_offset.get();
         let button_color = if selected == 0 {
             rgb(0x2f6fed)
         } else {
             rgb(0x2459bd)
+        };
+        let first_button_color = if hovered_control == 1 {
+            rgb(0x4f8dff)
+        } else {
+            button_color
+        };
+        let second_button_color = if hovered_control == 2 {
+            rgb(0x273653)
+        } else {
+            rgb(0x171d29)
         };
 
         div()
@@ -145,13 +159,19 @@ fn main() -> Result<(), ApplicationError> {
                                     .items_center()
                                     .justify_center()
                                     .rounded_lg()
-                                    .bg(button_color)
+                                    .bg(first_button_color)
                                     .text_color(rgb(0xffffff))
                             .child(format!("Rebuild visible tiles ({selected})"))
                                     .on_click({
                                         let selected = Rc::clone(&selected_for_button);
                                         move |_, _, _| {
                                             selected.set(selected.get().wrapping_add(1));
+                                        }
+                                    })
+                                    .on_hover({
+                                        let hovered_control = Rc::clone(&hovered_control_for_first);
+                                        move |is_hovered, _, _| {
+                                            hovered_control.set(if is_hovered { 1 } else { 0 });
                                         }
                                     }),
                             )
@@ -164,6 +184,7 @@ fn main() -> Result<(), ApplicationError> {
                                     .rounded_lg()
                                     .border_1()
                                     .border_color(rgb(0x34415d))
+                                    .bg(second_button_color)
                                     .text_color(rgb(0xb8c4dc))
                                     .child(if inspected {
                                         "Scene inspected"
@@ -174,6 +195,12 @@ fn main() -> Result<(), ApplicationError> {
                                         let inspected = Rc::clone(&inspected_for_button);
                                         move |_, _, _| {
                                             inspected.set(!inspected.get());
+                                        }
+                                    })
+                                    .on_hover({
+                                        let hovered_control = Rc::clone(&hovered_control_for_second);
+                                        move |is_hovered, _, _| {
+                                            hovered_control.set(if is_hovered { 2 } else { 0 });
                                         }
                                     }),
                             )

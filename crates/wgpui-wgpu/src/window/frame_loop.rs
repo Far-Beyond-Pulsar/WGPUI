@@ -219,6 +219,7 @@ pub struct FrameLoop {
     viewport_recomputes: u64,
     tile_flash_frames: HashMap<LayerId, u32>,
     viewport_flash_frames: u32,
+    interaction_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     scale_factor: f32,
 }
@@ -256,6 +257,7 @@ impl FrameLoop {
             viewport_recomputes: 0,
             tile_flash_frames: HashMap::new(),
             viewport_flash_frames: 0,
+            interaction_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             scale_factor: 1.0,
         }
@@ -302,6 +304,12 @@ impl FrameLoop {
     /// Update the opt-in diagnostics used by subsequent frames.
     pub fn set_performance_debug(&mut self, debug: PerformanceDebug) {
         self.performance_debug = debug;
+    }
+
+    /// Mark a hitbox region whose hover state changed. This is consumed by the
+    /// next frame as a dirty-region hint without invalidating unrelated tiles.
+    pub fn mark_interaction_dirty(&mut self, region: Rect) {
+        self.interaction_dirty_regions.push(region);
     }
 
     /// Set the native display scale used when shaping and rasterising text.
@@ -436,12 +444,15 @@ impl FrameLoop {
             self.last_viewport = Some(viewport);
             self.viewport_recomputes += 1;
         }
+        let interaction_dirty_regions = self.interaction_dirty_regions.clone();
         let debug_tiles = self.refresh_debug_tiles(
             &emission.patch,
             self.performance_debug.tile_refresh_flash(),
             viewport,
             viewport_changed,
+            &interaction_dirty_regions,
         );
+        self.interaction_dirty_regions.clear();
         self.renderer.set_debug_tiles(debug_tiles);
 
         self.atlas_textures
@@ -485,6 +496,7 @@ impl FrameLoop {
         flash: crate::debug::TileRefreshFlash,
         viewport: [f32; 2],
         viewport_changed: bool,
+        interaction_dirty_regions: &[Rect],
     ) -> Vec<DebugTile> {
         if !flash.enabled {
             self.tile_flash_frames.clear();
@@ -507,7 +519,11 @@ impl FrameLoop {
             self.tile_flash_frames
                 .insert(layer_id, flash.duration_frames.max(1));
         }
-        if flash.viewport_grid && (viewport_changed || !content_layers.is_empty()) {
+        if flash.viewport_grid
+            && (viewport_changed
+                || !content_layers.is_empty()
+                || !interaction_dirty_regions.is_empty())
+        {
             self.viewport_flash_frames = flash.duration_frames.max(1);
         }
         if flash.viewport_grid && self.viewport_flash_frames > 0 {
@@ -518,7 +534,18 @@ impl FrameLoop {
                 for x in 0..columns {
                     let width = flash.tile_size[0].min(viewport[0] - x as f32 * flash.tile_size[0]);
                     let height = flash.tile_size[1].min(viewport[1] - y as f32 * flash.tile_size[1]);
-                    if width > 0.0 && height > 0.0 {
+                    let tile_rect = Rect::from_origin_size(
+                        [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1]],
+                        [width, height],
+                    );
+                    let interaction_only = !viewport_changed
+                        && content_layers.is_empty()
+                        && !interaction_dirty_regions.is_empty();
+                    let region_matches = !interaction_only
+                        || interaction_dirty_regions
+                            .iter()
+                            .any(|region| tile_rect.intersects(region));
+                    if width > 0.0 && height > 0.0 && region_matches {
                         tiles.push(DebugTile {
                             origin_size: [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1], width, height],
                             color: flash.color,
@@ -553,22 +580,40 @@ impl FrameLoop {
         &self,
         plan: &mut wgpui_core::reconcile::plan::FramePlan,
     ) -> Result<Vec<InteractionRegistration>, LoopError> {
-        let mut origins = Vec::<[f32; 2]>::new();
+        let mut frames = Vec::<([f32; 2], [f32; 2], Option<Rect>)>::new();
         let mut result = Vec::new();
         for index in 0..plan.nodes().len() {
             let node = plan.nodes()[index];
-            let rectangle = self.layout.layout_of(node.layout_node).map_err(EmitError::from)?;
-            origins.truncate(node.depth as usize);
-            let parent = origins.last().copied().unwrap_or([0.0, 0.0]);
-            let origin = [parent[0] + rectangle.x, parent[1] + rectangle.y];
-            origins.push(origin);
+            let rectangle = self
+                .layout
+                .layout_of(node.layout_node)
+                .map_err(EmitError::from)?;
+            frames.truncate(node.depth as usize);
+            let (parent_origin, parent_offset, parent_clip) = frames
+                .last()
+                .copied()
+                .unwrap_or(([0.0, 0.0], [0.0, 0.0], None));
+            let origin = [
+                parent_origin[0] + parent_offset[0] + rectangle.x,
+                parent_origin[1] + parent_offset[1] + rectangle.y,
+            ];
+            let bounds = Rect::from_origin_size(origin, [rectangle.width, rectangle.height]);
             if let Some(interaction) = plan.take_interaction(index) {
-                result.push(InteractionRegistration {
-                    bounds: Rect::from_origin_size(origin, [rectangle.width, rectangle.height]),
-                    order: index as u64,
-                    interaction,
-                });
+                let visible_bounds = parent_clip.map_or(bounds, |clip| bounds.intersect(&clip));
+                if !visible_bounds.is_empty() {
+                    result.push(InteractionRegistration {
+                        bounds: visible_bounds,
+                        order: index as u64,
+                        interaction,
+                    });
+                }
             }
+            let clip = if node.clip_children {
+                Some(parent_clip.map_or(bounds, |parent| bounds.intersect(&parent)))
+            } else {
+                parent_clip
+            };
+            frames.push((origin, node.scroll_offset, clip));
         }
         Ok(result)
     }
