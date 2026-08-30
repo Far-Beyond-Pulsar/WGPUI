@@ -40,6 +40,9 @@ path = "examples/native_elements.rs"
 name = "native_interaction"
 path = "examples/native_interaction.rs"
 [[example]]
+name = "complex_app"
+path = "examples/complex_app.rs"
+[[example]]
 name = "interactive_elements"
 path = "examples/learn/interactive_elements.rs"
 [[example]]
