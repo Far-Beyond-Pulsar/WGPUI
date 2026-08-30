@@ -11,7 +11,11 @@ fn main() -> Result<(), ApplicationError> {
     let selected_for_button = Rc::clone(&selected);
 
     NativeApplication::new(WindowOptions::default(), move |window| {
-        window.performance_debug().flash_tile_refreshes();
+        window.performance_debug().set_tile_refresh_flash(
+            wgpui::TileRefreshFlash::enabled()
+                .with_tile_size(256.0, 256.0)
+                .with_color([1.0, 0.0, 1.0, 0.35]),
+        );
         let _ = window.interaction();
         let selected = selected.get();
         let button_color = if selected == 0 {
@@ -81,6 +85,7 @@ fn main() -> Result<(), ApplicationError> {
                             .border_1()
                             .border_color(rgb(0x293348))
                             .bg(rgb(0x171d29))
+                            .boundary()
                             .child(div().text_lg().text_color(rgb(0xf4f7ff)).child("Recent activity"))
                             .child(activity_row("GPU scene compacted", "just now", rgb(0x54d69b)))
                             .child(activity_row("Atlas page resident", "12 sec ago", rgb(0x5ca8ff)))
