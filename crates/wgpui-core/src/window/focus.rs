@@ -80,6 +80,9 @@ impl FocusManager {
         self.focus_visible
     }
     pub fn focus(&mut self, id: FocusId, visible: bool) -> bool {
+        if !self.tab_stops.contains_key(&id) {
+            return false;
+        }
         if self.focused == Some(id) {
             self.focus_visible = visible;
             return false;
@@ -115,6 +118,7 @@ impl FocusManager {
         let mut stops = self
             .tab_stops
             .iter()
+            .filter(|(_, index)| **index >= 0)
             .map(|(id, index)| (*index, *id))
             .collect::<Vec<_>>();
         stops.sort_by_key(|(index, id)| (*index, *id));

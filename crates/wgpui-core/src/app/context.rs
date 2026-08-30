@@ -57,6 +57,24 @@ impl<T> Context<T> {
 
 }
 
+impl<T: 'static> Context<T> {
+    /// Bind an entity method to an input callback without capturing a strong
+    /// entity reference.
+    pub fn listener<E: ?Sized>(
+        &self,
+        callback: impl Fn(&mut T, &E, &mut Window, &mut Context<T>) + 'static,
+    ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+        let entity = self.entity.downgrade();
+        move |event: &E, window: &mut Window, _app: &mut App| {
+            if let Some(entity) = entity.upgrade() {
+                entity.update_in(window, |value, window, context| {
+                    callback(value, event, window, context);
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,28 +121,5 @@ mod tests {
 
         assert!(app.is_active());
         assert!(app.quit_requested());
-    }
-}
-
-impl<T: 'static> Context<T> {
-    /// Bind an entity method to an input callback without capturing a strong
-    /// entity reference. This is the same lifetime behavior as `listener` in
-    /// the legacy API: a callback silently stops being callable once its
-    /// entity has been dropped.
-    pub fn listener<E: ?Sized>(
-        &self,
-        callback: impl Fn(&mut T, &E, &mut Window, &mut Context<T>) + 'static,
-    ) -> impl Fn(&E, &mut Window, &mut App) + 'static
-    where
-        T: 'static,
-    {
-        let entity = self.entity.downgrade();
-        move |event: &E, window: &mut Window, _app: &mut App| {
-            if let Some(entity) = entity.upgrade() {
-                entity.update_in(window, |value, window, context| {
-                    callback(value, event, window, context);
-                });
-            }
-        }
     }
 }

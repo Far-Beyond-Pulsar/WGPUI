@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use wgpui_core::geometry::{Bounds, Pixels, Point, Size, point, px, size};
+use wgpui_core::geometry::{Bounds, Pixels, Point, Size, point, size};
 
 #[derive(Clone, Debug, Default)]
 struct ScrollState {
@@ -11,6 +11,7 @@ struct ScrollState {
     viewport: Bounds<Pixels>,
     content_size: Size<Pixels>,
     pending: Option<Point<Pixels>>,
+    revision: u64,
 }
 
 /// A cloneable handle for reading and changing a scroll container's retained
@@ -25,6 +26,7 @@ impl ScrollHandle {
     pub fn max_offset(&self) -> Size<Pixels> { self.0.borrow().max_offset }
     pub fn bounds(&self) -> Bounds<Pixels> { self.0.borrow().viewport }
     pub fn content_size(&self) -> Size<Pixels> { self.0.borrow().content_size }
+    pub fn revision(&self) -> u64 { self.0.borrow().revision }
 
     pub fn set_offset(&self, offset: Point<Pixels>) -> bool {
         let mut state = self.0.borrow_mut();
@@ -35,6 +37,7 @@ impl ScrollHandle {
         if state.offset == clamped { return false; }
         state.offset = clamped;
         state.pending = None;
+        state.revision = state.revision.wrapping_add(1);
         true
     }
 
@@ -60,19 +63,34 @@ impl ScrollHandle {
         state.viewport = viewport;
         state.content_size = content_size;
         state.max_offset = max_offset;
-        state.offset.x = state.offset.x.clamp(-max_offset.width, Pixels::ZERO);
-        state.offset.y = state.offset.y.clamp(-max_offset.height, Pixels::ZERO);
+        let clamped_x = state.offset.x.clamp(-max_offset.width, Pixels::ZERO);
+        let clamped_y = state.offset.y.clamp(-max_offset.height, Pixels::ZERO);
+        if state.offset.x != clamped_x || state.offset.y != clamped_y {
+            state.offset.x = clamped_x;
+            state.offset.y = clamped_y;
+            state.revision = state.revision.wrapping_add(1);
+        }
+        if changed {
+            state.revision = state.revision.wrapping_add(1);
+        }
         changed
     }
 
     pub fn request_scroll_to(&self, offset: Point<Pixels>) { self.0.borrow_mut().pending = Some(offset); }
-    pub fn take_pending_scroll(&self) -> Option<Point<Pixels>> { self.0.borrow_mut().pending.take() }
+    pub fn take_pending_scroll(&self) -> Option<Point<Pixels>> {
+        let pending = self.0.borrow_mut().pending.take();
+        pending.map(|offset| {
+            self.set_offset(offset);
+            self.offset()
+        })
+    }
     pub fn logical_scroll_top(&self) -> (usize, Pixels) { (0, -self.offset().y) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wgpui_core::geometry::px;
     #[test]
     fn two_axis_offset_is_clamped_to_content_extent() {
         let handle = ScrollHandle::new();

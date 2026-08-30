@@ -53,15 +53,13 @@ impl HitTestIndex {
         id
     }
     pub fn insert_with_id(&mut self, id: HitboxId, bounds: Rect, z_index: i32) {
-        self.entries.retain(|entry| entry.id != id);
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.bounds = bounds;
+            entry.z_index = z_index;
+            return;
+        }
         self.next_order = self.next_order.wrapping_add(1);
-        self.entries.push(Hitbox {
-            id,
-            bounds,
-            z_index,
-            order: self.next_order,
-            hit_testable: true,
-        });
+        self.entries.push(Hitbox { id, bounds, z_index, order: self.next_order, hit_testable: true });
     }
     pub fn remove(&mut self, id: HitboxId) -> bool {
         let length = self.entries.len();
