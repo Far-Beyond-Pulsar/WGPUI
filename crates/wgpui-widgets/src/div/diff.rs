@@ -39,12 +39,25 @@ pub struct DivDiffKey {
     /// Taffy child list, and the reconciler needs `LAYOUT` raised for that even
     /// when every surviving child is individually clean.
     child_count: usize,
+    estimated_size: Option<[f32; 2]>,
 }
 
 impl DivDiffKey {
     /// The key for a `div` with `style` and `child_count` children.
     pub fn new(style: DivStyle, child_count: usize) -> DivDiffKey {
-        DivDiffKey { style, child_count }
+        Self::with_estimate(style, child_count, None)
+    }
+
+    pub fn with_estimate(
+        style: DivStyle,
+        child_count: usize,
+        estimated_size: Option<[f32; 2]>,
+    ) -> DivDiffKey {
+        DivDiffKey {
+            style,
+            child_count,
+            estimated_size,
+        }
     }
 }
 
@@ -55,6 +68,9 @@ impl ReconcileKey for DivDiffKey {
         };
         let mut axes = classify_style_change(&self.style, &previous.style);
         if self.child_count != previous.child_count {
+            axes |= Invalidation::LAYOUT;
+        }
+        if self.estimated_size != previous.estimated_size {
             axes |= Invalidation::LAYOUT;
         }
         axes
@@ -110,6 +126,14 @@ mod tests {
             Invalidation::LAYOUT,
             "a different child list is a different Taffy node list"
         );
+    }
+
+    #[test]
+    fn changing_an_estimated_size_is_a_layout_change() {
+        let previous = DivDiffKey::with_estimate(style(), 0, Some([40.0, 20.0]));
+        let current = DivDiffKey::with_estimate(style(), 0, Some([80.0, 20.0]));
+        assert_eq!(current.compare(&previous), Invalidation::LAYOUT);
+        assert_eq!(previous.compare(&previous), Invalidation::empty());
     }
 
     #[test]

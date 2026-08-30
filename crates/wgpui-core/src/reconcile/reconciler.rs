@@ -243,6 +243,7 @@ impl Reconciler {
             return self.visit_suppressed(instance_key, state, description, position, context);
         }
 
+        let clip_children = description.clips_children();
         let Description {
             type_id,
             diff_key,
@@ -309,6 +310,7 @@ impl Reconciler {
             declared_boundary,
             boundary_policy: boundary,
             scroll_offset,
+            clip_children,
             state,
             // Provisional: filled in below, once the children have been
             // visited and the reuse decision has settled. Recorded now so the
@@ -427,6 +429,7 @@ impl Reconciler {
             declared_boundary,
             boundary_policy: description.boundary,
             scroll_offset: description.scroll_offset,
+            clip_children: description.clips_children(),
             state,
             layout_node: LayoutNodeId::from_raw(0),
             depth: position.depth,

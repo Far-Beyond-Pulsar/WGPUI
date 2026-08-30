@@ -279,6 +279,7 @@ mod tests {
                 },
                 layer: LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT)),
                 boundary: BoundaryId::ROOT,
+                clip: None,
             },
             &mut emission,
         );

@@ -97,6 +97,7 @@ pub struct Description {
     pub(crate) emitter: Option<Box<dyn Emit>>,
     pub(crate) layout_style: LayoutStyle,
     pub(crate) children: Vec<Description>,
+    pub(crate) clip_children: bool,
 }
 
 impl std::fmt::Debug for Description {
@@ -111,6 +112,7 @@ impl std::fmt::Debug for Description {
             .field("scroll_offset", &self.scroll_offset)
             .field("has_emitter", &self.emitter.is_some())
             .field("children", &self.children.len())
+            .field("clip_children", &self.clip_children)
             .finish()
     }
 }
@@ -136,6 +138,7 @@ impl Description {
             emitter: None,
             layout_style: LayoutStyle::default(),
             children: Vec::new(),
+            clip_children: false,
         }
     }
 
@@ -234,6 +237,18 @@ impl Description {
     pub fn children(mut self, children: impl IntoIterator<Item = Description>) -> Self {
         self.children.extend(children);
         self
+    }
+
+    /// Clip this element's descendants to its resolved bounds. This is
+    /// retained metadata consumed by the emitter; it is not a paint callback
+    /// and therefore remains valid when the subtree is reused.
+    pub fn clip_children(mut self) -> Self {
+        self.clip_children = true;
+        self
+    }
+
+    pub fn clips_children(&self) -> bool {
+        self.clip_children
     }
 
     /// The explicit identity this element was given, if any.

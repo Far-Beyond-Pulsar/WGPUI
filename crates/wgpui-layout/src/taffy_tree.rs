@@ -25,8 +25,8 @@
 use std::collections::HashSet;
 use taffy::TaffyTree;
 pub use taffy::geometry::{Line, Size as TaffySize};
-pub use taffy::style_helpers::FromFr;
 pub use taffy::style::AvailableSpace;
+pub use taffy::style_helpers::FromFr;
 use taffy::tree::NodeId;
 
 /// The style a layout node is laid out with.

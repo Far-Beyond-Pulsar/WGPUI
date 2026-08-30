@@ -86,6 +86,8 @@ pub struct EmitContext {
     pub layer: LayerId,
     /// The compositing boundary owning that layer.
     pub boundary: BoundaryId,
+    /// The accumulated rectangular clip from ancestors, if any.
+    pub clip: Option<LayoutRect>,
 }
 
 /// What one element contributes to the scene this frame.
@@ -221,6 +223,27 @@ impl Emission {
         self.poly_sprites.clear();
         self.paths.clear();
         self.backdrop_filters.clear();
+    }
+
+    /// Retain primitive slots while applying an inherited rectangular clip.
+    /// Zeroing an outside quad rather than removing it keeps record ordinals
+    /// stable, so scrolling across a clip boundary remains a value update.
+    pub fn clip_quads_to(&mut self, clip: LayoutRect) {
+        for quad in &mut self.quads {
+            let left = quad.origin[0].max(clip.x);
+            let top = quad.origin[1].max(clip.y);
+            let right = (quad.origin[0] + quad.size[0]).min(clip.x + clip.width);
+            let bottom = (quad.origin[1] + quad.size[1]).min(clip.y + clip.height);
+            if right <= left || bottom <= top {
+                quad.origin = [left, top];
+                quad.size = [0.0, 0.0];
+                quad.background[3] = 0.0;
+                quad.border_color[3] = 0.0;
+            } else {
+                quad.origin = [left, top];
+                quad.size = [right - left, bottom - top];
+            }
+        }
     }
 }
 
@@ -388,6 +411,21 @@ struct WalkFrame {
     /// Displacement applied to this node's children's positions. Zero unless
     /// this node scrolls and could not hand that displacement to a layer.
     content_offset: [f32; 2],
+    clip: Option<LayoutRect>,
+}
+
+fn intersect_layout_rect(clip: Option<LayoutRect>, bounds: LayoutRect) -> LayoutRect {
+    let Some(clip) = clip else { return bounds };
+    let left = clip.x.max(bounds.x);
+    let top = clip.y.max(bounds.y);
+    let right = (clip.x + clip.width).min(bounds.x + bounds.width);
+    let bottom = (clip.y + clip.height).min(bounds.y + bounds.height);
+    LayoutRect {
+        x: left,
+        y: top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    }
 }
 
 /// One kind's pending operations, kept apart so removals can be emitted before
@@ -544,6 +582,7 @@ impl Emitter {
             boundary: BoundaryId::ROOT,
             origin: [0.0, 0.0],
             content_offset: [0.0, 0.0],
+            clip: None,
         };
 
         for (index, node) in plan.nodes().iter().enumerate() {
@@ -636,9 +675,13 @@ impl Emitter {
                                 bounds,
                                 layer,
                                 boundary: node.boundary,
+                                clip: parent.clip,
                             },
                             &mut emission,
                         );
+                        if let Some(clip) = parent.clip {
+                            emission.clip_quads_to(clip);
+                        }
                         Self::reconcile_records(
                             node.address,
                             layer,
@@ -726,6 +769,11 @@ impl Emitter {
                 boundary: child_boundary,
                 origin,
                 content_offset,
+                clip: if node.clip_children {
+                    Some(intersect_layout_rect(parent.clip, bounds))
+                } else {
+                    parent.clip
+                },
             });
         }
 
@@ -1693,6 +1741,7 @@ mod tests {
             declared_boundary: None,
             boundary_policy: None,
             scroll_offset: [0.0, 0.0],
+            clip_children: false,
             state: crate::reconcile::state::StateScope::from_path(&[]),
             layout_node: wgpui_layout::taffy_tree::LayoutNodeId::from_raw(0),
             depth: 0,

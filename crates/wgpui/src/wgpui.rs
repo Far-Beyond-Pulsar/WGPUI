@@ -29,7 +29,8 @@ pub use wgpui_core::{
     App, Context, Entity, EntityError, EntityId, Subscription, Task, TaskError, WeakEntity,
 };
 pub use wgpui_layout::{
-    AvailableSpace, Dimension, Display, FlexDirection, LayoutStyle, LayoutTree,
+    AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
+    LayoutTree, Measure,
 };
 pub use wgpui_text::patch::{RunPlacement, glyph_runs};
 pub use wgpui_text::shaping::{

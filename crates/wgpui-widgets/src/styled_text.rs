@@ -997,6 +997,7 @@ mod tests {
                 ),
             ),
             boundary: wgpui_core::scene::layer::BoundaryId::ROOT,
+            clip: None,
         }
     }
 

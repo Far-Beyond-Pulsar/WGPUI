@@ -46,7 +46,9 @@
 //! argument becomes an RGBA field; putting the conversion here would put a
 //! colour space in `wgpui-widgets` that nothing in `2.0` otherwise names.
 
-use crate::div::interactivity::style::{BoxShadow, Corners, CursorStyle, DivStyle, Edges};
+use crate::div::interactivity::style::{
+    BoxShadow, Corners, CursorStyle, DivStyle, Edges, LinearGradient, Pattern,
+};
 use wgpui_core::boundary::policy::Pixels;
 use wgpui_layout::taffy_tree::{
     AlignContent, AlignItems, Dimension, Display, FlexDirection, FlexWrap, LayoutStyle,
@@ -194,8 +196,8 @@ pub trait Styled: Sized {
     }
 
     fn grid_cols(mut self, columns: u16) -> Self {
-        use wgpui_layout::taffy_tree::{GridTemplateComponent, TrackSizingFunction};
         use wgpui_layout::taffy_tree::FromFr;
+        use wgpui_layout::taffy_tree::{GridTemplateComponent, TrackSizingFunction};
         self.layout_style().display = Display::Grid;
         self.layout_style().grid_template_columns = (0..columns)
             .map(|_| GridTemplateComponent::Single(TrackSizingFunction::from_fr(1.0)))
@@ -204,8 +206,8 @@ pub trait Styled: Sized {
     }
 
     fn grid_rows(mut self, rows: u16) -> Self {
-        use wgpui_layout::taffy_tree::{GridTemplateComponent, TrackSizingFunction};
         use wgpui_layout::taffy_tree::FromFr;
+        use wgpui_layout::taffy_tree::{GridTemplateComponent, TrackSizingFunction};
         self.layout_style().display = Display::Grid;
         self.layout_style().grid_template_rows = (0..rows)
             .map(|_| GridTemplateComponent::Single(TrackSizingFunction::from_fr(1.0)))
@@ -287,6 +289,31 @@ pub trait Styled: Sized {
     /// `justify-content: space-between`.
     fn justify_between(mut self) -> Self {
         self.layout_style().justify_content = Some(AlignContent::SpaceBetween);
+        self
+    }
+
+    fn justify_around(mut self) -> Self {
+        self.layout_style().justify_content = Some(AlignContent::SpaceAround);
+        self
+    }
+
+    fn justify_evenly(mut self) -> Self {
+        self.layout_style().justify_content = Some(AlignContent::SpaceEvenly);
+        self
+    }
+
+    fn content_center(mut self) -> Self {
+        self.layout_style().align_content = Some(AlignContent::Center);
+        self
+    }
+
+    fn self_center(mut self) -> Self {
+        self.layout_style().align_self = Some(AlignItems::Center);
+        self
+    }
+
+    fn basis(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().flex_basis = Dimension::length(pixels.into_style_pixels());
         self
     }
 
@@ -374,6 +401,27 @@ pub trait Styled: Sized {
         let padding = &mut self.layout_style().padding;
         padding.top = LengthPercentage::length(pixels);
         padding.bottom = LengthPercentage::length(pixels);
+        self
+    }
+
+    fn m_t(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().margin.top = LengthPercentageAuto::length(pixels.into_style_pixels());
+        self
+    }
+
+    fn m_r(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().margin.right = LengthPercentageAuto::length(pixels.into_style_pixels());
+        self
+    }
+
+    fn m_b(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().margin.bottom =
+            LengthPercentageAuto::length(pixels.into_style_pixels());
+        self
+    }
+
+    fn m_l(mut self, pixels: impl IntoStylePixels) -> Self {
+        self.layout_style().margin.left = LengthPercentageAuto::length(pixels.into_style_pixels());
         self
     }
 
@@ -484,8 +532,36 @@ pub trait Styled: Sized {
 
     /// Set the element background alpha without changing its layout.
     fn opacity(mut self, opacity: f32) -> Self {
-        let color = self.style().background.unwrap_or([1.0, 1.0, 1.0, 1.0]);
-        self.style().background = Some([color[0], color[1], color[2], color[3] * opacity]);
+        self.style().opacity = if opacity.is_finite() {
+            opacity.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self
+    }
+
+    fn bg_gradient(mut self, stops: impl IntoIterator<Item = LinearColorStop>, angle: f32) -> Self {
+        self.style().background_gradient = Some(LinearGradient {
+            stops: stops.into_iter().collect(),
+            angle,
+        });
+        self.style().background = None;
+        self.style().background_pattern = None;
+        self
+    }
+
+    fn bg_gradient_horizontal(self, from: LinearColorStop, to: LinearColorStop) -> Self {
+        self.bg_gradient([from, to], 0.0)
+    }
+
+    fn bg_gradient_vertical(self, from: LinearColorStop, to: LinearColorStop) -> Self {
+        self.bg_gradient([from, to], 90.0)
+    }
+
+    fn bg_pattern(mut self, pattern: Pattern) -> Self {
+        self.style().background_pattern = Some(pattern);
+        self.style().background = None;
+        self.style().background_gradient = None;
         self
     }
 
@@ -566,12 +642,24 @@ pub trait Styled: Sized {
         self
     }
 
-    fn border_t_1(self) -> Self { self.border_t(1.0) }
-    fn border_r_1(self) -> Self { self.border_r(1.0) }
-    fn border_b_1(self) -> Self { self.border_b(1.0) }
-    fn border_l_1(self) -> Self { self.border_l(1.0) }
-    fn border_y_1(self) -> Self { self.border_t_1().border_b_1() }
-    fn border_l_3(self) -> Self { self.border_l(3.0) }
+    fn border_t_1(self) -> Self {
+        self.border_t(1.0)
+    }
+    fn border_r_1(self) -> Self {
+        self.border_r(1.0)
+    }
+    fn border_b_1(self) -> Self {
+        self.border_b(1.0)
+    }
+    fn border_l_1(self) -> Self {
+        self.border_l(1.0)
+    }
+    fn border_y_1(self) -> Self {
+        self.border_t_1().border_b_1()
+    }
+    fn border_l_3(self) -> Self {
+        self.border_l(3.0)
+    }
 
     /// A uniform corner radius, in pixels.
     fn rounded(mut self, pixels: impl IntoStylePixels) -> Self {
@@ -747,13 +835,15 @@ pub trait Styled: Sized {
     }
 
     fn text_gradient_horizontal(mut self, from: LinearColorStop, to: LinearColorStop) -> Self {
-        self.style().text_gradient = Some(vec![(from.color, from.position), (to.color, to.position)]);
+        self.style().text_gradient =
+            Some(vec![(from.color, from.position), (to.color, to.position)]);
         self.style().text_gradient_angle = Some(90.0);
         self
     }
 
     fn text_gradient_vertical(mut self, from: LinearColorStop, to: LinearColorStop) -> Self {
-        self.style().text_gradient = Some(vec![(from.color, from.position), (to.color, to.position)]);
+        self.style().text_gradient =
+            Some(vec![(from.color, from.position), (to.color, to.position)]);
         self.style().text_gradient_angle = Some(180.0);
         self
     }
@@ -763,56 +853,151 @@ pub trait Styled: Sized {
         self
     }
 
-    fn text_xs(self) -> Self { self.text_size(12.0) }
-    fn text_sm(self) -> Self { self.text_size(14.0) }
-    fn text_base(self) -> Self { self.text_size(16.0) }
-    fn text_lg(self) -> Self { self.text_size(18.0) }
-    fn text_xl(self) -> Self { self.text_size(20.0) }
-    fn text_2xl(self) -> Self { self.text_size(24.0) }
-    fn text_center(mut self) -> Self { self.style().text_alignment = 1; self }
-    fn text_right(mut self) -> Self { self.style().text_alignment = 2; self }
-    fn font_weight(mut self, weight: FontWeight) -> Self { self.style().text_weight = Some(weight); self }
-    fn italic(mut self) -> Self { self.style().text_italic = true; self }
+    fn text_xs(self) -> Self {
+        self.text_size(12.0)
+    }
+    fn text_sm(self) -> Self {
+        self.text_size(14.0)
+    }
+    fn text_base(self) -> Self {
+        self.text_size(16.0)
+    }
+    fn text_lg(self) -> Self {
+        self.text_size(18.0)
+    }
+    fn text_xl(self) -> Self {
+        self.text_size(20.0)
+    }
+    fn text_2xl(self) -> Self {
+        self.text_size(24.0)
+    }
+    fn text_center(mut self) -> Self {
+        self.style().text_alignment = 1;
+        self
+    }
+    fn text_right(mut self) -> Self {
+        self.style().text_alignment = 2;
+        self
+    }
+    fn font_weight(mut self, weight: FontWeight) -> Self {
+        self.style().text_weight = Some(weight);
+        self
+    }
+    fn italic(mut self) -> Self {
+        self.style().text_italic = true;
+        self
+    }
     fn line_height(mut self, height: impl IntoStylePixels) -> Self {
         self.style().text_line_height = Some(height.into_style_pixels());
         self
     }
-    fn line_through(mut self) -> Self { self.style().text_line_through = true; self }
+    fn line_through(mut self) -> Self {
+        self.style().text_line_through = true;
+        self
+    }
 
-    fn p_0p5(self) -> Self { self.p(2.0) }
-    fn p_1(self) -> Self { self.p(4.0) }
-    fn p_2(self) -> Self { self.p(8.0) }
-    fn p_3(self) -> Self { self.p(12.0) }
-    fn p_4(self) -> Self { self.p(16.0) }
-    fn p_6(self) -> Self { self.p(24.0) }
-    fn px_2(self) -> Self { self.px(8.0) }
-    fn px_3(self) -> Self { self.px(12.0) }
-    fn px_4(self) -> Self { self.px(16.0) }
-    fn py_1(self) -> Self { self.py(4.0) }
-    fn py_2(self) -> Self { self.py(8.0) }
-    fn gap_1(self) -> Self { self.gap(4.0) }
-    fn gap_2(self) -> Self { self.gap(8.0) }
-    fn gap_3(self) -> Self { self.gap(12.0) }
-    fn gap_4(self) -> Self { self.gap(16.0) }
-    fn gap_6(self) -> Self { self.gap(24.0) }
-    fn w_16(self) -> Self { self.w(64.0) }
-    fn size_16(self) -> Self { self.size(64.0) }
-    fn size_8(self) -> Self { self.size(32.0) }
-    fn size_10(self) -> Self { self.size(40.0) }
-    fn h_6(self) -> Self { self.h(24.0) }
-    fn h_8(self) -> Self { self.h(32.0) }
-    fn h_20(self) -> Self { self.h(80.0) }
-    fn h_24(self) -> Self { self.h(96.0) }
-    fn h_32(self) -> Self { self.h(128.0) }
-    fn top_0(self) -> Self { self.top(0.0) }
-    fn top_2(self) -> Self { self.top(8.0) }
-    fn top_4(self) -> Self { self.top(16.0) }
-    fn top_6(self) -> Self { self.top(24.0) }
-    fn left_2(self) -> Self { self.left(8.0) }
-    fn left_4(self) -> Self { self.left(16.0) }
-    fn left_6(self) -> Self { self.left(24.0) }
-    fn right_0(self) -> Self { self.right(0.0) }
-    fn bottom_0(self) -> Self { self.bottom(0.0) }
+    fn p_0p5(self) -> Self {
+        self.p(2.0)
+    }
+    fn p_1(self) -> Self {
+        self.p(4.0)
+    }
+    fn p_2(self) -> Self {
+        self.p(8.0)
+    }
+    fn p_3(self) -> Self {
+        self.p(12.0)
+    }
+    fn p_4(self) -> Self {
+        self.p(16.0)
+    }
+    fn p_6(self) -> Self {
+        self.p(24.0)
+    }
+    fn px_2(self) -> Self {
+        self.px(8.0)
+    }
+    fn px_3(self) -> Self {
+        self.px(12.0)
+    }
+    fn px_4(self) -> Self {
+        self.px(16.0)
+    }
+    fn py_1(self) -> Self {
+        self.py(4.0)
+    }
+    fn py_2(self) -> Self {
+        self.py(8.0)
+    }
+    fn gap_1(self) -> Self {
+        self.gap(4.0)
+    }
+    fn gap_2(self) -> Self {
+        self.gap(8.0)
+    }
+    fn gap_3(self) -> Self {
+        self.gap(12.0)
+    }
+    fn gap_4(self) -> Self {
+        self.gap(16.0)
+    }
+    fn gap_6(self) -> Self {
+        self.gap(24.0)
+    }
+    fn w_16(self) -> Self {
+        self.w(64.0)
+    }
+    fn size_16(self) -> Self {
+        self.size(64.0)
+    }
+    fn size_8(self) -> Self {
+        self.size(32.0)
+    }
+    fn size_10(self) -> Self {
+        self.size(40.0)
+    }
+    fn h_6(self) -> Self {
+        self.h(24.0)
+    }
+    fn h_8(self) -> Self {
+        self.h(32.0)
+    }
+    fn h_20(self) -> Self {
+        self.h(80.0)
+    }
+    fn h_24(self) -> Self {
+        self.h(96.0)
+    }
+    fn h_32(self) -> Self {
+        self.h(128.0)
+    }
+    fn top_0(self) -> Self {
+        self.top(0.0)
+    }
+    fn top_2(self) -> Self {
+        self.top(8.0)
+    }
+    fn top_4(self) -> Self {
+        self.top(16.0)
+    }
+    fn top_6(self) -> Self {
+        self.top(24.0)
+    }
+    fn left_2(self) -> Self {
+        self.left(8.0)
+    }
+    fn left_4(self) -> Self {
+        self.left(16.0)
+    }
+    fn left_6(self) -> Self {
+        self.left(24.0)
+    }
+    fn right_0(self) -> Self {
+        self.right(0.0)
+    }
+    fn bottom_0(self) -> Self {
+        self.bottom(0.0)
+    }
     fn mt_2(mut self) -> Self {
         self.layout_style().margin.top = LengthPercentageAuto::length(8.0);
         self
@@ -822,31 +1007,73 @@ pub trait Styled: Sized {
         self
     }
 
-    fn p_5(self) -> Self { self.p(20.0) }
-    fn p_8(self) -> Self { self.p(32.0) }
-    fn p_12(self) -> Self { self.p(48.0) }
-    fn px_1(self) -> Self { self.px(4.0) }
-    fn py_0p5(self) -> Self { self.py(2.0) }
-    fn py_1p5(self) -> Self { self.py(6.0) }
-    fn py_3(self) -> Self { self.py(12.0) }
-    fn py_12(self) -> Self { self.py(48.0) }
-    fn gap_0p5(self) -> Self { self.gap(2.0) }
-    fn gap_5(self) -> Self { self.gap(20.0) }
-    fn gap_8(self) -> Self { self.gap(32.0) }
+    fn p_5(self) -> Self {
+        self.p(20.0)
+    }
+    fn p_8(self) -> Self {
+        self.p(32.0)
+    }
+    fn p_12(self) -> Self {
+        self.p(48.0)
+    }
+    fn px_1(self) -> Self {
+        self.px(4.0)
+    }
+    fn py_0p5(self) -> Self {
+        self.py(2.0)
+    }
+    fn py_1p5(self) -> Self {
+        self.py(6.0)
+    }
+    fn py_3(self) -> Self {
+        self.py(12.0)
+    }
+    fn py_12(self) -> Self {
+        self.py(48.0)
+    }
+    fn gap_0p5(self) -> Self {
+        self.gap(2.0)
+    }
+    fn gap_5(self) -> Self {
+        self.gap(20.0)
+    }
+    fn gap_8(self) -> Self {
+        self.gap(32.0)
+    }
     fn mt_1(mut self) -> Self {
         self.layout_style().margin.top = LengthPercentageAuto::length(4.0);
         self
     }
-    fn h_2(self) -> Self { self.h(8.0) }
-    fn h_10(self) -> Self { self.h(40.0) }
-    fn h_12(self) -> Self { self.h(48.0) }
-    fn h_16(self) -> Self { self.h(64.0) }
-    fn h_48(self) -> Self { self.h(192.0) }
-    fn bottom_4(self) -> Self { self.bottom(16.0) }
-    fn bottom_8(self) -> Self { self.bottom(32.0) }
-    fn left_0(self) -> Self { self.left(0.0) }
-    fn left_8(self) -> Self { self.left(32.0) }
-    fn inset_0(self) -> Self { self.top(0.0).right(0.0).bottom(0.0).left(0.0) }
+    fn h_2(self) -> Self {
+        self.h(8.0)
+    }
+    fn h_10(self) -> Self {
+        self.h(40.0)
+    }
+    fn h_12(self) -> Self {
+        self.h(48.0)
+    }
+    fn h_16(self) -> Self {
+        self.h(64.0)
+    }
+    fn h_48(self) -> Self {
+        self.h(192.0)
+    }
+    fn bottom_4(self) -> Self {
+        self.bottom(16.0)
+    }
+    fn bottom_8(self) -> Self {
+        self.bottom(32.0)
+    }
+    fn left_0(self) -> Self {
+        self.left(0.0)
+    }
+    fn left_8(self) -> Self {
+        self.left(32.0)
+    }
+    fn inset_0(self) -> Self {
+        self.top(0.0).right(0.0).bottom(0.0).left(0.0)
+    }
 
     // ---- conditionals -----------------------------------------------------
 

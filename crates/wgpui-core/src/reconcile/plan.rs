@@ -97,6 +97,7 @@ pub struct PlannedNode {
     /// The displacement this element applies to its children (§4.1's scroll
     /// signal, as a value rather than as an event).
     pub scroll_offset: [f32; 2],
+    pub clip_children: bool,
     /// The element's state scope, which exists regardless of reconciliation
     /// (§4.2: state retention and reconciliation-suppression are decoupled).
     pub state: StateScope,
@@ -332,6 +333,7 @@ mod tests {
             declared_boundary: None,
             boundary_policy: None,
             scroll_offset: [0.0, 0.0],
+            clip_children: false,
             state: StateScope::from_path(&[ElementId::Slot(raw as u32)]),
             layout_node: LayoutNodeId::from_raw(raw),
             depth,

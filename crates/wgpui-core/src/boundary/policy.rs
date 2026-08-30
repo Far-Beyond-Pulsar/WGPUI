@@ -43,11 +43,17 @@ impl Pixels {
         self.0
     }
 
-    pub const fn to_f64(self) -> f64 { self.0 as f64 }
+    pub const fn to_f64(self) -> f64 {
+        self.0 as f64
+    }
 
-    pub fn max(self, other: Self) -> Self { Self(self.0.max(other.0)) }
+    pub fn max(self, other: Self) -> Self {
+        Self(self.0.max(other.0))
+    }
 
-    pub fn half(self) -> Self { Self(self.0 / 2.0) }
+    pub fn half(self) -> Self {
+        Self(self.0 / 2.0)
+    }
 }
 
 impl Add for Pixels {
@@ -67,13 +73,17 @@ impl Sub for Pixels {
 }
 
 impl AddAssign for Pixels {
-    fn add_assign(&mut self, other: Self) { self.0 += other.0; }
+    fn add_assign(&mut self, other: Self) {
+        self.0 += other.0;
+    }
 }
 
 impl Neg for Pixels {
     type Output = Self;
 
-    fn neg(self) -> Self { Self(-self.0) }
+    fn neg(self) -> Self {
+        Self(-self.0)
+    }
 }
 
 impl From<Pixels> for f32 {

@@ -100,6 +100,7 @@ pub struct Div {
     boundary: bool,
     uncached: bool,
     scroll_offset: [f32; 2],
+    estimated_size: Option<[f32; 2]>,
 }
 
 /// A new, unstyled, childless `div`.
@@ -114,6 +115,7 @@ pub fn div() -> Div {
         boundary: false,
         uncached: false,
         scroll_offset: [0.0, 0.0],
+        estimated_size: None,
     }
 }
 
@@ -173,6 +175,19 @@ impl Div {
         self
     }
 
+    /// Supply a cheap intrinsic estimate for unresolved dimensions. The
+    /// estimate is used only for dimensions that remain `auto`; explicit
+    /// author sizing always wins. Keeping it on the description makes the
+    /// fallback deterministic and avoids invoking a content measurer twice.
+    pub fn estimated_size(mut self, size: [f32; 2]) -> Self {
+        self.estimated_size = Some([size[0].max(0.0), size[1].max(0.0)]);
+        self
+    }
+
+    pub fn intrinsic_size(&self) -> Option<[f32; 2]> {
+        self.estimated_size
+    }
+
     /// This `div`'s resolved style, for tests and for an inspector.
     pub fn div_style(&self) -> &DivStyle {
         &self.style
@@ -185,7 +200,11 @@ impl Div {
 
     /// This frame's fingerprint.
     pub fn diff_key(&self) -> DivDiffKey {
-        DivDiffKey::new(self.style.clone(), self.children.len())
+        DivDiffKey::with_estimate(
+            self.style.clone(),
+            self.children.len(),
+            self.estimated_size,
+        )
     }
 
     /// The per-frame description of this `div` and its subtree.
@@ -197,17 +216,39 @@ impl Div {
             boundary,
             uncached,
             scroll_offset,
+            estimated_size,
         } = self;
 
-        let key = DivDiffKey::new(style.clone(), children.len());
-        let layout_style = style.layout.clone();
+        let key = DivDiffKey::with_estimate(style.clone(), children.len(), estimated_size);
+        let mut layout_style = style.layout.clone();
+        if let Some([width, height]) = estimated_size {
+            if layout_style.size.width == wgpui_layout::taffy_tree::Dimension::auto() {
+                layout_style.size.width = wgpui_layout::taffy_tree::Dimension::length(width);
+            }
+            if layout_style.size.height == wgpui_layout::taffy_tree::Dimension::auto() {
+                layout_style.size.height = wgpui_layout::taffy_tree::Dimension::length(height);
+            }
+        }
         let paint = style;
+        let clips_children = matches!(
+            layout_style.overflow.x,
+            wgpui_layout::taffy_tree::Overflow::Hidden
+                | wgpui_layout::taffy_tree::Overflow::Scroll
+        ) || matches!(
+            layout_style.overflow.y,
+            wgpui_layout::taffy_tree::Overflow::Hidden
+                | wgpui_layout::taffy_tree::Overflow::Scroll
+        );
 
         let mut description = Description::new::<Div>()
             .diff_key(key)
             .style(layout_style)
             .scroll_offset(scroll_offset)
             .children(children);
+
+        if clips_children {
+            description = description.clip_children();
+        }
 
         if let Some(element_id) = element_id {
             description = description.id(element_id);
