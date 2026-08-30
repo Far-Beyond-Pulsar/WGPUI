@@ -21,8 +21,7 @@ fn main() -> Result<(), ApplicationError> {
 
         div()
             .id("application")
-            .w(800.0)
-            .h(600.0)
+            .size_full()
             .p_6()
             .flex()
             .flex_col()

@@ -376,6 +376,7 @@ impl Div {
         let mut description = Description::new::<Div>()
             .diff_key(key)
             .style(layout_style)
+            .text_metrics(paint.text_size, paint.text_color)
             .scroll_offset(scroll_offset)
             .children(children);
 

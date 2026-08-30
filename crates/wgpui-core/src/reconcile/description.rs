@@ -159,6 +159,8 @@ pub struct Description {
     pub(crate) children: Vec<Description>,
     pub(crate) clip_children: bool,
     pub(crate) raw_text: Option<RawText>,
+    pub(crate) text_size: Option<f32>,
+    pub(crate) text_color: Option<[f32; 4]>,
 }
 
 impl std::fmt::Debug for Description {
@@ -201,6 +203,8 @@ impl Description {
             children: Vec::new(),
             clip_children: false,
             raw_text: None,
+            text_size: None,
+            text_color: None,
         }
     }
 
@@ -315,6 +319,18 @@ impl Description {
     /// shaped and its glyphs have been assigned atlas tiles.
     pub fn set_text_emitter(&mut self, emitter: impl Emit) {
         self.emitter = Some(Box::new(emitter));
+    }
+
+    /// Carry the resolved inherited text metrics to a renderer-owned text
+    /// materializer without coupling the core description to a font system.
+    pub fn text_metrics(mut self, size: Option<f32>, color: Option<[f32; 4]>) -> Self {
+        self.text_size = size;
+        self.text_color = color;
+        self
+    }
+
+    pub fn text_metrics_value(&self) -> (Option<f32>, Option<[f32; 4]>) {
+        (self.text_size, self.text_color)
     }
 
     /// Set the style this element's layout node is laid out with.

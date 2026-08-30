@@ -204,7 +204,7 @@ pub struct FrameLoop {
     text_rasterizer: GlyphRasterizer,
     text_atlas: GlyphAtlas,
     atlas_textures: AtlasTextures,
-    prepared_text: HashMap<Arc<str>, PreparedText>,
+    prepared_text: HashMap<TextCacheKey, PreparedText>,
     frames: u64,
     last_viewport: Option<[f32; 2]>,
     viewport_recomputes: u64,
@@ -216,6 +216,12 @@ struct PreparedText {
     height: f32,
     baseline: f32,
     runs: Arc<Vec<CoreGlyphRun>>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TextCacheKey {
+    value: Arc<str>,
+    font_size_bits: u32,
 }
 
 impl FrameLoop {
@@ -430,13 +436,41 @@ impl FrameLoop {
     }
 
     fn materialize_raw_text(&mut self, description: &mut Description) -> Result<(), LoopError> {
+        self.materialize_raw_text_with_metrics(description, None, None)
+    }
+
+    fn materialize_raw_text_with_metrics(
+        &mut self,
+        description: &mut Description,
+        inherited_size: Option<f32>,
+        inherited_color: Option<[f32; 4]>,
+    ) -> Result<(), LoopError> {
         if let Some(raw) = description.take_raw_text() {
             let value = raw.shared_value();
-            let prepared = match self.prepared_text.get(&value).cloned() {
-                Some(prepared) => prepared,
-                None => self.prepare_text(raw)?,
+            let (local_size, local_color) = description.text_metrics_value();
+            let font_size = local_size.or(inherited_size);
+            let color = local_color.or(inherited_color);
+            let font_size = font_size.filter(|size| size.is_finite() && *size > 0.0).unwrap_or(14.0);
+            let key = TextCacheKey {
+                value: Arc::clone(&value),
+                font_size_bits: font_size.to_bits(),
             };
-            let runs = Arc::clone(&prepared.runs);
+            let prepared = match self.prepared_text.get(&key).cloned() {
+                Some(prepared) => prepared,
+                None => self.prepare_text(raw, font_size)?,
+            };
+            let text_color = color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            let runs = Arc::new(
+                prepared
+                    .runs
+                    .iter()
+                    .map(|run| {
+                        let mut run = run.clone();
+                        run.color = text_color;
+                        run
+                    })
+                    .collect::<Vec<_>>(),
+            );
             let baseline = prepared.baseline;
             description.set_intrinsic_size(prepared.width, prepared.height);
             description.set_text_emitter(move |context: &EmitContext, emission: &mut Emission| {
@@ -450,13 +484,16 @@ impl FrameLoop {
                 }
             });
         }
+        let (local_size, local_color) = description.text_metrics_value();
+        let effective_size = local_size.or(inherited_size);
+        let effective_color = local_color.or(inherited_color);
         for child in description.child_descriptions_mut() {
-            self.materialize_raw_text(child)?;
+            self.materialize_raw_text_with_metrics(child, effective_size, effective_color)?;
         }
         Ok(())
     }
 
-    fn prepare_text(&mut self, raw: RawText) -> Result<PreparedText, LoopError> {
+    fn prepare_text(&mut self, raw: RawText, font_size: f32) -> Result<PreparedText, LoopError> {
         let value = raw.shared_value();
         let shared = SharedString::from(value.as_ref());
         let font = wgpui_text::shaping::font("sans-serif");
@@ -467,7 +504,7 @@ impl FrameLoop {
         let font_runs = vec![FontRun::new(shared.len(), font_id)];
         let line = self
             .text_shaper
-            .shape_line(&shared, 14.0, &font_runs)
+            .shape_line(&shared, font_size, &font_runs)
             .map_err(|error| LoopError::Text(error.to_string()))?;
         let placement = RunPlacement {
             color: [1.0, 1.0, 1.0, 1.0],
@@ -486,7 +523,13 @@ impl FrameLoop {
             baseline: (height - line.ascent - line.descent) * 0.5 + line.ascent,
             runs: Arc::new(converted),
         };
-        self.prepared_text.insert(value, prepared.clone());
+        self.prepared_text.insert(
+            TextCacheKey {
+                value,
+                font_size_bits: font_size.to_bits(),
+            },
+            prepared.clone(),
+        );
         Ok(prepared)
     }
 }
