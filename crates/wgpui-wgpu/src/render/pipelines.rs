@@ -1248,13 +1248,13 @@ mod tests {
 
     #[test]
     fn the_shaders_agree_with_the_protocol_about_a_quad_slot() {
-        // `quads.wgsl`'s `QuadSlot` is five `vec4<f32>` since Phase 6.6 grew
+        // `quads.wgsl`'s `QuadSlot` is nine `vec4<f32>` since the material path
         // `Quad` to per-corner radii and per-side border widths. If
         // `Quad::SLOT_STRIDE` ever changes without the shader changing with it,
         // every instance past the first reads the wrong bytes and renders
         // plausible garbage — so the agreement is asserted rather than left to
         // a comment.
-        assert_eq!(QuadPipeline::arena_slot_stride(), 5 * 16);
+        assert_eq!(QuadPipeline::arena_slot_stride(), 9 * 16);
         let shader = super::super::shaders::QUADS_WGSL;
         assert!(shader.contains("struct QuadSlot"));
         for field in [
@@ -1263,6 +1263,10 @@ mod tests {
             "border_color",
             "corner_radii",
             "border_widths",
+            "material_kind",
+            "material_first",
+            "material_second",
+            "material_parameters",
         ] {
             assert!(shader.contains(field), "the shader dropped `{field}`");
         }

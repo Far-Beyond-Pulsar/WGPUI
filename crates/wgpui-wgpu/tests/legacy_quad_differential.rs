@@ -205,6 +205,7 @@ fn case(
             border_color: border_color.1,
             corner_radii,
             border_widths,
+            material: wgpui_core::patch::primitive::Material::Solid,
         },
         background_hsla: background.0,
         border_hsla: border_color.0,
@@ -946,6 +947,7 @@ fn legacy_style_paint(
                 border_color: faded_rgba,
                 corner_radii: radii,
                 border_widths: [0.0; 4],
+                material: wgpui_core::patch::primitive::Material::Solid,
             },
             background_hsla: hsla,
             border_hsla: faded_hsla,
@@ -990,6 +992,7 @@ fn legacy_style_paint(
         border_color: border_rgba,
         corner_radii: radii,
         border_widths,
+        material: wgpui_core::patch::primitive::Material::Solid,
     };
     // The legacy order is top, right, bottom, left.
     for (name, content_mask) in [

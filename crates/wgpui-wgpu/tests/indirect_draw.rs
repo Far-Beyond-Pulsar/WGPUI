@@ -721,5 +721,6 @@ fn chrome_quad(spec: &UiSceneSpec) -> Quad {
         border_color: [0.0, 0.0, 0.0, 0.0],
         corner_radii: [0.0; 4],
         border_widths: [0.0; 4],
+        material: wgpui_core::patch::primitive::Material::Solid,
     }
 }

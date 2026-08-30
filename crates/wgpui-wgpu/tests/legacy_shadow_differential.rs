@@ -836,6 +836,7 @@ fn a_shadow_covered_by_an_opaque_quad_still_paints_its_falloff_outside_it() {
         border_color: [0.0, 0.0, 0.0, 1.0],
         corner_radii: [0.0; 4],
         border_widths: [0.0; 4],
+        material: wgpui_core::patch::primitive::Material::Solid,
     };
 
     let render = |with_shadow: bool| -> Vec<u8> {

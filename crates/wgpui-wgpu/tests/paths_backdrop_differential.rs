@@ -397,6 +397,7 @@ fn scene_with_filter(include_filter: bool, filter: BackdropFilter) -> Scene {
             border_color: [0.0; 4],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: wgpui_core::patch::primitive::Material::Solid,
         },
     );
     if include_filter {

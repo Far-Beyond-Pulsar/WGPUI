@@ -39,7 +39,7 @@ use crate::geometry::Rect;
 use crate::invalidation::axes::Invalidation;
 use crate::occlusion::{CoverageItem, PoisonRegion, quad_coverage_item};
 use crate::patch::apply::{ScenePatch, UploadPlan, apply};
-use crate::patch::primitive::Quad;
+use crate::patch::primitive::{Material, Quad};
 use crate::patch::{PatchError, RecordKey};
 use crate::scene::layer::{Layer, LayerTransform};
 use crate::scene::{BoundaryId, LayerId, LayerKey, Scene, TileCoord};
@@ -205,6 +205,7 @@ fn plain(bounds: Rect, background: [f32; 4]) -> Quad {
         border_color: [0.0, 0.0, 0.0, 0.0],
         corner_radii: [0.0; 4],
         border_widths: [0.0; 4],
+        material: Material::Solid,
     }
 }
 
@@ -273,6 +274,7 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
             border_color: [0.0, 0.0, 0.0, 0.0],
             corner_radii: [(4.0 * scale).max(0.0); 4],
             border_widths: [0.0; 4],
+            material: Material::Solid,
         });
         // A label bar standing in for shaped text: translucent, never occludes.
         let label_left = 26.0 * scale;
@@ -333,6 +335,7 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
             border_color: translucent(0.55, 0.58, 0.66, 0.5),
             corner_radii: [6.0 * scale; 4],
             border_widths: [1.0 * scale; 4],
+            material: Material::Solid,
         });
         quads.push(plain(
             rect(
@@ -355,6 +358,7 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
                 border_color: [0.0, 0.0, 0.0, 0.0],
                 corner_radii: [port * 0.5; 4],
                 border_widths: [0.0; 4],
+                material: Material::Solid,
             });
         }
     }
@@ -412,6 +416,7 @@ pub fn build_frame(label: &str, spec: &UiSceneSpec) -> UiFrame {
             border_color: [0.0, 0.0, 0.0, 0.0],
             corner_radii: [8.0; 4],
             border_widths: [0.0; 4],
+            material: Material::Solid,
         });
         quads.push(plain(
             rect(dialog.min_x, dialog.min_y + 40.0, dialog.width(), 1.0),
@@ -893,6 +898,7 @@ impl NodeGraph {
                         border_color: translucent(0.55, 0.58, 0.66, 0.5),
                         corner_radii: [6.0; 4],
                         border_widths: [1.0; 4],
+                        material: Material::Solid,
                     },
                 );
                 let header = rect(x + 6.0, y + 6.0, GRAPH_NODE_WIDTH - 12.0, 16.0);
@@ -908,6 +914,7 @@ impl NodeGraph {
                             border_color: [0.0, 0.0, 0.0, 0.0],
                             corner_radii: [4.0; 4],
                             border_widths: [0.0; 4],
+                            material: Material::Solid,
                         },
                     );
                 }

@@ -288,8 +288,7 @@ impl<'a> SlotWriter<'a> {
 /// fake one rounded side — is not what the legacy renderer draws, so it could
 /// never be byte-exact against it.
 ///
-/// What is still deliberately absent, and named rather than implied: a gradient
-/// or pattern background (2.0's `background` is one solid straight-alpha RGBA),
+/// What is still deliberately absent, and named rather than implied:
 /// a border style (the legacy dashed-border branch), a content mask (§5.2 sends
 /// the clip to the occlusion pass instead), and an element-opacity field
 /// (folded into the colours by whoever builds the quad, exactly as
@@ -314,6 +313,9 @@ pub struct Quad {
     pub corner_radii: [f32; 4],
     /// Border widths, in the legacy `Edges` order: top, right, bottom, left.
     pub border_widths: [f32; 4],
+    /// Procedural background material. `Solid` preserves the original
+    /// `background` field; the other variants are evaluated per fragment.
+    pub material: Material,
 }
 
 impl Quad {
@@ -344,6 +346,7 @@ impl Quad {
         border_color: [0.0, 0.0, 0.0, 0.0],
         corner_radii: [0.0; 4],
         border_widths: [0.0; 4],
+        material: Material::Solid,
     };
 
     /// The largest of the four corner radii.
@@ -364,11 +367,11 @@ impl Quad {
 impl Primitive for Quad {
     const KIND: PrimitiveKind = PrimitiveKind::Quad;
 
-    // 80 bytes of payload, which is already a multiple of 16 and so needs no
+    // 144 bytes of payload, which is already a multiple of 16 and so needs no
     // tail padding — the reason Phase 1's 56-byte payload was padded to 64.
     // Phase 6.6 grew it from 64 by replacing two scalars with two `vec4<f32>`s;
     // the shader reads the same five 16-byte rows it always did, plus one more.
-    const SLOT_STRIDE: usize = 80;
+    const SLOT_STRIDE: usize = 144;
 
     fn slot_count(&self) -> u32 {
         1
@@ -382,7 +385,82 @@ impl Primitive for Quad {
         writer.write_f32_array(self.border_color)?;
         writer.write_f32_array(self.corner_radii)?;
         writer.write_f32_array(self.border_widths)?;
+        self.material.encode(&mut writer)?;
         writer.finish()
+    }
+}
+
+/// A fixed-layout background material carried by a [`Quad`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Material {
+    /// Use the quad's straight-alpha background colour.
+    Solid,
+    /// Interpolate `colors[0]` to `colors[1]` along the unit-space direction.
+    Linear {
+        direction: [f32; 2],
+        colors: [[f32; 4]; 2],
+    },
+    /// Interpolate `colors[0]` to `colors[1]` from the normalized center.
+    Radial {
+        center: [f32; 2],
+        radius: [f32; 2],
+        colors: [[f32; 4]; 2],
+    },
+    /// Repeat a slash pattern in local pixel coordinates.
+    Slash {
+        color: [f32; 4],
+        width: f32,
+        interval: f32,
+    },
+    Checker {
+        colors: [[f32; 4]; 2],
+        cell: f32,
+    },
+    Stripes {
+        colors: [[f32; 4]; 2],
+        width: f32,
+    },
+}
+
+impl Material {
+    fn encode(&self, writer: &mut SlotWriter<'_>) -> Result<(), EncodeError> {
+        let (kind, first, second, parameters) = match *self {
+            Self::Solid => (0.0, [0.0; 4], [0.0; 4], [0.0; 4]),
+            Self::Linear { direction, colors } => (
+                1.0,
+                colors[0],
+                colors[1],
+                [direction[0], direction[1], 0.0, 0.0],
+            ),
+            Self::Radial { center, radius, colors } => (
+                2.0,
+                colors[0],
+                colors[1],
+                [center[0], center[1], radius[0], radius[1]],
+            ),
+            Self::Slash { color, width, interval } => (
+                3.0,
+                color,
+                [0.0; 4],
+                [width, interval, 0.0, 0.0],
+            ),
+            Self::Checker { colors, cell } => (
+                4.0,
+                colors[0],
+                colors[1],
+                [cell, 0.0, 0.0, 0.0],
+            ),
+            Self::Stripes { colors, width } => (
+                5.0,
+                colors[0],
+                colors[1],
+                [width, 0.0, 0.0, 0.0],
+            ),
+        };
+        writer.write_f32_array([kind, 0.0, 0.0, 0.0])?;
+        writer.write_f32_array(first)?;
+        writer.write_f32_array(second)?;
+        writer.write_f32_array(parameters)
     }
 }
 
@@ -1080,6 +1158,7 @@ mod tests {
             border_color: [0.0, 0.0, 0.0, 1.0],
             corner_radii: [5.0, 6.0, 7.0, 8.0],
             border_widths: [1.5, 2.5, 3.5, 4.5],
+            material: Material::Solid,
         };
         assert_eq!(quad.slot_count(), 1);
         assert!(quad.encode(&mut bytes).is_ok());

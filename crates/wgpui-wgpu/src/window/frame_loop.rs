@@ -37,7 +37,7 @@ use wgpui_core::invalidation::request::FrameSignals;
 use wgpui_core::patch::PatchError;
 use wgpui_core::patch::apply::apply;
 use wgpui_core::patch::emit::{Emission, Emit, EmitContext, EmitError, Emitter, FrameEmission};
-use wgpui_core::patch::primitive::{Glyph, GlyphRun, Quad};
+use wgpui_core::patch::primitive::{Glyph, GlyphRun, Material, Quad};
 use wgpui_core::reconcile::description::{Description, RawText};
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
 use wgpui_core::reconcile::plan::FrameStats;
@@ -687,6 +687,7 @@ impl Emit for SolidFill {
             border_color: [0.0, 0.0, 0.0, 0.0],
             corner_radii: [0.0; 4],
             border_widths: [0.0; 4],
+            material: Material::Solid,
         });
     }
 }
