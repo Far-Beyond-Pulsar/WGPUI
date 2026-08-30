@@ -85,7 +85,7 @@ fn asset(name: &str) -> Vec<u8> {
     let path: PathBuf = [
         env!("CARGO_MANIFEST_DIR"),
         "..",
-        "..",
+        "wgpui-examples-2",
         "examples",
         "legacy",
         "image",

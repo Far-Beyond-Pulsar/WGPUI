@@ -189,6 +189,8 @@ fn quad_materials_use_the_three_final_protocol_rows() -> Result<(), Box<dyn std:
         let second: [f32; 4] = second;
         let parameters: [f32; 4] = parameters;
         assert_eq!(bytes.len(), 144);
+        assert_eq!(Quad::SLOT_STRIDE, 144);
+        assert_eq!(&bytes[..80], &[0; 80]);
         assert_eq!(&bytes[80..84], &(kind[0] as u32).to_le_bytes());
         assert_eq!(&bytes[84..96], &[0; 12]);
         assert_eq!(&bytes[96..112], bytemuck::cast_slice(&first));
