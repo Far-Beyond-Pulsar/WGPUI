@@ -40,7 +40,9 @@ use std::sync::Arc;
 
 use wgpui_core::invalidation::request::FrameSignals;
 use wgpui_core::patch::primitive::{Glyph, GlyphRun};
+use wgpui_core::reconcile::description::Description;
 use wgpui_core::scene::atlas::AtlasKind;
+use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 use wgpui_wgpu::render::atlas::{AtlasTileSource, GlyphAtlas, TilePlacement};
 use wgpui_wgpu::render::atlas_upload::AtlasTextures;
 use wgpui_wgpu::render::device::ComputeContext;
@@ -69,6 +71,20 @@ const FILL_SIZE: [f32; 2] = [320.0, 180.0];
 const TEXT_HEIGHT: f32 = 64.0;
 const TEXT: &str = "WGPUI 2.0 through the new stack";
 const TEXT_ORIGIN: [f32; 2] = [16.0, 40.0];
+
+struct RawTextGateRoot;
+
+fn raw_text_gate_description() -> Description {
+    Description::new::<RawTextGateRoot>()
+        .style(LayoutStyle {
+            size: LayoutSize {
+                width: Dimension::length(EXACT_WIDTH as f32),
+                height: Dimension::length(EXACT_HEIGHT as f32),
+            },
+            ..LayoutStyle::default()
+        })
+        .child(Description::raw_text("native raw text"))
+}
 
 /// Sizes the resize check drives, in order.
 ///
@@ -181,6 +197,7 @@ impl Harness {
         self.clear_frames_are_exact(&mut surface, &context);
         self.resizing_keeps_presenting_correctly(&mut surface, &context);
         self.the_pipeline_reaches_the_swapchain(&mut surface, &context);
+        self.raw_text_reaches_the_swapchain_and_settles(&mut surface, &context);
 
         let stats = surface.stats();
         self.check(
@@ -592,6 +609,122 @@ impl Harness {
                 ),
             ),
         }
+    }
+
+    fn raw_text_reaches_the_swapchain_and_settles(
+        &mut self,
+        surface: &mut WindowSurface,
+        context: &ComputeContext,
+    ) {
+        if !surface.resize(&context.device, EXACT_WIDTH, EXACT_HEIGHT) {
+            self.report.note("raw text gate already at the exact-comparison size");
+        }
+        let mut frame_loop = FrameLoop::new(&context.device);
+        let mode = DrawMode::best_available(context.indirect);
+        let mut first_pixels = Vec::new();
+        let mut first_frame = None;
+        let mut second_frame = None;
+
+        for frame_index in 0..2 {
+            let Acquired::Frame(texture) = surface.acquire(&context.device) else {
+                self.report
+                    .fail(format!("raw text gate could not acquire frame {frame_index}"));
+                continue;
+            };
+            let view = texture
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let (width, height) = surface.size();
+            let target = RenderTarget {
+                view: &view,
+                width,
+                height,
+                clear: wgpu::Color::BLACK,
+                source: Some(&texture.texture),
+            };
+            let result = frame_loop.draw(
+                &context.device,
+                &context.queue,
+                raw_text_gate_description(),
+                &LoopInput {
+                    atlas: None,
+                    target: &target,
+                    mode,
+                    signals: &FrameSignals::new(),
+                    composites: &[],
+                },
+            );
+            match result {
+                Ok(frame) => {
+                    if frame_index == 0 {
+                        first_frame = Some(frame);
+                    } else {
+                        second_frame = Some(frame);
+                    }
+                }
+                Err(error) => self
+                    .report
+                    .fail(format!("raw text frame {frame_index} failed: {error}")),
+            }
+            match read_texture_rgba8(
+                &context.device,
+                &context.queue,
+                &texture.texture,
+                width,
+                height,
+            ) {
+                Ok(pixels) if frame_index == 0 => first_pixels = pixels,
+                Ok(_) => {}
+                Err(error) => self
+                    .report
+                    .fail(format!("raw text readback failed: {error}")),
+            }
+            surface.present(&context.queue, texture);
+        }
+
+        let Some(first_frame) = first_frame else {
+            self.report.fail("raw text gate produced no first frame");
+            return;
+        };
+        let Some(second_frame) = second_frame else {
+            self.report.fail("raw text gate produced no second frame");
+            return;
+        };
+        let non_black_pixels = first_pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3] != [0, 0, 0])
+            .count();
+        self.check(
+            first_frame.frame.primitives_resident > 0
+                && first_frame.emission.patch.len() > 0
+                && first_frame.uploaded_bytes > 0,
+            format!(
+                "a raw string has intrinsic layout and emits resident glyphs: {} primitives, {} patch ops, {} uploaded bytes",
+                first_frame.frame.primitives_resident,
+                first_frame.emission.patch.len(),
+                first_frame.uploaded_bytes
+            ),
+        );
+        self.check(
+            non_black_pixels > 0,
+            format!(
+                "raw string glyphs are visible in the presented image: {non_black_pixels} non-black pixels"
+            ),
+        );
+        self.check(
+            frame_loop.prepared_text_count() == 1,
+            format!(
+                "the raw string is prepared once and retained: {} prepared entries",
+                frame_loop.prepared_text_count()
+            ),
+        );
+        self.check(
+            second_frame.was_idle(),
+            format!(
+                "the unchanged raw string does no new work on the steady frame: idle={}",
+                second_frame.was_idle()
+            ),
+        );
     }
 }
 

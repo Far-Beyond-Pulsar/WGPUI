@@ -41,8 +41,10 @@ pub struct Window {
     keymap: Keymap,
     hovered: Option<HitboxId>,
     pressed: Option<(HitboxId, MouseDownEvent)>,
+    focus_hitboxes: std::collections::HashMap<HitboxId, FocusId>,
     timers: WindowTimers,
     close: CloseState,
+    interaction_revision: u64,
 }
 impl Default for Window {
     fn default() -> Self {
@@ -64,8 +66,10 @@ impl Window {
             keymap: Keymap::default(),
             hovered: None,
             pressed: None,
+            focus_hitboxes: std::collections::HashMap::new(),
             timers: WindowTimers::default(),
             close: CloseState::default(),
+            interaction_revision: 0,
         }
     }
     pub fn next_frame(&mut self) {
@@ -133,6 +137,9 @@ impl Window {
     pub fn take_focus_transition(&mut self) -> Option<FocusTransition> {
         self.focus.take_transition()
     }
+    pub fn interaction_revision(&self) -> u64 {
+        self.interaction_revision
+    }
     pub fn hit_test(&mut self) -> &mut HitTestIndex {
         &mut self.hit_test
     }
@@ -141,9 +148,15 @@ impl Window {
         self.dispatch.bind_hitbox(hitbox.id, node);
         self.hit_test.set_hit_testable(hitbox.id, hitbox.hit_testable);
     }
+    pub fn register_focus_hitbox(&mut self, hitbox: Hitbox, node: DispatchNodeId, focus: FocusHandle) {
+        self.register_hitbox(hitbox, node);
+        self.register_focus_handle(focus);
+        self.focus_hitboxes.insert(hitbox.id, focus.id());
+    }
     pub fn unregister_hitbox(&mut self, id: HitboxId) {
         self.hit_test.remove(id);
         self.dispatch.unbind_hitbox(id);
+        self.focus_hitboxes.remove(&id);
         if self.hovered == Some(id) {
             self.hovered = None;
         }
@@ -175,6 +188,12 @@ impl Window {
     pub fn handle_input(&mut self, event: InputEvent) -> bool {
         match &event {
             InputEvent::KeyDown(key) => {
+                if key.key.eq_ignore_ascii_case("tab") {
+                    if key.modifiers.shift {
+                        return self.focus_previous().is_some();
+                    }
+                    return self.focus_next().is_some();
+                }
                 let action = self.keymap.resolve(key, None).map(Action::boxed_clone);
                 action.is_some_and(|action| {
                     self.dispatch
@@ -186,15 +205,44 @@ impl Window {
                 let hit = self
                     .hit_test
                     .hit_test([mouse.position[0].value(), mouse.position[1].value()]);
+                let previous = self.hovered;
                 self.hovered = hit;
-                hit.is_some_and(|id| self.dispatch.dispatch_input(id, &event))
+                let mut handled = false;
+                if previous != hit {
+                    self.interaction_revision = self.interaction_revision.wrapping_add(1);
+                    if let Some(id) = previous {
+                        handled |= self.dispatch.dispatch_input(
+                            id,
+                            &InputEvent::MouseLeave(*mouse),
+                        );
+                    }
+                    if let Some(id) = hit {
+                        handled |= self.dispatch.dispatch_input(
+                            id,
+                            &InputEvent::MouseEnter(*mouse),
+                        );
+                    }
+                }
+                handled |= hit.is_some_and(|id| self.dispatch.dispatch_input(id, &event));
+                handled
             }
             InputEvent::MouseDown(mouse) => {
                 let hit = self
                     .hit_test
                     .hit_test([mouse.position[0].value(), mouse.position[1].value()]);
                 self.pressed = hit.map(|id| (id, *mouse));
-                hit.is_some_and(|id| self.dispatch.dispatch_input(id, &event))
+                let mut handled = false;
+                if let Some(id) = hit {
+                    if mouse.is_focusing()
+                        && let Some(focus_id) = self.focus_hitboxes.get(&id).copied()
+                        && self.focus.focus(focus_id, false)
+                    {
+                        self.interaction_revision = self.interaction_revision.wrapping_add(1);
+                        handled = true;
+                    }
+                    handled |= self.dispatch.dispatch_input(id, &event);
+                }
+                handled
             }
             InputEvent::MouseUp(mouse) => {
                 let hit = self
@@ -212,7 +260,17 @@ impl Window {
                 }
                 handled
             }
-            InputEvent::KeyUp(_) | InputEvent::Scroll(_) | InputEvent::Click(_) => false,
+            InputEvent::Scroll(scroll) => {
+                let hit = self.hit_test.hit_test([
+                    scroll.position[0].value(),
+                    scroll.position[1].value(),
+                ]);
+                if hit.is_some() {
+                    self.interaction_revision = self.interaction_revision.wrapping_add(1);
+                }
+                hit.is_some_and(|id| self.dispatch.dispatch_input(id, &event))
+            }
+            InputEvent::KeyUp(_) | InputEvent::MouseEnter(_) | InputEvent::MouseLeave(_) | InputEvent::Click(_) => false,
         }
     }
     pub fn schedule_timer(&mut self, delay: Duration) -> TimerHandle {
@@ -250,7 +308,9 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{point, px, size};
+    use crate::geometry::{point, px, size, Rect};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn window_creation_bounds_resize_activation_and_close_are_stateful() {
@@ -271,5 +331,136 @@ mod tests {
         );
         assert!(window.is_active());
         assert!(window.should_close());
+    }
+
+    fn hitbox(window: &mut Window, id: u64, node: DispatchNodeId) -> Hitbox {
+        let value = Hitbox {
+            id: HitboxId::from_raw(id),
+            bounds: Rect::from_origin_size([0.0, 0.0], [100.0, 100.0]),
+            z_index: 0,
+            order: 0,
+            hit_testable: true,
+        };
+        window.register_hitbox(value, node);
+        value
+    }
+
+    #[test]
+    fn mouse_lifecycle_emits_enter_leave_and_click_only_after_release_inside() {
+        let mut window = Window::new();
+        let root = window.dispatch_tree().root();
+        let node = window.dispatch_tree().new_node(Some(root));
+        let target = hitbox(&mut window, 1, node);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        assert!(window.dispatch_tree().on_input(node, move |event| {
+            observed.borrow_mut().push(match event {
+                InputEvent::MouseEnter(_) => "enter",
+                InputEvent::MouseLeave(_) => "leave",
+                InputEvent::MouseDown(_) => "down",
+                InputEvent::MouseUp(_) => "up",
+                InputEvent::Click(_) => "click",
+                _ => "other",
+            });
+            EventResult::HANDLED
+        }));
+        let position = [Pixels(10.0), Pixels(10.0)];
+        let movement = InputEvent::MouseMove(MouseMoveEvent {
+            position,
+            modifiers: Modifiers::none(),
+            buttons: MouseButtonState::default(),
+        });
+        assert!(window.handle_input(movement));
+        assert!(window.handle_input(InputEvent::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        })));
+        assert!(window.handle_input(InputEvent::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        })));
+        assert!(window.handle_input(InputEvent::MouseMove(MouseMoveEvent {
+            position: [Pixels(200.0), Pixels(200.0)],
+            modifiers: Modifiers::none(),
+            buttons: MouseButtonState::default(),
+        })));
+        assert_eq!(&*events.borrow(), &["enter", "other", "down", "up", "click", "leave"]);
+        assert_eq!(window.hovered_hitbox(), None);
+        assert_eq!(target.id, HitboxId::from_raw(1));
+    }
+
+    #[test]
+    fn capture_runs_from_root_and_can_cancel_bubbling() {
+        let mut window = Window::new();
+        let root = window.dispatch_tree().root();
+        let child = window.dispatch_tree().new_node(Some(root));
+        let _target = hitbox(&mut window, 2, child);
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let capture_calls = calls.clone();
+        assert!(window.dispatch_tree().on_input_capture(root, move |_| {
+            capture_calls.borrow_mut().push("capture-root");
+            EventResult::HANDLED
+        }));
+        let child_calls = calls.clone();
+        assert!(window.dispatch_tree().on_input(child, move |_| {
+            child_calls.borrow_mut().push("bubble-child");
+            EventResult::HANDLED
+        }));
+        assert!(window.dispatch_tree().dispatch_input(
+            HitboxId::from_raw(2),
+            &InputEvent::KeyUp(KeyUpEvent { key: "x".into(), modifiers: Modifiers::none() })
+        ));
+        assert_eq!(&*calls.borrow(), &["capture-root"]);
+    }
+
+    #[test]
+    fn focused_hitboxes_focus_on_mouse_down_and_tab_wraps() {
+        let mut window = Window::new();
+        let root = window.dispatch_tree().root();
+        let first = FocusHandle::new().with_tab_index(0);
+        let second = FocusHandle::new().with_tab_index(1);
+        let first_node = window.dispatch_tree().new_node(Some(root));
+        let second_node = window.dispatch_tree().new_node(Some(root));
+        window.register_focus_hitbox(
+            Hitbox { id: HitboxId::from_raw(3), bounds: Rect::from_origin_size([0.0, 0.0], [20.0, 20.0]), z_index: 0, order: 0, hit_testable: true },
+            first_node,
+            first,
+        );
+        window.register_focus_hitbox(
+            Hitbox { id: HitboxId::from_raw(4), bounds: Rect::from_origin_size([30.0, 0.0], [20.0, 20.0]), z_index: 0, order: 0, hit_testable: true },
+            second_node,
+            second,
+        );
+        assert!(window.handle_input(InputEvent::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: [Pixels(5.0), Pixels(5.0)],
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        })));
+        assert_eq!(window.focused(), Some(first.id()));
+        assert!(window.handle_input(InputEvent::KeyDown(KeyDownEvent::new("Tab", Modifiers::none()))));
+        assert_eq!(window.focused(), Some(second.id()));
+        assert!(window.handle_input(InputEvent::KeyDown(KeyDownEvent::new("Tab", Modifiers::none()))));
+        assert_eq!(window.focused(), Some(first.id()));
+    }
+
+    #[test]
+    fn scroll_events_are_dispatched_to_the_hit_target() {
+        let mut window = Window::new();
+        let root = window.dispatch_tree().root();
+        let node = window.dispatch_tree().new_node(Some(root));
+        let _target = hitbox(&mut window, 5, node);
+        assert!(window.dispatch_tree().on_input(node, |event| {
+            if matches!(event, InputEvent::Scroll(_)) { EventResult::HANDLED } else { EventResult::IGNORED }
+        }));
+        assert!(window.handle_input(InputEvent::Scroll(ScrollWheelEvent {
+            position: [Pixels(4.0), Pixels(4.0)],
+            delta: [0.0, -20.0],
+            modifiers: Modifiers::none(),
+        })));
     }
 }

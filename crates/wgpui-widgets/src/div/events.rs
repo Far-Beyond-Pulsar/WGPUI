@@ -12,6 +12,22 @@ type ClickHandler = Box<dyn FnMut(&ClickEvent, &mut Window, &mut App) -> EventRe
 type MouseDownHandler = Box<dyn FnMut(&InputEvent, &mut Window, &mut App) -> EventResult>;
 type HoverHandler = Box<dyn FnMut(bool, &mut Window, &mut App) -> EventResult>;
 
+pub trait IntoEventResult {
+    fn into_event_result(self) -> EventResult;
+}
+
+impl IntoEventResult for () {
+    fn into_event_result(self) -> EventResult {
+        EventResult::HANDLED
+    }
+}
+
+impl IntoEventResult for EventResult {
+    fn into_event_result(self) -> EventResult {
+        self
+    }
+}
+
 fn merge_result(result: &mut EventResult, current: EventResult) {
     if current.handled {
         result.handled = true;
@@ -41,14 +57,30 @@ impl InteractionState {
         self.focused = focused;
         changed
     }
-    pub fn on_click(&mut self, handler: impl FnMut(&ClickEvent, &mut Window, &mut App) -> EventResult + 'static) {
-        self.click.push(Box::new(handler));
+    pub fn on_click<R: IntoEventResult + 'static>(
+        &mut self,
+        mut handler: impl FnMut(&ClickEvent, &mut Window, &mut App) -> R + 'static,
+    ) {
+        self.click.push(Box::new(move |event, window, app| {
+            handler(event, window, app).into_event_result()
+        }));
     }
-    pub fn on_mouse_down(&mut self, button: MouseButton, handler: impl FnMut(&InputEvent, &mut Window, &mut App) -> EventResult + 'static) {
-        self.mouse_down.push((button, Box::new(handler)));
+    pub fn on_mouse_down<R: IntoEventResult + 'static>(
+        &mut self,
+        button: MouseButton,
+        mut handler: impl FnMut(&InputEvent, &mut Window, &mut App) -> R + 'static,
+    ) {
+        self.mouse_down.push((button, Box::new(move |event, window, app| {
+            handler(event, window, app).into_event_result()
+        })));
     }
-    pub fn on_hover(&mut self, handler: impl FnMut(bool, &mut Window, &mut App) -> EventResult + 'static) {
-        self.hover.push(Box::new(handler));
+    pub fn on_hover<R: IntoEventResult + 'static>(
+        &mut self,
+        mut handler: impl FnMut(bool, &mut Window, &mut App) -> R + 'static,
+    ) {
+        self.hover.push(Box::new(move |hovered, window, app| {
+            handler(hovered, window, app).into_event_result()
+        }));
     }
     pub fn update_hover(&mut self, hovered: bool, window: &mut Window, app: &mut App) -> EventResult {
         if self.hovered == hovered { return EventResult::IGNORED; }
@@ -62,8 +94,10 @@ impl InteractionState {
     }
     pub fn handle_input(&mut self, event: &InputEvent, window: &mut Window, app: &mut App) -> EventResult {
         match event {
+            InputEvent::MouseEnter(_) => self.update_hover(true, window, app),
+            InputEvent::MouseLeave(_) => self.update_hover(false, window, app),
             InputEvent::MouseDown(mouse) => {
-                self.active = true;
+                self.active = mouse.button == MouseButton::Left;
                 let mut result = EventResult::IGNORED;
                 for (button, handler) in &mut self.mouse_down {
                     if *button == mouse.button {
@@ -73,7 +107,11 @@ impl InteractionState {
                 }
                 result
             }
-            InputEvent::MouseUp(_) => { self.active = false; EventResult::IGNORED }
+            InputEvent::MouseUp(_) => {
+                let changed = self.active;
+                self.active = false;
+                if changed { EventResult::HANDLED } else { EventResult::IGNORED }
+            }
             InputEvent::Click(click) => {
                 let mut result = EventResult::IGNORED;
                 for handler in &mut self.click {
@@ -92,19 +130,23 @@ mod tests {
     use super::*;
     use wgpui_core::window::{Modifiers, MouseDownEvent};
     use wgpui_core::boundary::Pixels;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
     fn hover_is_edge_triggered_and_mouse_down_is_button_specific() {
         let mut state = InteractionState::new();
-        let mut enters = 0;
-        state.on_hover(move |value, _, _| { if value { enters += 1; } EventResult::HANDLED });
+        let enters = Rc::new(Cell::new(0));
+        let observed_enters = enters.clone();
+        state.on_hover(move |value, _, _| { if value { observed_enters.set(observed_enters.get() + 1); } EventResult::HANDLED });
         assert!(state.update_hover(true, &mut Window::new(), &mut App::new()).handled);
         assert!(!state.update_hover(true, &mut Window::new(), &mut App::new()).handled);
-        assert_eq!(enters, 1);
-        let mut downs = 0;
-        state.on_mouse_down(MouseButton::Left, move |_, _, _| { downs += 1; EventResult::HANDLED });
+        assert_eq!(enters.get(), 1);
+        let downs = Rc::new(Cell::new(0));
+        let observed_downs = downs.clone();
+        state.on_mouse_down(MouseButton::Left, move |_, _, _| { observed_downs.set(observed_downs.get() + 1); EventResult::HANDLED });
         let event = InputEvent::MouseDown(MouseDownEvent { button: MouseButton::Right, position: [Pixels(0.0); 2], modifiers: Modifiers::none(), click_count: 1 });
         assert!(!state.handle_input(&event, &mut Window::new(), &mut App::new()).handled);
-        assert_eq!(downs, 0);
+        assert_eq!(downs.get(), 0);
     }
 }

@@ -219,6 +219,8 @@ pub enum InputEvent {
     MouseDown(MouseDownEvent),
     MouseUp(MouseUpEvent),
     MouseMove(MouseMoveEvent),
+    MouseEnter(MouseMoveEvent),
+    MouseLeave(MouseMoveEvent),
     Scroll(ScrollWheelEvent),
     Click(ClickEvent),
 }

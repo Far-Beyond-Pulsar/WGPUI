@@ -87,6 +87,9 @@ pub struct Div {
     uncached: bool,
     scroll_offset: [f32; 2],
     estimated_size: Option<[f32; 2]>,
+    interaction: events::InteractionState,
+    focus_handle: Option<wgpui_core::window::FocusHandle>,
+    scroll_handle: Option<scroll_state::ScrollHandle>,
 }
 
 /// A new, unstyled, childless `div`.
@@ -102,6 +105,9 @@ pub fn div() -> Div {
         uncached: false,
         scroll_offset: [0.0, 0.0],
         estimated_size: None,
+        interaction: events::InteractionState::new(),
+        focus_handle: None,
+        scroll_handle: None,
     }
 }
 
@@ -112,6 +118,63 @@ impl Default for Div {
 }
 
 impl Div {
+    pub fn on_click<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R + 'static,
+    ) -> Self {
+        self.interaction.on_click(handler);
+        self
+    }
+
+    pub fn on_mouse_down<R: events::IntoEventResult + 'static>(
+        mut self,
+        button: wgpui_core::window::MouseButton,
+        handler: impl FnMut(&wgpui_core::window::InputEvent, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R + 'static,
+    ) -> Self {
+        self.interaction.on_mouse_down(button, handler);
+        self
+    }
+
+    pub fn on_hover<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(bool, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R + 'static,
+    ) -> Self {
+        self.interaction.on_hover(handler);
+        self
+    }
+
+    pub fn track_focus(mut self, handle: &wgpui_core::window::FocusHandle) -> Self {
+        self.focus_handle = Some(*handle);
+        self
+    }
+
+    pub fn is_hovered(&self) -> bool { self.interaction.is_hovered() }
+    pub fn is_active(&self) -> bool { self.interaction.is_active() }
+    pub fn is_focused(&self) -> bool { self.interaction.is_focused() }
+
+    pub fn handle_input(
+        &mut self,
+        event: &wgpui_core::window::InputEvent,
+        window: &mut wgpui_core::window::Window,
+        app: &mut wgpui_core::app::App,
+    ) -> wgpui_core::window::EventResult {
+        self.interaction.handle_input(event, window, app)
+    }
+
+    pub fn update_hover(
+        &mut self,
+        hovered: bool,
+        window: &mut wgpui_core::window::Window,
+        app: &mut wgpui_core::app::App,
+    ) -> wgpui_core::window::EventResult {
+        self.interaction.update_hover(hovered, window, app)
+    }
+
+    pub fn track_scroll(mut self, handle: &scroll_state::ScrollHandle) -> Self {
+        self.scroll_handle = Some(handle.clone());
+        self
+    }
+
     /// Give this element an explicit identity, so it keeps its instance across a
     /// sibling reorder.
     ///
@@ -199,6 +262,8 @@ impl Div {
             uncached,
             scroll_offset,
             estimated_size,
+            scroll_handle,
+            ..
         } = self;
 
         let key = DivDiffKey::with_estimate(style.clone(), children.len(), estimated_size);
@@ -220,6 +285,10 @@ impl Div {
             wgpui_layout::taffy_tree::Overflow::Hidden | wgpui_layout::taffy_tree::Overflow::Scroll
         );
 
+        let scroll_offset = scroll_handle
+            .as_ref()
+            .map(|handle| [handle.offset().x.value(), handle.offset().y.value()])
+            .unwrap_or(scroll_offset);
         let mut description = Description::new::<Div>()
             .diff_key(key)
             .style(layout_style)

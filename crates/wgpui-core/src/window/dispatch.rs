@@ -10,6 +10,7 @@ type InputHandler = Box<dyn FnMut(&InputEvent) -> EventResult>;
 struct Node {
     parent: Option<DispatchNodeId>,
     action_handlers: Vec<Handler>,
+    capture_handlers: Vec<InputHandler>,
     input_handlers: Vec<InputHandler>,
 }
 #[derive(Default)]
@@ -42,6 +43,7 @@ impl DispatchTree {
             Node {
                 parent,
                 action_handlers: Vec::new(),
+                capture_handlers: Vec::new(),
                 input_handlers: Vec::new(),
             },
         );
@@ -84,6 +86,17 @@ impl DispatchTree {
         node.input_handlers.push(Box::new(handler));
         true
     }
+    pub fn on_input_capture(
+        &mut self,
+        node: DispatchNodeId,
+        handler: impl FnMut(&InputEvent) -> EventResult + 'static,
+    ) -> bool {
+        let Some(node) = self.nodes.get_mut(&node) else {
+            return false;
+        };
+        node.capture_handlers.push(Box::new(handler));
+        true
+    }
     pub fn dispatch_action(&mut self, target: DispatchNodeId, action: &dyn Action) -> bool {
         for node_id in self.path(target) {
             let Some(node) = self.nodes.get_mut(&node_id) else {
@@ -102,7 +115,19 @@ impl DispatchTree {
         let Some(node) = self.hitbox_nodes.get(&target).copied() else {
             return false;
         };
-        for node_id in self.path(node) {
+        let path = self.path(node);
+        for node_id in path.iter().rev() {
+            let Some(node) = self.nodes.get_mut(node_id) else {
+                continue;
+            };
+            for handler in node.capture_handlers.iter_mut().rev() {
+                let result = handler(event);
+                if result.handled && !result.propagate {
+                    return true;
+                }
+            }
+        }
+        for node_id in path {
             let Some(node) = self.nodes.get_mut(&node_id) else {
                 continue;
             };

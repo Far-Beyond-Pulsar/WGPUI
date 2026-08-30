@@ -7,6 +7,7 @@
 
 use crate::reconcile::description::{Description, ElementId};
 use crate::reconcile::state::{ElementStateStore, StateScope};
+use std::sync::Arc;
 
 /// A value that can lower itself into the retained frontend description.
 pub trait Element: 'static {
@@ -172,19 +173,20 @@ impl Element for Description {
 
 impl Element for String {
     fn into_description(self) -> Description {
-        Description::new::<String>()
+        Description::raw_text(Arc::from(self))
     }
 }
 
 impl Element for &'static str {
     fn into_description(self) -> Description {
-        Description::new::<&'static str>()
+        Description::raw_text(Arc::from(self))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reconcile::description::RawText;
     use crate::reconcile::reconciler::Reconciler;
     use wgpui_layout::taffy_tree::LayoutTree;
 
@@ -287,6 +289,32 @@ mod tests {
         assert_eq!(
             description.element_id(),
             Some(&ElementId::Name("counter".into()))
+        );
+    }
+
+    #[test]
+    fn string_children_lower_to_typed_retained_text_content() {
+        let description = IntoElement::into_description("hello native world");
+        assert_eq!(description.type_id(), std::any::TypeId::of::<RawText>());
+        assert_eq!(description.type_name(), std::any::type_name::<RawText>());
+        assert!(description.key().is_some());
+        assert!(!description.emits());
+
+        let mut description = description;
+        let raw = description.take_raw_text().expect("raw text is preserved");
+        assert_eq!(raw.value(), "hello native world");
+    }
+
+    #[test]
+    fn equal_raw_text_keys_report_no_invalidation() {
+        let first = Description::raw_text(Arc::from("same"));
+        let second = Description::raw_text(Arc::from("same"));
+        assert_eq!(
+            first
+                .key()
+                .expect("raw text has a content key")
+                .compare(second.key().expect("raw text has a content key")),
+            crate::invalidation::axes::Invalidation::empty()
         );
     }
 }
