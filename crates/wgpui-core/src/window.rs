@@ -12,6 +12,7 @@ pub mod prompts;
 pub mod timer;
 
 use crate::action::Action;
+use crate::geometry::{Bounds, Pixels, Size, point};
 use crate::reconcile::{ElementStateStore, StateKey, StateScope};
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,8 @@ pub use menu::{Menu, MenuItem};
 pub use timer::{TimerHandle, TimerId, TimerState};
 
 pub struct Window {
+    bounds: Bounds<Pixels>,
+    active: bool,
     state: ElementStateStore,
     frame: u64,
     focus: FocusManager,
@@ -51,6 +54,8 @@ impl Window {
         let mut dispatch = DispatchTree::new();
         dispatch.root();
         Self {
+            bounds: Bounds::new(point(Pixels::ZERO, Pixels::ZERO), Size::default()),
+            active: false,
             state: ElementStateStore::new(),
             frame: 0,
             focus: FocusManager::default(),
@@ -65,6 +70,24 @@ impl Window {
     }
     pub fn next_frame(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+    }
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        self.bounds
+    }
+    pub fn resize(&mut self, size: Size<Pixels>) {
+        self.bounds.size = size;
+    }
+    pub fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.bounds = bounds;
+    }
+    pub fn activate(&mut self) {
+        self.active = true;
+    }
+    pub fn deactivate(&mut self) {
+        self.active = false;
+    }
+    pub fn is_active(&self) -> bool {
+        self.active
     }
     pub fn use_state<T: 'static, R>(
         &mut self,
@@ -199,5 +222,32 @@ impl Window {
     }
     pub fn clear_close_request(&mut self) {
         self.close.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::{point, px, size};
+
+    #[test]
+    fn window_creation_bounds_resize_activation_and_close_are_stateful() {
+        let mut window = Window::new();
+        assert_eq!(window.bounds(), Bounds::default());
+        assert!(!window.is_active());
+        assert!(!window.close_requested());
+
+        let bounds = Bounds::new(point(px(12.0), px(24.0)), size(px(320.0), px(240.0)));
+        window.set_bounds(bounds);
+        window.resize(size(px(640.0), px(480.0)));
+        window.activate();
+        window.request_close();
+
+        assert_eq!(
+            window.bounds(),
+            Bounds::new(bounds.origin, size(px(640.0), px(480.0)))
+        );
+        assert!(window.is_active());
+        assert!(window.should_close());
     }
 }

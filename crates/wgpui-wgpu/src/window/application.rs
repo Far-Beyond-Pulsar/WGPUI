@@ -5,6 +5,7 @@ use std::sync::Arc;
 use wgpui_core::boundary::Pixels;
 use wgpui_core::boundary::compositor::CompositeEntry;
 use wgpui_core::element::IntoElement;
+use wgpui_core::geometry::{Bounds, Point, Size, WindowBounds, point, size};
 use wgpui_core::invalidation::request::FrameSignals;
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
@@ -26,6 +27,9 @@ pub struct WindowOptions {
     pub width: u32,
     pub height: u32,
     pub resizable: bool,
+    pub window_bounds: Option<WindowBounds>,
+    pub focus: bool,
+    pub show: bool,
 }
 
 impl Default for WindowOptions {
@@ -35,7 +39,30 @@ impl Default for WindowOptions {
             width: 800,
             height: 600,
             resizable: true,
+            window_bounds: None,
+            focus: true,
+            show: true,
         }
+    }
+}
+
+impl WindowOptions {
+    fn initial_bounds(&self) -> Bounds<Pixels> {
+        let fallback = size(Pixels(self.width as f32), Pixels(self.height as f32));
+        let Some(window_bounds) = self.window_bounds else {
+            return Bounds::new(point(Pixels::ZERO, Pixels::ZERO), fallback);
+        };
+        let bounds = window_bounds.get_bounds();
+        let size = if bounds.size.width.value() > 0.0 && bounds.size.height.value() > 0.0 {
+            bounds.size
+        } else {
+            fallback
+        };
+        Bounds::new(bounds.origin, size)
+    }
+
+    fn window_state(&self) -> Option<WindowBounds> {
+        self.window_bounds
     }
 }
 
@@ -69,6 +96,29 @@ impl Window {
     }
     pub fn inner_size(&self) -> winit::dpi::PhysicalSize<u32> {
         self.native.inner_size()
+    }
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        let origin = self.native.outer_position().map_or(
+            Point::new(Pixels::ZERO, Pixels::ZERO),
+            |position| {
+                point(
+                    Pixels(position.x as f32 / self.scale_factor as f32),
+                    Pixels(position.y as f32 / self.scale_factor as f32),
+                )
+            },
+        );
+        let size = self.inner_size();
+        Bounds::new(
+            origin,
+            Size::new(
+                Pixels(size.width as f32 / self.scale_factor as f32),
+                Pixels(size.height as f32 / self.scale_factor as f32),
+            ),
+        )
+    }
+    pub fn resize(&self, size: Size<Pixels>) -> Option<winit::dpi::PhysicalSize<u32>> {
+        let logical_size = winit::dpi::LogicalSize::new(size.width.value(), size.height.value());
+        self.native.request_inner_size(logical_size)
     }
     pub fn scale_factor(&self) -> f64 {
         self.scale_factor
@@ -433,10 +483,18 @@ where
         let attributes = winit::window::Window::default_attributes()
             .with_title(self.options.title.clone())
             .with_resizable(self.options.resizable)
-            .with_inner_size(winit::dpi::PhysicalSize::new(
-                self.options.width,
-                self.options.height,
+            .with_visible(self.options.show);
+        let initial_bounds = self.options.initial_bounds();
+        let mut attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(
+            initial_bounds.size.width.value(),
+            initial_bounds.size.height.value(),
+        ));
+        if self.options.window_bounds.is_some() {
+            attributes = attributes.with_position(winit::dpi::LogicalPosition::new(
+                initial_bounds.origin.x.value(),
+                initial_bounds.origin.y.value(),
             ));
+        }
         let native = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -448,6 +506,18 @@ where
             }
         };
         let scale_factor = native.scale_factor();
+        if let Some(window_bounds) = self.options.window_state() {
+            match window_bounds {
+                WindowBounds::Windowed(_) => {}
+                WindowBounds::Maximized(_) => native.set_maximized(true),
+                WindowBounds::Fullscreen(_) => native.set_fullscreen(Some(
+                    winit::window::Fullscreen::Borderless(native.current_monitor()),
+                )),
+            }
+        }
+        if self.options.focus {
+            native.focus_window();
+        }
         let (surface, context) = match WindowSurface::new(Arc::clone(&native)) {
             Ok(pair) => pair,
             Err(error) => {
@@ -532,7 +602,9 @@ where
                 }
             }
             winit::event::WindowEvent::CursorMoved { position, .. } => {
-                let point = live.window.logical_point_for_physical(position.x, position.y);
+                let point = live
+                    .window
+                    .logical_point_for_physical(position.x, position.y);
                 let event = InputEvent::MouseMove(MouseMoveEvent {
                     position: point,
                     modifiers: live.window.modifiers(),
@@ -639,5 +711,35 @@ fn key_name(event: &winit::event::KeyEvent) -> String {
         }
         .to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wgpui_core::geometry::{point, px, size};
+
+    #[test]
+    fn window_bounds_override_fallback_size_and_preserve_position() {
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(120.0), px(80.0)),
+                size(px(640.0), px(480.0)),
+            ))),
+            ..WindowOptions::default()
+        };
+        assert_eq!(options.initial_bounds().origin, point(px(120.0), px(80.0)));
+        assert_eq!(options.initial_bounds().size, size(px(640.0), px(480.0)));
+    }
+
+    #[test]
+    fn zero_window_bounds_use_the_explicit_fallback_size() {
+        let options = WindowOptions {
+            width: 320,
+            height: 240,
+            window_bounds: Some(WindowBounds::Windowed(Bounds::default())),
+            ..WindowOptions::default()
+        };
+        assert_eq!(options.initial_bounds().size, size(px(320.0), px(240.0)));
     }
 }

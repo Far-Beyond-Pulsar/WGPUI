@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::action::Action;
-use crate::window::{KeyBinding, KeyDownEvent, Keymap};
+use crate::window::{KeyBinding, KeyDownEvent, Keymap, Menu};
 use futures::channel::oneshot;
 use futures::future::{AbortHandle, Abortable};
 use futures::task::LocalSpawnExt;
@@ -24,6 +24,9 @@ struct AppState {
     keymap: Keymap,
     action_handlers: HashMap<TypeId, Vec<ActionHandler>>,
     propagate_actions: bool,
+    active: bool,
+    quit_requested: bool,
+    menus: Vec<Menu>,
 }
 
 /// The foreground application context. It owns entity identity and delivers
@@ -50,6 +53,9 @@ impl App {
                 keymap: Keymap::default(),
                 action_handlers: HashMap::new(),
                 propagate_actions: false,
+                active: false,
+                quit_requested: false,
+                menus: Vec::new(),
             })),
             foreground: Rc::new(RefCell::new(futures::executor::LocalPool::new())),
         }
@@ -157,6 +163,30 @@ impl App {
 
     pub fn propagate(&mut self) {
         self.state.borrow_mut().propagate_actions = true;
+    }
+
+    pub fn activate(&mut self, _ignoring_other_apps: bool) {
+        self.state.borrow_mut().active = true;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.state.borrow().active
+    }
+
+    pub fn quit(&mut self) {
+        self.state.borrow_mut().quit_requested = true;
+    }
+
+    pub fn quit_requested(&self) -> bool {
+        self.state.borrow().quit_requested
+    }
+
+    pub fn set_menus(&mut self, menus: impl IntoIterator<Item = Menu>) {
+        self.state.borrow_mut().menus = menus.into_iter().collect();
+    }
+
+    pub fn menus(&self) -> std::cell::Ref<'_, [Menu]> {
+        std::cell::Ref::map(self.state.borrow(), |state| state.menus.as_slice())
     }
 
     pub fn spawn<Fut, T>(&self, future: Fut) -> Task<T>
@@ -288,6 +318,7 @@ impl Drop for Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window::MenuItem;
     use std::cell::Cell;
     use std::future::pending;
     use std::rc::Rc;
@@ -380,6 +411,22 @@ mod tests {
         app.on_action(move |_: &Activate, _| second_calls.borrow_mut().push("second"));
         assert!(app.dispatch_action(&Activate));
         assert_eq!(&*calls.borrow(), &["first", "second"]);
+    }
+
+    #[test]
+    fn activation_quit_and_menus_update_shared_application_state() {
+        let mut app = App::new();
+        assert!(!app.is_active());
+        assert!(!app.quit_requested());
+        assert!(app.menus().is_empty());
+
+        app.activate(true);
+        app.set_menus([Menu::new("File", vec![MenuItem::separator()])]);
+        app.quit();
+
+        assert!(app.is_active());
+        assert!(app.quit_requested());
+        assert_eq!(app.menus()[0].name, "File");
     }
 }
 

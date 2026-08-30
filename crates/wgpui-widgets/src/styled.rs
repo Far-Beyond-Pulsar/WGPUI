@@ -95,6 +95,26 @@ impl IntoStylePixels for DefiniteLength {
     }
 }
 
+macro_rules! impl_numeric_style_conversions {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl IntoStylePixels for $type {
+                fn into_style_pixels(self) -> f32 {
+                    self as f32
+                }
+            }
+
+            impl IntoStyleDimension for $type {
+                fn into_style_dimension(self) -> Dimension {
+                    Dimension::length(self as f32)
+                }
+            }
+        )+
+    };
+}
+
+impl_numeric_style_conversions!(f64, i32, i64, isize, u32, u64, usize);
+
 pub trait IntoStyleDimension {
     fn into_style_dimension(self) -> Dimension;
 }
@@ -364,6 +384,22 @@ pub trait Styled: Sized {
         self
     }
 
+    fn row_span(mut self, span: u16) -> Self {
+        self.layout_style().grid_row = wgpui_layout::taffy_tree::Line {
+            start: wgpui_layout::taffy_tree::GridPlacement::Span(span),
+            end: wgpui_layout::taffy_tree::GridPlacement::Span(span),
+        };
+        self
+    }
+
+    fn row_span_full(mut self) -> Self {
+        self.layout_style().grid_row = wgpui_layout::taffy_tree::Line {
+            start: wgpui_layout::taffy_tree::GridPlacement::Line(1.into()),
+            end: wgpui_layout::taffy_tree::GridPlacement::Line((-1).into()),
+        };
+        self
+    }
+
     fn overflow_hidden(mut self) -> Self {
         self.layout_style().overflow.x = Overflow::Hidden;
         self.layout_style().overflow.y = Overflow::Hidden;
@@ -398,6 +434,11 @@ pub trait Styled: Sized {
     /// `align-items: flex-end`.
     fn items_end(mut self) -> Self {
         self.layout_style().align_items = Some(AlignItems::FlexEnd);
+        self
+    }
+
+    fn items_baseline(mut self) -> Self {
+        self.layout_style().align_items = Some(AlignItems::Baseline);
         self
     }
 
@@ -1139,6 +1180,12 @@ pub trait Styled: Sized {
     fn right_0(self) -> Self {
         self.right(0.0)
     }
+    fn right_1(self) -> Self {
+        self.right(4.0)
+    }
+    fn right_4(self) -> Self {
+        self.right(16.0)
+    }
     fn bottom_0(self) -> Self {
         self.bottom(0.0)
     }
@@ -1431,5 +1478,32 @@ mod tests {
         assert_eq!(styled.0.layout.overflow.y, Overflow::Scroll);
         assert_eq!(styled.0.border_widths.left, 3.0);
         assert_eq!(styled.0.text_size, Some(12.0));
+    }
+
+    #[test]
+    fn common_position_and_grid_aliases_change_layout_style() {
+        let styled = Styleable::default().right_1().row_span(2);
+        assert_eq!(
+            styled.0.layout.inset.right,
+            LengthPercentageAuto::length(4.0)
+        );
+        assert_eq!(
+            styled.0.layout.grid_row,
+            wgpui_layout::taffy_tree::Line {
+                start: wgpui_layout::taffy_tree::GridPlacement::Span(2),
+                end: wgpui_layout::taffy_tree::GridPlacement::Span(2),
+            }
+        );
+    }
+
+    #[test]
+    fn integer_style_inputs_are_resolved_without_changing_the_layout_path() {
+        let styled = Styleable::default().w(120_u32).p(3_i32).right(2_i64);
+        assert_eq!(styled.0.layout.size.width, Dimension::length(120.0));
+        assert_eq!(styled.0.layout.padding, uniform_rect(3.0));
+        assert_eq!(
+            styled.0.layout.inset.right,
+            LengthPercentageAuto::length(2.0)
+        );
     }
 }
