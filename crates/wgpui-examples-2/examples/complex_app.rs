@@ -109,6 +109,7 @@ fn main() -> Result<(), ApplicationError> {
                             .border_1()
                             .border_color(rgb(0x293348))
                             .bg(rgb(0x171d29))
+                            .id("activity-scroll")
                             .boundary()
                             .overflow_y_scroll()
                             .scroll_offset([0.0, -scroll_offset])

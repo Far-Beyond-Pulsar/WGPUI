@@ -252,15 +252,27 @@ impl Window {
                 }
                 handled
             }
+            InputEvent::Scroll(scroll) => {
+                let mut handled = false;
+                for index in self.hit_interactions(scroll.position) {
+                    let result = self.dispatch_interaction(index, &event, app);
+                    handled |= result;
+                    if result {
+                        break;
+                    }
+                }
+                handled
+            }
             _ => self.interaction.handle_input(event),
         }
     }
-    fn hit_interaction(&self, position: [Pixels; 2]) -> Option<usize> {
+    fn hit_interactions(&self, position: [Pixels; 2]) -> Vec<usize> {
         let point = [
             position[0].value() * self.scale_factor as f32,
             position[1].value() * self.scale_factor as f32,
         ];
-        self.interactions
+        let mut hits: Vec<_> = self
+            .interactions
             .iter()
             .enumerate()
             .filter(|(_, registration)| {
@@ -270,8 +282,13 @@ impl Window {
                     && point[1] >= bounds.min_y
                     && point[1] < bounds.max_y
             })
-            .max_by_key(|(_, registration)| registration.order)
             .map(|(index, _)| index)
+            .collect();
+        hits.sort_unstable_by_key(|index| std::cmp::Reverse(self.interactions[*index].order));
+        hits
+    }
+    fn hit_interaction(&self, position: [Pixels; 2]) -> Option<usize> {
+        self.hit_interactions(position).into_iter().next()
     }
     fn dispatch_interaction(&mut self, index: usize, event: &InputEvent, app: &mut App) -> bool {
         let mut interactions = std::mem::take(&mut self.interactions);
@@ -1018,8 +1035,9 @@ impl winit::application::ApplicationHandler for Handler {
                         click_count: 1,
                     })
                 };
-                live.window.handle_input_with_app(event, &mut live.app);
-                live.window.request_redraw();
+                if live.window.handle_input_with_app(event, &mut live.app) {
+                    live.window.request_redraw();
+                }
             }
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
@@ -1033,8 +1051,9 @@ impl winit::application::ApplicationHandler for Handler {
                     delta,
                     modifiers: live.window.modifiers(),
                 });
-                live.window.handle_input_with_app(event, &mut live.app);
-                live.window.request_redraw();
+                if live.window.handle_input_with_app(event, &mut live.app) {
+                    live.window.request_redraw();
+                }
             }
             winit::event::WindowEvent::RedrawRequested => self.draw(event_loop, window_id),
             winit::event::WindowEvent::CursorEntered { .. } => live.window.request_redraw(),
