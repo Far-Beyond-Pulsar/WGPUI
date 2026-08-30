@@ -54,7 +54,7 @@ use crate::render::atlas::{AtlasTileSource, GlyphAtlas};
 use crate::render::atlas_upload::AtlasTextures;
 use crate::render::draw::DrawMode;
 use crate::render::frame::{
-    Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, RenderTarget,
+    Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, OffscreenTarget, RenderTarget,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -215,6 +215,7 @@ pub struct FrameLoop {
     text_rasterizer: GlyphRasterizer,
     text_atlas: GlyphAtlas,
     atlas_textures: AtlasTextures,
+    presentation_target: Option<OffscreenTarget>,
     prepared_text: HashMap<TextCacheKey, PreparedText>,
     frames: u64,
     last_viewport: Option<[f32; 2]>,
@@ -253,6 +254,7 @@ impl FrameLoop {
             text_rasterizer: GlyphRasterizer::new(),
             text_atlas: GlyphAtlas::default(),
             atlas_textures: AtlasTextures::new(GlyphAtlas::default().page_size()),
+            presentation_target: None,
             prepared_text: HashMap::new(),
             frames: 0,
             last_viewport: None,
@@ -465,6 +467,19 @@ impl FrameLoop {
         self.interaction_dirty_regions.clear();
         self.renderer.set_debug_tiles(debug_tiles);
 
+        let damage = if viewport_changed {
+            None
+        } else {
+            let mut damage = None;
+            for region in emission.damage.iter().copied() {
+                damage = Some(union_damage(damage, region));
+            }
+            for region in interaction_dirty_regions.iter().copied() {
+                damage = Some(union_damage(damage, region));
+            }
+            Some(damage.unwrap_or(Rect::EMPTY))
+        };
+
         self.atlas_textures
             .sync(device, queue, &mut self.text_atlas);
         let owned_atlas = Some(&self.atlas_textures);
@@ -484,9 +499,42 @@ impl FrameLoop {
             viewport: [width, height],
             mode: input.mode,
         };
-        let frame = self
-            .renderer
-            .render_to(device, queue, &frame_input, input.target)?;
+        let can_preserve_presentation = input
+            .target
+            .source
+            .is_some_and(|source| source.usage().contains(wgpu::TextureUsages::COPY_DST));
+        let frame = if can_preserve_presentation {
+            let target_is_new = self.presentation_target.as_ref().is_none_or(|target| {
+                target.width != input.target.width || target.height != input.target.height
+            });
+            if target_is_new {
+                self.presentation_target = Some(OffscreenTarget::new(
+                    device,
+                    input.target.width,
+                    input.target.height,
+                ));
+            }
+            if let Some(retained_target) = self.presentation_target.as_ref() {
+                let retained_render_target = retained_target.target();
+                let frame = self.renderer.render_to_with_damage(
+                    device,
+                    queue,
+                    &frame_input,
+                    &retained_render_target,
+                    if target_is_new { None } else { damage },
+                )?;
+                if let Some(destination) = input.target.source {
+                    retained_target.copy_to_texture(device, queue, destination);
+                }
+                frame
+            } else {
+                self.renderer
+                    .render_to(device, queue, &frame_input, input.target)?
+            }
+        } else {
+            self.renderer
+                .render_to(device, queue, &frame_input, input.target)?
+        };
         self.frames += 1;
 
         Ok(LoopFrame {
@@ -726,6 +774,13 @@ impl FrameLoop {
             prepared.clone(),
         );
         Ok(prepared)
+    }
+}
+
+fn union_damage(current: Option<Rect>, next: Rect) -> Rect {
+    match current {
+        Some(current) => current.union(&next),
+        None => next,
     }
 }
 

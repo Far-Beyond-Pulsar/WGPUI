@@ -259,7 +259,8 @@ impl OffscreenTarget {
             format: TARGET_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -284,6 +285,28 @@ impl OffscreenTarget {
         queue: &wgpu::Queue,
     ) -> Result<Vec<u8>, ReadbackError> {
         read_texture_rgba8(device, queue, &self.texture, self.width, self.height)
+    }
+
+    /// Copy the retained presentation buffer into an acquired surface image.
+    pub fn copy_to_texture(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        destination: &wgpu::Texture,
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("present retained frame"),
+        });
+        encoder.copy_texture_to_texture(
+            self.texture.as_image_copy(),
+            destination.as_image_copy(),
+            wgpu::Extent3d {
+                width: self.width.min(destination.width()),
+                height: self.height.min(destination.height()),
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
     }
 
     /// This target as a [`RenderTarget`], cleared to black.
@@ -412,6 +435,9 @@ pub struct FrameRenderer {
     backdrop_snapshot: Option<wgpu::Texture>,
     backdrop_snapshot_view: Option<wgpu::TextureView>,
     backdrop_sampler: wgpu::Sampler,
+    damage_clear_pipeline: wgpu::RenderPipeline,
+    damage_clear_bind_group: wgpu::BindGroup,
+    damage_clear_color: wgpu::Buffer,
     debug_pipeline: wgpu::RenderPipeline,
     debug_bind_group_layout: wgpu::BindGroupLayout,
     debug_buffer: wgpu::Buffer,
@@ -423,6 +449,8 @@ pub struct FrameRenderer {
 impl FrameRenderer {
     /// Build every pipeline once.
     pub fn new(device: &wgpu::Device) -> FrameRenderer {
+        let (damage_clear_pipeline, damage_clear_bind_group, damage_clear_color) =
+            create_damage_clear_pipeline(device);
         let (debug_bind_group_layout, debug_pipeline) = create_debug_pipeline(device);
         let debug_buffer_capacity = std::mem::size_of::<DebugTile>() as u64;
         FrameRenderer {
@@ -486,6 +514,9 @@ impl FrameRenderer {
                 mipmap_filter: wgpu::MipmapFilterMode::Nearest,
                 ..Default::default()
             }),
+            damage_clear_pipeline,
+            damage_clear_bind_group,
+            damage_clear_color,
             debug_pipeline,
             debug_bind_group_layout,
             debug_buffer: device.create_buffer(&wgpu::BufferDescriptor {
@@ -750,6 +781,20 @@ impl FrameRenderer {
         queue: &wgpu::Queue,
         input: &FrameInput<'_>,
         target: &RenderTarget<'_>,
+    ) -> Result<FrameOutput, FrameError> {
+        self.render_to_with_damage(device, queue, input, target, None)
+    }
+
+    /// Render only the damaged part of a target whose previous contents are
+    /// still valid. The scene and its GPU arenas remain retained scene state;
+    /// this rectangle is only a raster/presentation restriction.
+    pub fn render_to_with_damage(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &FrameInput<'_>,
+        target: &RenderTarget<'_>,
+        damage: Option<Rect>,
     ) -> Result<FrameOutput, FrameError> {
         #[cfg(feature = "devtools")]
         let _instrumentation_span = {
@@ -1490,10 +1535,24 @@ impl FrameRenderer {
             label: Some("frame"),
         });
         let debug_tiles = self.debug_tiles.clone();
+        let mut stats;
+        let scissor = damage.map(|damage| scissor_rect(damage, target.width, target.height));
+        if scissor.is_some_and(|[_, _, width, height]| width > 0 && height > 0) {
+            let clear_color = [
+                target.clear.r as f32,
+                target.clear.g as f32,
+                target.clear.b as f32,
+                target.clear.a as f32,
+            ];
+            queue.write_buffer(
+                &self.damage_clear_color,
+                0,
+                bytemuck::bytes_of(&clear_color),
+            );
+        }
         let has_debug_tiles = self
             .prepare_debug_tiles(device, queue, &debug_tiles)
             .is_some();
-        let mut stats;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame"),
@@ -1502,7 +1561,11 @@ impl FrameRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(target.clear),
+                        load: if scissor.is_some() {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(target.clear)
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1511,6 +1574,14 @@ impl FrameRenderer {
                 occlusion_query_set: None,
                 multiview_mask: Default::default(),
             });
+            if let Some([x, y, width, height]) = scissor {
+                pass.set_scissor_rect(x, y, width, height);
+            }
+            if scissor.is_some_and(|[_, _, width, height]| width > 0 && height > 0) {
+                pass.set_pipeline(&self.damage_clear_pipeline);
+                pass.set_bind_group(0, &self.damage_clear_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
             let started = Instant::now();
             // First, and under everything: `PrimitiveKind::ALL` declares
             // `Shadow` before `Quad` because the legacy sorter's own
@@ -1615,6 +1686,9 @@ impl FrameRenderer {
                     occlusion_query_set: None,
                     multiview_mask: Default::default(),
                 });
+                if let Some([x, y, width, height]) = scissor {
+                    pass.set_scissor_rect(x, y, width, height);
+                }
                 if let Some(texture_group) = backdrop_texture_group.as_ref() {
                     stats.merge(issue_backdrop_filters(
                         &mut pass,
@@ -1670,6 +1744,89 @@ impl FrameRenderer {
                 .unwrap_or(u32::MAX),
         })
     }
+}
+
+fn scissor_rect(damage: Rect, target_width: u32, target_height: u32) -> [u32; 4] {
+    if damage.is_empty()
+        || !damage.min_x.is_finite()
+        || !damage.min_y.is_finite()
+        || !damage.max_x.is_finite()
+        || !damage.max_y.is_finite()
+    {
+        return [0, 0, 0, 0];
+    }
+    let min_x = damage.min_x.floor().clamp(0.0, target_width as f32) as u32;
+    let min_y = damage.min_y.floor().clamp(0.0, target_height as f32) as u32;
+    let max_x = damage.max_x.ceil().clamp(0.0, target_width as f32) as u32;
+    let max_y = damage.max_y.ceil().clamp(0.0, target_height as f32) as u32;
+    [min_x, min_y, max_x.saturating_sub(min_x), max_y.saturating_sub(min_y)]
+}
+
+fn create_damage_clear_pipeline(
+    device: &wgpu::Device,
+) -> (wgpu::RenderPipeline, wgpu::BindGroup, wgpu::Buffer) {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("damage clear"),
+        source: wgpu::ShaderSource::Wgsl(crate::render::shaders::DAMAGE_CLEAR_WGSL.into()),
+    });
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("damage clear"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: std::num::NonZeroU64::new(16),
+            },
+            count: None,
+        }],
+    });
+    let color = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("damage clear color"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("damage clear"),
+        layout: &bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: color.as_entire_binding(),
+        }],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("damage clear"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("damage clear"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vertex_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fragment_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: TARGET_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, bind_group, color)
 }
 
 fn create_debug_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {

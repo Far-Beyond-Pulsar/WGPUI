@@ -376,10 +376,10 @@ impl BoundaryComposite {
 
 /// What one tiled boundary's frame resolved to (§4.3).
 ///
-/// Every field is a list of tiles the caller turns into ordinary layer work.
-/// Nothing here is a layer, a slab, or an invalidation — see
-/// [`Compositor::visit_tiled`] for why that separation is the phase's whole
-/// claim rather than a stylistic choice.
+/// These are visibility, residency, and damage candidates for the one retained
+/// boundary layer. They are not a render cache and do not create scene layers,
+/// slabs, or invalidations. The native emitter uses this metadata to decide
+/// which screen regions need presentation updates.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TiledVisit {
     /// The boundary these tiles belong to.
@@ -402,7 +402,11 @@ pub struct TiledVisit {
 }
 
 impl TiledVisit {
-    /// The layer holding one tile of this boundary.
+    /// The compatibility layer key for one tile of this boundary.
+    ///
+    /// Production emission does not create or retain this layer. The method
+    /// remains available to callers that use the tile-key model in test
+    /// support or custom renderers.
     pub fn tile_layer(&self, tile: TileCoord) -> LayerId {
         LayerId::from_key(LayerKey::tiled(self.boundary, tile))
     }
@@ -418,7 +422,7 @@ impl TiledVisit {
         LayerId::from_key(LayerKey::untiled(self.boundary))
     }
 
-    /// Every visible tile's layer, in draw order.
+    /// Compatibility layer keys for visible tiles, in draw order.
     pub fn visible_layers(&self) -> Vec<LayerId> {
         self.visible
             .iter()
@@ -426,7 +430,7 @@ impl TiledVisit {
             .collect()
     }
 
-    /// Which layer a primitive with these content-plane bounds belongs in.
+    /// The compatibility layer key for a primitive's tile placement.
     pub fn placement_layer(&self, bounds: Rect) -> LayerId {
         match self.grid.placement(bounds) {
             crate::scene::tile::TilePlacement::Tile(tile) => self.tile_layer(tile),
@@ -470,6 +474,9 @@ impl Compositor {
             });
         state.policy = policy;
         state.last_visited_frame = frame;
+        if policy.buffering.tile_grid().is_none() {
+            state.tiles = None;
+        }
         state.layer
     }
 
@@ -486,27 +493,21 @@ impl Compositor {
     /// Both mean the same thing to a caller: buffer this boundary the untiled
     /// way, which [`Compositor::visit`] already did for it.
     ///
-    /// # More than one `Layer` per boundary, and nothing else new
+    /// # Visibility metadata, and nothing else new
     ///
     /// §4.3's whole claim is that tiling "needs almost no new machinery," and
-    /// this method is where that is either true or not. What it does is call
-    /// [`crate::scene::TileGrid::visible_span`], hand the result to
-    /// [`TileResidency`], and name a [`LayerKey::tiled`] per surviving tile. It
-    /// creates no layer, allocates no slab, and raises no invalidation — every
-    /// one of those is the caller's ordinary machinery, applied to the layer
-    /// keys this returns:
+    /// this method is where that is either true or not. It calls
+    /// [`crate::scene::TileGrid::visible_span`], hands the result to
+    /// [`TileResidency`], and reports which content-plane tiles are visible or
+    /// newly revealed. It creates no layer, allocates no slab, and raises no
+    /// invalidation. The caller uses the result as presentation damage
+    /// metadata while the ordinary retained boundary layer remains the only
+    /// scene ownership.
     ///
-    /// - A **revealed** tile becomes a layer nobody declared before, and
-    ///   [`crate::scene::layer::LayerTable::insert`] starts a new layer at
-    ///   `Invalidation::all()` on its own rule. That is §4.3's "crossing into a
-    ///   new tile triggers `DISPLAY` for *that tile alone*", and it needed no
-    ///   tile-specific code to happen.
-    /// - A **still-visible** tile is a layer that already exists, so declaring
-    ///   it again is idempotent and the pan reaches it as one
-    ///   [`crate::scene::layer::LayerTable::set_transform`] — `TRANSFORM` and
-    ///   nothing else, which is §5.4's path, live since Phase 2.
-    /// - An **evicted** tile is a layer the caller removes, releasing its slab
-    ///   through [`crate::scene::Scene::remove_layer`] like any other.
+    /// - A **revealed** tile is newly exposed presentation damage.
+    /// - A **still-visible** tile remains resident metadata; scrolling it does
+    ///   not require shaping, layout, primitive upload, or atlas upload.
+    /// - An **evicted** tile is no longer part of the resident-range metadata.
     ///
     /// # Two ordering and lifetime facts worth knowing before calling this
     ///
@@ -517,16 +518,10 @@ impl Compositor {
     /// call [`Compositor::visit`] (or this method) before setting the transform
     /// that positions it. Every later frame is unaffected.
     ///
-    /// **A boundary switched away from `Tiled` keeps its tile layers until it is
-    /// swept.** This method returns `None` for a non-tiled policy without
-    /// touching the residency, so the tiles stay recorded and
-    /// [`Compositor::sweep`] still names them when the boundary itself is
-    /// evicted — nothing is lost, but nothing is released early either. Changing
-    /// a live boundary's buffering from `Tiled` to `Margin` therefore holds its
-    /// tile slabs until the boundary leaves the tree. Recorded rather than
-    /// fixed: releasing them here would mean this method returning layers on the
-    /// path where it reports having no tile set at all, and no caller in this
-    /// phase changes a boundary's buffering mid-life.
+    /// **A boundary switched away from `Tiled` drops its tile metadata on the
+    /// next visit.** The ordinary untiled boundary layer remains live, and
+    /// [`Compositor::sweep`] releases that layer when the boundary itself is
+    /// evicted.
     pub fn visit_tiled(
         &mut self,
         boundary: BoundaryId,
@@ -637,7 +632,8 @@ impl Compositor {
     }
 
     /// Drop the state of every boundary unvisited for longer than its own
-    /// `evict_after_frames`, returning the layers those boundaries owned.
+    /// `evict_after_frames`, returning the retained boundary layers those
+    /// boundaries owned.
     ///
     /// R-N §3.4's mark-and-sweep, with its deliberate delay: a panel scrolled
     /// out of the tree and back within the interval re-materialises at the
@@ -649,32 +645,20 @@ impl Compositor {
     /// The evicted layers are returned rather than counted because a boundary's
     /// layer outlives its records: the records go when the elements leave the
     /// tree, but the `Layer` entry itself is the compositor's to release, and
-    /// nothing else knows when the interval has elapsed.
+    /// nothing else knows when the interval has elapsed. Tile metadata is
+    /// discarded with the boundary state and is never returned as scene-layer
+    /// ownership.
     pub fn sweep(&mut self, frame: u64) -> Vec<LayerId> {
         let mut evicted = Vec::new();
-        self.boundaries.retain(|boundary, state| {
+        self.boundaries.retain(|_boundary, state| {
             let elapsed = frame.saturating_sub(state.last_visited_frame);
             if elapsed <= u64::from(state.policy.evict_after_frames) {
                 return true;
             }
             evicted.push(state.layer);
-            // **Every** layer the boundary owned, not just its own. Before
-            // Phase 4.5 a boundary had exactly one layer and `state.layer` was
-            // the complete answer; a tiled boundary has one per resident tile,
-            // and dropping its `BoundaryState` here is what makes this the last
-            // moment anything knows those tiles existed. Returning only
-            // `state.layer` left every tile's slab reservation resident for the
-            // lifetime of the scene — this method's own doc is the argument for
-            // why: the layer entry "is the compositor's to release, and nothing
-            // else knows when the interval has elapsed."
-            if let Some(tiles) = &state.tiles {
-                evicted.extend(
-                    tiles
-                        .resident()
-                        .into_iter()
-                        .map(|tile| LayerId::from_key(LayerKey::tiled(*boundary, tile))),
-                );
-            }
+            // Tiles are visibility and damage metadata, not scene layers. The
+            // boundary's untiled layer is the only retained GPU ownership that
+            // this compositor can release here.
             false
         });
         evicted
@@ -1076,12 +1060,9 @@ mod tests {
         );
     }
 
-    /// The bug this test exists because of: `sweep` returned only
-    /// `state.layer`, which was the complete answer when a boundary had exactly
-    /// one layer and silently leaked every tile's reservation once it could have
-    /// many.
+    /// Tiled visibility does not create a second retained scene ownership.
     #[test]
-    fn sweeping_a_tiled_boundary_names_every_layer_it_owned_not_just_its_own() {
+    fn sweeping_a_tiled_boundary_names_only_its_untiled_layer() {
         let mut compositor = Compositor::new();
         let visit = compositor
             .visit_tiled(PANEL, tiled_policy(), 1, canvas_viewport())
@@ -1093,24 +1074,10 @@ mod tests {
         let evicted = compositor.sweep(2 + interval);
         assert!(compositor.is_empty());
 
-        let expected: std::collections::BTreeSet<LayerId> = tiles
-            .iter()
-            .map(|tile| LayerId::from_key(LayerKey::tiled(PANEL, *tile)))
-            .chain(Some(LayerId::from_key(LayerKey::untiled(PANEL))))
-            .collect();
         assert_eq!(
-            evicted
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>(),
-            expected,
-            "an evicted tiled boundary must name its overlay and every resident \
-             tile, or their slab reservations outlive the scene"
-        );
-        assert_eq!(
-            evicted.len(),
-            tiles.len() + 1,
-            "and must not name any layer twice"
+            evicted,
+            vec![LayerId::from_key(LayerKey::untiled(PANEL))],
+            "tile residency is not a second scene layer"
         );
     }
 

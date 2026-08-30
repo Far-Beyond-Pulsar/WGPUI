@@ -247,6 +247,270 @@ fn a_layer_transform_moves_native_pixels_without_scene_uploads() {
     assert_eq!(output.scene_upload_bytes, 0);
 }
 
+#[test]
+fn a_layer_transform_keeps_rounded_quad_edges_attached_to_the_quad() {
+    let Some(context) = context_or_report("rounded_layer_transform") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 128.0,
+        height: 128.0,
+        ..UiSceneSpec::small()
+    };
+    let quad = Quad {
+        origin: [24.0, 28.0],
+        size: [56.0, 44.0],
+        background: [0.15, 0.35, 0.75, 1.0],
+        border_color: [0.95, 0.9, 0.7, 1.0],
+        corner_radii: [12.0; 4],
+        border_widths: [2.0; 4],
+        ..Quad::ZERO
+    };
+    let translation = [17.0, 11.0];
+    let shifted = Quad {
+        origin: [quad.origin[0] + translation[0], quad.origin[1] + translation[1]],
+        ..quad
+    };
+
+    let mut transformed_scene = MultiLayerSceneDriver::new(1);
+    transformed_scene
+        .set_layer(0, &[quad])
+        .expect("the rounded quad scene applies");
+    let layer = transformed_scene
+        .scene
+        .layers
+        .ids()
+        .first()
+        .copied()
+        .expect("the test scene has one layer");
+    let mut expected_scene = MultiLayerSceneDriver::new(1);
+    expected_scene
+        .set_layer(0, &[shifted])
+        .expect("the shifted rounded quad scene applies");
+
+    let mut renderer = FrameRenderer::new(&context.device);
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let initial_input = FrameInput {
+        scene: &transformed_scene.scene,
+        clip: window(&spec),
+        poison: &transformed_scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    render(&context, &mut renderer, &target, &initial_input);
+    assert!(transformed_scene
+        .scene
+        .layers
+        .set_transform(layer, LayerTransform::translated(translation[0], translation[1])));
+    let transformed_input = FrameInput {
+        scene: &transformed_scene.scene,
+        clip: window(&spec),
+        poison: &transformed_scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, transformed) = render(&context, &mut renderer, &target, &transformed_input);
+
+    let expected_input = FrameInput {
+        scene: &expected_scene.scene,
+        clip: window(&spec),
+        poison: &expected_scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let mut expected_renderer = FrameRenderer::new(&context.device);
+    let (_, expected) = render(&context, &mut expected_renderer, &target, &expected_input);
+
+    let differing_pixels = expected
+        .chunks_exact(4)
+        .zip(transformed.chunks_exact(4))
+        .filter(|(expected, transformed)| expected != transformed)
+        .count();
+    assert!(
+        differing_pixels <= 8,
+        "layer translation changed {} rounded-edge pixels",
+        differing_pixels
+    );
+}
+
+#[test]
+fn damaged_presentation_preserves_untouched_pixels() {
+    let Some(context) = context_or_report("damaged_presentation") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 128.0,
+        height: 64.0,
+        ..UiSceneSpec::small()
+    };
+    let quad = |origin: [f32; 2], background: [f32; 4]| Quad {
+        origin,
+        size: [48.0, 48.0],
+        background,
+        ..Quad::ZERO
+    };
+    let initial = [
+        quad([8.0, 8.0], [0.8, 0.1, 0.1, 1.0]),
+        quad([72.0, 8.0], [0.1, 0.2, 0.8, 1.0]),
+    ];
+    let updated = [
+        quad([8.0, 8.0], [0.1, 0.8, 0.2, 1.0]),
+        initial[1],
+    ];
+
+    let mut scene = MultiLayerSceneDriver::new(1);
+    scene.set_layer(0, &initial).expect("the initial scene applies");
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let mut renderer = FrameRenderer::new(&context.device);
+    let initial_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    render(&context, &mut renderer, &target, &initial_input);
+    scene.set_layer(0, &updated).expect("the update applies");
+    let mut renderer = FrameRenderer::new(&context.device);
+    let updated_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let retained_target = target.target();
+    renderer
+        .render_to_with_damage(
+            &context.device,
+            &context.queue,
+            &updated_input,
+            &retained_target,
+            Some(Rect::from_origin_size([0.0, 0.0], [64.0, 64.0])),
+        )
+        .expect("the damaged frame renders");
+    let damaged = target
+        .read_pixels(&context.device, &context.queue)
+        .expect("the damaged frame reads back");
+
+    let mut expected_scene = MultiLayerSceneDriver::new(1);
+    expected_scene
+        .set_layer(0, &updated)
+        .expect("the expected scene applies");
+    let expected_target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let mut expected_renderer = FrameRenderer::new(&context.device);
+    let expected_input = FrameInput {
+        scene: &expected_scene.scene,
+        clip: window(&spec),
+        poison: &expected_scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    render(
+        &context,
+        &mut expected_renderer,
+        &expected_target,
+        &expected_input,
+    );
+    let expected = expected_target
+        .read_pixels(&context.device, &context.queue)
+        .expect("the expected frame reads back");
+    assert_eq!(damaged, expected);
+}
+
+#[test]
+fn damaged_presentation_clears_removed_content() {
+    let Some(context) = context_or_report("damaged_presentation_removal") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 64.0,
+        height: 64.0,
+        ..UiSceneSpec::small()
+    };
+    let quad = Quad {
+        origin: [8.0, 8.0],
+        size: [40.0, 40.0],
+        background: [0.8, 0.2, 0.1, 1.0],
+        ..Quad::ZERO
+    };
+    let mut scene = MultiLayerSceneDriver::new(1);
+    scene.set_layer(0, &[quad]).expect("the initial scene applies");
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let mut renderer = FrameRenderer::new(&context.device);
+    let initial_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    render(&context, &mut renderer, &target, &initial_input);
+
+    scene.set_layer(0, &[]).expect("the removal applies");
+    let updated_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let retained_target = target.target();
+    FrameRenderer::new(&context.device)
+        .render_to_with_damage(
+            &context.device,
+            &context.queue,
+            &updated_input,
+            &retained_target,
+            Some(Rect::from_origin_size([0.0, 0.0], [64.0, 64.0])),
+        )
+        .expect("the damaged removal frame renders");
+    let pixels = target
+        .read_pixels(&context.device, &context.queue)
+        .expect("the damaged removal frame reads back");
+    assert!(pixels.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 255]));
+}
+
 /// **Gate 1**: a clean window's CPU-side draw-issuing work is O(layer slots),
 /// independent of resident primitive count.
 ///

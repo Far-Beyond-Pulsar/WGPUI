@@ -43,14 +43,14 @@ impl BoundaryId {
     }
 }
 
-/// A layer's cross-frame address: which boundary owns it, and — once §4.3's
-/// tiling exists — which tile of that boundary's content plane it holds.
+/// A retained layer's cross-frame address: which boundary owns it, and the
+/// optional compatibility tile key used by older/custom scene drivers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LayerKey {
     /// The owning compositing boundary.
     pub boundary: BoundaryId,
-    /// The tile within that boundary, or `None` for an untiled boundary —
-    /// which is every boundary in Phase 1.
+    /// The compatibility tile within that boundary, or `None` for the retained
+    /// boundary layer used by native production emission.
     pub tile: Option<TileCoord>,
 }
 
@@ -63,7 +63,10 @@ impl LayerKey {
         }
     }
 
-    /// The layer holding `tile` of `boundary` (§4.3, Phase 4.5).
+    /// A compatibility key for `tile` of `boundary` (§4.3, Phase 4.5).
+    ///
+    /// Native production emission uses tile coordinates as visibility and
+    /// damage metadata instead of creating a scene layer for each key.
     pub const fn tiled(boundary: BoundaryId, tile: TileCoord) -> Self {
         Self {
             boundary,

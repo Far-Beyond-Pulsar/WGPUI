@@ -307,17 +307,23 @@ has a documented untiled fallback for unsupported or over-budget cases.
 ## Implementation boundary
 
 The native backend now implements the shared retained walk, nested root and
-tile ownership primitives, regional damage calculations, scroll bubbling,
-delta-only scene updates, layer translations in every native primitive shader,
-and the untiled fallback. The existing GPU tile-visibility and indirect
-argument passes remain covered by their differential integration tests.
+tile visibility/residency metadata, regional damage calculations, scroll
+bubbling, delta-only scene updates, layer translations in every native
+primitive shader, and the untiled fallback. The last presented frame is held
+in one presentation buffer when the target supports `COPY_DST`; tile metadata
+then restricts the damage raster region, rather than becoming a second scene
+or render cache. The existing GPU tile-visibility and indirect-argument
+passes remain covered by their differential integration tests.
 
 Two pieces remain deliberately isolated because the current public frame
 protocol has no data path for them. `ScrollRootTable` is not yet the source of
 truth for ordinary overflow discovery: `PlannedNode::declared_boundary` is
 still populated only by an explicit boundary description. The GPU tile pass is
 also not yet driven by per-root descriptors from `FrameRenderer`; the native
-frame path uses its retained per-tile layers and ordinary indirect visibility
-passes instead. Wiring either path further requires extending the frame input
-protocol, so the current behavior stays conservative and correct rather than
-silently treating retained metadata as GPU state.
+frame path currently uses ordinary indirect visibility passes plus a single
+union scissor over the presentation damage. This is conservative for
+disjoint regions and does not create per-tile scene layers or a secondary tile
+render cache. Wiring exact per-tile GPU visibility further requires extending
+the frame input protocol. Targets that do not offer `COPY_DST` use the untiled
+full-render fallback, preserving correctness while the presentation buffer
+cannot be retained.
