@@ -398,12 +398,13 @@ impl<T> Entity<T> {
     fn initialize(&self, value: T) {
         *self.0.borrow_mut() = Some(value);
     }
-    pub fn read(&self) -> std::cell::Ref<'_, T> {
+    pub fn read<C>(&self, _cx: &C) -> std::cell::Ref<'_, T> {
         std::cell::Ref::map(self.0.borrow(), |value| {
             value.as_ref().expect("entity is initialized")
         })
     }
-    pub fn update<R>(&self, cx: &mut Context<T>, update: impl FnOnce(&mut T, &mut Context<T>) -> R) -> R {
+    pub fn update<C, R>(&self, cx: &mut C, update: impl FnOnce(&mut T, &mut C) -> R) -> R
+    where C: EntityContext<T> {
         let mut value = self.0.borrow_mut();
         update(value.as_mut().expect("entity is initialized"), cx)
     }
@@ -413,6 +414,9 @@ impl<T> Entity<T> {
 }
 #[derive(Debug)]
 pub struct EntityError;
+pub trait EntityContext<T> {
+    fn notify(&mut self);
+}
 pub struct WeakEntity<T>(std::rc::Weak<RefCell<Option<T>>>);
 impl<T> Clone for WeakEntity<T> {
     fn clone(&self) -> Self {
@@ -420,7 +424,8 @@ impl<T> Clone for WeakEntity<T> {
     }
 }
 impl<T> WeakEntity<T> {
-    pub fn update<R>(&self, cx: &mut Context<T>, update: impl FnOnce(&mut T, &mut Context<T>) -> R) -> Result<R, EntityError> {
+    pub fn update<C, R>(&self, cx: &mut C, update: impl FnOnce(&mut T, &mut C) -> R) -> Result<R, EntityError>
+    where C: EntityContext<T> {
         let entity = self.0.upgrade().ok_or(EntityError)?;
         let mut value = entity.borrow_mut();
         let value = value.as_mut().ok_or(EntityError)?;
@@ -488,6 +493,9 @@ impl<T> Context<T> {
         Task::ready(futures::executor::block_on(callback(entity, context)))
     }
 }
+impl<T> EntityContext<T> for Context<T> {
+    fn notify(&mut self) { Context::notify(self); }
+}
 
 pub struct App {
     notifications: Rc<RefCell<u64>>,
@@ -521,6 +529,9 @@ impl App {
         };
         entity.initialize(build(&mut context));
         entity
+    }
+    pub fn notify(&mut self) {
+        *self.notifications.borrow_mut() += 1;
     }
     pub fn new<T>(&mut self, build: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
         self.new_entity(build)
@@ -587,6 +598,17 @@ impl Application {
 pub struct Window;
 pub struct WindowHandle;
 type WindowClosedHandler = Box<dyn FnMut(&mut App, WindowHandle)>;
+
+impl Window {
+    pub fn use_state<T>(&mut self, cx: &mut App, build: impl FnOnce(&mut Window, &mut App) -> T) -> Entity<T> {
+        let value = build(self, cx);
+        cx.new_entity(|_| value)
+    }
+}
+
+impl<T> EntityContext<T> for App {
+    fn notify(&mut self) { App::notify(self); }
+}
 #[derive(Default)]
 pub struct WindowOptions {
     pub window_bounds: Option<WindowBounds>,
