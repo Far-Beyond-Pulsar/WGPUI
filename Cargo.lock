@@ -6743,6 +6743,7 @@ version = "0.1.0"
 dependencies = [
  "wgpui-core",
  "wgpui-layout",
+ "wgpui-macros",
  "wgpui-text",
  "wgpui-wgpu",
  "wgpui-widgets",
@@ -6818,6 +6819,15 @@ name = "wgpui-layout"
 version = "0.1.0"
 dependencies = [
  "taffy",
+]
+
+[[package]]
+name = "wgpui-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

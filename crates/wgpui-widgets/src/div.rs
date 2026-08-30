@@ -53,6 +53,7 @@ pub mod scroll_state;
 use crate::div::diff::DivDiffKey;
 use crate::div::interactivity::style::DivStyle;
 use crate::styled::Styled;
+use wgpui_core::element::Element;
 use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::reconcile::description::{Description, ElementId};
 
@@ -279,6 +280,12 @@ impl IntoDescription for Div {
         self.describe()
     }
 }
+impl Element for Div {
+    fn into_description(self) -> Description {
+        self.describe()
+    }
+}
+
 
 impl Styled for Div {
     fn style(&mut self) -> &mut DivStyle {

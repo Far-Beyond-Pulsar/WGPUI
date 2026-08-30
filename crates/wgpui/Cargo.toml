@@ -14,6 +14,7 @@ wgpui-layout = { path = "../wgpui-layout" }
 wgpui-text = { path = "../wgpui-text" }
 wgpui-wgpu = { path = "../wgpui-wgpu" }
 wgpui-widgets = { path = "../wgpui-widgets" }
+wgpui-macros = { path = "../wgpui-macros" }
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }

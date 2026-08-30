@@ -11,4 +11,5 @@ members = [
     "crates/wgpui-examples-2",
     "crates/wgpui-compat",
     "crates/wgpui-compat-macros",
+    "crates/wgpui-macros",
 ]

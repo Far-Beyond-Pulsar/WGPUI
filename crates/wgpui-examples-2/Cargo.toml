@@ -29,6 +29,9 @@ path = "examples/karaoke_multiline.rs"
 name = "text_gradients"
 path = "examples/text_gradients.rs"
 [[example]]
+name = "native_elements"
+path = "examples/native_elements.rs"
+[[example]]
 name = "interactive_elements"
 path = "examples/learn/interactive_elements.rs"
 [[example]]

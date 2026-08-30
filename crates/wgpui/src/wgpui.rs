@@ -26,12 +26,16 @@ pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey,
 pub use wgpui_core::reconcile::{StateKey, StateScope};
 pub use wgpui_core::scene;
 pub use wgpui_core::{
+    Component, Element, IntoElement, Render, RenderOnce, Stateful, render_description,
+};
+pub use wgpui_core::{
     App, Context, Entity, EntityError, EntityId, Subscription, Task, TaskError, WeakEntity,
 };
 pub use wgpui_layout::{
     AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
     LayoutTree, Measure,
 };
+pub use wgpui_macros::IntoElement;
 pub use wgpui_text::patch::{RunPlacement, glyph_runs};
 pub use wgpui_text::shaping::{
     Font, FontId, FontRun, FontStyle, FontWeight, SharedString, TextMeasurement, TextShaper,
@@ -42,7 +46,7 @@ pub use wgpui_widgets::animation::{
 pub use wgpui_widgets::div::interactivity::style::{
     Corners, DivStyle, Edges, LinearGradient, Pattern,
 };
-pub use wgpui_widgets::div::{Div, IntoDescription, div};
+pub use wgpui_widgets::div::{Div, div};
 pub use wgpui_widgets::image_cache::{
     DecodedFrame, DecodedImage, ImageCache, ImageDecodeError, decode, decode_async,
 };
@@ -62,5 +66,8 @@ pub use wgpui_wgpu::window::application::{
 };
 
 pub mod prelude {
-    pub use crate::{Application, Description, Div, IntoDescription, Window, WindowOptions, div};
+    pub use crate::{
+        Application, Description, Div, Element, IntoElement, Render, RenderOnce, Stateful, Window,
+        WindowOptions, div,
+    };
 }

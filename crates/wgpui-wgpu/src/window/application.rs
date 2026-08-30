@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use wgpui_core::boundary::compositor::CompositeEntry;
+use wgpui_core::element::IntoElement;
 use wgpui_core::invalidation::request::FrameSignals;
-use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
 use wgpui_core::reconcile::plan::FrameStats;
 
@@ -155,21 +155,24 @@ impl From<WindowError> for ApplicationError {
 }
 
 /// The native retained application.
-pub struct Application<F> {
+pub struct Application<F, R> {
     options: WindowOptions,
     build: F,
     max_frames: Option<u64>,
+    marker: std::marker::PhantomData<fn() -> R>,
 }
 
-impl<F> Application<F>
+impl<F, R> Application<F, R>
 where
-    F: FnMut(&mut Window) -> Description + 'static,
+    F: FnMut(&mut Window) -> R + 'static,
+    R: IntoElement,
 {
     pub fn new(options: WindowOptions, build: F) -> Self {
         Self {
             options,
             build,
             max_frames: None,
+            marker: std::marker::PhantomData,
         }
     }
 
@@ -191,6 +194,7 @@ where
             max_frames: self.max_frames,
             live: None,
             failure: None,
+            marker: std::marker::PhantomData,
         };
         event_loop
             .run_app(&mut handler)
@@ -225,17 +229,19 @@ struct Live {
     last_report: Option<FrameReport>,
 }
 
-struct Handler<F> {
+struct Handler<F, R> {
     options: WindowOptions,
     build: F,
     max_frames: Option<u64>,
     live: Option<Live>,
     failure: Option<ApplicationError>,
+    marker: std::marker::PhantomData<fn() -> R>,
 }
 
-impl<F> Handler<F>
+impl<F, R> Handler<F, R>
 where
-    F: FnMut(&mut Window) -> Description + 'static,
+    F: FnMut(&mut Window) -> R + 'static,
+    R: IntoElement,
 {
     fn fail(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, error: ApplicationError) {
         self.failure = Some(error);
@@ -268,7 +274,7 @@ where
             .create_view(&wgpu::TextureViewDescriptor::default());
         let (width, height) = live.surface.size();
         live.window.begin_frame();
-        let description = (self.build)(&mut live.window);
+        let description = (self.build)(&mut live.window).into_description();
         live.window.end_frame();
         let target = RenderTarget {
             view: &view,
@@ -316,9 +322,10 @@ where
     }
 }
 
-impl<F> winit::application::ApplicationHandler for Handler<F>
+impl<F, R> winit::application::ApplicationHandler for Handler<F, R>
 where
-    F: FnMut(&mut Window) -> Description + 'static,
+    F: FnMut(&mut Window) -> R + 'static,
+    R: IntoElement,
 {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.live.is_some() {
