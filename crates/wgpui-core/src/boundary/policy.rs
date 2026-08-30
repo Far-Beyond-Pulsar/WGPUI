@@ -46,6 +46,8 @@ impl Pixels {
     pub const fn to_f64(self) -> f64 { self.0 as f64 }
 
     pub fn max(self, other: Self) -> Self { Self(self.0.max(other.0)) }
+
+    pub fn half(self) -> Self { Self(self.0 / 2.0) }
 }
 
 impl Add for Pixels {

@@ -26,6 +26,54 @@ pub use wgpui_widgets::div::interactivity::style::BoxShadow as ResolvedBoxShadow
 pub use wgpui_widgets::styled::Styled;
 pub use wgpui_widgets::styled::LinearColorStop;
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Modifiers;
+
+#[derive(Hash, Default, PartialEq, Eq, Copy, Clone, Debug)]
+pub enum MouseButton {
+    #[default]
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MouseMoveEvent {
+    pub position: Point<Pixels>,
+    pub pressed_button: Option<MouseButton>,
+    pub modifiers: Modifiers,
+}
+
+impl MouseMoveEvent {
+    pub fn dragging(&self) -> bool { self.pressed_button == Some(MouseButton::Left) }
+}
+
+pub trait Half { fn half(&self) -> Self; }
+impl Half for Pixels { fn half(&self) -> Self { (*self).half() } }
+impl Half for f32 { fn half(&self) -> Self { *self / 2.0 } }
+impl Half for i32 { fn half(&self) -> Self { *self / 2 } }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StyleRefinement;
+impl StyleRefinement {
+    pub fn bg(self, _color: impl Into<[f32; 4]>) -> Self { self }
+    pub fn border_color(self, _color: impl Into<[f32; 4]>) -> Self { self }
+    pub fn opacity(self, _value: f32) -> Self { self }
+}
+
+pub trait InteractiveElement: Sized {
+    fn hover(self, _style: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self { self }
+    fn active(self, _style: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self { self }
+    fn on_hover<F: 'static>(self, _handler: F) -> Self { self }
+    fn on_click<F: 'static>(self, _handler: F) -> Self { self }
+    fn on_mouse_down<F: 'static>(self, _button: MouseButton, _handler: F) -> Self { self }
+    fn on_mouse_up<F: 'static>(self, _button: MouseButton, _handler: F) -> Self { self }
+    fn on_mouse_move<F: 'static>(self, _handler: F) -> Self { self }
+    fn on_drag<F: 'static>(self, _handler: F) -> Self { self }
+    fn on_drop<F: 'static>(self, _handler: F) -> Self { self }
+}
+impl InteractiveElement for Div {}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Size<T> {
     pub width: T,
@@ -704,5 +752,6 @@ pub mod prelude {
     pub use crate::{
         div, linear_color_stop, Div, IntoDescription, IntoElement, ReconcileKey, Render,
         RenderOnce, Stateful, StatefulElement, Styled, FocusHandleBuilder, FocusStyle,
+        InteractiveElement, Half,
     };
 }
