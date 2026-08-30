@@ -23,7 +23,11 @@ pub use wgpui_core::patch::primitive::{
 };
 pub use wgpui_core::reconcile;
 pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey, Reconciler};
+pub use wgpui_core::reconcile::{StateKey, StateScope};
 pub use wgpui_core::scene;
+pub use wgpui_core::{
+    App, Context, Entity, EntityError, EntityId, Subscription, Task, TaskError, WeakEntity,
+};
 pub use wgpui_layout::{
     AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutStyle, LayoutTree,
     Measure, MeasureSize,
