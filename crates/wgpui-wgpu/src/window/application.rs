@@ -5,6 +5,7 @@ use std::sync::Arc;
 use wgpui_core::boundary::compositor::CompositeEntry;
 use wgpui_core::invalidation::request::FrameSignals;
 use wgpui_core::reconcile::description::Description;
+use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
 use wgpui_core::reconcile::plan::FrameStats;
 
 use crate::render::draw::DrawMode;
@@ -39,6 +40,8 @@ pub struct Window {
     scale_factor: f64,
     close_requested: bool,
     last_frame: Option<FrameReport>,
+    state: ElementStateStore,
+    state_frame: u64,
 }
 
 /// A clonable handle for scheduling work on a native window.
@@ -72,6 +75,31 @@ impl Window {
     }
     pub fn last_frame(&self) -> Option<&FrameReport> {
         self.last_frame.as_ref()
+    }
+
+    /// Access state retained by an element scope. The store belongs to the
+    /// logical window, not to a rendered layer, so cache boundaries cannot
+    /// accidentally discard interactive state.
+    pub fn use_state<T: 'static, R>(
+        &mut self,
+        scope: StateScope,
+        initialise: impl FnOnce() -> T,
+        access: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        self.state.with_state(
+            StateKey::new::<T>(scope),
+            self.state_frame,
+            initialise,
+            access,
+        )
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.state_frame = self.state_frame.wrapping_add(1);
+    }
+
+    pub fn end_frame(&mut self) -> usize {
+        self.state.sweep(self.state_frame)
     }
 }
 
@@ -239,7 +267,9 @@ where
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let (width, height) = live.surface.size();
+        live.window.begin_frame();
         let description = (self.build)(&mut live.window);
+        live.window.end_frame();
         let target = RenderTarget {
             view: &view,
             width,
@@ -328,6 +358,8 @@ where
             scale_factor,
             close_requested: false,
             last_frame: None,
+            state: ElementStateStore::new(),
+            state_frame: 0,
         };
         self.live = Some(Live {
             frame_loop: FrameLoop::new(&context.device),
