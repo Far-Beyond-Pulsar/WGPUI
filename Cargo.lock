@@ -6754,11 +6754,21 @@ dependencies = [
  "smol",
  "unicode-segmentation",
  "wgpu",
+ "wgpui-compat-macros",
  "wgpui-core",
  "wgpui-layout",
  "wgpui-text",
  "wgpui-wgpu",
  "wgpui-widgets",
+]
+
+[[package]]
+name = "wgpui-compat-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

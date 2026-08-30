@@ -8,4 +8,5 @@ members = [
     "crates/wgpui-wgpu",
     "crates/wgpui-devtools",
     "crates/wgpui-compat",
+    "crates/wgpui-compat-macros",
 ]

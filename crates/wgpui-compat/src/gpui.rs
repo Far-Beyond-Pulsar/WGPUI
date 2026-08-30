@@ -12,6 +12,7 @@ use std::any::TypeId;
 use std::ops::{Deref, DerefMut};
 
 pub use smol::Timer;
+pub use wgpui_compat_macros::IntoElement;
 
 pub use wgpui_core::boundary::policy::Pixels;
 pub use wgpui_core::geometry::Rect;
