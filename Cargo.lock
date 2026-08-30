@@ -1972,7 +1972,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui-ce"
+name = "gpui-ce-legacy"
 version = "1.0.0"
 dependencies = [
  "anyhow",
@@ -6746,7 +6746,6 @@ dependencies = [
  "env_logger",
  "futures",
  "glam",
- "gpui-ce",
  "helio",
  "helio-default-graphs",
  "log",

@@ -11,7 +11,6 @@ path = "src/gpui.rs"
 doctest = false
 
 [dependencies]
-gpui_legacy = { package = "gpui-ce", path = "../.." }
 wgpui-core = { path = "../wgpui-core" }
 wgpui-layout = { path = "../wgpui-layout" }
 wgpui-text = { path = "../wgpui-text" }
@@ -33,167 +32,168 @@ helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev
 
 [[example]]
 name = "karaoke_text"
-path = "../../examples/karaoke_text.rs"
+path = "../../old/examples/karaoke_text.rs"
 
 [[example]]
 name = "karaoke_app"
-path = "../../examples/karaoke_app.rs"
+path = "../../old/examples/karaoke_app.rs"
 
 [[example]]
 name = "text_gradients"
-path = "../../examples/text_gradients.rs"
+path = "../../old/examples/text_gradients.rs"
 
 [[example]]
 name = "interactive_elements"
-path = "../../examples/learn/interactive_elements.rs"
+path = "../../old/examples/learn/interactive_elements.rs"
 
 [[example]]
 name = "creating_components"
-path = "../../examples/learn/creating_components.rs"
+path = "../../old/examples/learn/creating_components.rs"
 
 [[example]]
 name = "layout"
-path = "../../examples/learn/layout.rs"
+path = "../../old/examples/learn/layout.rs"
 
 [[example]]
 name = "styling"
-path = "../../examples/learn/styling.rs"
+path = "../../old/examples/learn/styling.rs"
 
 [[example]]
 name = "async_tasks"
-path = "../../examples/learn/async_tasks.rs"
+path = "../../old/examples/learn/async_tasks.rs"
 
 [[example]]
 name = "custom_drawing"
-path = "../../examples/learn/custom_drawing.rs"
+path = "../../old/examples/learn/custom_drawing.rs"
 
 [[example]]
 name = "animation"
-path = "../../examples/learn/animation.rs"
+path = "../../old/examples/learn/animation.rs"
 
 [[example]]
 name = "text"
-path = "../../examples/learn/text.rs"
+path = "../../old/examples/learn/text.rs"
 
 [[example]]
 name = "emoji_display"
-path = "../../examples/learn/emoji_display.rs"
+path = "../../old/examples/learn/emoji_display.rs"
 
 [[example]]
 name = "wgpu_surface"
-path = "../../examples/learn/wgpu_surface.rs"
+path = "../../old/examples/learn/wgpu_surface.rs"
 
 [[example]]
 name = "wgpu_surface_basic"
-path = "../../examples/learn/wgpu_surface_basic.rs"
+path = "../../old/examples/learn/wgpu_surface_basic.rs"
 
 [[example]]
 name = "wgpu_surface_quad"
-path = "../../examples/learn/wgpu_surface_quad.rs"
+path = "../../old/examples/learn/wgpu_surface_quad.rs"
 
 [[example]]
 name = "wgpu_surface_stress"
-path = "../../examples/learn/wgpu_surface_stress.rs"
+path = "../../old/examples/learn/wgpu_surface_stress.rs"
 
 [[example]]
 name = "mouse_events"
-path = "../../examples/learn/mouse_events.rs"
+path = "../../old/examples/learn/mouse_events.rs"
 
 [[example]]
 name = "blur_showcase"
-path = "../../examples/learn/blur_showcase.rs"
+path = "../../old/examples/learn/blur_showcase.rs"
 
 [[example]]
 name = "smooth_scrolling"
-path = "../../examples/learn/smooth_scrolling.rs"
+path = "../../old/examples/learn/smooth_scrolling.rs"
 
 [[example]]
 name = "virtual_list"
-path = "../../examples/learn/virtual_list.rs"
+path = "../../old/examples/learn/virtual_list.rs"
 
 [[example]]
 name = "data_table"
-path = "../../examples/bench/data_table.rs"
+path = "../../old/examples/bench/data_table.rs"
 
 [[example]]
 name = "plain_scroll_10k"
-path = "../../examples/bench/plain_scroll_10k.rs"
+path = "../../old/examples/bench/plain_scroll_10k.rs"
 
 [[example]]
 name = "paths_bench"
-path = "../../examples/bench/paths_bench.rs"
+path = "../../old/examples/bench/paths_bench.rs"
 
 [[example]]
 name = "pattern"
-path = "../../examples/bench/pattern.rs"
+path = "../../old/examples/bench/pattern.rs"
 
 [[example]]
 name = "shadow"
-path = "../../examples/bench/shadow.rs"
+path = "../../old/examples/bench/shadow.rs"
 
 [[example]]
 name = "focus_visible"
-path = "../../examples/legacy/focus_visible.rs"
+path = "../../old/examples/legacy/focus_visible.rs"
 
 [[example]]
 name = "gif_viewer"
-path = "../../examples/legacy/gif_viewer.rs"
+path = "../../old/examples/legacy/gif_viewer.rs"
 
 [[example]]
 name = "gradient"
-path = "../../examples/legacy/gradient.rs"
+path = "../../old/examples/legacy/gradient.rs"
 
 [[example]]
 name = "hello_world"
-path = "../../examples/legacy/hello_world.rs"
+path = "../../old/examples/legacy/hello_world.rs"
 
 [[example]]
 name = "image_loading"
-path = "../../examples/legacy/image_loading.rs"
+path = "../../old/examples/legacy/image_loading.rs"
 
 [[example]]
 name = "input"
-path = "../../examples/legacy/input.rs"
+path = "../../old/examples/legacy/input.rs"
 
 [[example]]
 name = "on_window_close_quit"
-path = "../../examples/legacy/on_window_close_quit.rs"
+path = "../../old/examples/legacy/on_window_close_quit.rs"
 
 [[example]]
 name = "opacity"
-path = "../../examples/legacy/opacity.rs"
+path = "../../old/examples/legacy/opacity.rs"
 
 [[example]]
 name = "scrollable"
-path = "../../examples/legacy/scrollable.rs"
+path = "../../old/examples/legacy/scrollable.rs"
 
 [[example]]
 name = "svg"
-path = "../../examples/legacy/svg/svg.rs"
+path = "../../old/examples/legacy/svg/svg.rs"
 
 [[example]]
 name = "tab_stop"
-path = "../../examples/legacy/tab_stop.rs"
+path = "../../old/examples/legacy/tab_stop.rs"
 
 [[example]]
 name = "tree"
-path = "../../examples/legacy/tree.rs"
+path = "../../old/examples/legacy/tree.rs"
 
 [[example]]
 name = "uniform_list"
-path = "../../examples/legacy/uniform_list.rs"
+path = "../../old/examples/legacy/uniform_list.rs"
 
 [[example]]
 name = "window"
-path = "../../examples/legacy/window.rs"
+path = "../../old/examples/legacy/window.rs"
 
 [[example]]
 name = "window_positioning"
-path = "../../examples/legacy/window_positioning.rs"
+path = "../../old/examples/legacy/window_positioning.rs"
 
 [[example]]
 name = "window_shadow"
-path = "../../examples/legacy/window_shadow.rs"
+path = "../../old/examples/legacy/window_shadow.rs"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
+

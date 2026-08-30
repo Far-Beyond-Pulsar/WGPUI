@@ -59,8 +59,8 @@ impl CosmicTextSystem {
         #[cfg(target_family = "wasm")]
         {
             let db = font_system.db_mut();
-            db.load_font_data(include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf").to_vec());
-            db.load_font_data(include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf").to_vec());
+            db.load_font_data(include_bytes!("../../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf").to_vec());
+            db.load_font_data(include_bytes!("../../../../assets/fonts/lilex/Lilex-Regular.ttf").to_vec());
         }
 
         Self(RwLock::new(CosmicTextSystemState {

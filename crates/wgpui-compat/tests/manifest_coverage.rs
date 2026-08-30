@@ -1,4 +1,4 @@
-const ROOT_MANIFEST: &str = include_str!("../../../Cargo.toml");
+const LEGACY_MANIFEST: &str = include_str!("../../../old/Cargo.toml");
 const COMPAT_MANIFEST: &str = include_str!("../Cargo.toml");
 
 fn example_names(manifest: &str) -> Vec<&str> {
@@ -20,5 +20,5 @@ fn example_names(manifest: &str) -> Vec<&str> {
 
 #[test]
 fn every_declared_legacy_example_is_in_the_compatibility_probe() {
-    assert_eq!(example_names(ROOT_MANIFEST), example_names(COMPAT_MANIFEST));
+    assert_eq!(example_names(LEGACY_MANIFEST), example_names(COMPAT_MANIFEST));
 }
