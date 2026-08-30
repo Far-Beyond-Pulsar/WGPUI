@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use unicode_segmentation::*;
 use wgpui::{
     App, Application, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, Keystroke,
@@ -8,7 +9,6 @@ use wgpui::{
     WindowBounds, WindowOptions, actions, black, div, fill, hsla, opaque_grey, point, prelude::*,
     px, relative, rgb, rgba, size, white, yellow,
 };
-use unicode_segmentation::*;
 
 actions!(
     text_input,

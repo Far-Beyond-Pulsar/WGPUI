@@ -174,10 +174,13 @@ mod tests {
             EventResult::HANDLED
         });
         assert!(tree.dispatch_action(child, &Activate));
-        assert!(!tree.dispatch_input(hitbox, &InputEvent::KeyUp(crate::window::KeyUpEvent {
-            key: "x".into(),
-            modifiers: crate::window::Modifiers::none(),
-        })));
+        assert!(!tree.dispatch_input(
+            hitbox,
+            &InputEvent::KeyUp(crate::window::KeyUpEvent {
+                key: "x".into(),
+                modifiers: crate::window::Modifiers::none(),
+            })
+        ));
         assert_eq!(&*calls.borrow(), &["child", "root"]);
     }
 }

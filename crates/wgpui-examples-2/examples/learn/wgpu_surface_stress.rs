@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use wgpu::util::DeviceExt;
 /// Example: stress multi-surface rendering with an 8xN grid of WgpuSurface views.
 ///
 /// Set `WGPU_SURFACE_STRESS_ROWS` to control the row count (default: 8).
@@ -5,8 +7,6 @@ use wgpui::{
     App, Application, Context, Render, WgpuSurfaceHandle, Window, WindowOptions, div, prelude::*,
     px, rgb, rgba, wgpu_surface,
 };
-use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 const GRID_COLUMNS: usize = 8;
 const DEFAULT_GRID_ROWS: usize = 8;

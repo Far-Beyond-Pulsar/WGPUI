@@ -75,7 +75,8 @@ use wgpui_wgpu::render::pipelines::TARGET_FORMAT;
 
 /// The legacy shader, byte for byte off disk. A build error here means the
 /// frozen tree moved and this differential no longer has a subject.
-const LEGACY_SHADOWS_WGSL: &str = include_str!("../../../old/src/platform/cross/shaders/shadows.wgsl");
+const LEGACY_SHADOWS_WGSL: &str =
+    include_str!("../../../old/src/platform/cross/shaders/shadows.wgsl");
 
 const WIDTH: u32 = 224;
 const HEIGHT: u32 = 176;

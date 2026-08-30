@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use wgpu::util::DeviceExt;
 /// Example: render four WgpuSurface views at the same time.
 ///
 /// This is intended for validating multi-surface composition and fast-blit behavior.
@@ -5,8 +7,6 @@ use wgpui::{
     App, Application, Context, Render, WgpuSurfaceHandle, Window, WindowOptions, div, prelude::*,
     px, rgb, rgba, wgpu_surface,
 };
-use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 const SHADER: &str = r#"
 struct Uniforms {

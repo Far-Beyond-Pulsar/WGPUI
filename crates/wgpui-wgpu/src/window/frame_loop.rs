@@ -48,8 +48,8 @@ use wgpui_layout::taffy_tree::{
     Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
 };
 
-use crate::render::atlas_upload::AtlasTextures;
 use crate::render::atlas::{AtlasTileSource, GlyphAtlas};
+use crate::render::atlas_upload::AtlasTextures;
 use crate::render::draw::DrawMode;
 use crate::render::frame::{
     Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, RenderTarget,
@@ -57,7 +57,7 @@ use crate::render::frame::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
-use wgpui_text::patch::{glyph_runs, RunPlacement};
+use wgpui_text::patch::{RunPlacement, glyph_runs};
 use wgpui_text::raster::GlyphRasterizer;
 use wgpui_text::shaping::{FontRun, SharedString, TextShaper};
 

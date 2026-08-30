@@ -20,5 +20,8 @@ fn example_names(manifest: &str) -> Vec<&str> {
 
 #[test]
 fn every_declared_legacy_example_is_in_the_compatibility_probe() {
-    assert_eq!(example_names(LEGACY_MANIFEST), example_names(COMPAT_MANIFEST));
+    assert_eq!(
+        example_names(LEGACY_MANIFEST),
+        example_names(COMPAT_MANIFEST)
+    );
 }

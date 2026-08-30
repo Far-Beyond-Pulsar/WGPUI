@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, parse_quote, DeriveInput};
+use syn::{DeriveInput, parse_macro_input, parse_quote};
 
 /// Generate the native element conversion for a `RenderOnce` component.
 #[proc_macro_derive(IntoElement)]

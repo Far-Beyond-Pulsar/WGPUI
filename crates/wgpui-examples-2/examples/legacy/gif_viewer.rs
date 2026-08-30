@@ -1,5 +1,5 @@
-use wgpui::{App, Application, Context, Render, Window, WindowOptions, div, img, prelude::*};
 use std::path::PathBuf;
+use wgpui::{App, Application, Context, Render, Window, WindowOptions, div, img, prelude::*};
 
 struct GifViewer {
     gif_path: PathBuf,

@@ -57,19 +57,32 @@ impl MultilineKaraoke {
         let lines = vec![
             KaraokeLine::new(
                 "Twinkle, twinkle, little star,",
-                vec![0.15, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.15, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.15, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.15, 0.08, 0.08, 0.08, 0.08, 0.15]
+                vec![
+                    0.15, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.15, 0.08, 0.08, 0.08, 0.08, 0.08,
+                    0.08, 0.08, 0.15, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.15, 0.08, 0.08, 0.08,
+                    0.08, 0.15,
+                ],
             ),
             KaraokeLine::new(
                 "How I wonder what you are!",
-                vec![0.15, 0.08, 0.08, 0.10, 0.10, 0.12, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.12]
+                vec![
+                    0.15, 0.08, 0.08, 0.10, 0.10, 0.12, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.10,
+                    0.08, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.12,
+                ],
             ),
             KaraokeLine::new(
                 "Up above the world so high,",
-                vec![0.15, 0.08, 0.10, 0.08, 0.08, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.08, 0.15]
+                vec![
+                    0.15, 0.08, 0.10, 0.08, 0.08, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.10,
+                    0.08, 0.08, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.08, 0.15,
+                ],
             ),
             KaraokeLine::new(
                 "Like a diamond in the sky.",
-                vec![0.15, 0.08, 0.08, 0.08, 0.10, 0.08, 0.10, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.15]
+                vec![
+                    0.15, 0.08, 0.08, 0.08, 0.10, 0.08, 0.10, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08,
+                    0.08, 0.10, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.10, 0.08, 0.08, 0.08, 0.15,
+                ],
             ),
         ];
 
@@ -83,18 +96,23 @@ impl MultilineKaraoke {
         cx.spawn(async move |this, cx| {
             loop {
                 for line_idx in 0..4 {
-                    let duration = this.update(cx, |this, _| {
-                        this.current_line = line_idx;
-                        this.lines[line_idx].total_duration
-                    }).ok().unwrap_or(3.0);
+                    let duration = this
+                        .update(cx, |this, _| {
+                            this.current_line = line_idx;
+                            this.lines[line_idx].total_duration
+                        })
+                        .ok()
+                        .unwrap_or(3.0);
 
                     let steps = (duration * 60.0) as u32; // 60 FPS
                     for i in 0..=steps {
                         let elapsed = (i as f32 / steps as f32) * duration;
                         this.update(cx, |this, cx| {
-                            this.line_progress = this.lines[this.current_line].progress_at_time(elapsed);
+                            this.line_progress =
+                                this.lines[this.current_line].progress_at_time(elapsed);
                             cx.notify();
-                        }).ok();
+                        })
+                        .ok();
                         Timer::after(Duration::from_millis((1000.0 / 60.0) as u64)).await;
                     }
 
@@ -109,9 +127,11 @@ impl MultilineKaraoke {
                     this.current_line = 0;
                     this.line_progress = 0.0;
                     cx.notify();
-                }).ok();
+                })
+                .ok();
             }
-        }).detach();
+        })
+        .detach();
 
         karaoke
     }
@@ -146,41 +166,39 @@ impl Render for MultilineKaraoke {
                     .flex()
                     .flex_col()
                     .gap_4()
-                    .children(
-                        self.lines.iter().enumerate().map(|(idx, line)| {
-                            let (active_color, inactive_color) = colors[idx % colors.len()];
-                            let is_current = idx == self.current_line;
-                            let progress = if is_current {
-                                self.line_progress
-                            } else if idx < self.current_line {
-                                1.0 // Already sung
-                            } else {
-                                0.0 // Not yet sung
-                            };
+                    .children(self.lines.iter().enumerate().map(|(idx, line)| {
+                        let (active_color, inactive_color) = colors[idx % colors.len()];
+                        let is_current = idx == self.current_line;
+                        let progress = if is_current {
+                            self.line_progress
+                        } else if idx < self.current_line {
+                            1.0 // Already sung
+                        } else {
+                            0.0 // Not yet sung
+                        };
 
-                            let opacity = if is_current {
-                                1.0
-                            } else if idx < self.current_line {
-                                0.5
-                            } else {
-                                0.3
-                            };
+                        let opacity = if is_current {
+                            1.0
+                        } else if idx < self.current_line {
+                            0.5
+                        } else {
+                            0.3
+                        };
 
-                            div()
-                                .text_size(px(if is_current { 42.0 } else { 36.0 }))
-                                .font_weight(if is_current {
-                                    FontWeight::BOLD
-                                } else {
-                                    FontWeight::NORMAL
-                                })
-                                .text_gradient_horizontal(
-                                    linear_color_stop(active_color, progress.max(0.01) - 0.01),
-                                    linear_color_stop(inactive_color, progress.max(0.01) + 0.01),
-                                )
-                                .with_opacity(opacity)
-                                .child(line.text.clone())
-                        }),
-                    ),
+                        div()
+                            .text_size(px(if is_current { 42.0 } else { 36.0 }))
+                            .font_weight(if is_current {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_gradient_horizontal(
+                                linear_color_stop(active_color, progress.max(0.01) - 0.01),
+                                linear_color_stop(inactive_color, progress.max(0.01) + 0.01),
+                            )
+                            .with_opacity(opacity)
+                            .child(line.text.clone())
+                    })),
             )
             .child(
                 div()
