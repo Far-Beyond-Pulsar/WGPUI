@@ -498,6 +498,9 @@ impl FrameEmission {
 struct EmittedNode {
     layer: LayerId,
     bounds: LayoutRect,
+    /// The inherited clip used when this node last emitted. A resize can
+    /// change this without changing the node's own layout rectangle.
+    clip: Option<LayoutRect>,
     shadows: u32,
     quads: u32,
     underlines: u32,
@@ -784,7 +787,11 @@ impl Emitter {
             match plan.emitter(index) {
                 Some(emitter) => {
                     let stale = previous
-                        .is_none_or(|record| record.bounds != bounds || record.layer != layer);
+                        .is_none_or(|record| {
+                            record.bounds != bounds
+                                || record.layer != layer
+                                || record.clip != parent.clip
+                        });
                     if node.skipped_prepaint_and_paint() && !stale {
                         stats.nodes_skipped += 1;
                         if let Some(record) = previous {
@@ -863,6 +870,7 @@ impl Emitter {
                         let emitted = EmittedNode {
                             layer,
                             bounds,
+                            clip: parent.clip,
                             shadows: u32::try_from(emission.shadows().len()).unwrap_or(u32::MAX),
                             quads: u32::try_from(emission.quads().len()).unwrap_or(u32::MAX),
                             underlines: u32::try_from(emission.underlines().len())

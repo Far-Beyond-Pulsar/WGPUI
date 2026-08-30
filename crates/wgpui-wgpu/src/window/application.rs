@@ -55,6 +55,7 @@ pub struct Window {
     interaction_modifiers: Modifiers,
     mouse_buttons: MouseButtonState,
     cursor: [Pixels; 2],
+    cursor_inside: bool,
     interactions: Vec<InteractionRegistration>,
     hovered_interaction: Option<usize>,
     pressed_interaction: Option<usize>,
@@ -112,6 +113,7 @@ impl Window {
     }
 
     pub fn clear_hover_with_app(&mut self, app: &mut App) -> bool {
+        self.cursor_inside = false;
         let Some(index) = self.hovered_interaction.take() else {
             return false;
         };
@@ -197,6 +199,7 @@ impl Window {
         }
         match &event {
             InputEvent::MouseMove(mouse) => {
+                self.cursor_inside = true;
                 let hit = self.hit_interaction(mouse.position);
                 let mut handled = false;
                 if self.hovered_interaction != hit {
@@ -278,14 +281,53 @@ impl Window {
         self.interactions = interactions;
         handled
     }
-    fn set_interactions(&mut self, interactions: Vec<InteractionRegistration>) {
-        self.interactions = interactions;
-        if self
+    fn set_interactions(&mut self, interactions: Vec<InteractionRegistration>, app: &mut App) {
+        let previous_address = self
             .hovered_interaction
-            .is_some_and(|index| index >= self.interactions.len())
-        {
-            self.hovered_interaction = None;
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        let previous_bounds = self
+            .hovered_interaction
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.bounds);
+        let previous_interactions = std::mem::replace(&mut self.interactions, interactions);
+        let hit = self.cursor_inside.then(|| self.hit_interaction(self.cursor)).flatten();
+        let hit_address = hit
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        if previous_address != hit_address {
+            if let Some(bounds) = previous_bounds {
+                self.hover_dirty_regions.push(bounds);
+            }
+            if let Some(index) = hit
+                && let Some(registration) = self.interactions.get(index)
+            {
+                self.hover_dirty_regions.push(registration.bounds);
+            }
+            let mouse = MouseMoveEvent {
+                position: self.cursor,
+                modifiers: self.modifiers(),
+                buttons: self.mouse_buttons,
+            };
+            if let Some(old_address) = previous_address
+                && let Some(old_index) = previous_interactions
+                    .iter()
+                    .position(|registration| registration.address == old_address)
+            {
+                let mut previous_interactions = previous_interactions;
+                if let Some(registration) = previous_interactions.get_mut(old_index) {
+                    registration.interaction.dispatch(
+                        &InputEvent::MouseLeave(mouse),
+                        &mut self.interaction,
+                        app,
+                    );
+                }
+            }
+            if let Some(index) = hit {
+                self.dispatch_interaction(index, &InputEvent::MouseEnter(mouse), app);
+            }
         }
+        self.hovered_interaction = hit;
         self.pressed_interaction = None;
         self.pressed_event = None;
     }
@@ -626,6 +668,7 @@ impl Handler {
             interaction_modifiers: Modifiers::default(),
             mouse_buttons: MouseButtonState::default(),
             cursor: [Pixels::ZERO, Pixels::ZERO],
+            cursor_inside: false,
             interactions: Vec::new(),
             hovered_interaction: None,
             pressed_interaction: None,
@@ -746,7 +789,7 @@ impl Handler {
         );
         match result {
             Ok(frame) => {
-                live.window.set_interactions(frame.interactions);
+                live.window.set_interactions(frame.interactions, &mut live.app);
                 live.frames += 1;
                 let report = FrameReport {
                     frame_number: live.frames,
@@ -854,6 +897,7 @@ impl winit::application::ApplicationHandler for Handler {
             interaction_modifiers: Modifiers::default(),
             mouse_buttons: MouseButtonState::default(),
             cursor: [Pixels::ZERO, Pixels::ZERO],
+            cursor_inside: false,
             interactions: Vec::new(),
             hovered_interaction: None,
             pressed_interaction: None,
@@ -945,11 +989,14 @@ impl winit::application::ApplicationHandler for Handler {
                     modifiers: live.window.modifiers(),
                     buttons: live.window.mouse_buttons,
                 });
-                live.window.handle_input_with_app(event, &mut live.app);
-                for region in live.window.take_hover_dirty_regions() {
+                let handled = live.window.handle_input_with_app(event, &mut live.app);
+                let hover_dirty_regions = live.window.take_hover_dirty_regions();
+                for region in hover_dirty_regions.iter().copied() {
                     live.frame_loop.mark_interaction_dirty(region);
                 }
-                live.window.request_redraw();
+                if handled || !hover_dirty_regions.is_empty() {
+                    live.window.request_redraw();
+                }
             }
             winit::event::WindowEvent::MouseInput { state, button, .. } => {
                 let point = live.window.cursor_position();

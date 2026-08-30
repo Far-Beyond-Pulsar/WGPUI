@@ -145,6 +145,7 @@ pub struct LoopFrame {
 
 #[derive(Debug)]
 pub struct InteractionRegistration {
+    pub address: wgpui_core::reconcile::instance::InstanceKey,
     pub bounds: Rect,
     pub order: u64,
     pub interaction: DescriptionInteraction,
@@ -513,15 +514,28 @@ impl FrameLoop {
             let Some(layer) = self.scene.layers.get(layer_id) else {
                 continue;
             };
-            let Some(_tile) = layer.key().tile else {
+            let Some(tile) = layer.key().tile else {
                 continue;
             };
+            let tile_rect = Rect::from_origin_size(
+                [
+                    tile.x as f32 * flash.tile_size[0] + layer.transform().translation[0],
+                    tile.y as f32 * flash.tile_size[1] + layer.transform().translation[1],
+                ],
+                flash.tile_size,
+            );
+            if !interaction_dirty_regions.is_empty()
+                && !interaction_dirty_regions
+                    .iter()
+                    .any(|region| tile_rect.intersects(region))
+            {
+                continue;
+            }
             self.tile_flash_frames
                 .insert(layer_id, flash.duration_frames.max(1));
         }
         if flash.viewport_grid
             && (viewport_changed
-                || !content_layers.is_empty()
                 || !interaction_dirty_regions.is_empty())
         {
             self.viewport_flash_frames = flash.duration_frames.max(1);
@@ -538,10 +552,8 @@ impl FrameLoop {
                         [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1]],
                         [width, height],
                     );
-                    let interaction_only = !viewport_changed
-                        && content_layers.is_empty()
-                        && !interaction_dirty_regions.is_empty();
-                    let region_matches = !interaction_only
+                    let region_matches = viewport_changed
+                        || interaction_dirty_regions.is_empty()
                         || interaction_dirty_regions
                             .iter()
                             .any(|region| tile_rect.intersects(region));
@@ -601,7 +613,8 @@ impl FrameLoop {
             if let Some(interaction) = plan.take_interaction(index) {
                 let visible_bounds = parent_clip.map_or(bounds, |clip| bounds.intersect(&clip));
                 if !visible_bounds.is_empty() {
-                    result.push(InteractionRegistration {
+                result.push(InteractionRegistration {
+                        address: node.address,
                         bounds: visible_bounds,
                         order: index as u64,
                         interaction,
