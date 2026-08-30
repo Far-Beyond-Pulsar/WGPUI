@@ -35,6 +35,7 @@
 //! quietly folded into "SVG works."
 
 use std::any::Any;
+use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::reconcile::description::Description;
@@ -184,6 +185,12 @@ impl Svg {
     /// emission directly.
     pub fn emit_into(&self, context: &EmitContext, emission: &mut Emission) {
         self.image.emit_into(context, emission);
+    }
+}
+
+impl Element for Svg {
+    fn into_description(self) -> Description {
+        self.describe()
     }
 }
 

@@ -69,31 +69,10 @@ pub trait IntoDescription {
     fn into_description(self) -> Description;
 }
 
-impl IntoDescription for wgpui_text::shaping::SharedString {
-    fn into_description(self) -> Description {
-        Description::new::<wgpui_text::shaping::SharedString>()
-    }
-}
-
-impl IntoDescription for Div {
-    fn into_description(self) -> Description {
-        wgpui_core::element::IntoElement::into_description(self)
-    }
-}
-
-impl IntoDescription for Description {
-    fn into_description(self) -> Description {
-        self
-    }
-}
-
-impl IntoDescription for String {
-    fn into_description(self) -> Description {
-        wgpui_core::element::IntoElement::into_description(self)
-    }
-}
-
-impl IntoDescription for &'static str {
+impl<T> IntoDescription for T
+where
+    T: wgpui_core::element::IntoElement,
+{
     fn into_description(self) -> Description {
         wgpui_core::element::IntoElement::into_description(self)
     }

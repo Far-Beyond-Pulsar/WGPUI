@@ -46,6 +46,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
+use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::patch::primitive::{AtlasTileId, PolySprite};
@@ -583,6 +584,12 @@ impl Img {
             // decodes in a value update rather than an insert.
             atlas_tile: placement.map(|tile| tile.tile).unwrap_or(AtlasTileId::NONE),
         });
+    }
+}
+
+impl Element for Img {
+    fn into_description(self) -> Description {
+        self.describe()
     }
 }
 

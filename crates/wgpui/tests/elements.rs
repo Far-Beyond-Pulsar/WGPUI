@@ -1,6 +1,6 @@
 use wgpui::{
-    Component, Element, ElementId, IntoElement, Render, RenderOnce, Stateful, div,
-    render_description,
+    div, render_description, Component, Element, ElementId, IntoElement, Render, RenderOnce,
+    Stateful, Styled,
 };
 
 #[derive(IntoElement)]
@@ -16,6 +16,18 @@ impl RenderOnce for Badge {
 
 struct Root {
     value: String,
+}
+
+#[derive(IntoElement)]
+struct GenericBadge<T> {
+    value: T,
+}
+
+impl<T: 'static> RenderOnce for GenericBadge<T> {
+    fn render(self) -> impl IntoElement + 'static {
+        let _value = self.value;
+        div().id("generic-badge").child("generic")
+    }
 }
 
 impl Render for Root {
@@ -40,16 +52,28 @@ fn render_and_derive_lower_nested_descriptions() {
         Some(&ElementId::Name("root".into()))
     );
     assert_eq!(description.child_descriptions().len(), 2);
-    assert!(
-        description.child_descriptions()[0]
-            .type_name()
-            .ends_with("::Div")
-    );
+    assert!(description.child_descriptions()[0]
+        .type_name()
+        .ends_with("::Div"));
     assert_eq!(
         description.child_descriptions()[0]
             .child_descriptions()
             .len(),
         1
+    );
+}
+
+#[test]
+fn opaque_native_elements_can_be_nested_without_a_facade_trait() {
+    fn child() -> impl IntoElement {
+        div().id("child").child("content")
+    }
+
+    let description = div().id("root").child(child()).describe();
+    assert_eq!(description.child_descriptions().len(), 1);
+    assert_eq!(
+        description.child_descriptions()[0].element_id(),
+        Some(&ElementId::Name("child".into()))
     );
 }
 
@@ -65,6 +89,52 @@ fn derived_component_is_a_real_component_element() {
         description.element_id(),
         Some(&ElementId::Name("badge".into()))
     );
+}
+
+#[test]
+fn derived_generic_component_owns_its_render_once_value() {
+    let description = Element::into_description(
+        GenericBadge {
+            value: String::from("owned"),
+        }
+        .into_element(),
+    );
+    assert_eq!(
+        description.element_id(),
+        Some(&ElementId::Name("generic-badge".into()))
+    );
+}
+
+#[test]
+fn native_style_changes_report_display_invalidation_through_reconciliation() {
+    let mut reconciler = wgpui::Reconciler::new();
+    let mut layout = wgpui::LayoutTree::new();
+    reconciler
+        .reconcile(
+            div()
+                .id("root")
+                .w(100.0)
+                .bg(wgpui::rgb(0x112233))
+                .describe(),
+            &mut layout,
+        )
+        .expect("first frame should reconcile");
+    let plan = reconciler
+        .reconcile(
+            div()
+                .id("root")
+                .w(100.0)
+                .bg(wgpui::rgb(0x445566))
+                .describe(),
+            &mut layout,
+        )
+        .expect("second frame should reconcile");
+    assert!(plan.nodes()[0]
+        .invalidation
+        .contains(wgpui::invalidation::axes::Invalidation::DISPLAY));
+    assert!(!plan.nodes()[0]
+        .invalidation
+        .contains(wgpui::invalidation::axes::Invalidation::LAYOUT));
 }
 
 #[test]

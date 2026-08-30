@@ -114,6 +114,10 @@ impl<E: IntoElement + 'static> Element for Stateful<E> {
 /// A stateless component whose value is consumed when it is rendered.
 pub trait RenderOnce: 'static + Sized {
     /// Produce this component's native element tree.
+    ///
+    /// Native `RenderOnce` deliberately receives no window or app context:
+    /// element construction is a pure value-to-description step, while
+    /// retained services belong to the reconciliation and scene layers.
     fn render(self) -> impl IntoElement + 'static;
 
     /// Lower this component's rendered tree into the per-frame description.
@@ -125,6 +129,9 @@ pub trait RenderOnce: 'static + Sized {
 /// A retained view that is rendered again when its entity is invalidated.
 pub trait Render: 'static + Sized {
     /// Produce this view's native element tree for the current frame.
+    ///
+    /// Native `Render` deliberately receives no window or app context for the
+    /// same reason as [`RenderOnce`].
     fn render(&mut self) -> impl IntoElement + 'static;
 }
 

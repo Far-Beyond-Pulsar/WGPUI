@@ -42,12 +42,14 @@
 use crate::fonts::fallbacks::FontFallbacks;
 use crate::fonts::features::FontFeatures;
 use cosmic_text::{
-    Attrs, AttrsList, Ellipsize, Family, Font as CosmicFont, FontSystem, Hinting, ShapeBuffer,
-    ShapeLine, Shaping, Wrap, fontdb,
+    fontdb, Attrs, AttrsList, Ellipsize, Family, Font as CosmicFont, FontSystem, Hinting,
+    ShapeBuffer, ShapeLine, Shaping, Wrap,
 };
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use wgpui_core::element::Element;
+use wgpui_core::reconcile::Description;
 
 /// An immutable string that is cheap to clone and cheap to compare when it is
 /// a clone.
@@ -472,6 +474,12 @@ pub struct TextShaper {
     cache: HashMap<ShapeCacheKey, CachedLine>,
     frame: u64,
     stats: ShaperStats,
+}
+
+impl Element for SharedString {
+    fn into_description(self) -> Description {
+        Description::new::<Self>()
+    }
 }
 
 /// Renderer-independent metrics returned by text measurement.

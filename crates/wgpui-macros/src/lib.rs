@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{DeriveInput, parse_macro_input, parse_quote};
+use syn::{parse_macro_input, parse_quote, DeriveInput};
 
 /// Generate the native element conversion for a `RenderOnce` component.
 #[proc_macro_derive(IntoElement)]
@@ -19,13 +19,6 @@ pub fn derive_into_element(input: TokenStream) -> TokenStream {
 
             fn into_element(self) -> Self::Element {
                 ::wgpui::Component::new(self)
-            }
-        }
-
-        impl #impl_generics ::wgpui::widgets::div::IntoDescription
-            for #name #type_generics #where_clause {
-            fn into_description(self) -> ::wgpui::Description {
-                ::wgpui::IntoElement::into_description(self)
             }
         }
     }

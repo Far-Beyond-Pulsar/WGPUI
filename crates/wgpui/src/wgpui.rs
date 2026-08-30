@@ -84,7 +84,7 @@ pub use wgpui_wgpu::window::application::{
 
 pub mod prelude {
     pub use crate::{
-        Application, Description, Div, Element, IntoElement, Render, RenderOnce, Stateful, Window,
-        WindowOptions, div,
+        Application, Description, Div, Element, IntoElement, Render, RenderOnce, Stateful, Styled,
+        Window, WindowOptions, div,
     };
 }

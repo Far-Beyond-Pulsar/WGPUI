@@ -672,6 +672,11 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Set the element opacity using the spelling used by the native examples.
+    fn with_opacity(self, opacity: f32) -> Self {
+        self.opacity(opacity)
+    }
+
     fn bg_gradient(mut self, stops: impl IntoIterator<Item = LinearColorStop>, angle: f32) -> Self {
         self.style().background_gradient = Some(LinearGradient {
             stops: stops.into_iter().collect(),
