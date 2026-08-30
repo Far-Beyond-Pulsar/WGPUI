@@ -34,6 +34,7 @@
 //! is the fields beside it, and [`DivStyle::paint`] cannot see the layout half
 //! at all because it takes only the resolved rectangle.
 
+use crate::styled_text::{StrikethroughStyle, UnderlineStyle};
 use wgpui_core::color::{ColorSpace, GradientStop, Hsla, LinearColorStop};
 use wgpui_core::geometry::{Pixels, Point};
 use wgpui_core::invalidation::axes::Invalidation;
@@ -210,6 +211,15 @@ pub struct DivStyle {
     pub text_italic: bool,
     pub text_alignment: u8,
     pub text_line_through: bool,
+    pub text_white_space_nowrap: bool,
+    pub text_ellipsis: bool,
+    pub text_line_clamp: Option<usize>,
+    pub text_letter_spacing: Option<f32>,
+    pub text_underline: Option<UnderlineStyle>,
+    pub text_decoration_color: Option<[f32; 4]>,
+    pub text_decoration_thickness: Option<f32>,
+    pub text_decoration_wavy: bool,
+    pub text_strikethrough: Option<StrikethroughStyle>,
     pub text_gradient: Option<Vec<([f32; 4], f32)>>,
     pub text_gradient_angle: Option<f32>,
     pub cursor: CursorStyle,
@@ -236,6 +246,15 @@ impl Default for DivStyle {
             text_italic: false,
             text_alignment: 0,
             text_line_through: false,
+            text_white_space_nowrap: false,
+            text_ellipsis: false,
+            text_line_clamp: None,
+            text_letter_spacing: None,
+            text_underline: None,
+            text_decoration_color: None,
+            text_decoration_thickness: None,
+            text_decoration_wavy: false,
+            text_strikethrough: None,
             text_gradient: None,
             text_gradient_angle: None,
             cursor: CursorStyle::default(),
