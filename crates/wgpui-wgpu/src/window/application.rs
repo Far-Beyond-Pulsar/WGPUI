@@ -40,6 +40,7 @@ fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
 /// A handle to the native window visible to the application callback.
 type CloseHandler = Box<dyn FnMut(&mut Window) -> bool>;
 type AppInitializer = Box<dyn FnOnce(&mut App)>;
+type WindowBuildCallback = Box<dyn FnMut(&mut Window) -> Description>;
 
 pub struct Window {
     native: Arc<winit::window::Window>,
@@ -319,11 +320,13 @@ where
     ) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
-            options: self.options,
-            build: Box::new(move |window| (self.build)(window).into_description()),
+            initial: Some((
+                self.options,
+                Box::new(move |window| (self.build)(window).into_description()),
+            )),
             max_frames: self.max_frames,
             initialize: Some(Box::new(initialize)),
-            live: None,
+            live: Vec::new(),
             failure: None,
             app: App::new(),
         };
@@ -346,11 +349,13 @@ where
     pub fn run(mut self) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
-            options: self.options,
-            build: Box::new(move |window| (self.build)(window).into_description()),
+            initial: Some((
+                self.options,
+                Box::new(move |window| (self.build)(window).into_description()),
+            )),
             max_frames: self.max_frames,
             initialize: None,
-            live: None,
+            live: Vec::new(),
             failure: None,
             app: App::new(),
         };
@@ -371,12 +376,14 @@ impl Application {
     pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
-            options: WindowOptions::default(),
-            build: Box::new(|_| Description::new::<()>()),
+            initial: Some((
+                WindowOptions::default(),
+                Box::new(|_| Description::new::<()>()),
+            )),
             max_frames: None,
             initialize: Some(Box::new(initialize)),
             app: App::new(),
-            live: None,
+            live: Vec::new(),
             failure: None,
         };
         event_loop
@@ -417,14 +424,14 @@ struct Live {
     frames: u64,
     last_report: Option<FrameReport>,
     app: App,
+    build: WindowBuildCallback,
 }
 
 struct Handler {
-    options: WindowOptions,
-    build: Box<dyn FnMut(&mut Window) -> Description>,
+    initial: Option<(WindowOptions, WindowBuildCallback)>,
     max_frames: Option<u64>,
     initialize: Option<AppInitializer>,
-    live: Option<Live>,
+    live: Vec<Live>,
     failure: Option<ApplicationError>,
     app: App,
 }
@@ -435,10 +442,125 @@ impl Handler {
         event_loop.exit();
     }
 
-    fn draw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let Some(live) = self.live.as_mut() else {
+    fn create_window(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        options: WindowOptions,
+        build: WindowBuildCallback,
+    ) -> Result<(), ApplicationError> {
+        let attributes = winit::window::Window::default_attributes()
+            .with_title(options.title.clone())
+            .with_resizable(options.resizable)
+            .with_visible(options.show);
+        let bounds = initial_bounds(&options);
+        let mut attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(
+            bounds.size.width.value(),
+            bounds.size.height.value(),
+        ));
+        if options.window_bounds.is_some() {
+            attributes = attributes.with_position(winit::dpi::LogicalPosition::new(
+                bounds.origin.x.value(),
+                bounds.origin.y.value(),
+            ));
+        }
+        let native = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .map_err(|error| ApplicationError::CreateWindow(error.to_string()))?,
+        );
+        let scale_factor = native.scale_factor();
+        if let Some(window_bounds) = options.window_bounds {
+            match window_bounds {
+                WindowBounds::Windowed(_) => {}
+                WindowBounds::Maximized(_) => native.set_maximized(true),
+                WindowBounds::Fullscreen(_) => native.set_fullscreen(Some(
+                    winit::window::Fullscreen::Borderless(native.current_monitor()),
+                )),
+            }
+        }
+        if options.focus {
+            native.focus_window();
+        }
+        let (surface, context) = WindowSurface::new(Arc::clone(&native))?;
+        let (width, height) = surface.size();
+        let mut resizes = ResizeDetector::new();
+        resizes.seed(width, height);
+        let mode = DrawMode::best_available(context.indirect);
+        let window = Window {
+            native,
+            scale_factor,
+            close_requested: false,
+            last_frame: None,
+            state: ElementStateStore::new(),
+            state_frame: 0,
+            interaction: wgpui_core::window::Window::new(),
+            close_handler: None,
+            interaction_modifiers: Modifiers::default(),
+            mouse_buttons: MouseButtonState::default(),
+            cursor: [Pixels::ZERO, Pixels::ZERO],
+        };
+        self.live.push(Live {
+            frame_loop: FrameLoop::new(&context.device),
+            surface,
+            context,
+            window,
+            resizes,
+            mode,
+            frames: 0,
+            last_report: None,
+            app: self.app.clone(),
+            build,
+        });
+        self.live.last().map(|live| live.window.request_redraw());
+        Ok(())
+    }
+
+    fn create_pending_windows(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        loop {
+            let requests = self.app.take_window_requests();
+            if requests.is_empty() {
+                break;
+            }
+            let mut first_error = None;
+            for request in requests {
+                let mut renderer =
+                    (request.build)(&mut wgpui_core::window::Window::new(), &mut self.app);
+                let mut app = self.app.clone();
+                let build = Box::new(move |window: &mut Window| {
+                    (renderer.render)(&mut window.interaction, &mut app)
+                });
+                if let Err(error) = self.create_window(event_loop, request.options, build) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                self.fail(event_loop, error);
+                return;
+            }
+        }
+    }
+
+    fn draw(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+    ) {
+        let Some(index) = self
+            .live
+            .iter()
+            .position(|live| live.window.id() == window_id)
+        else {
             return;
         };
+        let all_other_windows_reached_limit = self.max_frames.is_some_and(|limit| {
+            self.live
+                .iter()
+                .enumerate()
+                .all(|(other_index, live)| other_index == index || live.frames >= limit)
+        });
+        let live = &mut self.live[index];
         if let Some((width, height)) = live.resizes.take_pending() {
             live.surface.resize(&live.context.device, width, height);
         }
@@ -461,7 +583,7 @@ impl Handler {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let (width, height) = live.surface.size();
         live.window.begin_frame();
-        let description = (self.build)(&mut live.window);
+        let description = (live.build)(&mut live.window);
         live.window.end_frame();
         let target = RenderTarget {
             view: &view,
@@ -496,9 +618,13 @@ impl Handler {
                 live.window.last_frame = Some(report.clone());
                 live.last_report = Some(report);
                 live.surface.present(&live.context.queue, texture);
-                if live.window.close_requested
-                    || live.app.quit_requested()
-                    || self.max_frames.is_some_and(|limit| live.frames >= limit)
+                if live.window.close_requested || live.app.quit_requested() {
+                    self.live.remove(index);
+                    if self.live.is_empty() {
+                        event_loop.exit();
+                    }
+                } else if self.max_frames.is_some_and(|limit| live.frames >= limit)
+                    && all_other_windows_reached_limit
                 {
                     event_loop.exit();
                 } else {
@@ -512,20 +638,21 @@ impl Handler {
 
 impl winit::application::ApplicationHandler for Handler {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if self.live.is_some() {
+        if !self.live.is_empty() {
             return;
         }
         if let Some(initialize) = self.initialize.take() {
             initialize(&mut self.app);
-            if let Some(request) = self.app.take_window_requests().into_iter().next() {
-                self.options = request.options;
-                let mut renderer =
-                    (request.build)(&mut wgpui_core::window::Window::new(), &mut self.app);
-                let mut app = self.app.clone();
-                self.build =
-                    Box::new(move |window| (renderer.render)(&mut window.interaction, &mut app));
-            }
         }
+        self.create_pending_windows(event_loop);
+        if let Some((options, build)) = self.initial.take()
+            && let Err(error) = self.create_window(event_loop, options, build)
+        {
+            self.fail(event_loop, error);
+        }
+    }
+
+    /*
         let attributes = winit::window::Window::default_attributes()
             .with_title(self.options.title.clone())
             .with_resizable(self.options.resizable)
@@ -609,20 +736,29 @@ impl winit::application::ApplicationHandler for Handler {
             live.window.request_redraw();
         }
     }
+    */
 
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
-        _window_id: winit::window::WindowId,
+        window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        let Some(live) = self.live.as_mut() else {
+        let Some(index) = self
+            .live
+            .iter()
+            .position(|live| live.window.id() == window_id)
+        else {
             return;
         };
+        let live = &mut self.live[index];
         match event {
             winit::event::WindowEvent::CloseRequested => {
                 if live.window.try_close() {
-                    event_loop.exit();
+                    self.live.remove(index);
+                    if self.live.is_empty() {
+                        event_loop.exit();
+                    }
                 }
             }
             winit::event::WindowEvent::Resized(size) => {
@@ -707,7 +843,7 @@ impl winit::application::ApplicationHandler for Handler {
                     live.window.request_redraw();
                 }
             }
-            winit::event::WindowEvent::RedrawRequested => self.draw(event_loop),
+            winit::event::WindowEvent::RedrawRequested => self.draw(event_loop, window_id),
             winit::event::WindowEvent::CursorEntered { .. } => live.window.request_redraw(),
             winit::event::WindowEvent::CursorLeft { .. } => {
                 live.window.interaction.clear_hover();
@@ -717,8 +853,9 @@ impl winit::application::ApplicationHandler for Handler {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        if let Some(live) = self.live.as_ref() {
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        self.create_pending_windows(event_loop);
+        for live in &self.live {
             live.window.request_redraw();
         }
     }

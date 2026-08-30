@@ -5,19 +5,28 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use wgpui_core::reconcile::description::Description;
+use wgpui_core::{App, Render};
 use wgpui_wgpu::window::application::{Application, WindowOptions};
 
 #[test]
-fn native_run_creates_a_window_and_presents_multiple_retained_frames() {
-    let frames = Arc::new(AtomicU64::new(0));
-    let observed = Arc::clone(&frames);
-    let result = Application::new(WindowOptions::default(), move |_window| {
-        observed.fetch_add(1, Ordering::Relaxed);
-        Description::new::<Root>()
-    })
-    .with_frame_limit(2)
-    .run();
+fn application_renders_two_independent_native_windows() {
+    let frames = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let result = Application::new().run({
+        let frames = Arc::clone(&frames);
+        move |app| {
+            for index in 0..2 {
+                let frames = Arc::clone(&frames);
+                app.open_window(WindowOptions::default(), move |_, app| {
+                    app.new_entity(TwoWindowRoot {
+                        app: app.clone(),
+                        frames,
+                        index,
+                    })
+                })
+                .expect("window request should be accepted");
+            }
+        }
+    });
 
     assert!(
         result.is_ok(),
@@ -25,9 +34,32 @@ fn native_run_creates_a_window_and_presents_multiple_retained_frames() {
         result.err()
     );
     assert!(
-        frames.load(Ordering::Relaxed) >= 2,
-        "run returned without presenting frames"
+        frames
+            .iter()
+            .map(|frames| frames.load(Ordering::Relaxed))
+            .sum::<u64>()
+            >= 4
     );
 }
 
-struct Root;
+struct TwoWindowRoot {
+    app: App,
+    frames: Arc<[AtomicU64; 2]>,
+    index: usize,
+}
+
+impl Render for TwoWindowRoot {
+    fn render(&mut self) -> impl wgpui_core::element::IntoElement + 'static {
+        self.frames[self.index].fetch_add(1, Ordering::Relaxed);
+        if self
+            .frames
+            .iter()
+            .map(|frames| frames.load(Ordering::Relaxed))
+            .sum::<u64>()
+            >= 4
+        {
+            self.app.quit();
+        }
+        wgpui_core::reconcile::description::Description::new::<Self>()
+    }
+}
