@@ -133,7 +133,7 @@ impl QuadPipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("quads slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, true)],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("quads"),
@@ -262,7 +262,7 @@ impl ShadowPipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadows slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, true)],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadows"),
@@ -388,7 +388,7 @@ impl PathPipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("paths slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, true)],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("paths"),
@@ -605,7 +605,7 @@ impl UnderlinePipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("underlines slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, true)],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("underlines"),
@@ -760,7 +760,7 @@ impl MonoSpritePipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mono sprites slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, true)],
         });
         let page_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mono sprites atlas page"),
@@ -928,7 +928,7 @@ impl PolySpritePipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("poly sprites slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 16, true)],
         });
         let page_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("poly sprites atlas page"),

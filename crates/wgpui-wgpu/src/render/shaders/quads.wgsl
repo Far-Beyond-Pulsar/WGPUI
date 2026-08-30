@@ -70,8 +70,7 @@ struct Globals {
 struct SlotBase {
     base: u32,
     padding_0: u32,
-    padding_1: u32,
-    padding_2: u32,
+    translation: vec2<f32>,
 };
 
 // 144 bytes, matching `wgpui_core::patch::primitive::Quad::SLOT_STRIDE` and the
@@ -127,7 +126,7 @@ fn vertex_main(
     let quad = quads[arena_index];
     // Four corners of a triangle strip: (0,0) (1,0) (0,1) (1,1).
     let unit = vec2<f32>(f32(corner & 1u), f32((corner >> 1u) & 1u));
-    let point = quad.origin_size.xy + unit * quad.origin_size.zw;
+    let point = quad.origin_size.xy + unit * quad.origin_size.zw + slot.translation;
     out.position = vec4<f32>(
         point.x / globals.viewport.x * 2.0 - 1.0,
         1.0 - point.y / globals.viewport.y * 2.0,

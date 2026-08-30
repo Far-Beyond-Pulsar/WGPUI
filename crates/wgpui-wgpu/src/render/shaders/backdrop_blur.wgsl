@@ -1,7 +1,7 @@
 const M_PI_F: f32 = 3.1415926;
 
 struct Globals { viewport: vec2<f32>, padding: vec2<f32>, }
-struct SlotBase { base: u32, padding_0: u32, padding_1: u32, padding_2: u32, }
+struct SlotBase { base: u32, padding_0: u32, translation: vec2<f32>, }
 struct BackdropFilter {
     origin: vec2<f32>, size: vec2<f32>,
     clip_origin: vec2<f32>, clip_size: vec2<f32>,
@@ -43,11 +43,12 @@ fn vertex_main(
 ) -> VertexOutput {
     let unit_vertex = vec2<f32>(f32(vertex_index & 1u), 0.5 * f32(vertex_index & 2u));
     let current = current_filter(instance_index);
-    let pixel_position = unit_vertex * current.size + current.origin;
+    let pixel_position = unit_vertex * current.size + current.origin + slot.translation;
     let device_position = pixel_position / globals.viewport
         * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
-    let top_left = pixel_position - current.clip_origin;
-    let bottom_right = current.clip_origin + current.clip_size - pixel_position;
+    let clip_origin = current.clip_origin + slot.translation;
+    let top_left = pixel_position - clip_origin;
+    let bottom_right = clip_origin + current.clip_size - pixel_position;
     return VertexOutput(vec4<f32>(device_position, 0.0, 1.0),
         vec4<f32>(top_left.x, bottom_right.x, top_left.y, bottom_right.y), instance_index);
 }
@@ -87,7 +88,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
         if total_weight > 0.0 { blurred_color /= total_weight; }
     }
-    let mask = clamp(0.5 - rounded_rectangle_sdf(pixel_position, current.origin,
+    let mask = clamp(0.5 - rounded_rectangle_sdf(pixel_position, current.origin + slot.translation,
         current.size, current.corner_radii), 0.0, 1.0);
     let factor = mask * current.opacity;
     return vec4<f32>(blurred_color.rgb * factor, blurred_color.a * factor);

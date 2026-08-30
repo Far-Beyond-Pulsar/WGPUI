@@ -57,8 +57,7 @@ struct Globals {
 struct SlotBase {
     base: u32,
     padding_0: u32,
-    padding_1: u32,
-    padding_2: u32,
+    translation: vec2<f32>,
 };
 
 // Which atlas page the bound texture is. See `mono_sprites.wgsl`'s header for
@@ -153,7 +152,7 @@ fn vertex_main(
     var out: VertexOutput;
     // Four corners of a triangle strip: (0,0) (1,0) (0,1) (1,1).
     let unit = vec2<f32>(f32(corner & 1u), f32((corner >> 1u) & 1u));
-    let point = sprite.origin + unit * sprite.size;
+    let point = sprite.origin + unit * sprite.size + slot.translation;
     out.position = vec4<f32>(
         point.x / globals.viewport.x * 2.0 - 1.0,
         1.0 - point.y / globals.viewport.y * 2.0,

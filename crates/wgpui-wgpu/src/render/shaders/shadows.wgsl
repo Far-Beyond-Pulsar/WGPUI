@@ -58,8 +58,7 @@ struct Globals {
 struct SlotBase {
     base: u32,
     padding_0: u32,
-    padding_1: u32,
-    padding_2: u32,
+    translation: vec2<f32>,
 };
 
 // 64 bytes, matching `wgpui_core::patch::primitive::Shadow::SLOT_STRIDE` and the
@@ -167,7 +166,7 @@ fn vertex_main(
     let expanded_origin = shadow.origin_size.xy - vec2<f32>(margin);
     let expanded_size = shadow.origin_size.zw + 2.0 * vec2<f32>(margin);
 
-    out.position = to_device_position_impl(unit * expanded_size + expanded_origin);
+    out.position = to_device_position_impl(unit * expanded_size + expanded_origin + slot.translation);
     out.color = shadow.color;
     out.arena_index = arena_index;
     return out;
@@ -178,7 +177,7 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // The unexpanded rectangle — see this file's header.
     let shadow = shadows[in.arena_index];
     let half_size = shadow.origin_size.zw / 2.0;
-    let center = shadow.origin_size.xy + half_size;
+    let center = shadow.origin_size.xy + half_size + slot.translation;
     let center_to_point = in.position.xy - center;
 
     // `pick_corner_radius`, transcribed. Phase 6.3 collapsed this branch because
