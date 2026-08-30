@@ -356,14 +356,10 @@ fn a_translucent_sprite_composites_over_the_target() {
     );
 }
 
-/// A scaled sprite takes the nearest texel — asserted, and its limits recorded.
-///
-/// This is the case the legacy renderer filters and this one does not. The test
-/// exists so the difference is a documented behaviour rather than an
-/// undiscovered one: doubling the sprite's size must repeat each texel twice,
-/// not blend between neighbours.
+/// A scaled sprite uses linear filtering, while natural-size sprites retain
+/// their exact integer-load path.
 #[test]
-fn a_scaled_sprite_samples_the_nearest_texel() {
+fn a_scaled_sprite_interpolates_between_texels() {
     let Some(context) = context_or_report("image_sprite_scaled") else {
         return;
     };
@@ -390,24 +386,33 @@ fn a_scaled_sprite_samples_the_nearest_texel() {
         ),
     );
 
+    let mut saw_interpolated = false;
     for x in 20..22u32 {
         for y in 20..22u32 {
-            assert_eq!(
-                pixel(&pixels, x, y),
-                [200, 0, 0, 255],
-                "the left half must be the left texel, unblended"
+            let sampled = pixel(&pixels, x, y);
+            saw_interpolated |= sampled == [150, 50, 0, 255] || sampled == [50, 150, 0, 255];
+            assert!(
+                sampled == [200, 0, 0, 255]
+                    || sampled == [0, 200, 0, 255]
+                    || sampled == [150, 50, 0, 255]
+                    || sampled == [50, 150, 0, 255],
+                "scaled sampling must use the source texels, got {sampled:?}"
             );
         }
     }
     for x in 22..24u32 {
         for y in 20..22u32 {
-            assert_eq!(
-                pixel(&pixels, x, y),
-                [0, 200, 0, 255],
-                "and the right half the right texel"
+            let sampled = pixel(&pixels, x, y);
+            assert!(
+                sampled == [200, 0, 0, 255]
+                    || sampled == [0, 200, 0, 255]
+                    || sampled == [150, 50, 0, 255]
+                    || sampled == [50, 150, 0, 255],
+                "scaled sampling must use the source texels, got {sampled:?}"
             );
         }
     }
+    assert!(saw_interpolated, "scaled sampling must interpolate at an edge");
 }
 
 /// Grayscale and opacity are applied, and a corner radius rounds the rectangle.

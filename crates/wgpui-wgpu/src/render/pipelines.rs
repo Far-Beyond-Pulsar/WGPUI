@@ -902,6 +902,9 @@ pub struct PolySpritePipeline {
     pub page_layout: wgpu::BindGroupLayout,
     /// Byte stride between two slots' entries in the slot-base buffer.
     pub slot_stride: u32,
+    /// Linear sampler used only for sprites whose drawn size differs from the
+    /// resident bitmap size.
+    pub sampler: wgpu::Sampler,
 }
 
 impl PolySpritePipeline {
@@ -935,13 +938,16 @@ impl PolySpritePipeline {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        // Not filterable, and no sampler: the shader reads texels
-                        // at integer addresses. See `shaders/poly_sprites.wgsl`,
-                        // which also records what that costs for scaled images.
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -986,6 +992,12 @@ impl PolySpritePipeline {
             slot_layout,
             page_layout,
             slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("poly sprite filtering"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
         }
     }
 
@@ -1029,6 +1041,10 @@ impl PolySpritePipeline {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
         })

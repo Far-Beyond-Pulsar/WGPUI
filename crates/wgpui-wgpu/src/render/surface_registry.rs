@@ -43,8 +43,8 @@
 //! surfaces batch makes, in the same order — and nothing else.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// An opaque identifier for a registered WGPU surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -324,6 +324,19 @@ impl SurfaceRegistry {
             return true;
         }
         false
+    }
+
+    /// Recreate every surface texture after the device has been recovered.
+    /// Surface IDs and dimensions remain stable, so producers can continue to
+    /// use their handles and publish a fresh frame without re-registering.
+    pub fn recover(&self, device: &wgpu::Device) {
+        let mut surfaces = self.surfaces.lock().unwrap();
+        for surface in surfaces.values_mut() {
+            let width = surface.width;
+            let height = surface.height;
+            let format = surface.format;
+            *surface = Self::create_triple_buffer(device, width, height, format);
+        }
     }
 
     /// Get the current size of a surface.

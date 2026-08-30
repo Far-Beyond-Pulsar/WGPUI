@@ -154,6 +154,30 @@ impl DecodedImage {
         (self.frames.len() - 1) as u32
     }
 
+    /// Time until the next frame boundary in a looping playback clock.
+    pub fn time_until_next_frame(&self, elapsed: Duration) -> Option<Duration> {
+        if self.frames.len() <= 1 {
+            return None;
+        }
+        let cycle = self
+            .frames
+            .iter()
+            .map(|frame| frame.delay)
+            .fold(Duration::ZERO, |total, delay| total.saturating_add(delay));
+        if cycle.is_zero() {
+            return None;
+        }
+        let mut elapsed_in_frame =
+            Duration::from_secs_f64(elapsed.as_secs_f64() % cycle.as_secs_f64());
+        for frame in &self.frames {
+            if elapsed_in_frame < frame.delay {
+                return Some(frame.delay.saturating_sub(elapsed_in_frame));
+            }
+            elapsed_in_frame = elapsed_in_frame.saturating_sub(frame.delay);
+        }
+        Some(cycle)
+    }
+
     /// One frame, wrapping the index into range.
     ///
     /// Wrapping rather than clamping or failing, because that is what a looping
@@ -681,6 +705,35 @@ mod tests {
         assert_eq!(image.frame_index_at(Duration::from_millis(100)), 1);
         assert_eq!(image.frame_index_at(Duration::from_millis(299)), 2);
         assert_eq!(image.frame_index_at(Duration::from_millis(300)), 0);
+    }
+
+    #[test]
+    fn animation_reports_the_deadline_for_scheduler_pacing() {
+        let image = DecodedImage::from_frames(vec![
+            DecodedFrame {
+                size: [1, 1],
+                texels: vec![0; 4],
+                delay: Duration::from_millis(100),
+            },
+            DecodedFrame {
+                size: [1, 1],
+                texels: vec![0; 4],
+                delay: Duration::from_millis(250),
+            },
+        ])
+        .expect("frames");
+        assert_eq!(
+            image.time_until_next_frame(Duration::from_millis(40)),
+            Some(Duration::from_millis(60))
+        );
+        assert_eq!(
+            image.time_until_next_frame(Duration::from_millis(120)),
+            Some(Duration::from_millis(230))
+        );
+        assert_eq!(
+            image.time_until_next_frame(Duration::ZERO),
+            Some(Duration::from_millis(100))
+        );
     }
 
     /// A real animated GIF, encoded here so the input is a file and not a

@@ -46,6 +46,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::{Emission, EmitContext};
@@ -388,6 +389,8 @@ pub struct Img {
     requested_size: [f32; 2],
     style: ImageStyle,
     engine: SharedImageEngine,
+    started: Instant,
+    automatic_frame: bool,
 }
 
 impl std::fmt::Debug for Img {
@@ -434,25 +437,52 @@ impl Img {
                 corner_radius: 0.0,
             },
             engine,
+            started: Instant::now(),
+            automatic_frame: true,
         }
     }
 
     /// Select the frame of an animated source that is currently displayed.
     pub fn frame_index(mut self, frame_index: u32) -> Self {
         self.frame_index = frame_index;
+        self.automatic_frame = false;
         self
     }
 
     /// Select the frame visible at `now - started` and return this image for
     /// the next ordinary description pass.
-    pub fn frame_at(self, started: std::time::Instant, now: std::time::Instant) -> Self {
+    pub fn frame_at(mut self, started: std::time::Instant, now: std::time::Instant) -> Self {
         let elapsed = now.saturating_duration_since(started);
         let frame_index = self
             .engine
             .borrow()
             .frame_index_at(self.source, elapsed)
             .unwrap_or(0);
-        self.frame_index(frame_index)
+        self.frame_index = frame_index;
+        self.automatic_frame = true;
+        self
+    }
+
+    /// Request a display tick while this image has another GIF/WebP frame.
+    pub fn request_next_frame(
+        &self,
+        now: Instant,
+        scheduler: &mut wgpui_core::window::animation::AnimationScheduler,
+    ) {
+        if !self.automatic_frame {
+            return;
+        }
+        let elapsed = now.saturating_duration_since(self.started);
+        if self
+            .engine
+            .borrow()
+            .cache
+            .get(self.source)
+            .and_then(|image| image.time_until_next_frame(elapsed))
+            .is_some()
+        {
+            scheduler.request_animation_frame();
+        }
     }
 
     /// Record which of the three renderings is active this frame.
@@ -522,10 +552,14 @@ impl Img {
 
     /// The per-frame description of this image.
     pub fn describe(&self) -> Description {
-        let [width, height] = self.layout_size();
-        let image = self.clone();
+        let image = if self.automatic_frame {
+            self.clone().frame_at(self.started, Instant::now())
+        } else {
+            self.clone()
+        };
+        let [width, height] = image.layout_size();
         Description::new::<Img>()
-            .diff_key(self.diff_key())
+            .diff_key(image.diff_key())
             .style(LayoutStyle {
                 size: LayoutSize {
                     width: Dimension::length(width),

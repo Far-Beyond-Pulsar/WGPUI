@@ -95,6 +95,7 @@ struct SpriteSlot {
 @group(1) @binding(0) var<uniform> slot: SlotBase;
 @group(2) @binding(0) var<uniform> page: AtlasPage;
 @group(2) @binding(1) var atlas: texture_2d<f32>;
+@group(2) @binding(2) var atlas_sampler: sampler;
 
 // `wgpui_core::indirect::UNUSED_INSTANCE`.
 const UNUSED_INSTANCE: u32 = 0xffffffffu;
@@ -179,7 +180,20 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // neighbouring image's texels instead of this one's.
     let last = max(sprite.atlas_size - vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0));
     let inside = clamp(floor(scaled), vec2<f32>(0.0, 0.0), last);
-    var color = textureLoad(atlas, vec2<i32>(sprite.atlas_origin + inside), 0);
+    var color: vec4<f32>;
+    if (all(abs(sprite.size - sprite.atlas_size) < vec2<f32>(0.001, 0.001))) {
+        color = textureLoad(atlas, vec2<i32>(sprite.atlas_origin + inside), 0);
+    } else {
+        let dimensions = vec2<f32>(textureDimensions(atlas));
+        let tile_min = (sprite.atlas_origin + vec2<f32>(0.5, 0.5)) / dimensions;
+        let tile_max = (sprite.atlas_origin + sprite.atlas_size - vec2<f32>(0.5, 0.5)) / dimensions;
+        let coordinate = clamp(
+            (sprite.atlas_origin + scaled + vec2<f32>(0.5, 0.5)) / dimensions,
+            tile_min,
+            tile_max,
+        );
+        color = textureSampleLevel(atlas, atlas_sampler, coordinate, 0.0);
+    }
 
     if (sprite.grayscale != 0u) {
         let luma = dot(color.rgb, GRAYSCALE_FACTORS);
