@@ -9,15 +9,22 @@ use wgpui::{ApplicationError, NativeApplication, Styled, WindowOptions, div, rgb
 fn main() -> Result<(), ApplicationError> {
     let selected = Rc::new(Cell::new(0_u32));
     let selected_for_button = Rc::clone(&selected);
+    let inspected = Rc::new(Cell::new(false));
+    let inspected_for_button = Rc::clone(&inspected);
+    let scroll_offset = Rc::new(Cell::new(0.0_f32));
+    let scroll_offset_for_handler = Rc::clone(&scroll_offset);
 
     NativeApplication::new(WindowOptions::default(), move |window| {
         window.performance_debug().set_tile_refresh_flash(
             wgpui::TileRefreshFlash::enabled()
                 .with_tile_size(256.0, 256.0)
-                .with_color([1.0, 0.0, 1.0, 0.35]),
+                .with_color([1.0, 0.0, 1.0, 0.35])
+                .with_viewport_grid(true),
         );
         let _ = window.interaction();
         let selected = selected.get();
+        let inspected = inspected.get();
+        let scroll_offset = scroll_offset.get();
         let button_color = if selected == 0 {
             rgb(0x2f6fed)
         } else {
@@ -86,11 +93,35 @@ fn main() -> Result<(), ApplicationError> {
                             .border_color(rgb(0x293348))
                             .bg(rgb(0x171d29))
                             .boundary()
+                            .overflow_y_scroll()
+                            .scroll_offset([0.0, -scroll_offset])
+                            .on_scroll({
+                                let scroll_offset = Rc::clone(&scroll_offset_for_handler);
+                                move |event, _, _| {
+                                    scroll_offset.set(
+                                        (scroll_offset.get() - event.delta[1])
+                                            .clamp(0.0, 520.0),
+                                    );
+                                }
+                            })
                             .child(div().text_lg().text_color(rgb(0xf4f7ff)).child("Recent activity"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0xff73d9ff))
+                                    .child("Scroll this panel to inspect retained activity content"),
+                            )
                             .child(activity_row("GPU scene compacted", "just now", rgb(0x54d69b)))
                             .child(activity_row("Atlas page resident", "12 sec ago", rgb(0x5ca8ff)))
                             .child(activity_row("Tile boundary crossed", "48 sec ago", rgb(0xe6b85c)))
-                            .child(activity_row("Surface synchronized", "2 min ago", rgb(0xb18cff))),
+                            .child(activity_row("Surface synchronized", "2 min ago", rgb(0xb18cff)))
+                            .child(activity_row("Indirect args rebuilt", "3 min ago", rgb(0xf28c68)))
+                            .child(activity_row("Atlas upload delta", "4 min ago", rgb(0xd18cff)))
+                            .child(activity_row("Occlusion pass complete", "5 min ago", rgb(0x62d4e8)))
+                            .child(activity_row("Input region updated", "6 min ago", rgb(0xffc857)))
+                            .child(activity_row("Surface presented", "7 min ago", rgb(0x8fd694)))
+                            .child(activity_row("Retained node reused", "8 min ago", rgb(0x9ca9ff)))
+                            .child(activity_row("Glyph page compacted", "9 min ago", rgb(0xe78ac3))),
                     )
                     .child(
                         div()
@@ -131,9 +162,24 @@ fn main() -> Result<(), ApplicationError> {
                                     .border_1()
                                     .border_color(rgb(0x34415d))
                                     .text_color(rgb(0xb8c4dc))
-                                    .child("Inspect retained scene"),
+                                    .child(if inspected {
+                                        "Scene inspected"
+                                    } else {
+                                        "Inspect retained scene"
+                                    })
+                                    .on_click({
+                                        let inspected = Rc::clone(&inspected_for_button);
+                                        move |_, _, _| {
+                                            inspected.set(!inspected.get());
+                                        }
+                                    }),
                             )
-                            .child(div().text_xs().text_color(rgb(0x7f8ba5)).child("Actions update retained state without rebuilding unchanged content.")),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x7f8ba5))
+                                    .child("Actions update retained state without rebuilding unchanged content."),
+                            )
                     ),
             )
             .child(
@@ -168,6 +214,7 @@ fn stat_card(label: &'static str, value: &'static str, color: wgpui::Rgba) -> wg
 fn activity_row(label: &'static str, time: &'static str, color: wgpui::Rgba) -> wgpui::Div {
     div()
         .flex()
+        .flex_shrink_0()
         .items_center()
         .gap_2()
         .p_2()

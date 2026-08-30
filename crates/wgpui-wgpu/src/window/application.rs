@@ -910,9 +910,8 @@ impl winit::application::ApplicationHandler for Handler {
                     modifiers: live.window.modifiers(),
                     buttons: live.window.mouse_buttons,
                 });
-                if live.window.handle_input_with_app(event, &mut live.app) {
-                    live.window.request_redraw();
-                }
+                live.window.handle_input_with_app(event, &mut live.app);
+                live.window.request_redraw();
             }
             winit::event::WindowEvent::MouseInput { state, button, .. } => {
                 let point = live.window.cursor_position();
@@ -934,9 +933,8 @@ impl winit::application::ApplicationHandler for Handler {
                         click_count: 1,
                     })
                 };
-                if live.window.handle_input_with_app(event, &mut live.app) {
-                    live.window.request_redraw();
-                }
+                live.window.handle_input_with_app(event, &mut live.app);
+                live.window.request_redraw();
             }
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
@@ -950,9 +948,8 @@ impl winit::application::ApplicationHandler for Handler {
                     delta,
                     modifiers: live.window.modifiers(),
                 });
-                if live.window.handle_input_with_app(event, &mut live.app) {
-                    live.window.request_redraw();
-                }
+                live.window.handle_input_with_app(event, &mut live.app);
+                live.window.request_redraw();
             }
             winit::event::WindowEvent::RedrawRequested => self.draw(event_loop, window_id),
             winit::event::WindowEvent::CursorEntered { .. } => live.window.request_redraw(),

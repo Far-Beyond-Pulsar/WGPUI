@@ -6,12 +6,13 @@
 //! style resolver and do not require repainting unchanged siblings.
 
 use wgpui_core::app::App;
-use wgpui_core::window::{ClickEvent, EventResult, InputEvent, MouseButton, Window};
+use wgpui_core::window::{ClickEvent, EventResult, InputEvent, MouseButton, ScrollWheelEvent, Window};
 use wgpui_core::reconcile::description::DescriptionInteraction;
 
 type ClickHandler = Box<dyn FnMut(&ClickEvent, &mut Window, &mut App) -> EventResult>;
 type MouseDownHandler = Box<dyn FnMut(&InputEvent, &mut Window, &mut App) -> EventResult>;
 type HoverHandler = Box<dyn FnMut(bool, &mut Window, &mut App) -> EventResult>;
+type ScrollHandler = Box<dyn FnMut(&ScrollWheelEvent, &mut Window, &mut App) -> EventResult>;
 
 pub trait IntoEventResult {
     fn into_event_result(self) -> EventResult;
@@ -46,6 +47,7 @@ pub struct InteractionState {
     click: Vec<ClickHandler>,
     mouse_down: Vec<(MouseButton, MouseDownHandler)>,
     hover: Vec<HoverHandler>,
+    scroll: Vec<ScrollHandler>,
 }
 
 impl InteractionState {
@@ -90,6 +92,14 @@ impl InteractionState {
     ) {
         self.hover.push(Box::new(move |hovered, window, app| {
             handler(hovered, window, app).into_event_result()
+        }));
+    }
+    pub fn on_scroll<R: IntoEventResult + 'static>(
+        &mut self,
+        mut handler: impl FnMut(&ScrollWheelEvent, &mut Window, &mut App) -> R + 'static,
+    ) {
+        self.scroll.push(Box::new(move |event, window, app| {
+            handler(event, window, app).into_event_result()
         }));
     }
     pub fn update_hover(
@@ -146,12 +156,24 @@ impl InteractionState {
                 }
                 result
             }
+            InputEvent::Scroll(scroll) => {
+                let mut result = EventResult::IGNORED;
+                for handler in &mut self.scroll {
+                    let current = handler(scroll, window, app);
+                    merge_result(&mut result, current);
+                }
+                result
+            }
             _ => EventResult::IGNORED,
         }
     }
 
     pub fn into_description_interaction(self) -> Option<DescriptionInteraction> {
-        if self.click.is_empty() && self.mouse_down.is_empty() && self.hover.is_empty() {
+        if self.click.is_empty()
+            && self.mouse_down.is_empty()
+            && self.hover.is_empty()
+            && self.scroll.is_empty()
+        {
             return None;
         }
         let mut state = self;

@@ -218,6 +218,7 @@ pub struct FrameLoop {
     last_viewport: Option<[f32; 2]>,
     viewport_recomputes: u64,
     tile_flash_frames: HashMap<LayerId, u32>,
+    viewport_flash_frames: u32,
     performance_debug: PerformanceDebug,
     scale_factor: f32,
 }
@@ -254,6 +255,7 @@ impl FrameLoop {
             last_viewport: None,
             viewport_recomputes: 0,
             tile_flash_frames: HashMap::new(),
+            viewport_flash_frames: 0,
             performance_debug: PerformanceDebug::default(),
             scale_factor: 1.0,
         }
@@ -428,18 +430,19 @@ impl FrameLoop {
             .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
         let uploads = apply(&mut self.scene, &emission.patch)?;
         let dirty_layers = emission.patch.layers();
-        let debug_tiles = self.refresh_debug_tiles(
-            &emission.patch,
-            self.performance_debug.tile_refresh_flash(),
-        );
-        self.renderer.set_debug_tiles(debug_tiles);
-
         let viewport = [width, height];
         let viewport_changed = self.last_viewport != Some(viewport);
         if viewport_changed {
             self.last_viewport = Some(viewport);
             self.viewport_recomputes += 1;
         }
+        let debug_tiles = self.refresh_debug_tiles(
+            &emission.patch,
+            self.performance_debug.tile_refresh_flash(),
+            viewport,
+            viewport_changed,
+        );
+        self.renderer.set_debug_tiles(debug_tiles);
 
         self.atlas_textures
             .sync(device, queue, &mut self.text_atlas);
@@ -480,16 +483,21 @@ impl FrameLoop {
         &mut self,
         patch: &wgpui_core::patch::apply::ScenePatch,
         flash: crate::debug::TileRefreshFlash,
+        viewport: [f32; 2],
+        viewport_changed: bool,
     ) -> Vec<DebugTile> {
         if !flash.enabled {
             self.tile_flash_frames.clear();
+            self.viewport_flash_frames = 0;
             return Vec::new();
         }
         self.tile_flash_frames.retain(|_, frames| {
             *frames = frames.saturating_sub(1);
             *frames > 0
         });
-        for layer_id in patch.content_layers() {
+        self.viewport_flash_frames = self.viewport_flash_frames.saturating_sub(1);
+        let content_layers = patch.content_layers();
+        for layer_id in content_layers.iter().copied() {
             let Some(layer) = self.scene.layers.get(layer_id) else {
                 continue;
             };
@@ -498,6 +506,27 @@ impl FrameLoop {
             };
             self.tile_flash_frames
                 .insert(layer_id, flash.duration_frames.max(1));
+        }
+        if flash.viewport_grid && (viewport_changed || !content_layers.is_empty()) {
+            self.viewport_flash_frames = flash.duration_frames.max(1);
+        }
+        if flash.viewport_grid && self.viewport_flash_frames > 0 {
+            let columns = (viewport[0] / flash.tile_size[0]).ceil().max(0.0) as i32;
+            let rows = (viewport[1] / flash.tile_size[1]).ceil().max(0.0) as i32;
+            let mut tiles = Vec::new();
+            for y in 0..rows {
+                for x in 0..columns {
+                    let width = flash.tile_size[0].min(viewport[0] - x as f32 * flash.tile_size[0]);
+                    let height = flash.tile_size[1].min(viewport[1] - y as f32 * flash.tile_size[1]);
+                    if width > 0.0 && height > 0.0 {
+                        tiles.push(DebugTile {
+                            origin_size: [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1], width, height],
+                            color: flash.color,
+                        });
+                    }
+                }
+            }
+            return tiles;
         }
         self.tile_flash_frames
             .keys()

@@ -27,6 +27,9 @@ pub struct TileRefreshFlash {
     pub duration_frames: u32,
     /// RGBA overlay colour. Alpha controls how strongly content is tinted.
     pub color: [f32; 4],
+    /// Also flash the visible diagnostic grid when the scene has not yet
+    /// opted a boundary into tiled residency.
+    pub viewport_grid: bool,
 }
 
 impl Default for TileRefreshFlash {
@@ -36,6 +39,7 @@ impl Default for TileRefreshFlash {
             tile_size: [256.0, 256.0],
             duration_frames: 2,
             color: [1.0, 0.0, 1.0, 0.35],
+            viewport_grid: false,
         }
     }
 }
@@ -70,6 +74,13 @@ impl TileRefreshFlash {
     /// Set the overlay colour.
     pub fn with_color(mut self, color: [f32; 4]) -> Self {
         self.color = color;
+        self
+    }
+
+    /// Also flash the visible tile grid when an application has not yet
+    /// opted a boundary into tiled residency.
+    pub fn with_viewport_grid(mut self, enabled: bool) -> Self {
+        self.viewport_grid = enabled;
         self
     }
 }

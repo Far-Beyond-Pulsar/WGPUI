@@ -166,6 +166,19 @@ impl Div {
         self
     }
 
+    pub fn on_scroll<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::ScrollWheelEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+        + 'static,
+    ) -> Self {
+        self.interaction.on_scroll(handler);
+        self
+    }
+
     pub fn track_focus(mut self, handle: &wgpui_core::window::FocusHandle) -> Self {
         self.focus_handle = Some(*handle);
         self
