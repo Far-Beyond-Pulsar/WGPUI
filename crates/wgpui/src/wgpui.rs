@@ -29,7 +29,7 @@ pub use wgpui_core::invalidation;
 pub use wgpui_core::patch;
 pub use wgpui_core::patch::emit::{Emit, EmitContext, Emitter, FrameEmission};
 pub use wgpui_core::patch::primitive::{
-    AtlasTileId, Glyph, GlyphRun, Path, PolySprite, Quad, Shadow, Underline,
+    AtlasTileId, Glyph, GlyphRun, Path, PolySprite, Quad, Shadow, ShadowClip, Underline,
 };
 pub use wgpui_core::reconcile;
 pub use wgpui_core::reconcile::description::{RawText, RawTextKey};
@@ -85,11 +85,11 @@ pub use wgpui_widgets::styled_text::{
 pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
 pub use wgpui_widgets::wgpu_surface::{WgpuSurface, WgpuSurfaceKey};
 
+pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 pub use wgpui_wgpu::window::application::{
     Application, ApplicationError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
     WindowOptions,
 };
-pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 
 pub mod prelude {
     pub use crate::{

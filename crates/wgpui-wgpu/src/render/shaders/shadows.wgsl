@@ -62,8 +62,8 @@ struct SlotBase {
     padding_2: u32,
 };
 
-// 64 bytes, matching `wgpui_core::patch::primitive::Shadow::SLOT_STRIDE` and the
-// field order `Shadow::encode` writes.
+// 80 bytes, matching `wgpui_core::patch::primitive::Shadow::SLOT_STRIDE` and the
+// field order `Shadow::encode` writes, followed by the renderer's clip sidecar.
 struct ShadowSlot {
     origin_size: vec4<f32>,
     color: vec4<f32>,
@@ -72,6 +72,8 @@ struct ShadowSlot {
     corner_radii: vec4<f32>,
     // blur_radius, and three words of padding.
     blur: vec4<f32>,
+    // Per-shadow clip: a negative width means unbounded.
+    clip: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -175,8 +177,15 @@ fn vertex_main(
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // The unexpanded rectangle — see this file's header.
     let shadow = shadows[in.arena_index];
+    if shadow.clip.z >= 0.0 {
+        let clip_max = shadow.clip.xy + shadow.clip.zw;
+        if in.position.x < shadow.clip.x || in.position.y < shadow.clip.y
+            || in.position.x >= clip_max.x || in.position.y >= clip_max.y {
+            discard;
+        }
+    }
+    // The unexpanded rectangle — see this file's header.
     let half_size = shadow.origin_size.zw / 2.0;
     let center = shadow.origin_size.xy + half_size;
     let center_to_point = in.position.xy - center;

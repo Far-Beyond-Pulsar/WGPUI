@@ -65,7 +65,8 @@ use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::request::FrameSignals;
 use crate::patch::apply::ScenePatch;
 use crate::patch::primitive::{
-    AtlasTileId, BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, Underline,
+    AtlasTileId, BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, ShadowClip,
+    Underline,
 };
 use crate::patch::{PatchList, RecordKey};
 use crate::reconcile::instance::InstanceKey;
@@ -101,6 +102,7 @@ pub struct EmitContext {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Emission {
     shadows: Vec<Shadow>,
+    shadow_clips: Vec<ShadowClip>,
     quads: Vec<Quad>,
     underlines: Vec<Underline>,
     glyph_runs: Vec<GlyphRun>,
@@ -118,12 +120,18 @@ impl Emission {
     /// Contribute a drop shadow.
     pub fn shadow(&mut self, shadow: Shadow) -> &mut Self {
         self.shadows.push(shadow);
+        self.shadow_clips.push(ShadowClip::UNCLIPPED);
         self
     }
 
     /// The shadows contributed, in emission order.
     pub fn shadows(&self) -> &[Shadow] {
         &self.shadows
+    }
+
+    /// The clips corresponding one-for-one with [`Self::shadows`].
+    pub fn shadow_clips(&self) -> &[ShadowClip] {
+        &self.shadow_clips
     }
 
     /// Contribute a quad.
@@ -217,6 +225,7 @@ impl Emission {
     /// Drop everything, keeping the allocations for the next element.
     pub fn clear(&mut self) {
         self.shadows.clear();
+        self.shadow_clips.clear();
         self.quads.clear();
         self.underlines.clear();
         self.glyph_runs.clear();
@@ -250,6 +259,10 @@ impl Emission {
     /// container. Variable-size kinds keep their slots so retained addresses
     /// do not churn while scrolling; fully outside instances become inert.
     pub fn clip_to(&mut self, clip: LayoutRect) {
+        if self.shadow_clips.len() < self.shadows.len() {
+            self.shadow_clips
+                .resize(self.shadows.len(), ShadowClip::UNCLIPPED);
+        }
         self.clip_quads_to(clip);
         for run in &mut self.glyph_runs {
             for glyph in &mut run.glyphs {
@@ -276,9 +289,9 @@ impl Emission {
             let bounds = LayoutRect {
                 x: sprite.origin[0],
                 y: sprite.origin[1],
-                    width: sprite.size[0],
-                    height: sprite.size[1],
-                };
+                width: sprite.size[0],
+                height: sprite.size[1],
+            };
             if let Some(cropped) = intersect_rect(bounds, clip) {
                 let scale_x = if sprite.size[0] > 0.0 {
                     sprite.atlas_size[0] / sprite.size[0]
@@ -305,9 +318,9 @@ impl Emission {
             let bounds = LayoutRect {
                 x: underline.origin[0],
                 y: underline.origin[1],
-                    width: underline.size[0],
-                    height: underline.size[1],
-                };
+                width: underline.size[0],
+                height: underline.size[1],
+            };
             if let Some(cropped) = intersect_rect(bounds, clip) {
                 underline.origin = [cropped.x, cropped.y];
                 underline.size = [cropped.width, cropped.height];
@@ -316,16 +329,23 @@ impl Emission {
                 underline.color[3] = 0.0;
             }
         }
-        for shadow in &mut self.shadows {
+        for (shadow, shadow_clip) in self.shadows.iter_mut().zip(&mut self.shadow_clips) {
             let (origin, size) = shadow.drawn_bounds();
-            if !rects_intersect(LayoutRect {
+            let bounds = LayoutRect {
                 x: origin[0],
                 y: origin[1],
                 width: size[0],
                 height: size[1],
-            }, clip) {
+            };
+            if rects_intersect(bounds, clip) {
+                *shadow_clip = ShadowClip {
+                    origin: [clip.x, clip.y],
+                    size: [clip.width, clip.height],
+                };
+            } else {
                 shadow.size = [0.0; 2];
                 shadow.color[3] = 0.0;
+                *shadow_clip = ShadowClip::EMPTY;
             }
         }
         for path in &mut self.paths {
@@ -590,6 +610,7 @@ impl<P> Default for KindOperations<P> {
 #[derive(Default)]
 struct PendingOperations {
     shadows: KindOperations<Shadow>,
+    shadow_clips: KindOperations<ShadowClip>,
     quads: KindOperations<Quad>,
     underlines: KindOperations<Underline>,
     glyph_runs: KindOperations<GlyphRun>,
@@ -624,6 +645,29 @@ impl<P: Primitive> KindOperations<P> {
             list.insert(layer, key, *length, value);
             *length = length.saturating_add(1);
             stats.records_inserted += 1;
+        }
+        list
+    }
+}
+
+impl<P: Clone> KindOperations<P> {
+    /// Fold metadata operations into a keyed CPU-side record list.
+    fn into_record_patch_list(self, store: &crate::scene::RecordStore<P>) -> PatchList<P> {
+        let mut list = PatchList::new();
+        let mut lengths: HashMap<LayerId, u32> = HashMap::new();
+
+        for (layer, key) in self.removes {
+            let length = lengths.entry(layer).or_insert_with(|| store.len(layer));
+            *length = length.saturating_sub(1);
+            list.remove(layer, key);
+        }
+        for (layer, key, value) in self.updates {
+            list.update(layer, key, value);
+        }
+        for (layer, key, value) in self.inserts {
+            let length = lengths.entry(layer).or_insert_with(|| store.len(layer));
+            list.insert(layer, key, *length, value);
+            *length = length.saturating_add(1);
         }
         list
     }
@@ -786,12 +830,11 @@ impl Emitter {
             let previous = self.emitted.get(&node.address).copied();
             match plan.emitter(index) {
                 Some(emitter) => {
-                    let stale = previous
-                        .is_none_or(|record| {
-                            record.bounds != bounds
-                                || record.layer != layer
-                                || record.clip != parent.clip
-                        });
+                    let stale = previous.is_none_or(|record| {
+                        record.bounds != bounds
+                            || record.layer != layer
+                            || record.clip != parent.clip
+                    });
                     if node.skipped_prepaint_and_paint() && !stale {
                         stats.nodes_skipped += 1;
                         if let Some(record) = previous {
@@ -824,6 +867,13 @@ impl Emitter {
                             previous.map(|record| (record.layer, record.shadows)),
                             emission.shadows(),
                             &mut pending.shadows,
+                        );
+                        Self::reconcile_records(
+                            node.address,
+                            layer,
+                            previous.map(|record| (record.layer, record.shadows)),
+                            emission.shadow_clips(),
+                            &mut pending.shadow_clips,
                         );
                         Self::reconcile_records(
                             node.address,
@@ -918,6 +968,9 @@ impl Emitter {
 
         let patch = ScenePatch {
             shadows: pending.shadows.into_patch_list(&scene.shadows, &mut stats),
+            shadow_clips: pending
+                .shadow_clips
+                .into_record_patch_list(&scene.shadow_clips),
             quads: pending.quads.into_patch_list(&scene.quads, &mut stats),
             underlines: pending
                 .underlines
@@ -1023,7 +1076,7 @@ impl Emitter {
     /// takes §5.0's O(1) in-place update. The two kinds' ordinals are
     /// independent, which is safe because a [`RecordKey`] is only ever unique
     /// within one kind's store.
-    fn reconcile_records<P: Primitive>(
+    fn reconcile_records<P: Clone>(
         address: InstanceKey,
         layer: LayerId,
         previous: Option<(LayerId, u32)>,
@@ -1065,6 +1118,10 @@ impl Emitter {
         for ordinal in 0..record.shadows {
             pending
                 .shadows
+                .removes
+                .push((record.layer, RecordKey::new(address, ordinal)));
+            pending
+                .shadow_clips
                 .removes
                 .push((record.layer, RecordKey::new(address, ordinal)));
         }
@@ -1911,13 +1968,49 @@ mod tests {
     }
 
     #[test]
+    fn clipping_keeps_a_partial_shadow_and_retains_its_shader_clip() {
+        let mut emission = Emission::new();
+        emission.shadow(Shadow {
+            origin: [20.0, 20.0],
+            size: [40.0, 40.0],
+            color: [0.0, 0.0, 0.0, 0.5],
+            corner_radii: [8.0; 4],
+            blur_radius: 12.0,
+        });
+        emission.clip_to(LayoutRect {
+            x: 10.0,
+            y: 30.0,
+            width: 32.0,
+            height: 18.0,
+        });
+
+        assert_eq!(emission.shadows()[0].size, [40.0, 40.0]);
+        assert_eq!(
+            emission.shadow_clips()[0],
+            ShadowClip {
+                origin: [10.0, 30.0],
+                size: [32.0, 18.0],
+            }
+        );
+    }
+
+    #[test]
     fn clipping_intersects_existing_path_and_backdrop_masks() {
         let mut emission = Emission::default();
         emission.paths.push(Path::new(
             vec![
-                PathVertex { position: [0.0, 0.0], st: [0.0, 0.0] },
-                PathVertex { position: [20.0, 0.0], st: [1.0, 0.0] },
-                PathVertex { position: [0.0, 20.0], st: [0.0, 1.0] },
+                PathVertex {
+                    position: [0.0, 0.0],
+                    st: [0.0, 0.0],
+                },
+                PathVertex {
+                    position: [20.0, 0.0],
+                    st: [1.0, 0.0],
+                },
+                PathVertex {
+                    position: [0.0, 20.0],
+                    st: [0.0, 1.0],
+                },
             ],
             [1.0; 4],
         ));

@@ -48,7 +48,7 @@ use wgpui_core::occlusion::{
     CoverageItem, PoisonRegion, encode_coverage_items, encode_poison_regions, quad_coverage_item,
 };
 use wgpui_core::ordering::encode_ordering_items;
-use wgpui_core::patch::primitive::{PrimitiveKind, Quad};
+use wgpui_core::patch::primitive::{Primitive, PrimitiveKind, Quad, Shadow, ShadowClip};
 use wgpui_core::scene::atlas::AtlasKind;
 use wgpui_core::scene::layer::LayerId;
 use wgpui_core::scene::{Scene, UploadRange};
@@ -105,8 +105,9 @@ impl std::fmt::Display for FrameError {
                 formatter,
                 "backdrop filtering requires a copyable render-target texture"
             ),
-            FrameError::DebugOverlayUnavailable =>
-                write!(formatter, "tile refresh diagnostics could not be prepared"),
+            FrameError::DebugOverlayUnavailable => {
+                write!(formatter, "tile refresh diagnostics could not be prepared")
+            }
         }
     }
 }
@@ -818,7 +819,7 @@ impl FrameRenderer {
         let backdrops_grew = self
             .backdrop_arena
             .reserve(device, backdrop_resident.len() as u64);
-        if shadows_grew
+        let upload_all = shadows_grew
             || grew
             || underlines_grew
             || glyphs_grew
@@ -826,8 +827,8 @@ impl FrameRenderer {
             || paths_grew
             || backdrops_grew
             || self.uploaded_generation.is_none()
-            || matches!(input.dirty, Dirty::All)
-        {
+            || matches!(input.dirty, Dirty::All);
+        if upload_all {
             self.shadow_arena.upload_all(device, queue, shadow_resident);
             self.arena.upload_all(device, queue, resident);
             self.underline_arena
@@ -888,6 +889,12 @@ impl FrameRenderer {
                 &kind_uploads(input.uploads, PrimitiveKind::BackdropFilter),
             );
         }
+        upload_shadow_clips(
+            self.shadow_arena.buffer(),
+            queue,
+            input.scene,
+            if upload_all { Dirty::All } else { input.dirty },
+        );
         queue.write_buffer(
             &self.globals,
             0,
@@ -1634,7 +1641,10 @@ impl FrameRenderer {
                 };
                 pass.set_pipeline(&self.debug_pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
-                pass.draw(0..4, 0..u32::try_from(debug_tiles.len()).unwrap_or(u32::MAX));
+                pass.draw(
+                    0..4,
+                    0..u32::try_from(debug_tiles.len()).unwrap_or(u32::MAX),
+                );
             }
             timing.draw_issue = started.elapsed();
         }
@@ -1691,7 +1701,7 @@ fn create_debug_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu:
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
                     min_binding_size: std::num::NonZeroU64::new(
-                        std::mem::size_of::<DebugTile>() as u64,
+                        std::mem::size_of::<DebugTile>() as u64
                     ),
                 },
                 count: None,
@@ -1755,6 +1765,50 @@ fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
             Rect::from_origin_size(origin, size)
         })
         .collect()
+}
+
+/// Upload inherited shadow clips only for layers whose scene bytes were part of
+/// this frame's upload. Clean retained frames therefore do no clip work.
+fn upload_shadow_clips(
+    buffer: &wgpu::Buffer,
+    queue: &wgpu::Queue,
+    scene: &Scene,
+    dirty: Dirty<'_>,
+) {
+    if dirty.is_empty() {
+        return;
+    }
+    for layer in scene.layers.ids() {
+        if !dirty.contains(layer) {
+            continue;
+        }
+        let range = scene.shadows.slab(layer);
+        for (ordinal, key) in scene.shadows.keys(layer).into_iter().enumerate() {
+            let clip = scene
+                .shadow_clips
+                .get(layer, key)
+                .copied()
+                .unwrap_or(ShadowClip::UNCLIPPED);
+            let Some(offset) = usize::try_from(range.base)
+                .ok()
+                .and_then(|base| base.checked_add(ordinal))
+                .and_then(|slot| slot.checked_mul(Shadow::SLOT_STRIDE))
+            else {
+                continue;
+            };
+            let Some(offset) = offset.checked_add(64) else {
+                continue;
+            };
+            let Some(offset) = u64::try_from(offset).ok() else {
+                continue;
+            };
+            let mut bytes = [0u8; 16];
+            for (index, value) in clip.origin.into_iter().chain(clip.size).enumerate() {
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            queue.write_buffer(buffer, offset, &bytes);
+        }
+    }
 }
 
 /// One layer's underlines as bounding rectangles, in arena slot order.
