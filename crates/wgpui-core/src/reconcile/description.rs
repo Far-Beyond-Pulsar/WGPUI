@@ -20,10 +20,10 @@
 //! a scope flag, and children. Every element type in `wgpui-widgets` will
 //! produce one of these; nothing here knows or cares which.
 
+use crate::app::App;
 use crate::boundary::policy::BoundaryPolicy;
 use crate::patch::emit::Emit;
 use crate::reconcile::diff_key::ReconcileKey;
-use crate::app::App;
 use crate::window::{EventResult, InputEvent, Window};
 use std::any::TypeId;
 use std::sync::Arc;
@@ -93,6 +93,19 @@ pub struct DescriptionInteraction {
     callback: InteractionCallback,
 }
 
+/// Retained scroll metadata supplied by a scroll handle for diagnostics.
+///
+/// The callback and handle implementation remain outside the core crate. This
+/// value is only the safe, copyable state an inspector needs to describe the
+/// scroll container without retaining application-owned objects.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScrollInfo {
+    pub handle_id: u64,
+    pub content_size: [f32; 2],
+    pub max_offset: [f32; 2],
+    pub offset: [f32; 2],
+}
+
 impl std::fmt::Debug for DescriptionInteraction {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("DescriptionInteraction(..)")
@@ -103,7 +116,9 @@ impl DescriptionInteraction {
     pub fn new(
         callback: impl FnMut(&InputEvent, &mut Window, &mut App) -> EventResult + 'static,
     ) -> Self {
-        Self { callback: Box::new(callback) }
+        Self {
+            callback: Box::new(callback),
+        }
     }
 
     pub fn dispatch(
@@ -197,6 +212,7 @@ pub struct Description {
     pub(crate) text_size: Option<f32>,
     pub(crate) text_color: Option<[f32; 4]>,
     pub(crate) interaction: Option<DescriptionInteraction>,
+    pub(crate) scroll_info: Option<ScrollInfo>,
 }
 
 impl std::fmt::Debug for Description {
@@ -242,6 +258,7 @@ impl Description {
             text_size: None,
             text_color: None,
             interaction: None,
+            scroll_info: None,
         }
     }
 
@@ -373,6 +390,12 @@ impl Description {
 
     pub fn interaction(mut self, interaction: DescriptionInteraction) -> Self {
         self.interaction = Some(interaction);
+        self
+    }
+
+    /// Attach copy-only scroll state for a capture-time inspector snapshot.
+    pub fn scroll_info(mut self, scroll_info: ScrollInfo) -> Self {
+        self.scroll_info = Some(scroll_info);
         self
     }
 

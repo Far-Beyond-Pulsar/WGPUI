@@ -15,8 +15,8 @@
 use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::axes::Invalidation;
 use crate::patch::emit::Emit;
+use crate::reconcile::description::{DescriptionInteraction, ScrollInfo};
 use crate::reconcile::instance::InstanceKey;
-use crate::reconcile::description::DescriptionInteraction;
 use crate::reconcile::state::StateScope;
 use crate::scene::layer::BoundaryId;
 use wgpui_layout::taffy_tree::LayoutNodeId;
@@ -170,6 +170,7 @@ pub struct FramePlan {
     nodes: Vec<PlannedNode>,
     emitters: Vec<Option<Box<dyn Emit>>>,
     interactions: Vec<Option<DescriptionInteraction>>,
+    scroll_infos: Vec<Option<ScrollInfo>>,
     stats: FrameStats,
 }
 
@@ -200,6 +201,7 @@ impl FramePlan {
         self.nodes.push(node);
         self.emitters.push(None);
         self.interactions.push(None);
+        self.scroll_infos.push(None);
         self.nodes.len() - 1
     }
 
@@ -217,7 +219,11 @@ impl FramePlan {
         }
     }
 
-    pub(crate) fn set_interaction(&mut self, index: usize, interaction: Option<DescriptionInteraction>) {
+    pub(crate) fn set_interaction(
+        &mut self,
+        index: usize,
+        interaction: Option<DescriptionInteraction>,
+    ) {
         if let Some(slot) = self.interactions.get_mut(index) {
             *slot = interaction;
         }
@@ -225,6 +231,17 @@ impl FramePlan {
 
     pub fn take_interaction(&mut self, index: usize) -> Option<DescriptionInteraction> {
         self.interactions.get_mut(index)?.take()
+    }
+
+    pub(crate) fn set_scroll_info(&mut self, index: usize, scroll_info: Option<ScrollInfo>) {
+        if let Some(slot) = self.scroll_infos.get_mut(index) {
+            *slot = scroll_info;
+        }
+    }
+
+    /// Copy-only scroll state attached to an element for diagnostics.
+    pub fn scroll_info(&self, index: usize) -> Option<ScrollInfo> {
+        self.scroll_infos.get(index).copied().flatten()
     }
 
     /// The emitter for the element at `index`, if it has one.

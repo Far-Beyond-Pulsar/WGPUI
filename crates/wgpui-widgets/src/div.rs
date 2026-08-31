@@ -393,6 +393,10 @@ impl Div {
             .scroll_offset(scroll_offset)
             .children(children);
 
+        if let Some(scroll_handle) = scroll_handle {
+            description = description.scroll_info(scroll_handle.inspector_info());
+        }
+
         if clips_children {
             description = description.clip_children();
         }

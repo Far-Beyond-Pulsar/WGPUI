@@ -15,13 +15,16 @@
 pub mod app;
 pub use app::entity::EntityError;
 pub use app::{App, Context, Entity, EntityId, Subscription, Task, TaskError, WeakEntity};
+pub use reconcile::ScrollInfo;
 pub use window::{
-    ClickEvent, CloseState, DispatchNodeId, EventResult, FocusHandle, FocusId, FocusManager,
-    FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId, InputEvent, KeyBinding,
-    KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu,
-    MenuItem, Modifiers, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TimerHandle, TimerId, TimerState,
-    WindowOptions,
+    ClickEvent, CloseState, DispatchNodeId, DispatchNodeInfo, DispatchPhase, DispatchTreeSnapshot,
+    ElementInteractionInfo, EventResult, FocusHandle, FocusId, FocusManager, FocusTransition,
+    Focusable, FrameInteractionSnapshot, HitTestIndex, Hitbox, HitboxId, HitboxInfo, InputEvent,
+    InputEventFamily, InputRejection, InputRejectionReason, InteractionSnapshot, KeyBinding,
+    KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke,
+    ListenerInfo, Menu, MenuItem, Modifiers, MouseButton, MouseButtonState, MouseClickEvent,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TimerHandle, TimerId,
+    TimerState, WindowOptions,
 };
 pub mod boundary;
 pub mod color;
