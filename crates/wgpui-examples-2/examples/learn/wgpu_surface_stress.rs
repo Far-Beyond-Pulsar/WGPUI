@@ -4,8 +4,8 @@ use wgpu::util::DeviceExt;
 ///
 /// Set `WGPU_SURFACE_STRESS_ROWS` to control the row count (default: 8).
 use wgpui::{
-    ApplicationError, NativeApplication, Styled, WgpuSurfaceHandle, WindowOptions, div, px, rgb,
-    rgba, wgpu_surface,
+    App, Application, Context, Render, WgpuSurfaceHandle, Window, WindowOptions, div, prelude::*,
+    px, rgb, rgba, wgpu_surface,
 };
 
 const GRID_COLUMNS: usize = 8;
@@ -371,7 +371,7 @@ impl SurfaceStressExample {
 
             state.render(&view);
             drop(view);
-            tile.surface.present();
+            tile.surface.swap_buffers();
 
             tile.frame_count = tile.frame_count.wrapping_add(1);
             let now = std::time::Instant::now();
@@ -383,7 +383,7 @@ impl SurfaceStressExample {
         }
     }
 
-    fn tile_element(tile: &SurfaceTile) -> wgpui::Div {
+    fn tile_element(tile: &SurfaceTile) -> impl IntoElement {
         div()
             .relative()
             .h(px(112.0))
@@ -408,14 +408,13 @@ impl SurfaceStressExample {
     }
 }
 
-impl SurfaceStressExample {
-    fn render(&mut self) {
+impl Render for SurfaceStressExample {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         for tile in &mut self.tiles {
             Self::render_tile(tile);
         }
-    }
+        cx.notify();
 
-    fn description(&self) -> wgpui::Div {
         div().size_full().p_2().bg(rgb(0x0b0e14)).child(
             div()
                 .id("stress-root")
@@ -466,43 +465,38 @@ fn tile_clear_color(index: usize) -> [f64; 3] {
     [red, green, blue]
 }
 
-fn main() -> Result<(), ApplicationError> {
+fn main() {
     env_logger::init();
     let rows = read_rows();
     let tile_count = GRID_COLUMNS * rows;
-    let mut example = None;
-    NativeApplication::new(WindowOptions::default(), move |window| {
-        if example.is_none() {
-            let mut tiles = Vec::with_capacity(tile_count);
-            for index in 0..tile_count {
-                let surface = window
-                    .create_wgpu_surface(
-                        SURFACE_WIDTH,
-                        SURFACE_HEIGHT,
-                        wgpu::TextureFormat::Rgba8UnormSrgb,
-                    )
-                    .expect("WgpuSurface not supported on this platform");
 
-                let speed = 0.8 + ((index % 17) as f32 * 0.09);
-                let phase = index as f32 * 0.31;
-                tiles.push(SurfaceTile::new(
-                    index,
-                    surface,
-                    speed,
-                    phase,
-                    tile_clear_color(index),
-                ));
-            }
-            example = Some(SurfaceStressExample { tiles, rows });
-        }
-        example
-            .as_mut()
-            .expect("surface example initialized")
-            .render();
-        example
-            .as_ref()
-            .expect("surface example initialized")
-            .description()
-    })
-    .run()
+    Application::new().run(move |cx: &mut App| {
+        _ = cx.open_window(
+            WindowOptions::default(),
+            move |window: &mut Window, cx: &mut App| {
+                let mut tiles = Vec::with_capacity(tile_count);
+                for index in 0..tile_count {
+                    let surface = window
+                        .create_wgpu_surface(
+                            SURFACE_WIDTH,
+                            SURFACE_HEIGHT,
+                            wgpu::TextureFormat::Rgba8UnormSrgb,
+                        )
+                        .expect("WgpuSurface not supported on this platform");
+
+                    let speed = 0.8 + ((index % 17) as f32 * 0.09);
+                    let phase = index as f32 * 0.31;
+                    tiles.push(SurfaceTile::new(
+                        index,
+                        surface,
+                        speed,
+                        phase,
+                        tile_clear_color(index),
+                    ));
+                }
+
+                cx.new(|_cx| SurfaceStressExample { tiles, rows })
+            },
+        );
+    });
 }

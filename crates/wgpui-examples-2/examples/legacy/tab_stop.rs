@@ -1,43 +1,155 @@
-//! Native tab-stop ordering example.
+use wgpui::{
+    App, Application, Bounds, Context, Div, ElementId, FocusHandle, KeyBinding, SharedString,
+    Stateful, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+};
 
-use wgpui::{ApplicationError, FocusHandle, NativeApplication, Styled, WindowOptions, div, px, rgb};
+actions!(example, [Tab, TabPrev]);
 
-fn main() -> Result<(), ApplicationError> {
-    let first = FocusHandle::new().with_tab_index(20).with_tab_stop(true);
-    let skipped = FocusHandle::new().with_tab_index(10).with_tab_stop(false);
-    let second = FocusHandle::new().with_tab_index(20).with_tab_stop(true);
-    NativeApplication::with_window(WindowOptions::default(), move |_| {
-        div()
-            .size_full()
-            .p_12()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .bg(rgb(0x0f172a))
-            .child(div().text_color(rgb(0xffffff)).text_xl().child("Tab stops"))
-            .child(tab_button("First (20)", first))
-            .child(tab_button("Skipped (disabled)", skipped))
-            .child(tab_button("Second (20)", second))
-            .child(
-                div()
-                    .text_color(rgb(0x94a3b8))
-                    .child("Tab index orders stops; equal indices keep tree order."),
-            )
-    })
-    .run()
+struct Example {
+    focus_handle: FocusHandle,
+    items: Vec<FocusHandle>,
+    message: SharedString,
 }
 
-fn tab_button(label: &'static str, focus: FocusHandle) -> impl wgpui::IntoElement {
-    div()
-        .w(px(280.0))
-        .h(px(52.0))
-        .rounded_md()
-        .bg(rgb(0x1e293b))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(rgb(0xffffff))
-        .child(label)
-        .track_focus(&focus)
-        .focus_visible(|style| style.border_2().border_color(rgb(0x22c55e)))
+impl Example {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let items = vec![
+            cx.focus_handle().tab_index(1).tab_stop(true),
+            cx.focus_handle().tab_index(2).tab_stop(true),
+            cx.focus_handle().tab_index(3).tab_stop(true),
+            cx.focus_handle(),
+            cx.focus_handle().tab_index(2).tab_stop(true),
+        ];
+
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle, cx);
+
+        Self {
+            focus_handle,
+            items,
+            message: SharedString::from("Press `Tab`, `Shift-Tab` to switch focus."),
+        }
+    }
+
+    fn on_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_next(cx);
+        self.message = SharedString::from("You have pressed `Tab`.");
+    }
+
+    fn on_tab_prev(&mut self, _: &TabPrev, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus_prev(cx);
+        self.message = SharedString::from("You have pressed `Shift-Tab`.");
+    }
+}
+
+impl Render for Example {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn tab_stop_style<T: Styled>(this: T) -> T {
+            this.border_3().border_color(wgpui::blue())
+        }
+
+        fn button(id: impl Into<ElementId>) -> Stateful<Div> {
+            div()
+                .id(id)
+                .h_10()
+                .flex_1()
+                .flex()
+                .justify_center()
+                .items_center()
+                .border_1()
+                .border_color(wgpui::black())
+                .bg(wgpui::black())
+                .text_color(wgpui::white())
+                .focus(tab_stop_style)
+                .shadow_sm()
+        }
+
+        div()
+            .id("app")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_tab))
+            .on_action(cx.listener(Self::on_tab_prev))
+            .size_full()
+            .flex()
+            .flex_col()
+            .p_4()
+            .gap_3()
+            .bg(wgpui::white())
+            .text_color(wgpui::black())
+            .child(self.message.clone())
+            .children(
+                self.items
+                    .clone()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, item_handle)| {
+                        div()
+                            .id(("item", ix))
+                            .track_focus(&item_handle)
+                            .h_10()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .border_1()
+                            .border_color(wgpui::black())
+                            .when(
+                                item_handle.tab_stop && item_handle.is_focused(window),
+                                tab_stop_style,
+                            )
+                            .map(|this| match item_handle.tab_stop {
+                                true => this
+                                    .hover(|this| this.bg(wgpui::black().opacity(0.1)))
+                                    .child(format!("tab_index: {}", item_handle.tab_index)),
+                                false => this.opacity(0.4).child("tab_stop: false"),
+                            })
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_3()
+                    .items_center()
+                    .child(
+                        button("el1")
+                            .tab_index(4)
+                            .child("Button 1")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.message = "You have clicked Button 1.".into();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button("el2")
+                            .tab_index(5)
+                            .child("Button 2")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.message = "You have clicked Button 2.".into();
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+}
+
+fn main() {
+    Application::new().run(|cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("tab", Tab, None),
+            KeyBinding::new("shift-tab", TabPrev, None),
+        ]);
+
+        let bounds = Bounds::centered(None, size(px(800.), px(600.0)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |window, cx| cx.new(|cx| Example::new(window, cx)),
+        )
+        .unwrap();
+
+        cx.activate(true);
+    });
 }

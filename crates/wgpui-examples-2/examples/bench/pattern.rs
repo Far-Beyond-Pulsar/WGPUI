@@ -1,12 +1,12 @@
 use wgpui::{
-    App, Application, ApplicationError, Bounds, WindowBounds, WindowOptions, div,
+    App, AppContext, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div,
     gradient_color_stop, linear_gradient, pattern_slash, prelude::*, px, rgb, size,
 };
 
 struct PatternExample;
 
 impl Render for PatternExample {
-    fn render(&mut self) -> impl IntoElement + 'static {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -98,9 +98,9 @@ impl Render for PatternExample {
     }
 }
 
-fn main() -> Result<(), ApplicationError> {
+fn main() {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None::<()>, size(px(600.0), px(600.0)), cx);
+        let bounds = Bounds::centered(None, size(px(600.0), px(600.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -111,5 +111,5 @@ fn main() -> Result<(), ApplicationError> {
         .unwrap();
 
         cx.activate(true);
-    })
+    });
 }

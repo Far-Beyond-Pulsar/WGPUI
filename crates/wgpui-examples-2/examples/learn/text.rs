@@ -14,8 +14,8 @@ mod example_prelude;
 
 use example_prelude::init_example;
 use wgpui::{
-    App, Application, ApplicationError, Bounds, Colors, FontWeight, Hsla, Render, TextOverflow,
-    WindowBounds, WindowOptions, div, prelude::*, px, relative, size,
+    App, Application, Bounds, Colors, Context, FontStyle, FontWeight, Hsla, Render, StyledText,
+    TextOverflow, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, size,
 };
 
 // Text Styling Examples
@@ -345,17 +345,13 @@ fn styled_text_example(colors: &Colors) -> impl IntoElement {
                 .text_color(text_muted)
                 .child("StyledText with inline highlights"),
         )
-        .child(
-            div()
-                .flex()
-                .text_lg()
-                .text_color(text)
-                .child(div().font_weight(FontWeight::BOLD).child("Bold"))
-                .child(" ")
-                .child(div().italic().child("Italic"))
-                .child(" Normal ")
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Semibold")),
-        )
+        .child(div().text_lg().text_color(text).child(
+            StyledText::new("Bold Italic Normal Semibold").with_highlights([
+                (0..4, FontWeight::BOLD.into()),
+                (5..11, FontStyle::Italic.into()),
+                (19..27, FontWeight::SEMIBOLD.into()),
+            ]),
+        ))
 }
 
 // Character Grid Example
@@ -535,8 +531,8 @@ fn tracking_example(colors: &Colors) -> impl IntoElement {
 struct TextExample;
 
 impl Render for TextExample {
-    fn render(&mut self) -> impl IntoElement + 'static {
-        let colors = Colors::default();
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = Colors::for_appearance(window);
 
         div()
             .id("main")
@@ -633,9 +629,9 @@ fn section(colors: &Colors, title: &'static str, content: impl IntoElement) -> i
         .child(content)
 }
 
-fn main() -> Result<(), ApplicationError> {
+fn main() {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None::<()>, size(px(650.), px(900.)), cx);
+        let bounds = Bounds::centered(None, size(px(650.), px(900.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -646,5 +642,5 @@ fn main() -> Result<(), ApplicationError> {
         .expect("Failed to open window");
 
         init_example(cx, "Text");
-    })
+    });
 }

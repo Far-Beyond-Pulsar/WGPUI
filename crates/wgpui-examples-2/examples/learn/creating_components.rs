@@ -12,7 +12,7 @@ mod example_prelude;
 
 use example_prelude::init_example;
 use wgpui::{
-    App, Application, Bounds, Colors, Context, Entity, IntoElement, Render, RenderOnce, WeakEntity,
+    App, Application, Bounds, Colors, Context, Entity, IntoElement, Render, RenderOnce, Window,
     WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 
@@ -33,11 +33,16 @@ use wgpui::{
 // - Less explicit than Entity-backed state
 // - State is tied to call site location
 
-fn use_state_counter(
-    colors: &Colors,
-    parent: &WeakEntity<CreatingComponentsExample>,
+struct UseStateCounter {
     count: i32,
-) -> impl IntoElement + 'static {
+}
+
+fn use_state_counter(colors: &Colors, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    let state: Entity<UseStateCounter> =
+        window.use_state(cx, |_window, _cx| UseStateCounter { count: 0 });
+
+    let count = state.read(cx).count;
+
     let error = colors.error;
     let error_hover = colors.error_hover;
     let success = colors.success;
@@ -79,14 +84,12 @@ fn use_state_counter(
                         .hover(move |style| style.bg(error_hover))
                         .child("−")
                         .on_click({
-                            let parent = parent.clone();
-                            move |_, _, _cx| {
-                                if let Err(error) = parent.update(|parent, cx| {
-                                    parent.use_state_count -= 1;
+                            let state = state.clone();
+                            move |_, _, cx| {
+                                state.update(cx, |state, cx| {
+                                    state.count -= 1;
                                     cx.notify();
-                                }) {
-                                    eprintln!("use-state counter update failed: {error}");
-                                }
+                                });
                             }
                         }),
                 )
@@ -101,16 +104,11 @@ fn use_state_counter(
                         .cursor_pointer()
                         .hover(move |style| style.bg(success_hover))
                         .child("+")
-                        .on_click({
-                            let parent = parent.clone();
-                            move |_, _, _| {
-                                if let Err(error) = parent.update(|parent, cx| {
-                                    parent.use_state_count += 1;
-                                    cx.notify();
-                                }) {
-                                    eprintln!("use-state counter update failed: {error}");
-                                }
-                            }
+                        .on_click(move |_, _, cx| {
+                            state.update(cx, |state, cx| {
+                                state.count += 1;
+                                cx.notify();
+                            });
                         }),
                 ),
         )
@@ -134,14 +132,12 @@ fn use_state_counter(
 // - Cannot maintain internal state
 // - Parent must manage all state
 
-type AppCallback = Box<dyn Fn(&mut App) + 'static>;
-
 #[derive(IntoElement)]
 struct RenderOnceCounter {
     colors: Colors,
     count: i32,
-    on_increment: Option<AppCallback>,
-    on_decrement: Option<AppCallback>,
+    on_increment: Option<Box<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_decrement: Option<Box<dyn Fn(&mut Window, &mut App) + 'static>>,
 }
 
 impl RenderOnceCounter {
@@ -154,19 +150,19 @@ impl RenderOnceCounter {
         }
     }
 
-    fn on_increment(mut self, callback: impl Fn(&mut App) + 'static) -> Self {
+    fn on_increment(mut self, callback: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_increment = Some(Box::new(callback));
         self
     }
 
-    fn on_decrement(mut self, callback: impl Fn(&mut App) + 'static) -> Self {
+    fn on_decrement(mut self, callback: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_decrement = Some(Box::new(callback));
         self
     }
 }
 
 impl RenderOnce for RenderOnceCounter {
-    fn render(self) -> impl IntoElement + 'static {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let colors = self.colors;
         let error = colors.error;
         let error_hover = colors.error_hover;
@@ -209,7 +205,7 @@ impl RenderOnce for RenderOnceCounter {
                             .hover(move |style| style.bg(error_hover))
                             .child("−")
                             .when_some(self.on_decrement, |element, callback| {
-                                element.on_click(move |_, _, cx| callback(cx))
+                                element.on_click(move |_, window, cx| callback(window, cx))
                             }),
                     )
                     .child(
@@ -224,7 +220,7 @@ impl RenderOnce for RenderOnceCounter {
                             .hover(move |style| style.bg(success_hover))
                             .child("+")
                             .when_some(self.on_increment, |element, callback| {
-                                element.on_click(move |_, _, cx| callback(cx))
+                                element.on_click(move |_, window, cx| callback(window, cx))
                             }),
                     ),
             )
@@ -252,31 +248,27 @@ impl RenderOnce for RenderOnceCounter {
 
 struct RenderCounter {
     count: i32,
-    handle: WeakEntity<Self>,
 }
 
 impl RenderCounter {
-    fn new(cx: &mut Context<Self>) -> Self {
-        Self {
-            count: 0,
-            handle: cx.entity().downgrade(),
-        }
+    fn new() -> Self {
+        Self { count: 0 }
     }
 
-    fn increment(&mut self, cx: &mut Context<Self>) {
+    fn increment(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.count += 1;
         cx.notify();
     }
 
-    fn decrement(&mut self, cx: &mut Context<Self>) {
+    fn decrement(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.count -= 1;
         cx.notify();
     }
 }
 
 impl Render for RenderCounter {
-    fn render(&mut self) -> impl IntoElement + 'static {
-        let colors = Colors::for_appearance(&());
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = Colors::for_appearance(window);
         let error = colors.error;
         let error_hover = colors.error_hover;
         let success = colors.success;
@@ -317,15 +309,9 @@ impl Render for RenderCounter {
                             .cursor_pointer()
                             .hover(move |style| style.bg(error_hover))
                             .child("−")
-                            .on_click({
-                                let handle = self.handle.clone();
-                                move |_, _, _| {
-                                    if let Err(error) = handle.update(|this, cx| this.decrement(cx))
-                                    {
-                                        eprintln!("render counter update failed: {error}");
-                                    }
-                                }
-                            }),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.decrement(window, cx);
+                            })),
                     )
                     .child(
                         div()
@@ -338,15 +324,9 @@ impl Render for RenderCounter {
                             .cursor_pointer()
                             .hover(move |style| style.bg(success_hover))
                             .child("+")
-                            .on_click({
-                                let handle = self.handle.clone();
-                                move |_, _, _| {
-                                    if let Err(error) = handle.update(|this, cx| this.increment(cx))
-                                    {
-                                        eprintln!("render counter update failed: {error}");
-                                    }
-                                }
-                            }),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.increment(window, cx);
+                            })),
                     ),
             )
     }
@@ -359,26 +339,22 @@ impl Render for RenderCounter {
 struct CreatingComponentsExample {
     render_counter: Entity<RenderCounter>,
     render_once_count: i32,
-    use_state_count: i32,
-    handle: WeakEntity<Self>,
 }
 
 impl CreatingComponentsExample {
     fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            render_counter: cx.new(RenderCounter::new),
+            render_counter: cx.new(|_| RenderCounter::new()),
             render_once_count: 0,
-            use_state_count: 0,
-            handle: cx.entity().downgrade(),
         }
     }
 }
 
 impl Render for CreatingComponentsExample {
-    fn render(&mut self) -> impl IntoElement + 'static {
-        let colors = Colors::for_appearance(&());
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = Colors::for_appearance(window);
         let render_once_count = self.render_once_count;
-        let handle = self.handle.clone();
+        let handle = cx.entity().downgrade();
 
         div()
             .id("main")
@@ -413,35 +389,27 @@ impl Render for CreatingComponentsExample {
                     .flex()
                     .flex_row()
                     .gap_4()
-                    .child(use_state_counter(
-                        &colors,
-                        &self.handle,
-                        self.use_state_count,
-                    ))
+                    .child(use_state_counter(&colors, window, cx))
                     .child(
                         RenderOnceCounter::new(colors.clone(), render_once_count)
                             .on_increment({
                                 let handle = handle.clone();
-                                move |_cx| {
+                                move |_window, cx| {
                                     handle
-                                        .update(|this, cx| {
+                                        .update(cx, |this, cx| {
                                             this.render_once_count += 1;
                                             cx.notify();
                                         })
-                                        .unwrap_or_else(|error| {
-                                            eprintln!("render-once counter update failed: {error}");
-                                        });
+                                        .ok();
                                 }
                             })
-                            .on_decrement(move |_cx| {
+                            .on_decrement(move |_window, cx| {
                                 handle
-                                    .update(|this, cx| {
+                                    .update(cx, |this, cx| {
                                         this.render_once_count -= 1;
                                         cx.notify();
                                     })
-                                    .unwrap_or_else(|error| {
-                                        eprintln!("render-once counter update failed: {error}");
-                                    });
+                                    .ok();
                             }),
                     )
                     .child(self.render_counter.clone()),
@@ -450,22 +418,17 @@ impl Render for CreatingComponentsExample {
 }
 
 fn main() {
-    if let Err(error) = Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None::<()>, size(px(700.), px(400.)), cx);
-        if let Err(error) = cx.open_window(
+    Application::new().run(|cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(700.), px(400.)), cx);
+        cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(CreatingComponentsExample::new),
-        ) {
-            eprintln!("failed to open creating-components window: {error}");
-            cx.quit();
-            return;
-        }
+            |_, cx| cx.new(|cx| CreatingComponentsExample::new(cx)),
+        )
+        .expect("Failed to open window");
 
         init_example(cx, "Creating Components");
-    }) {
-        eprintln!("native application failed: {error}");
-    }
+    });
 }
