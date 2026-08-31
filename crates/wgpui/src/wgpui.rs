@@ -32,7 +32,9 @@ pub use wgpui_core::patch::primitive::{
     AtlasTileId, Glyph, GlyphRun, Path, PolySprite, Quad, Shadow, Underline,
 };
 pub use wgpui_core::reconcile;
-pub use wgpui_core::reconcile::description::{RawText, RawTextKey};
+pub use wgpui_core::reconcile::description::{
+    RawText, RawTextKey, TextDecoration, TextOptions,
+};
 pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey, Reconciler};
 pub use wgpui_core::reconcile::{StateKey, StateScope};
 pub use wgpui_core::scene;

@@ -54,7 +54,7 @@ use crate::div::interactivity::style::DivStyle;
 use crate::styled::Styled;
 use wgpui_core::element::Element;
 use wgpui_core::patch::emit::{Emission, EmitContext};
-use wgpui_core::reconcile::description::{Description, ElementId};
+use wgpui_core::reconcile::description::{Description, ElementId, TextDecoration, TextOptions};
 
 /// Anything that can become one node of a description tree.
 ///
@@ -472,6 +472,30 @@ impl Div {
             }
         }
         let paint = style;
+        let text_options = TextOptions {
+            size: paint.text_size,
+            line_height: paint.text_line_height,
+            color: paint.text_color,
+            weight: paint.text_weight.map(|weight| weight.0 as u16),
+            italic: paint.text_italic.then_some(true),
+            alignment: (paint.text_alignment != 0).then_some(paint.text_alignment),
+            nowrap: paint.text_white_space_nowrap.then_some(true),
+            ellipsis: paint.text_ellipsis.then_some(true),
+            line_clamp: paint.text_line_clamp,
+            letter_spacing: paint.text_letter_spacing,
+            underline: paint.text_underline.map(|decoration| TextDecoration {
+                thickness: decoration.thickness,
+                color: decoration.color,
+                wavy: decoration.wavy,
+            }),
+            strikethrough: paint.text_strikethrough.map(|decoration| TextDecoration {
+                thickness: decoration.thickness,
+                color: decoration.color,
+                wavy: false,
+            }),
+            gradient: paint.text_gradient.clone(),
+            gradient_angle: paint.text_gradient_angle,
+        };
         let clips_children = matches!(
             layout_style.overflow.x,
             wgpui_layout::taffy_tree::Overflow::Hidden | wgpui_layout::taffy_tree::Overflow::Scroll
@@ -494,6 +518,7 @@ impl Div {
             .diff_key(key)
             .style(layout_style)
             .text_metrics(paint.text_size, paint.text_color)
+            .text_options(text_options)
             .scroll_offset(scroll_offset)
             .children(children);
 
