@@ -9,6 +9,7 @@ pub mod flamegraph;
 pub mod hooks;
 #[cfg(feature = "inspector")]
 pub mod inspector;
+pub mod memory;
 #[cfg(feature = "perf-ab")]
 pub mod perf_ab_tests;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
@@ -18,6 +19,10 @@ pub mod render_stats;
 pub use hooks::DevtoolsHooks;
 #[cfg(feature = "inspector")]
 pub use inspector::{ElementInfo, Inspector};
+pub use memory::{
+    AllocationCategory, AllocationCategorySnapshot, AllocationEntry, AllocationId,
+    AllocationRegistry, AllocationSnapshot,
+};
 #[cfg(feature = "perf-ab")]
 pub use perf_ab_tests::Sample;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
