@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 /// Stored as min/max rather than origin/size because every predicate below
 /// wants edges, and because that is the form the WGSL port reads out of a
 /// `vec4<f32>`.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     /// Left edge.
     pub min_x: f32,

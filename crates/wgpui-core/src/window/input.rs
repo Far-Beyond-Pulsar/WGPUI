@@ -1,6 +1,7 @@
 use crate::boundary::Pixels;
+use serde::{Deserialize, Serialize};
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Modifiers {
     pub shift: bool,
     pub control: bool,
@@ -42,7 +43,7 @@ impl Modifiers {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
     #[default]
     Left,
@@ -50,7 +51,7 @@ pub enum MouseButton {
     Middle,
     Other(u16),
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KeyDownEvent {
     pub key: String,
     pub modifiers: Modifiers,
@@ -65,12 +66,12 @@ impl KeyDownEvent {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KeyUpEvent {
     pub key: String,
     pub modifiers: Modifiers,
 }
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MouseDownEvent {
     pub button: MouseButton,
     pub position: [Pixels; 2],
@@ -82,7 +83,7 @@ impl MouseDownEvent {
         self.button == MouseButton::Left
     }
 }
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MouseUpEvent {
     pub button: MouseButton,
     pub position: [Pixels; 2],
@@ -94,13 +95,13 @@ impl MouseUpEvent {
         self.button == MouseButton::Left
     }
 }
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MouseButtonState {
     pub left: bool,
     pub right: bool,
     pub middle: bool,
 }
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MouseMoveEvent {
     pub position: [Pixels; 2],
     pub modifiers: Modifiers,
@@ -111,29 +112,29 @@ impl MouseMoveEvent {
         self.buttons.left || self.buttons.right || self.buttons.middle
     }
 }
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrollWheelEvent {
     pub position: [Pixels; 2],
     pub delta: [f32; 2],
     pub modifiers: Modifiers,
 }
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyboardButton {
     #[default]
     Enter,
     Space,
 }
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KeyboardClickEvent {
     pub button: KeyboardButton,
     pub bounds: crate::geometry::Rect,
 }
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MouseClickEvent {
     pub down: MouseDownEvent,
     pub up: MouseUpEvent,
 }
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClickEvent {
     Mouse(MouseClickEvent),
     Keyboard(KeyboardClickEvent),
@@ -197,7 +198,7 @@ impl ClickEvent {
         matches!(self, Self::Keyboard(_))
     }
 }
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventResult {
     pub handled: bool,
     pub propagate: bool,
@@ -212,7 +213,7 @@ impl EventResult {
         propagate: true,
     };
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
     KeyDown(KeyDownEvent),
     KeyUp(KeyUpEvent),

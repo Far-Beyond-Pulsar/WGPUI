@@ -15,6 +15,7 @@ use crate::invalidation::axes::Invalidation;
 use crate::patch::primitive::PrimitiveKind;
 use crate::scene::slab_range::SlabRange;
 use crate::scene::tile::TileCoord;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
@@ -25,7 +26,7 @@ use std::hash::{Hash, Hasher};
 /// opaque, caller-chosen identity — in practice the window root's. Phase 2 is
 /// what derives these from positional identity (§4.1, SFD §1.0); nothing about
 /// this type has to change when it does.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BoundaryId(u64);
 
 impl BoundaryId {
@@ -45,7 +46,7 @@ impl BoundaryId {
 
 /// A layer's cross-frame address: which boundary owns it, and — once §4.3's
 /// tiling exists — which tile of that boundary's content plane it holds.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LayerKey {
     /// The owning compositing boundary.
     pub boundary: BoundaryId,
@@ -78,7 +79,7 @@ impl LayerKey {
 /// (§2): a producer can name a layer in a `PatchList` without first asking a
 /// scene to allocate an id for it, so building a frame's patches never
 /// requires a round trip into the backend.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LayerId(u64);
 
 impl LayerId {

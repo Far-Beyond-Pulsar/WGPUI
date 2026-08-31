@@ -31,6 +31,7 @@
 use crate::boundary::policy::{Pixels, Size};
 use crate::geometry::Rect;
 use crate::scene::layer::LayerTransform;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A tile's integer coordinate on its boundary's content plane.
@@ -39,7 +40,7 @@ use std::collections::HashMap;
 /// — panning up and left from the initial view produces negative coordinates,
 /// and clamping them at zero would silently alias two distinct tiles onto one
 /// address.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TileCoord {
     /// Column index along the horizontal axis.
     pub x: i32,

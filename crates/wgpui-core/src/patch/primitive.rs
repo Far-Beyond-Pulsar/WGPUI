@@ -62,7 +62,9 @@
 /// A runtime tag only: payload types stay statically known via [`Primitive`].
 /// Ordering is declaration order and is used as a dense array index by
 /// [`PrimitiveKind::index`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum PrimitiveKind {
     /// Fixed-size, one slot per primitive, drawn under everything else in its

@@ -24,7 +24,10 @@ pub use layer::{BoundaryId, Layer, LayerId, LayerKey, LayerTable};
 pub use primitive_store::{DrawRange, PrimitiveStore};
 pub use record::{DispatchNode, Hitbox, LayoutInput, RecordStore};
 pub use slab::{Reallocation, SlabAllocator, SlabOverflow};
-pub use slab_range::{SlabRange, UploadRange, coalesce_uploads, uploaded_byte_count};
+pub use slab_range::{
+    PrimitiveSlotDiff, SlotChange, SlotSpan, SlabRange, UploadRange, coalesce_uploads,
+    uploaded_byte_count,
+};
 pub use tile::{
     EvictedTile, TILE_DESCRIPTOR_STRIDE, TileCoord, TileDescriptor, TileEviction, TileGrid,
     TilePlacement, TileResidency, TileSpan, TileVisibility, encode_tiles, tile_visibility,

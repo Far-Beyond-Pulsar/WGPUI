@@ -37,7 +37,9 @@ use crate::patch::primitive::{
 use crate::patch::{PatchError, PatchList};
 use crate::scene::layer::LayerId;
 use crate::scene::record::{DispatchNode, Hitbox, LayoutInput};
-use crate::scene::slab_range::{UploadRange, coalesce_uploads, uploaded_byte_count};
+use crate::scene::slab_range::{
+    PrimitiveSlotDiff, UploadRange, coalesce_uploads, uploaded_byte_count,
+};
 use crate::scene::{PrimitiveStore, Scene};
 use std::collections::HashSet;
 
@@ -87,13 +89,27 @@ impl ScenePatch {
                 layers.push(layer);
             }
         };
-        for patch in self.shadows.patches() { add(patch.layer); }
-        for patch in self.quads.patches() { add(patch.layer); }
-        for patch in self.underlines.patches() { add(patch.layer); }
-        for patch in self.glyph_runs.patches() { add(patch.layer); }
-        for patch in self.poly_sprites.patches() { add(patch.layer); }
-        for patch in self.paths.patches() { add(patch.layer); }
-        for patch in self.backdrop_filters.patches() { add(patch.layer); }
+        for patch in self.shadows.patches() {
+            add(patch.layer);
+        }
+        for patch in self.quads.patches() {
+            add(patch.layer);
+        }
+        for patch in self.underlines.patches() {
+            add(patch.layer);
+        }
+        for patch in self.glyph_runs.patches() {
+            add(patch.layer);
+        }
+        for patch in self.poly_sprites.patches() {
+            add(patch.layer);
+        }
+        for patch in self.paths.patches() {
+            add(patch.layer);
+        }
+        for patch in self.backdrop_filters.patches() {
+            add(patch.layer);
+        }
         layers.sort_unstable();
         layers
     }
@@ -198,12 +214,19 @@ impl ScenePatch {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UploadPlan {
     entries: Vec<UploadRange>,
+    slot_diffs: Vec<PrimitiveSlotDiff>,
 }
 
 impl UploadPlan {
     /// Every pending upload, sorted by kind then offset.
     pub fn entries(&self) -> &[UploadRange] {
         &self.entries
+    }
+
+    /// Exact primitive records whose retained slots changed. This is an owned
+    /// report and remains valid after the scene is changed or dropped.
+    pub fn slot_diffs(&self) -> &[PrimitiveSlotDiff] {
+        &self.slot_diffs
     }
 
     /// How many `write_buffer` calls this plan implies. §5.0's gate counts
@@ -236,6 +259,25 @@ impl UploadPlan {
 /// caller's correct response is to rebuild the affected layer — R-N §2.2's "one
 /// slow frame, never incorrect output" — not to retry the same patch.
 pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchError> {
+    apply_internal(scene, patch, false)
+}
+
+/// Apply one frame's patches and capture exact primitive-slot transitions.
+///
+/// This is deliberately separate from [`apply`]: ordinary rendering keeps the
+/// capture-only diagnostics allocation-free and branch-free at the call site.
+pub fn apply_with_diagnostics(
+    scene: &mut Scene,
+    patch: &ScenePatch,
+) -> Result<UploadPlan, PatchError> {
+    apply_internal(scene, patch, true)
+}
+
+fn apply_internal(
+    scene: &mut Scene,
+    patch: &ScenePatch,
+    capture_slot_diffs: bool,
+) -> Result<UploadPlan, PatchError> {
     let touched = patch.layers();
     for layer in touched.iter().copied() {
         if !scene.layers.contains(layer) {
@@ -244,27 +286,75 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     }
 
     let mut entries: Vec<UploadRange> = Vec::new();
-    scene
-        .shadows
-        .apply(&patch.shadows, &mut scene.allocator, &mut entries)?;
-    scene
-        .quads
-        .apply(&patch.quads, &mut scene.allocator, &mut entries)?;
-    scene
-        .underlines
-        .apply(&patch.underlines, &mut scene.allocator, &mut entries)?;
-    scene
-        .glyph_runs
-        .apply(&patch.glyph_runs, &mut scene.allocator, &mut entries)?;
-    scene
-        .poly_sprites
-        .apply(&patch.poly_sprites, &mut scene.allocator, &mut entries)?;
-    scene
-        .paths
-        .apply(&patch.paths, &mut scene.allocator, &mut entries)?;
-    scene
-        .backdrop_filters
-        .apply(&patch.backdrop_filters, &mut scene.allocator, &mut entries)?;
+    let mut slot_diffs = capture_slot_diffs.then(Vec::new);
+    if let Some(slot_diffs) = slot_diffs.as_mut() {
+        scene.shadows.apply_with_diffs(
+            &patch.shadows,
+            &mut scene.allocator,
+            &mut entries,
+            slot_diffs,
+        )?;
+        scene.quads.apply_with_diffs(
+            &patch.quads,
+            &mut scene.allocator,
+            &mut entries,
+            slot_diffs,
+        )?;
+        scene.underlines.apply_with_diffs(
+            &patch.underlines,
+            &mut scene.allocator,
+            &mut entries,
+            slot_diffs,
+        )?;
+        scene.glyph_runs.apply_with_diffs(
+            &patch.glyph_runs,
+            &mut scene.allocator,
+            &mut entries,
+            slot_diffs,
+        )?;
+        scene.poly_sprites.apply_with_diffs(
+            &patch.poly_sprites,
+            &mut scene.allocator,
+            &mut entries,
+            slot_diffs,
+        )?;
+        scene.paths.apply_with_diffs(
+            &patch.paths,
+            &mut scene.allocator,
+            &mut entries,
+            slot_diffs,
+        )?;
+        scene.backdrop_filters.apply_with_diffs(
+            &patch.backdrop_filters,
+            &mut scene.allocator,
+            &mut entries,
+            slot_diffs,
+        )?;
+    } else {
+        scene
+            .shadows
+            .apply(&patch.shadows, &mut scene.allocator, &mut entries)?;
+        scene
+            .quads
+            .apply(&patch.quads, &mut scene.allocator, &mut entries)?;
+        scene
+            .underlines
+            .apply(&patch.underlines, &mut scene.allocator, &mut entries)?;
+        scene
+            .glyph_runs
+            .apply(&patch.glyph_runs, &mut scene.allocator, &mut entries)?;
+        scene
+            .poly_sprites
+            .apply(&patch.poly_sprites, &mut scene.allocator, &mut entries)?;
+        scene
+            .paths
+            .apply(&patch.paths, &mut scene.allocator, &mut entries)?;
+        scene.backdrop_filters.apply(
+            &patch.backdrop_filters,
+            &mut scene.allocator,
+            &mut entries,
+        )?;
+    }
     scene.layout_inputs.apply(&patch.layout_inputs)?;
     scene.hitboxes.apply(&patch.hitboxes)?;
     scene.dispatch_nodes.apply(&patch.dispatch_nodes)?;
@@ -274,14 +364,19 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     // standing rule, applied at the one place that knows what actually moved.
     for layer in touched {
         let mut axes = Invalidation::empty();
-        if names(&patch.shadows, layer)
-            || names(&patch.quads, layer)
-            || names(&patch.underlines, layer)
-            || names(&patch.glyph_runs, layer)
-            || names(&patch.poly_sprites, layer)
-            || names(&patch.paths, layer)
-            || names(&patch.backdrop_filters, layer)
-        {
+        let display_changed = slot_diffs.as_ref().map_or_else(
+            || {
+                names(&patch.shadows, layer)
+                    || names(&patch.quads, layer)
+                    || names(&patch.underlines, layer)
+                    || names(&patch.glyph_runs, layer)
+                    || names(&patch.poly_sprites, layer)
+                    || names(&patch.paths, layer)
+                    || names(&patch.backdrop_filters, layer)
+            },
+            |slot_diffs| slot_diffs.iter().any(|diff| diff.layer == layer),
+        );
+        if display_changed {
             axes |= Invalidation::DISPLAY;
             scene
                 .layers
@@ -317,7 +412,12 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     }
 
     coalesce_uploads(&mut entries);
-    Ok(UploadPlan { entries })
+    let mut slot_diffs = slot_diffs.unwrap_or_default();
+    slot_diffs.sort_unstable();
+    Ok(UploadPlan {
+        entries,
+        slot_diffs,
+    })
 }
 
 fn names<T>(list: &PatchList<T>, layer: LayerId) -> bool {
@@ -949,6 +1049,10 @@ mod tests {
         patch.quads.insert(layer, key(3), 0, quad(1.0));
         let plan = apply(&mut scene, &patch)?;
         assert_eq!(scene.shadows.len(layer), 2);
+        assert!(
+            plan.slot_diffs().is_empty(),
+            "ordinary apply does not capture diagnostics"
+        );
         assert_eq!(
             scene
                 .layers
@@ -969,9 +1073,11 @@ mod tests {
                 ..first
             },
         );
-        let plan = apply(&mut scene, &update)?;
+        let plan = apply_with_diagnostics(&mut scene, &update)?;
         assert_eq!(plan.len(), 1);
         assert_eq!(plan.byte_count(), Shadow::SLOT_STRIDE as u64);
+        assert_eq!(plan.slot_diffs().len(), 1);
+        assert_eq!(plan.slot_diffs()[0].kind, Shadow::KIND);
         assert_eq!(
             plan.entries().first().map(|entry| entry.kind),
             Some(Shadow::KIND),
