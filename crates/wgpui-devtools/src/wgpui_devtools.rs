@@ -13,10 +13,12 @@ pub mod inspector;
 pub mod memory;
 #[cfg(feature = "perf-ab")]
 pub mod perf_ab_tests;
+pub mod reference_viewer;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod render_stats;
 pub mod resource_snapshot;
 
+pub use capture::{Availability, CaptureBundle, CaptureError};
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use hooks::DevtoolsHooks;
 #[cfg(feature = "inspector")]
@@ -27,6 +29,7 @@ pub use memory::{
 };
 #[cfg(feature = "perf-ab")]
 pub use perf_ab_tests::Sample;
+pub use reference_viewer::{CaptureViewerError, ReferenceViewer};
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use render_stats::{Scope, Snapshot, TimerSnapshot};
 pub use capture::{
