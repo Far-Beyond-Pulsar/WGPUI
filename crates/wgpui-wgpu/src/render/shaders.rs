@@ -12,3 +12,4 @@ pub const UNDERLINES_WGSL: &str = include_str!("shaders/underlines.wgsl");
 pub const BACKDROP_BLUR_WGSL: &str = include_str!("shaders/backdrop_blur.wgsl");
 pub const SURFACES_WGSL: &str = include_str!("shaders/surfaces.wgsl");
 pub const DEBUG_TILES_WGSL: &str = include_str!("shaders/debug_tiles.wgsl");
+pub const DAMAGE_CLEAR_WGSL: &str = include_str!("shaders/damage_clear.wgsl");

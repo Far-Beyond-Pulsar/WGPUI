@@ -47,8 +47,9 @@ struct Globals {
 struct SlotBase {
     base: u32,
     padding_0: u32,
-    padding_1: u32,
-    padding_2: u32,
+    translation: vec2<f32>,
+    clip_origin: vec2<f32>,
+    clip_size: vec2<f32>,
 };
 
 // Which atlas page the bound texture is. See this file's header.
@@ -136,7 +137,7 @@ fn vertex_main(
     var out: VertexOutput;
     // Four corners of a triangle strip: (0,0) (1,0) (0,1) (1,1).
     let unit = vec2<f32>(f32(corner & 1u), f32((corner >> 1u) & 1u));
-    let point = glyph.position + unit * glyph.atlas_size;
+    let point = glyph.position + unit * glyph.atlas_size + slot.translation;
     out.position = vec4<f32>(
         point.x / globals.viewport.x * 2.0 - 1.0,
         1.0 - point.y / globals.viewport.y * 2.0,
@@ -150,6 +151,13 @@ fn vertex_main(
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    if slot.clip_size.x >= 0.0 {
+        let clip_max = slot.clip_origin + slot.clip_size;
+        if in.position.x < slot.clip_origin.x || in.position.y < slot.clip_origin.y
+            || in.position.x >= clip_max.x || in.position.y >= clip_max.y {
+            discard;
+        }
+    }
     let glyph = glyphs[in.arena_index];
     // Clamped rather than trusted: interpolation at the quad's far edge can land
     // exactly on `atlas_size`, and a `textureLoad` outside the tile would read a

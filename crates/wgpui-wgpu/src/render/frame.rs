@@ -259,7 +259,8 @@ impl OffscreenTarget {
             format: TARGET_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -284,6 +285,28 @@ impl OffscreenTarget {
         queue: &wgpu::Queue,
     ) -> Result<Vec<u8>, ReadbackError> {
         read_texture_rgba8(device, queue, &self.texture, self.width, self.height)
+    }
+
+    /// Copy the retained presentation buffer into an acquired surface image.
+    pub fn copy_to_texture(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        destination: &wgpu::Texture,
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("present retained frame"),
+        });
+        encoder.copy_texture_to_texture(
+            self.texture.as_image_copy(),
+            destination.as_image_copy(),
+            wgpu::Extent3d {
+                width: self.width.min(destination.width()),
+                height: self.height.min(destination.height()),
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
     }
 
     /// This target as a [`RenderTarget`], cleared to black.
@@ -412,6 +435,9 @@ pub struct FrameRenderer {
     backdrop_snapshot: Option<wgpu::Texture>,
     backdrop_snapshot_view: Option<wgpu::TextureView>,
     backdrop_sampler: wgpu::Sampler,
+    damage_clear_pipeline: wgpu::RenderPipeline,
+    damage_clear_bind_group: wgpu::BindGroup,
+    damage_clear_color: wgpu::Buffer,
     debug_pipeline: wgpu::RenderPipeline,
     debug_bind_group_layout: wgpu::BindGroupLayout,
     debug_buffer: wgpu::Buffer,
@@ -423,6 +449,8 @@ pub struct FrameRenderer {
 impl FrameRenderer {
     /// Build every pipeline once.
     pub fn new(device: &wgpu::Device) -> FrameRenderer {
+        let (damage_clear_pipeline, damage_clear_bind_group, damage_clear_color) =
+            create_damage_clear_pipeline(device);
         let (debug_bind_group_layout, debug_pipeline) = create_debug_pipeline(device);
         let debug_buffer_capacity = std::mem::size_of::<DebugTile>() as u64;
         FrameRenderer {
@@ -486,6 +514,9 @@ impl FrameRenderer {
                 mipmap_filter: wgpu::MipmapFilterMode::Nearest,
                 ..Default::default()
             }),
+            damage_clear_pipeline,
+            damage_clear_bind_group,
+            damage_clear_color,
             debug_pipeline,
             debug_bind_group_layout,
             debug_buffer: device.create_buffer(&wgpu::BufferDescriptor {
@@ -751,6 +782,20 @@ impl FrameRenderer {
         input: &FrameInput<'_>,
         target: &RenderTarget<'_>,
     ) -> Result<FrameOutput, FrameError> {
+        self.render_to_with_damage(device, queue, input, target, None)
+    }
+
+    /// Render only the damaged part of a target whose previous contents are
+    /// still valid. The scene and its GPU arenas remain retained scene state;
+    /// this rectangle is only a raster/presentation restriction.
+    pub fn render_to_with_damage(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &FrameInput<'_>,
+        target: &RenderTarget<'_>,
+        damage: Option<Rect>,
+    ) -> Result<FrameOutput, FrameError> {
         #[cfg(feature = "devtools")]
         let _instrumentation_span = {
             static HOOKS: std::sync::OnceLock<wgpui_devtools::hooks::DevtoolsHooks> =
@@ -826,7 +871,6 @@ impl FrameRenderer {
             || paths_grew
             || backdrops_grew
             || self.uploaded_generation.is_none()
-            || matches!(input.dirty, Dirty::All)
         {
             self.shadow_arena.upload_all(device, queue, shadow_resident);
             self.arena.upload_all(device, queue, resident);
@@ -1205,6 +1249,30 @@ impl FrameRenderer {
         }
         timing.compute = started.elapsed();
 
+        // A non-identity layer state requires one dynamic slot-base bind per
+        // draw. Multi-draw records cannot carry the matching clip/translation
+        // for each record, so the argument pass must use the same per-slot
+        // first-instance convention as the draw pass below.
+        let draw_mode = if matches!(
+            input.mode,
+            DrawMode::MultiDrawIndirect | DrawMode::MultiDrawIndirectCount
+        ) && shadow_slots
+            .iter()
+            .chain(quad_slots.iter())
+            .chain(underline_slots.iter())
+            .chain(glyph_slots.iter())
+            .chain(sprite_slots.iter())
+            .any(|slot| {
+                input.scene.layers.get(slot.layer).is_some_and(|layer| {
+                    !layer.transform().is_identity() || layer.clip().is_some()
+                })
+            })
+        {
+            DrawMode::PerSlotIndirect
+        } else {
+            input.mode
+        };
+
         // --- 3. Arguments.
         let started = Instant::now();
         let mut shadow_slot_bytes = Vec::new();
@@ -1215,7 +1283,7 @@ impl FrameRenderer {
             &self.shadow_args,
             &shadow_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         let mut slot_bytes = Vec::new();
         encode_slots(&quad_slots, &mut slot_bytes);
@@ -1225,7 +1293,7 @@ impl FrameRenderer {
             &self.quad_args,
             &slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         let mut underline_slot_bytes = Vec::new();
         encode_slots(&underline_slots, &mut underline_slot_bytes);
@@ -1235,7 +1303,7 @@ impl FrameRenderer {
             &self.underline_args,
             &underline_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         let mut glyph_slot_bytes = Vec::new();
         encode_slots(&glyph_slots, &mut glyph_slot_bytes);
@@ -1247,7 +1315,7 @@ impl FrameRenderer {
             &self.glyph_args,
             &glyph_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         let mut sprite_slot_bytes = Vec::new();
         encode_slots(&sprite_slots, &mut sprite_slot_bytes);
@@ -1257,7 +1325,7 @@ impl FrameRenderer {
             &self.sprite_args,
             &sprite_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
 
         let composite_plan = plan_composites(
@@ -1301,7 +1369,7 @@ impl FrameRenderer {
             &self.composite_args,
             &composite_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         timing.arguments = started.elapsed();
 
@@ -1309,7 +1377,7 @@ impl FrameRenderer {
         // because it submits its own encoder and blocks.
         let started = Instant::now();
         let shadow_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.shadow_args,
@@ -1317,7 +1385,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let quad_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.quad_args,
@@ -1325,7 +1393,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let underline_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.underline_args,
@@ -1333,7 +1401,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let glyph_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.glyph_args,
@@ -1341,7 +1409,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let sprite_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.sprite_args,
@@ -1349,7 +1417,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let composite_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.composite_args,
@@ -1365,49 +1433,49 @@ impl FrameRenderer {
         // changed contents but not residency reuses the buffer and the bind
         // group untouched. The clean frame the gate measures is exactly that
         // frame.
-        let shadow_plan = match self.shadow_plan.take() {
+        let mut shadow_plan = match self.shadow_plan.take() {
             Some(plan) if plan.slots() == shadow_slots.as_slice() => plan,
             _ => {
                 self.shadow_plan_builds += 1;
                 SlotBasePlan::for_shadows(device, queue, &self.shadows, &shadow_slots)
             }
         };
-        let quad_plan = match self.quad_plan.take() {
+        let mut quad_plan = match self.quad_plan.take() {
             Some(plan) if plan.slots() == quad_slots.as_slice() => plan,
             _ => {
                 self.quad_plan_builds += 1;
                 SlotBasePlan::for_quads(device, queue, &self.quads, &quad_slots)
             }
         };
-        let underline_plan = match self.underline_plan.take() {
+        let mut underline_plan = match self.underline_plan.take() {
             Some(plan) if plan.slots() == underline_slots.as_slice() => plan,
             _ => {
                 self.underline_plan_builds += 1;
                 SlotBasePlan::for_underlines(device, queue, &self.underlines, &underline_slots)
             }
         };
-        let glyph_plan = match self.glyph_plan.take() {
+        let mut glyph_plan = match self.glyph_plan.take() {
             Some(plan) if plan.slots() == glyph_slots.as_slice() => plan,
             _ => {
                 self.glyph_plan_builds += 1;
                 SlotBasePlan::for_glyphs(device, queue, &self.glyphs, &glyph_slots)
             }
         };
-        let sprite_plan = match self.sprite_plan.take() {
+        let mut sprite_plan = match self.sprite_plan.take() {
             Some(plan) if plan.slots() == sprite_slots.as_slice() => plan,
             _ => {
                 self.sprite_plan_builds += 1;
                 SlotBasePlan::for_poly_sprites(device, queue, &self.sprites, &sprite_slots)
             }
         };
-        let path_plan = match self.path_plan.take() {
+        let mut path_plan = match self.path_plan.take() {
             Some(plan) if plan.slots() == path_slots.as_slice() => plan,
             _ => {
                 self.path_plan_builds += 1;
                 SlotBasePlan::for_paths(device, queue, &self.paths, &path_slots)
             }
         };
-        let backdrop_plan = match self.backdrop_plan.take() {
+        let mut backdrop_plan = match self.backdrop_plan.take() {
             Some(plan) if plan.slots() == backdrop_slots.as_slice() => plan,
             _ => {
                 self.backdrop_plan_builds += 1;
@@ -1419,6 +1487,13 @@ impl FrameRenderer {
                 )
             }
         };
+        shadow_plan.sync_layer_state(queue, &input.scene.layers);
+        quad_plan.sync_layer_state(queue, &input.scene.layers);
+        underline_plan.sync_layer_state(queue, &input.scene.layers);
+        glyph_plan.sync_layer_state(queue, &input.scene.layers);
+        sprite_plan.sync_layer_state(queue, &input.scene.layers);
+        path_plan.sync_layer_state(queue, &input.scene.layers);
+        backdrop_plan.sync_layer_state(queue, &input.scene.layers);
         let shadow_frame_group = self.shadows.frame_bind_group(
             device,
             &self.globals,
@@ -1484,10 +1559,24 @@ impl FrameRenderer {
             label: Some("frame"),
         });
         let debug_tiles = self.debug_tiles.clone();
+        let mut stats;
+        let scissor = damage.map(|damage| scissor_rect(damage, target.width, target.height));
+        if scissor.is_some_and(|[_, _, width, height]| width > 0 && height > 0) {
+            let clear_color = [
+                target.clear.r as f32,
+                target.clear.g as f32,
+                target.clear.b as f32,
+                target.clear.a as f32,
+            ];
+            queue.write_buffer(
+                &self.damage_clear_color,
+                0,
+                bytemuck::bytes_of(&clear_color),
+            );
+        }
         let has_debug_tiles = self
             .prepare_debug_tiles(device, queue, &debug_tiles)
             .is_some();
-        let mut stats;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame"),
@@ -1496,7 +1585,11 @@ impl FrameRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(target.clear),
+                        load: if scissor.is_some() {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(target.clear)
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1505,6 +1598,14 @@ impl FrameRenderer {
                 occlusion_query_set: None,
                 multiview_mask: Default::default(),
             });
+            if let Some([x, y, width, height]) = scissor {
+                pass.set_scissor_rect(x, y, width, height);
+            }
+            if scissor.is_some_and(|[_, _, width, height]| width > 0 && height > 0) {
+                pass.set_pipeline(&self.damage_clear_pipeline);
+                pass.set_bind_group(0, &self.damage_clear_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
             let started = Instant::now();
             // First, and under everything: `PrimitiveKind::ALL` declares
             // `Shadow` before `Quad` because the legacy sorter's own
@@ -1515,7 +1616,7 @@ impl FrameRenderer {
                 &shadow_plan,
                 &shadow_frame_group,
                 &self.shadow_args,
-                input.mode,
+                draw_mode,
                 &shadow_resolved,
             );
             stats.merge(issue_instanced(
@@ -1524,7 +1625,7 @@ impl FrameRenderer {
                 &quad_plan,
                 &quad_frame_group,
                 &self.quad_args,
-                input.mode,
+                draw_mode,
                 &quad_resolved,
             ));
             stats.merge(issue_paths(
@@ -1542,7 +1643,7 @@ impl FrameRenderer {
                 &underline_plan,
                 &underline_frame_group,
                 &self.underline_args,
-                input.mode,
+                draw_mode,
                 &underline_resolved,
             ));
             // After the quads and before the composites: text paints over the
@@ -1557,7 +1658,7 @@ impl FrameRenderer {
                 },
                 &glyph_frame_group,
                 &self.glyph_args,
-                input.mode,
+                draw_mode,
                 &glyph_resolved,
             ));
             // After the text and before the composites, which is the order
@@ -1573,7 +1674,7 @@ impl FrameRenderer {
                 },
                 &sprite_frame_group,
                 &self.sprite_args,
-                input.mode,
+                draw_mode,
                 &sprite_resolved,
             ));
             if has_backdrop_filters {
@@ -1609,6 +1710,9 @@ impl FrameRenderer {
                     occlusion_query_set: None,
                     multiview_mask: Default::default(),
                 });
+                if let Some([x, y, width, height]) = scissor {
+                    pass.set_scissor_rect(x, y, width, height);
+                }
                 if let Some(texture_group) = backdrop_texture_group.as_ref() {
                     stats.merge(issue_backdrop_filters(
                         &mut pass,
@@ -1625,7 +1729,7 @@ impl FrameRenderer {
                 &composite_frame_group,
                 &self.composite_args,
                 &composite_plan,
-                input.mode,
+                draw_mode,
                 &composite_resolved,
             ));
             if has_debug_tiles {
@@ -1664,6 +1768,89 @@ impl FrameRenderer {
                 .unwrap_or(u32::MAX),
         })
     }
+}
+
+fn scissor_rect(damage: Rect, target_width: u32, target_height: u32) -> [u32; 4] {
+    if damage.is_empty()
+        || !damage.min_x.is_finite()
+        || !damage.min_y.is_finite()
+        || !damage.max_x.is_finite()
+        || !damage.max_y.is_finite()
+    {
+        return [0, 0, 0, 0];
+    }
+    let min_x = damage.min_x.floor().clamp(0.0, target_width as f32) as u32;
+    let min_y = damage.min_y.floor().clamp(0.0, target_height as f32) as u32;
+    let max_x = damage.max_x.ceil().clamp(0.0, target_width as f32) as u32;
+    let max_y = damage.max_y.ceil().clamp(0.0, target_height as f32) as u32;
+    [min_x, min_y, max_x.saturating_sub(min_x), max_y.saturating_sub(min_y)]
+}
+
+fn create_damage_clear_pipeline(
+    device: &wgpu::Device,
+) -> (wgpu::RenderPipeline, wgpu::BindGroup, wgpu::Buffer) {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("damage clear"),
+        source: wgpu::ShaderSource::Wgsl(crate::render::shaders::DAMAGE_CLEAR_WGSL.into()),
+    });
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("damage clear"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: std::num::NonZeroU64::new(16),
+            },
+            count: None,
+        }],
+    });
+    let color = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("damage clear color"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("damage clear"),
+        layout: &bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: color.as_entire_binding(),
+        }],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("damage clear"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("damage clear"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vertex_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fragment_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: TARGET_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, bind_group, color)
 }
 
 fn create_debug_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
@@ -1745,6 +1932,7 @@ fn create_debug_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu:
 /// margin. Ordering a shadow by its unblurred rectangle would sort a wide soft
 /// shadow as though it were the small hard rectangle at its centre.
 fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    let translation = layer_translation(scene, layer);
     scene
         .shadows
         .keys(layer)
@@ -1752,7 +1940,7 @@ fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
         .filter_map(|key| scene.shadows.get(layer, key))
         .map(|shadow| {
             let (origin, size) = shadow.drawn_bounds();
-            Rect::from_origin_size(origin, size)
+            translate_rect(Rect::from_origin_size(origin, size), translation)
         })
         .collect()
 }
@@ -1764,21 +1952,30 @@ fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
 /// `origin`/`size`. That this function is the boring one is the finding — see
 /// [`layer_shadow_bounds`], which is the same function and is not.
 fn layer_underline_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    let translation = layer_translation(scene, layer);
     scene
         .underlines
         .keys(layer)
         .into_iter()
         .filter_map(|key| scene.underlines.get(layer, key))
-        .map(|underline| Rect::from_origin_size(underline.origin, underline.size))
+        .map(|underline| {
+            translate_rect(Rect::from_origin_size(underline.origin, underline.size), translation)
+        })
         .collect()
 }
 
 fn layer_quads(scene: &Scene, layer: LayerId) -> Vec<Quad> {
+    let translation = layer_translation(scene, layer);
     scene
         .quads
         .keys(layer)
         .into_iter()
         .filter_map(|key| scene.quads.get(layer, key).copied())
+        .map(|mut quad| {
+            quad.origin[0] += translation[0];
+            quad.origin[1] += translation[1];
+            quad
+        })
         .collect()
 }
 
@@ -1797,6 +1994,7 @@ fn layer_quads(scene: &Scene, layer: LayerId) -> Vec<Quad> {
 /// `mono_sprites.wgsl` builds. A blank glyph is a zero-sized rectangle, which
 /// intersects nothing and orders under everything.
 fn layer_glyph_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    let translation = layer_translation(scene, layer);
     let mut bounds = Vec::new();
     for key in scene.glyph_runs.keys(layer) {
         let Some(run) = scene.glyph_runs.get(layer, key) else {
@@ -1805,7 +2003,12 @@ fn layer_glyph_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
         bounds.extend(
             run.glyphs
                 .iter()
-                .map(|glyph| Rect::from_origin_size(glyph.position, glyph.atlas_size)),
+                .map(|glyph| {
+                    translate_rect(
+                        Rect::from_origin_size(glyph.position, glyph.atlas_size),
+                        translation,
+                    )
+                }),
         );
     }
     bounds
@@ -1821,13 +2024,32 @@ fn layer_glyph_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
 /// decoded is still a real rectangle with a real position; it draws nothing
 /// because its tile is `NONE`, not because its bounds are empty.
 fn layer_sprite_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
+    let translation = layer_translation(scene, layer);
     scene
         .poly_sprites
         .keys(layer)
         .into_iter()
         .filter_map(|key| scene.poly_sprites.get(layer, key))
-        .map(|sprite| Rect::from_origin_size(sprite.origin, sprite.size))
+        .map(|sprite| {
+            translate_rect(Rect::from_origin_size(sprite.origin, sprite.size), translation)
+        })
         .collect()
+}
+
+fn layer_translation(scene: &Scene, layer: LayerId) -> [f32; 2] {
+    scene
+        .layers
+        .get(layer)
+        .map_or([0.0, 0.0], |layer| layer.transform().translation)
+}
+
+fn translate_rect(rectangle: Rect, translation: [f32; 2]) -> Rect {
+    Rect {
+        min_x: rectangle.min_x + translation[0],
+        min_y: rectangle.min_y + translation[1],
+        max_x: rectangle.max_x + translation[0],
+        max_y: rectangle.max_y + translation[1],
+    }
 }
 
 /// The upload instructions addressed to one kind's arena.

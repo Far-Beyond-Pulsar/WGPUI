@@ -133,7 +133,7 @@ impl QuadPipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("quads slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 32, true)],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("quads"),
@@ -175,7 +175,7 @@ impl QuadPipeline {
             pipeline,
             frame_layout,
             slot_layout,
-            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(32),
         }
     }
 
@@ -262,7 +262,7 @@ impl ShadowPipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadows slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 32, true)],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadows"),
@@ -302,7 +302,7 @@ impl ShadowPipeline {
             pipeline,
             frame_layout,
             slot_layout,
-            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(32),
         }
     }
 
@@ -388,7 +388,7 @@ impl PathPipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("paths slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 32, true)],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("paths"),
@@ -427,7 +427,7 @@ impl PathPipeline {
             pipeline,
             frame_layout,
             slot_layout,
-            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(32),
         }
     }
 
@@ -479,7 +479,7 @@ impl BackdropPipeline {
             entries: &[uniform_entry(
                 0,
                 wgpu::ShaderStages::VERTEX_FRAGMENT,
-                16,
+                32,
                 true,
             )],
         });
@@ -546,7 +546,7 @@ impl BackdropPipeline {
             frame_layout,
             slot_layout,
             texture_layout,
-            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(32),
         }
     }
 
@@ -605,7 +605,7 @@ impl UnderlinePipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("underlines slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 32, true)],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("underlines"),
@@ -645,7 +645,7 @@ impl UnderlinePipeline {
             pipeline,
             frame_layout,
             slot_layout,
-            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(32),
         }
     }
 
@@ -702,7 +702,7 @@ pub fn slot_base_bind_group(
             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer: bases,
                 offset: 0,
-                size: std::num::NonZeroU64::new(16),
+                size: std::num::NonZeroU64::new(32),
             }),
         }],
     })
@@ -760,7 +760,7 @@ impl MonoSpritePipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mono sprites slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 32, true)],
         });
         let page_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mono sprites atlas page"),
@@ -820,7 +820,7 @@ impl MonoSpritePipeline {
             frame_layout,
             slot_layout,
             page_layout,
-            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(32),
         }
     }
 
@@ -928,7 +928,7 @@ impl PolySpritePipeline {
         });
         let slot_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("poly sprites slot base"),
-            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX, 16, true)],
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, 32, true)],
         });
         let page_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("poly sprites atlas page"),
@@ -991,7 +991,7 @@ impl PolySpritePipeline {
             frame_layout,
             slot_layout,
             page_layout,
-            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(16),
+            slot_stride: device.limits().min_uniform_buffer_offset_alignment.max(32),
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("poly sprite filtering"),
                 mag_filter: wgpu::FilterMode::Linear,

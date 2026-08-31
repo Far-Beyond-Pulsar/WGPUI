@@ -27,12 +27,14 @@ use wgpui_core::boundary::compositor::{CompositeEntry, CompositeSource, External
 use wgpui_core::geometry::Rect;
 use wgpui_core::patch::primitive::{PrimitiveKind, Quad};
 use wgpui_core::scene::layer::BoundaryId;
+use wgpui_core::scene::layer::LayerTransform;
 use wgpui_core::test_support::ui_walk::{MultiLayerSceneDriver, UiSceneSpec, build_frame};
 use wgpui_wgpu::render::device::{ComputeContext, context_or_report};
 use wgpui_wgpu::render::draw::DrawMode;
 use wgpui_wgpu::render::frame::{Dirty, FrameInput, FrameOutput, FrameRenderer, OffscreenTarget};
 use wgpui_wgpu::render::pipelines::TARGET_FORMAT;
 use wgpui_wgpu::render::surface_registry::SurfaceRegistry;
+use wgpui_wgpu::debug::DebugTile;
 
 const LAYERS: usize = 6;
 
@@ -190,6 +192,570 @@ fn every_draw_mode_renders_the_same_picture() {
             }
         }
     }
+}
+
+#[test]
+fn a_layer_transform_moves_native_pixels_without_scene_uploads() {
+    let Some(context) = context_or_report("layer_transform") else {
+        return;
+    };
+    let spec = UiSceneSpec::small();
+    let frame = build_frame("layer_transform", &spec);
+    let mut scene = MultiLayerSceneDriver::new(1);
+    scene.apply_frame(&frame).expect("the frame applies");
+    let layer = scene
+        .scene
+        .layers
+        .ids()
+        .first()
+        .copied()
+        .expect("the test scene has one layer");
+    let mut renderer = FrameRenderer::new(&context.device);
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, initial) = render(&context, &mut renderer, &target, &input);
+
+    assert!(scene
+        .scene
+        .layers
+        .set_transform(layer, LayerTransform::translated(32.0, 0.0)));
+    let translated_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (output, translated) = render(&context, &mut renderer, &target, &translated_input);
+
+    assert!(first_difference(&initial, &translated).is_some());
+    assert_eq!(output.scene_upload_bytes, 0);
+}
+
+#[test]
+fn a_layer_clip_is_enforced_after_the_layer_transform() {
+    let Some(context) = context_or_report("layer_clip") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 128.0,
+        height: 128.0,
+        ..UiSceneSpec::small()
+    };
+    let quad = Quad {
+        origin: [0.0, 0.0],
+        size: [128.0, 128.0],
+        background: [0.1, 0.8, 0.2, 1.0],
+        ..Quad::ZERO
+    };
+    let mut scene = MultiLayerSceneDriver::new(1);
+    scene.set_layer(0, &[quad]).expect("the clip scene applies");
+    let layer = scene
+        .scene
+        .layers
+        .ids()
+        .first()
+        .copied()
+        .expect("the test scene has one layer");
+    let clip = Rect::from_origin_size([16.0, 20.0], [48.0, 40.0]);
+    assert!(scene.scene.layers.set_clip(layer, Some(clip)));
+    assert!(scene
+        .scene
+        .layers
+        .set_transform(layer, LayerTransform::translated(8.0, 10.0)));
+    assert_eq!(
+        scene.scene.draw_slots().kind_slots(PrimitiveKind::Quad)[0].layer,
+        layer
+    );
+
+    let mut renderer = FrameRenderer::new(&context.device);
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, pixels) = render(&context, &mut renderer, &target, &input);
+
+    let mut painted_inside = 0;
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        let x = (index % spec.width as usize) as f32;
+        let y = (index / spec.width as usize) as f32;
+        let painted = pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0;
+        let inside = x + 0.5 >= clip.min_x
+            && x + 0.5 < clip.max_x
+            && y + 0.5 >= clip.min_y
+            && y + 0.5 < clip.max_y;
+        if inside {
+            painted_inside += usize::from(painted);
+        } else {
+            assert!(!painted, "layer clip leaked at ({x}, {y})");
+        }
+    }
+    assert_eq!(painted_inside, (clip.width() * clip.height()) as usize);
+}
+
+#[test]
+fn a_clipped_layer_does_not_hide_other_layers_on_the_indirect_fallback() {
+    let Some(context) = context_or_report("multi_layer_clip") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 128.0,
+        height: 128.0,
+        ..UiSceneSpec::small()
+    };
+    let root = Quad {
+        origin: [0.0, 0.0],
+        size: [128.0, 128.0],
+        background: [0.1, 0.2, 0.8, 1.0],
+        ..Quad::ZERO
+    };
+    let clipped = Quad {
+        origin: [0.0, 0.0],
+        size: [128.0, 128.0],
+        background: [0.8, 0.2, 0.1, 1.0],
+        ..Quad::ZERO
+    };
+    let mut scene = MultiLayerSceneDriver::new(2);
+    scene.set_layer(0, &[root]).expect("the root layer applies");
+    scene
+        .set_layer(1, &[clipped])
+        .expect("the clipped layer applies");
+    let clip = Rect::from_origin_size([16.0, 20.0], [48.0, 40.0]);
+    let clipped_layer = scene.layers()[1];
+    assert!(scene.scene.layers.set_clip(clipped_layer, Some(clip)));
+    assert!(scene
+        .scene
+        .layers
+        .set_transform(clipped_layer, LayerTransform::translated(8.0, 10.0)));
+
+    let mut renderer = FrameRenderer::new(&context.device);
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, pixels) = render(&context, &mut renderer, &target, &input);
+
+    let pixel_at = |x: usize, y: usize| -> &[u8] {
+        let index = (y * spec.width as usize + x) * 4;
+        pixels.get(index..index + 4).unwrap_or(&[])
+    };
+    let root_pixel = pixel_at(4, 4);
+    assert!(
+        root_pixel.get(2).copied().unwrap_or(0) > root_pixel.first().copied().unwrap_or(0),
+        "the unclipped root layer disappeared: {root_pixel:?}"
+    );
+    let clipped_pixel = pixel_at(32, 40);
+    assert!(
+        clipped_pixel.first().copied().unwrap_or(0) > clipped_pixel.get(2).copied().unwrap_or(0),
+        "the clipped layer did not paint inside its clip: {clipped_pixel:?}"
+    );
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        let x = index % spec.width as usize;
+        let y = index / spec.width as usize;
+        let inside = x as f32 + 0.5 >= clip.min_x
+            && x as f32 + 0.5 < clip.max_x
+            && y as f32 + 0.5 >= clip.min_y
+            && y as f32 + 0.5 < clip.max_y;
+        if !inside {
+            assert!(
+                pixel[2] >= pixel[0],
+                "the clipped layer leaked outside its clip at ({x}, {y}): {pixel:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_layer_transform_keeps_rounded_quad_edges_attached_to_the_quad() {
+    let Some(context) = context_or_report("rounded_layer_transform") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 128.0,
+        height: 128.0,
+        ..UiSceneSpec::small()
+    };
+    let quad = Quad {
+        origin: [24.0, 28.0],
+        size: [56.0, 44.0],
+        background: [0.15, 0.35, 0.75, 1.0],
+        border_color: [0.95, 0.9, 0.7, 1.0],
+        corner_radii: [12.0; 4],
+        border_widths: [2.0; 4],
+        ..Quad::ZERO
+    };
+    let translation = [17.0, 11.0];
+    let shifted = Quad {
+        origin: [quad.origin[0] + translation[0], quad.origin[1] + translation[1]],
+        ..quad
+    };
+
+    let mut transformed_scene = MultiLayerSceneDriver::new(1);
+    transformed_scene
+        .set_layer(0, &[quad])
+        .expect("the rounded quad scene applies");
+    let layer = transformed_scene
+        .scene
+        .layers
+        .ids()
+        .first()
+        .copied()
+        .expect("the test scene has one layer");
+    let mut expected_scene = MultiLayerSceneDriver::new(1);
+    expected_scene
+        .set_layer(0, &[shifted])
+        .expect("the shifted rounded quad scene applies");
+
+    let mut renderer = FrameRenderer::new(&context.device);
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let initial_input = FrameInput {
+        scene: &transformed_scene.scene,
+        clip: window(&spec),
+        poison: &transformed_scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    render(&context, &mut renderer, &target, &initial_input);
+    assert!(transformed_scene
+        .scene
+        .layers
+        .set_transform(layer, LayerTransform::translated(translation[0], translation[1])));
+    let transformed_input = FrameInput {
+        scene: &transformed_scene.scene,
+        clip: window(&spec),
+        poison: &transformed_scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, transformed) = render(&context, &mut renderer, &target, &transformed_input);
+
+    let expected_input = FrameInput {
+        scene: &expected_scene.scene,
+        clip: window(&spec),
+        poison: &expected_scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let mut expected_renderer = FrameRenderer::new(&context.device);
+    let (_, expected) = render(&context, &mut expected_renderer, &target, &expected_input);
+
+    let differing_pixels = expected
+        .chunks_exact(4)
+        .zip(transformed.chunks_exact(4))
+        .filter(|(expected, transformed)| expected != transformed)
+        .count();
+    assert!(
+        differing_pixels <= 8,
+        "layer translation changed {} rounded-edge pixels",
+        differing_pixels
+    );
+}
+
+#[test]
+fn damaged_presentation_preserves_untouched_pixels() {
+    let Some(context) = context_or_report("damaged_presentation") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 128.0,
+        height: 64.0,
+        ..UiSceneSpec::small()
+    };
+    let quad = |origin: [f32; 2], background: [f32; 4]| Quad {
+        origin,
+        size: [48.0, 48.0],
+        background,
+        ..Quad::ZERO
+    };
+    let initial = [
+        quad([8.0, 8.0], [0.8, 0.1, 0.1, 1.0]),
+        quad([72.0, 8.0], [0.1, 0.2, 0.8, 1.0]),
+    ];
+    let updated = [
+        quad([8.0, 8.0], [0.1, 0.8, 0.2, 1.0]),
+        initial[1],
+    ];
+
+    let mut scene = MultiLayerSceneDriver::new(1);
+    scene.set_layer(0, &initial).expect("the initial scene applies");
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let mut renderer = FrameRenderer::new(&context.device);
+    let initial_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    render(&context, &mut renderer, &target, &initial_input);
+    scene.set_layer(0, &updated).expect("the update applies");
+    let mut renderer = FrameRenderer::new(&context.device);
+    let updated_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let retained_target = target.target();
+    renderer
+        .render_to_with_damage(
+            &context.device,
+            &context.queue,
+            &updated_input,
+            &retained_target,
+            Some(Rect::from_origin_size([0.0, 0.0], [64.0, 64.0])),
+        )
+        .expect("the damaged frame renders");
+    let damaged = target
+        .read_pixels(&context.device, &context.queue)
+        .expect("the damaged frame reads back");
+
+    let mut expected_scene = MultiLayerSceneDriver::new(1);
+    expected_scene
+        .set_layer(0, &updated)
+        .expect("the expected scene applies");
+    let expected_target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let mut expected_renderer = FrameRenderer::new(&context.device);
+    let expected_input = FrameInput {
+        scene: &expected_scene.scene,
+        clip: window(&spec),
+        poison: &expected_scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    render(
+        &context,
+        &mut expected_renderer,
+        &expected_target,
+        &expected_input,
+    );
+    let expected = expected_target
+        .read_pixels(&context.device, &context.queue)
+        .expect("the expected frame reads back");
+    assert_eq!(damaged, expected);
+}
+
+#[test]
+fn damaged_presentation_clears_removed_content() {
+    let Some(context) = context_or_report("damaged_presentation_removal") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 64.0,
+        height: 64.0,
+        ..UiSceneSpec::small()
+    };
+    let quad = Quad {
+        origin: [8.0, 8.0],
+        size: [40.0, 40.0],
+        background: [0.8, 0.2, 0.1, 1.0],
+        ..Quad::ZERO
+    };
+    let mut scene = MultiLayerSceneDriver::new(1);
+    scene.set_layer(0, &[quad]).expect("the initial scene applies");
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let mut renderer = FrameRenderer::new(&context.device);
+    let initial_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    render(&context, &mut renderer, &target, &initial_input);
+
+    scene.set_layer(0, &[]).expect("the removal applies");
+    let updated_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let retained_target = target.target();
+    FrameRenderer::new(&context.device)
+        .render_to_with_damage(
+            &context.device,
+            &context.queue,
+            &updated_input,
+            &retained_target,
+            Some(Rect::from_origin_size([0.0, 0.0], [64.0, 64.0])),
+        )
+        .expect("the damaged removal frame renders");
+    let pixels = target
+        .read_pixels(&context.device, &context.queue)
+        .expect("the damaged removal frame reads back");
+    assert!(pixels.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 255]));
+}
+
+#[test]
+fn tile_refresh_diagnostics_draw_the_measured_rate_label() {
+    let Some(context) = context_or_report("tile_refresh_rate_label") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 64.0,
+        height: 64.0,
+        ..UiSceneSpec::small()
+    };
+    let mut scene = MultiLayerSceneDriver::new(1);
+    let content = Quad {
+        origin: [0.0, 0.0],
+        size: [64.0, 64.0],
+        background: [0.15, 0.35, 0.75, 1.0],
+        ..Quad::ZERO
+    };
+    scene
+        .set_layer(0, &[content])
+        .expect("the diagnostic content applies");
+    let baseline_target = OffscreenTarget::new(
+        &context.device,
+        spec.width as u32,
+        spec.height as u32,
+    );
+    let baseline_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let mut baseline_renderer = FrameRenderer::new(&context.device);
+    let (_, baseline) = render(
+        &context,
+        &mut baseline_renderer,
+        &baseline_target,
+        &baseline_input,
+    );
+
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let mut renderer = FrameRenderer::new(&context.device);
+    renderer.set_debug_tiles(vec![
+        DebugTile {
+            origin_size: [0.0, 0.0, 64.0, 64.0],
+            color: [1.0, 1.0, 0.0, 1.0],
+            border_width: 2.0,
+            _padding: [0.0; 7],
+        }
+        .with_refresh_rate(888.0),
+    ]);
+    let input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, pixels) = render(&context, &mut renderer, &target, &input);
+    assert!(
+        pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel == [255, 255, 0, 255]),
+        "the active tile must contain visible rate glyphs"
+    );
+    let label_gap_index = (7 * spec.width as usize + 8) * 4;
+    assert_eq!(
+        pixels.get(label_gap_index..label_gap_index + 4),
+        baseline.get(label_gap_index..label_gap_index + 4),
+        "diagnostic digits must not fill their interior gaps"
+    );
+    let last_digit_index = (5 * spec.width as usize + 20) * 4;
+    assert_eq!(
+        pixels.get(last_digit_index..last_digit_index + 4),
+        Some(&[255, 255, 0, 255][..]),
+        "the third rate digit must not be clipped at the label edge"
+    );
+    let interior_index = (40 * spec.width as usize + 40) * 4;
+    assert_eq!(
+        pixels.get(interior_index..interior_index + 4),
+        baseline.get(interior_index..interior_index + 4),
+        "the refresh diagnostic must not shade the content interior"
+    );
 }
 
 /// **Gate 1**: a clean window's CPU-side draw-issuing work is O(layer slots),

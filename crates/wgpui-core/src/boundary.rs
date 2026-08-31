@@ -20,8 +20,13 @@
 
 pub mod compositor;
 pub mod identity;
+pub mod nested;
 pub mod policy;
 
 pub use compositor::{BoundaryComposite, BoundaryState, Composite, Compositor, TiledVisit};
 pub use identity::BoundaryIdentity;
+pub use nested::{
+    ClipChange, Damage, DamageReason, HierarchicalTileKey, ScrollRootConfig, ScrollRootId,
+    ScrollRootTable, ScrollRootVisit,
+};
 pub use policy::{BoundaryPolicy, Buffering, Pixels, Retention, Size};

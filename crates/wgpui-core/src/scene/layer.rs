@@ -12,6 +12,7 @@
 //! `ElementInstance`.
 
 use crate::invalidation::axes::Invalidation;
+use crate::geometry::Rect;
 use crate::patch::primitive::PrimitiveKind;
 use crate::scene::slab_range::SlabRange;
 use crate::scene::tile::TileCoord;
@@ -43,14 +44,14 @@ impl BoundaryId {
     }
 }
 
-/// A layer's cross-frame address: which boundary owns it, and — once §4.3's
-/// tiling exists — which tile of that boundary's content plane it holds.
+/// A retained layer's cross-frame address: which boundary owns it, and the
+/// optional compatibility tile key used by older/custom scene drivers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LayerKey {
     /// The owning compositing boundary.
     pub boundary: BoundaryId,
-    /// The tile within that boundary, or `None` for an untiled boundary —
-    /// which is every boundary in Phase 1.
+    /// The compatibility tile within that boundary, or `None` for the retained
+    /// boundary layer used by native production emission.
     pub tile: Option<TileCoord>,
 }
 
@@ -63,7 +64,10 @@ impl LayerKey {
         }
     }
 
-    /// The layer holding `tile` of `boundary` (§4.3, Phase 4.5).
+    /// A compatibility key for `tile` of `boundary` (§4.3, Phase 4.5).
+    ///
+    /// Native production emission uses tile coordinates as visibility and
+    /// damage metadata instead of creating a scene layer for each key.
     pub const fn tiled(boundary: BoundaryId, tile: TileCoord) -> Self {
         Self {
             boundary,
@@ -144,6 +148,7 @@ pub struct Layer {
     key: LayerKey,
     slabs: [SlabRange; PrimitiveKind::COUNT],
     transform: LayerTransform,
+    clip: Option<Rect>,
     invalidation: Invalidation,
     generation: u64,
 }
@@ -160,6 +165,11 @@ impl Layer {
     /// a scrolling boundary can leave every primitive it owns untouched.
     pub const fn transform(&self) -> LayerTransform {
         self.transform
+    }
+
+    /// The screen-space clip applied after this layer's transform.
+    pub const fn clip(&self) -> Option<Rect> {
+        self.clip
     }
 
     /// This layer's reservation in `kind`'s arena.
@@ -221,6 +231,7 @@ impl LayerTable {
                     key,
                     slabs: [SlabRange::EMPTY; PrimitiveKind::COUNT],
                     transform: LayerTransform::IDENTITY,
+                    clip: None,
                     invalidation: Invalidation::all(),
                     generation,
                 },
@@ -293,6 +304,22 @@ impl LayerTable {
             Some(layer) => {
                 if layer.transform != transform {
                     layer.transform = transform;
+                    layer.invalidation |= Invalidation::TRANSFORM;
+                    layer.generation = generation;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set the screen-space clip for a retained layer.
+    pub fn set_clip(&mut self, id: LayerId, clip: Option<Rect>) -> bool {
+        let generation = self.next_generation();
+        match self.layers.get_mut(&id) {
+            Some(layer) => {
+                if layer.clip != clip {
+                    layer.clip = clip;
                     layer.invalidation |= Invalidation::TRANSFORM;
                     layer.generation = generation;
                 }
@@ -382,6 +409,20 @@ mod tests {
             table.get(id).map(Layer::invalidation),
             Some(Invalidation::all())
         );
+    }
+
+    #[test]
+    fn changing_a_layer_clip_invalidates_only_its_transform_state() {
+        let mut table = LayerTable::new();
+        let id = table.insert(LayerKey::untiled(BoundaryId::ROOT));
+        assert!(table.mark_clean(id));
+        let clip = Rect::from_origin_size([4.0, 8.0], [32.0, 24.0]);
+
+        assert!(table.set_clip(id, Some(clip)));
+        assert_eq!(table.get(id).map(Layer::clip), Some(Some(clip)));
+        assert_eq!(table.get(id).map(Layer::invalidation), Some(Invalidation::TRANSFORM));
+        assert!(table.set_clip(id, Some(clip)));
+        assert_eq!(table.get(id).map(Layer::invalidation), Some(Invalidation::TRANSFORM));
     }
 
     #[test]
