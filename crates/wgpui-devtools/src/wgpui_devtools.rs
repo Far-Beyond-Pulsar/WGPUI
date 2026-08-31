@@ -17,8 +17,20 @@ pub mod render_stats;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use hooks::DevtoolsHooks;
 #[cfg(feature = "inspector")]
-pub use inspector::{ElementInfo, Inspector};
+pub use inspector::{
+    CaptureState, ElementInfo, ElementQuery, ElementRecord, ElementSelector, Inspector,
+    InspectorQuery, InspectorSnapshot, OverlayStats, QueryError, SelectionError, SelectionOverlay,
+    SelectionUpdate, SourceLocation, StableElementAddress,
+};
 #[cfg(feature = "perf-ab")]
 pub use perf_ab_tests::Sample;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use render_stats::{Scope, Snapshot, TimerSnapshot};
+#[cfg(feature = "inspector")]
+pub use wgpui_core::boundary::ScrollRootId;
+#[cfg(feature = "inspector")]
+pub use wgpui_core::geometry::Rect;
+#[cfg(feature = "inspector")]
+pub use wgpui_core::reconcile::{ElementId, InstanceKey};
+#[cfg(feature = "inspector")]
+pub use wgpui_core::scene::{BoundaryId, TileCoord};

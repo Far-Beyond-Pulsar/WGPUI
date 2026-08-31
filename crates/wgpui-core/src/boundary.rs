@@ -23,5 +23,5 @@ pub mod identity;
 pub mod policy;
 
 pub use compositor::{BoundaryComposite, BoundaryState, Composite, Compositor, TiledVisit};
-pub use identity::BoundaryIdentity;
+pub use identity::{BoundaryIdentity, ScrollRootId};
 pub use policy::{BoundaryPolicy, Buffering, Pixels, Retention, Size};
