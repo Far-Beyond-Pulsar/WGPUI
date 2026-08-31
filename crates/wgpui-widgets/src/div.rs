@@ -279,6 +279,71 @@ impl Div {
         self
     }
 
+    pub fn on_key_down<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::KeyDownEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_key_down(handler);
+        self
+    }
+
+    pub fn on_key_up<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::KeyUpEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_key_up(handler);
+        self
+    }
+
+    pub fn on_text_input<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::TextInputEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_text_input(handler);
+        self
+    }
+
+    pub fn on_ime<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::ImeEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_ime(handler);
+        self
+    }
+
+    pub fn on_modifiers_changed<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::ModifiersChangedEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_modifiers_changed(handler);
+        self
+    }
+
     pub fn track_focus(mut self, handle: &wgpui_core::window::FocusHandle) -> Self {
         self.focus_handle = Some(*handle);
         self

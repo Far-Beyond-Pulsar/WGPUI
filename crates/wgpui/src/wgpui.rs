@@ -43,12 +43,12 @@ pub use wgpui_core::window::{
     AnimationClock, AnimationScheduler, DispatchTree, FocusManager, Keymap, WindowTimers,
 };
 pub use wgpui_core::{
-    Action, App, ClickEvent, CloseState, Context, DispatchNodeId, DragData, DragHoverEvent,
+    Action, App, ClipboardItem, ClickEvent, CloseState, Context, DispatchNodeId, DragData, DragHoverEvent,
     DropEvent, Entity, EntityError, EntityFactory, EntityId, EventResult, FocusEvent, FocusHandle,
-    FocusId, FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId,
+    FocusId, FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId, ImeEvent,
     InputEvent, KeyBinding, KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton,
-    KeyboardClickEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseButtonState,
-    MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Subscription,
+    KeyboardClickEvent, Keystroke, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseButtonState,
+    MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Subscription, TextInputEvent,
     Task, TaskError, TimerHandle, TimerId, TimerState, WeakEntity, WindowClosedSubscription,
     WindowId, WindowList,
 };
@@ -106,7 +106,7 @@ pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
 pub use wgpui_widgets::wgpu_surface::{SurfaceId, SurfaceStyle, WgpuSurface, WgpuSurfaceKey};
 
 pub use wgpui_wgpu::window::application::{
-    Application, ApplicationError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
+    Application, ApplicationError, ClipboardError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
     WindowOptions,
 };
 pub use wgpui_wgpu::window::surface::WgpuSurfaceHandle;

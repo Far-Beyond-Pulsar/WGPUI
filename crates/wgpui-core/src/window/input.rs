@@ -1,6 +1,7 @@
 use crate::boundary::Pixels;
 use crate::geometry::Rect;
 use std::any::Any;
+use std::ops::Range;
 use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -9,6 +10,11 @@ pub struct Modifiers {
     pub control: bool,
     pub alt: bool,
     pub command: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModifiersChangedEvent {
+    pub modifiers: Modifiers,
 }
 impl Modifiers {
     pub const fn none() -> Self {
@@ -72,6 +78,37 @@ impl KeyDownEvent {
 pub struct KeyUpEvent {
     pub key: String,
     pub modifiers: Modifiers,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextInputEvent {
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImeEvent {
+    Enabled,
+    Preedit {
+        text: String,
+        selection: Option<Range<usize>>,
+    },
+    Commit(String),
+    Disabled,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardItem {
+    text: Option<String>,
+}
+
+impl ClipboardItem {
+    pub fn new_string(text: String) -> Self {
+        Self { text: Some(text) }
+    }
+
+    pub fn text(&self) -> Option<String> {
+        self.text.clone()
+    }
 }
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct MouseDownEvent {
@@ -276,8 +313,11 @@ impl EventResult {
 }
 #[derive(Clone, Debug)]
 pub enum InputEvent {
+    ModifiersChanged(ModifiersChangedEvent),
     KeyDown(KeyDownEvent),
     KeyUp(KeyUpEvent),
+    TextInput(TextInputEvent),
+    Ime(ImeEvent),
     MouseDown(MouseDownEvent),
     MouseUp(MouseUpEvent),
     MouseMove(MouseMoveEvent),

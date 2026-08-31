@@ -9,8 +9,9 @@ use wgpui_core::app::App;
 use std::sync::Arc;
 use wgpui_core::action::Action;
 use wgpui_core::window::{
-    ClickEvent, DragData, EventResult, FocusEvent, InputEvent, MouseButton, MouseMoveEvent,
-    MouseUpEvent, ScrollWheelEvent, Window,
+    ClickEvent, DragData, EventResult, FocusEvent, ImeEvent, InputEvent, KeyDownEvent,
+    KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseMoveEvent, MouseUpEvent,
+    ScrollWheelEvent, TextInputEvent, Window,
 };
 use wgpui_core::reconcile::description::DescriptionInteraction;
 
@@ -21,6 +22,11 @@ type MouseMoveHandler = Box<dyn FnMut(&MouseMoveEvent, &mut Window, &mut App) ->
 type MouseBoundaryHandler = Box<dyn FnMut(&mut Window, &mut App) -> EventResult>;
 type HoverHandler = Box<dyn FnMut(bool, &mut Window, &mut App) -> EventResult>;
 type ScrollHandler = Box<dyn FnMut(&ScrollWheelEvent, &mut Window, &mut App) -> EventResult>;
+type KeyDownHandler = Box<dyn FnMut(&KeyDownEvent, &mut Window, &mut App) -> EventResult>;
+type KeyUpHandler = Box<dyn FnMut(&KeyUpEvent, &mut Window, &mut App) -> EventResult>;
+type TextInputHandler = Box<dyn FnMut(&TextInputEvent, &mut Window, &mut App) -> EventResult>;
+type ImeHandler = Box<dyn FnMut(&ImeEvent, &mut Window, &mut App) -> EventResult>;
+type ModifiersHandler = Box<dyn FnMut(&ModifiersChangedEvent, &mut Window, &mut App) -> EventResult>;
 type ActionHandler = Box<dyn FnMut(&dyn Action, &mut Window, &mut App) -> EventResult>;
 type DragStartHandler = Box<dyn FnMut(&DragData, [wgpui_core::boundary::Pixels; 2], &mut Window, &mut App)>;
 type DragHoverHandler = Box<dyn FnMut(bool, &DragData, &mut Window, &mut App) -> EventResult>;
@@ -65,6 +71,11 @@ pub struct InteractionState {
     mouse_leave: Vec<MouseBoundaryHandler>,
     hover: Vec<HoverHandler>,
     scroll: Vec<ScrollHandler>,
+    key_down: Vec<KeyDownHandler>,
+    key_up: Vec<KeyUpHandler>,
+    text_input: Vec<TextInputHandler>,
+    ime: Vec<ImeHandler>,
+    modifiers_changed: Vec<ModifiersHandler>,
     actions: Vec<ActionHandler>,
     drag: Option<(DragData, DragStartHandler)>,
     drag_hover: Vec<(std::any::TypeId, DragHoverHandler)>,
@@ -207,6 +218,46 @@ impl InteractionState {
             handler(event, window, app).into_event_result()
         }));
     }
+    pub fn on_key_down<R: IntoEventResult + 'static>(
+        &mut self,
+        mut handler: impl FnMut(&KeyDownEvent, &mut Window, &mut App) -> R + 'static,
+    ) {
+        self.key_down.push(Box::new(move |event, window, app| {
+            handler(event, window, app).into_event_result()
+        }));
+    }
+    pub fn on_key_up<R: IntoEventResult + 'static>(
+        &mut self,
+        mut handler: impl FnMut(&KeyUpEvent, &mut Window, &mut App) -> R + 'static,
+    ) {
+        self.key_up.push(Box::new(move |event, window, app| {
+            handler(event, window, app).into_event_result()
+        }));
+    }
+    pub fn on_text_input<R: IntoEventResult + 'static>(
+        &mut self,
+        mut handler: impl FnMut(&TextInputEvent, &mut Window, &mut App) -> R + 'static,
+    ) {
+        self.text_input.push(Box::new(move |event, window, app| {
+            handler(event, window, app).into_event_result()
+        }));
+    }
+    pub fn on_ime<R: IntoEventResult + 'static>(
+        &mut self,
+        mut handler: impl FnMut(&ImeEvent, &mut Window, &mut App) -> R + 'static,
+    ) {
+        self.ime.push(Box::new(move |event, window, app| {
+            handler(event, window, app).into_event_result()
+        }));
+    }
+    pub fn on_modifiers_changed<R: IntoEventResult + 'static>(
+        &mut self,
+        mut handler: impl FnMut(&ModifiersChangedEvent, &mut Window, &mut App) -> R + 'static,
+    ) {
+        self.modifiers_changed.push(Box::new(move |event, window, app| {
+            handler(event, window, app).into_event_result()
+        }));
+    }
     pub fn update_hover(
         &mut self,
         hovered: bool,
@@ -234,6 +285,18 @@ impl InteractionState {
         app: &mut App,
     ) -> EventResult {
         match event {
+            InputEvent::ModifiersChanged(event) => dispatch_handlers(
+                &mut self.modifiers_changed,
+                event,
+                window,
+                app,
+            ),
+            InputEvent::KeyDown(event) => dispatch_handlers(&mut self.key_down, event, window, app),
+            InputEvent::KeyUp(event) => dispatch_handlers(&mut self.key_up, event, window, app),
+            InputEvent::TextInput(event) => {
+                dispatch_handlers(&mut self.text_input, event, window, app)
+            }
+            InputEvent::Ime(event) => dispatch_handlers(&mut self.ime, event, window, app),
             InputEvent::MouseLeave(_) => {
                 let mut result = self.update_hover(false, window, app);
                 for handler in &mut self.mouse_leave {
@@ -360,7 +423,6 @@ impl InteractionState {
                 }
                 result
             }
-            _ => EventResult::IGNORED,
         }
     }
 
@@ -376,6 +438,11 @@ impl InteractionState {
             && self.mouse_leave.is_empty()
             && self.hover.is_empty()
             && self.scroll.is_empty()
+            && self.key_down.is_empty()
+            && self.key_up.is_empty()
+            && self.text_input.is_empty()
+            && self.ime.is_empty()
+            && self.modifiers_changed.is_empty()
             && self.actions.is_empty()
             && self.drag.is_none()
             && self.drag_hover.is_empty()
@@ -415,6 +482,24 @@ impl InteractionState {
         }
         Some(interaction)
     }
+}
+
+type EventHandler<T> = Box<dyn FnMut(&T, &mut Window, &mut App) -> EventResult>;
+
+fn dispatch_handlers<T>(
+    handlers: &mut [EventHandler<T>],
+    event: &T,
+    window: &mut Window,
+    app: &mut App,
+) -> EventResult {
+    let mut result = EventResult::IGNORED;
+    for handler in handlers {
+        merge_result(&mut result, handler(event, window, app));
+        if !result.propagate {
+            break;
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -584,5 +669,56 @@ mod tests {
         assert_eq!(hover_calls.get(), 1);
         assert_eq!(drop_calls.get(), 1);
         assert_eq!(interaction.focus_handle(), Some(focus));
+    }
+
+    #[test]
+    fn keyboard_text_ime_and_modifier_callbacks_are_dispatched() {
+        let mut state = InteractionState::new();
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = events.clone();
+        state.on_key_down(move |event, _, _| {
+            observed.borrow_mut().push(format!("down:{}", event.key));
+        });
+        let observed = events.clone();
+        state.on_text_input(move |event, _, _| {
+            observed.borrow_mut().push(format!("text:{}", event.text));
+        });
+        let observed = events.clone();
+        state.on_ime(move |event, _, _| {
+            if matches!(event, ImeEvent::Commit(_)) {
+                observed.borrow_mut().push("commit".to_string());
+            }
+        });
+        let observed = events.clone();
+        state.on_modifiers_changed(move |event, _, _| {
+            if event.modifiers.shift {
+                observed.borrow_mut().push("shift".to_string());
+            }
+        });
+        let mut window = Window::new();
+        let mut app = App::create();
+        state.handle_input(
+            &InputEvent::KeyDown(KeyDownEvent::new("a", Modifiers::none())),
+            &mut window,
+            &mut app,
+        );
+        state.handle_input(
+            &InputEvent::TextInput(TextInputEvent { text: "é".into() }),
+            &mut window,
+            &mut app,
+        );
+        state.handle_input(
+            &InputEvent::Ime(ImeEvent::Commit("語".into())),
+            &mut window,
+            &mut app,
+        );
+        state.handle_input(
+            &InputEvent::ModifiersChanged(ModifiersChangedEvent {
+                modifiers: Modifiers::shift(),
+            }),
+            &mut window,
+            &mut app,
+        );
+        assert_eq!(&*events.borrow(), &["down:a", "text:é", "commit", "shift"]);
     }
 }

@@ -1,6 +1,7 @@
 //! Native application lifecycle for the retained WGPUI renderer.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use wgpui_core::app::App;
 use wgpui_core::boundary::Pixels;
@@ -13,9 +14,10 @@ use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
 pub use wgpui_core::window::WindowOptions;
 use wgpui_core::window::{
-    AnimationClock, DragData, FocusEvent, InputEvent, KeyDownEvent, KeyUpEvent, Modifiers,
-    MouseButton as CoreMouseButton, MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ScrollWheelEvent,
+    AnimationClock, ClipboardItem, DragData, FocusEvent, ImeEvent, InputEvent, KeyDownEvent,
+    KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton as CoreMouseButton,
+    MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
+    TextInputEvent,
 };
 
 use crate::debug::PerformanceDebug;
@@ -71,11 +73,41 @@ pub struct Window {
     hover_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     animation_clock: AnimationClock,
+    last_click: Option<ClickState>,
+}
+
+#[derive(Copy, Clone)]
+struct ClickState {
+    button: CoreMouseButton,
+    position: [Pixels; 2],
+    time: Instant,
+    count: u32,
 }
 
 /// A clonable handle for scheduling work on a native window.
 #[derive(Clone)]
 pub struct WindowHandle(Arc<winit::window::Window>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardError {
+    message: String,
+}
+
+impl std::fmt::Display for ClipboardError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClipboardError {}
+
+impl From<arboard::Error> for ClipboardError {
+    fn from(error: arboard::Error) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
 
 /// The monitor containing a window, when the platform reports one.
 pub type DisplayId = winit::monitor::MonitorHandle;
@@ -170,6 +202,27 @@ impl Window {
             },
         ))
     }
+
+    pub fn write_to_clipboard(&self, item: ClipboardItem) -> Result<(), ClipboardError> {
+        let text = item.text().ok_or_else(|| ClipboardError {
+            message: "native clipboard currently supports text items only".to_string(),
+        })?;
+        let mut clipboard = arboard::Clipboard::new().map_err(ClipboardError::from)?;
+        clipboard.set_text(text).map_err(ClipboardError::from)
+    }
+
+    pub fn read_from_clipboard(&self) -> Result<Option<ClipboardItem>, ClipboardError> {
+        let mut clipboard = arboard::Clipboard::new().map_err(ClipboardError::from)?;
+        match clipboard.get_text() {
+            Ok(text) => Ok(Some(ClipboardItem::new_string(text))),
+            Err(arboard::Error::ContentNotAvailable) => Ok(None),
+            Err(error) => Err(ClipboardError::from(error)),
+        }
+    }
+
+    pub fn set_ime_allowed(&self, allowed: bool) {
+        self.native.set_ime_allowed(allowed);
+    }
     pub fn set_title(&self, title: &str) {
         self.native.set_title(title);
     }
@@ -242,8 +295,15 @@ impl Window {
                 handled | self.apply_focus_transition(app)
             }
             InputEvent::KeyDown(key) => {
-                let action = self.interaction.resolve_action(key);
                 let mut handled = false;
+                if let Some(index) = self.focused_interaction() {
+                    let result = self.dispatch_interaction_bubbled_result(index, &event, app);
+                    handled |= result.handled;
+                    if !result.propagate {
+                        return handled | self.apply_focus_transition(app);
+                    }
+                }
+                let action = self.interaction.resolve_action(key);
                 if let Some(action) = action {
                     if let Some(index) = self.interactions.iter().position(|registration| {
                         registration
@@ -256,6 +316,18 @@ impl Window {
                         handled = app.dispatch_action(&*action);
                     }
                 }
+                handled | self.apply_focus_transition(app)
+            }
+            InputEvent::KeyUp(_) | InputEvent::TextInput(_) | InputEvent::Ime(_) => {
+                let handled = self
+                    .focused_interaction()
+                    .is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app));
+                handled | self.apply_focus_transition(app)
+            }
+            InputEvent::ModifiersChanged(_) => {
+                let handled = self
+                    .focused_interaction()
+                    .is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app));
                 handled | self.apply_focus_transition(app)
             }
             InputEvent::MouseMove(mouse) => {
@@ -422,6 +494,28 @@ impl Window {
         }
         handled
     }
+    fn dispatch_interaction_bubbled_result(
+        &mut self,
+        index: usize,
+        event: &InputEvent,
+        app: &mut App,
+    ) -> wgpui_core::window::EventResult {
+        let mut current = Some(index);
+        let mut result = wgpui_core::window::EventResult::IGNORED;
+        while let Some(index) = current {
+            let parent = self.interactions.get(index).and_then(|registration| registration.parent);
+            let current_result = self.dispatch_interaction_result(index, event, app);
+            if current_result.handled {
+                result.handled = true;
+            }
+            result.propagate = current_result.propagate;
+            if !current_result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        result
+    }
     fn dispatch_action_bubbled(
         &mut self,
         index: usize,
@@ -555,6 +649,7 @@ impl Window {
                 app,
             );
         }
+        self.native.set_ime_allowed(self.interaction.focused().is_some());
         handled
     }
     fn mark_interaction_dirty_for(&mut self, index: usize) {
@@ -726,6 +821,28 @@ impl Window {
             });
         }
     }
+    fn focused_interaction(&self) -> Option<usize> {
+        let focused = self.interaction.focused()?;
+        self.interactions
+            .iter()
+            .position(|registration| registration.focus.is_some_and(|focus| focus.id() == focused))
+    }
+    pub fn handle_window_focus(&mut self, focused: bool, app: &mut App) -> bool {
+        if focused {
+            self.native.set_ime_allowed(self.interaction.focused().is_some());
+            return false;
+        }
+        let mut handled = self.clear_hover_with_app(app);
+        self.pressed_interaction = None;
+        self.pressed_event = None;
+        self.active_drag = None;
+        self.drag_hovered = None;
+        if self.interaction.blur() {
+            handled |= self.apply_focus_transition(app);
+        }
+        self.native.set_ime_allowed(false);
+        handled
+    }
     pub fn cursor_position(&self) -> [Pixels; 2] {
         self.cursor
     }
@@ -739,6 +856,29 @@ impl Window {
             CoreMouseButton::Middle => self.mouse_buttons.middle = pressed,
             CoreMouseButton::Other(_) => {}
         }
+    }
+    fn next_click_count(&mut self, button: CoreMouseButton, position: [Pixels; 2]) -> u32 {
+        let now = Instant::now();
+        let count = self.last_click.map_or(1, |last| {
+            let distance_x = position[0].value() - last.position[0].value();
+            let distance_y = position[1].value() - last.position[1].value();
+            let close = distance_x.mul_add(distance_x, distance_y * distance_y) <= 16.0;
+            if last.button == button
+                && now.duration_since(last.time) <= Duration::from_millis(500)
+                && close
+            {
+                last.count.saturating_add(1)
+            } else {
+                1
+            }
+        });
+        self.last_click = Some(ClickState {
+            button,
+            position,
+            time: now,
+            count,
+        });
+        count
     }
     fn logical_point_for_physical(&mut self, x: f64, y: f64) -> [Pixels; 2] {
         let point = [
@@ -1079,6 +1219,7 @@ impl Handler {
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             animation_clock: AnimationClock::new(),
+            last_click: None,
         };
         let mut frame_loop = FrameLoop::new(&context.device);
         frame_loop.set_surface_registry(surface_registry);
@@ -1342,6 +1483,7 @@ impl winit::application::ApplicationHandler for Handler {
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             animation_clock: AnimationClock::new(),
+            last_click: None,
         };
         let mut frame_loop = FrameLoop::new(&context.device);
         frame_loop.set_surface_registry(surface_registry);
@@ -1401,10 +1543,18 @@ impl winit::application::ApplicationHandler for Handler {
                 live.window.request_redraw();
             }
             winit::event::WindowEvent::ModifiersChanged(modifiers) => {
-                live.window.interaction_modifiers = modifiers_from_winit(modifiers.state());
+                let modifiers = modifiers_from_winit(modifiers.state());
+                live.window.interaction_modifiers = modifiers;
+                if live.window.handle_input_with_app(
+                    InputEvent::ModifiersChanged(ModifiersChangedEvent { modifiers }),
+                    &mut live.app,
+                ) {
+                    live.window.request_redraw();
+                }
             }
             winit::event::WindowEvent::KeyboardInput { event, .. } => {
                 let key = key_name(&event);
+                let text = event.text.as_ref().map(ToString::to_string);
                 let input = if event.state == winit::event::ElementState::Pressed {
                     InputEvent::KeyDown(KeyDownEvent {
                         key,
@@ -1418,6 +1568,15 @@ impl winit::application::ApplicationHandler for Handler {
                     })
                 };
                 if live.window.handle_input_with_app(input, &mut live.app) {
+                    live.window.request_redraw();
+                }
+                if let Some(text) = text
+                    && !text.is_empty()
+                    && live.window.handle_input_with_app(
+                        InputEvent::TextInput(TextInputEvent { text }),
+                        &mut live.app,
+                    )
+                {
                     live.window.request_redraw();
                 }
             }
@@ -1444,19 +1603,26 @@ impl winit::application::ApplicationHandler for Handler {
                 let button = core_mouse_button(button);
                 live.window
                     .set_mouse_button(button, state == winit::event::ElementState::Pressed);
+                let click_count = if state == winit::event::ElementState::Pressed {
+                    live.window.next_click_count(button, point)
+                } else {
+                    live.window
+                        .pressed_event
+                        .map_or(1, |event| event.click_count)
+                };
                 let event = if state == winit::event::ElementState::Pressed {
                     InputEvent::MouseDown(MouseDownEvent {
                         button,
                         position: point,
                         modifiers: live.window.modifiers(),
-                        click_count: 1,
+                        click_count,
                     })
                 } else {
                     InputEvent::MouseUp(MouseUpEvent {
                         button,
                         position: point,
                         modifiers: live.window.modifiers(),
-                        click_count: 1,
+                        click_count,
                     })
                 };
                 if live.window.handle_input_with_app(event, &mut live.app) {
@@ -1467,7 +1633,10 @@ impl winit::application::ApplicationHandler for Handler {
                 let delta = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => [x * 16.0, y * 16.0],
                     winit::event::MouseScrollDelta::PixelDelta(point) => {
-                        [point.x as f32, point.y as f32]
+                        [
+                            point.x as f32 / live.window.scale_factor as f32,
+                            point.y as f32 / live.window.scale_factor as f32,
+                        ]
                     }
                 };
                 let event = InputEvent::Scroll(ScrollWheelEvent {
@@ -1476,6 +1645,23 @@ impl winit::application::ApplicationHandler for Handler {
                     modifiers: live.window.modifiers(),
                 });
                 if live.window.handle_input_with_app(event, &mut live.app) {
+                    live.window.request_redraw();
+                }
+            }
+            winit::event::WindowEvent::Ime(ime) => {
+                let event = ime_event(ime);
+                if live.window.handle_input_with_app(InputEvent::Ime(event), &mut live.app) {
+                    live.window.request_redraw();
+                }
+            }
+            winit::event::WindowEvent::Focused(focused) => {
+                let handled = live.window.handle_window_focus(focused, &mut live.app);
+                let dirty_regions = live.window.take_hover_dirty_regions();
+                let has_dirty_regions = !dirty_regions.is_empty();
+                for region in dirty_regions {
+                    live.frame_loop.mark_interaction_dirty(region);
+                }
+                if handled || has_dirty_regions {
                     live.window.request_redraw();
                 }
             }
@@ -1523,10 +1709,34 @@ fn core_mouse_button(button: winit::event::MouseButton) -> CoreMouseButton {
         winit::event::MouseButton::Right => CoreMouseButton::Right,
         winit::event::MouseButton::Middle => CoreMouseButton::Middle,
         winit::event::MouseButton::Back | winit::event::MouseButton::Forward => {
-            CoreMouseButton::Other(0)
+            CoreMouseButton::Other(match button {
+                winit::event::MouseButton::Back => 4,
+                _ => 5,
+            })
         }
         winit::event::MouseButton::Other(value) => CoreMouseButton::Other(value),
     }
+}
+
+fn ime_event(event: winit::event::Ime) -> ImeEvent {
+    match event {
+        winit::event::Ime::Enabled => ImeEvent::Enabled,
+        winit::event::Ime::Preedit(text, cursor) => ImeEvent::Preedit {
+            selection: cursor.map(|(start, end)| {
+                byte_to_utf16_offset(&text, start)..byte_to_utf16_offset(&text, end)
+            }),
+            text,
+        },
+        winit::event::Ime::Commit(text) => ImeEvent::Commit(text),
+        winit::event::Ime::Disabled => ImeEvent::Disabled,
+    }
+}
+
+fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
+    text.get(..byte_offset.min(text.len()))
+        .unwrap_or(text)
+        .encode_utf16()
+        .count()
 }
 
 fn key_name(event: &winit::event::KeyEvent) -> String {
@@ -1578,5 +1788,36 @@ mod tests {
             ..WindowOptions::default()
         };
         assert_eq!(initial_bounds(&options).size, size(px(320.0), px(240.0)));
+    }
+
+    #[test]
+    fn ime_preedit_offsets_are_converted_from_utf8_bytes_to_utf16_units() {
+        let event = ime_event(winit::event::Ime::Preedit(
+            "a😀中".to_string(),
+            Some((1, 6)),
+        ));
+        assert_eq!(
+            event,
+            ImeEvent::Preedit {
+                text: "a😀中".to_string(),
+                selection: Some(1..4),
+            }
+        );
+    }
+
+    #[test]
+    fn native_modifiers_preserve_command_and_alt_without_losing_shift() {
+        let state = winit::keyboard::ModifiersState::SUPER
+            | winit::keyboard::ModifiersState::ALT
+            | winit::keyboard::ModifiersState::SHIFT;
+        assert_eq!(
+            modifiers_from_winit(state),
+            Modifiers {
+                shift: true,
+                control: false,
+                alt: true,
+                command: true,
+            }
+        );
     }
 }

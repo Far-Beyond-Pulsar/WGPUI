@@ -21,9 +21,9 @@ pub use dispatch::{DispatchNodeId, DispatchTree};
 pub use focus::{FocusHandle, FocusId, FocusManager, FocusTransition, Focusable};
 pub use hitbox::{HitTestIndex, Hitbox, HitboxId};
 pub use input::{
-    ClickEvent, DragData, DragHoverEvent, DropEvent, EventResult, FocusEvent, InputEvent, KeyDownEvent, KeyUpEvent, KeyboardButton,
+    ClipboardItem, ClickEvent, DragData, DragHoverEvent, DropEvent, EventResult, FocusEvent, ImeEvent, InputEvent, KeyDownEvent, KeyUpEvent, KeyboardButton,
     KeyboardClickEvent, Modifiers, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
+    MouseMoveEvent, MouseUpEvent, ModifiersChangedEvent, ScrollWheelEvent, TextInputEvent,
 };
 pub use keymap::{KeyBinding, KeyParseError, Keymap, Keystroke};
 pub use menu::{Menu, MenuItem};
@@ -248,6 +248,7 @@ impl Window {
     }
     pub fn handle_input(&mut self, event: InputEvent) -> bool {
         match &event {
+            InputEvent::ModifiersChanged(_) => self.focused_input(&event),
             InputEvent::KeyDown(key) => {
                 if key.key.eq_ignore_ascii_case("tab") {
                     if key.modifiers.shift {
@@ -255,7 +256,11 @@ impl Window {
                     }
                     return self.focus_next().is_some();
                 }
+                let input_handled = self.focused_input(&event);
                 let action = self.keymap.resolve(key, None).map(Action::boxed_clone);
+                if input_handled {
+                    return true;
+                }
                 action.is_some_and(|action| {
                     self.dispatch
                         .root_id()
@@ -328,14 +333,25 @@ impl Window {
                 }
                 hit.is_some_and(|id| self.dispatch.dispatch_input(id, &event))
             }
-            InputEvent::KeyUp(_)
+            InputEvent::KeyUp(_) | InputEvent::TextInput(_) | InputEvent::Ime(_) => {
+                self.focused_input(&event)
+            }
+            InputEvent::Focus(_)
             | InputEvent::MouseEnter(_)
             | InputEvent::MouseLeave(_)
             | InputEvent::Click(_)
-            | InputEvent::Focus(_)
             | InputEvent::DragHover(_)
             | InputEvent::Drop(_) => false,
         }
+    }
+    fn focused_input(&mut self, event: &InputEvent) -> bool {
+        let Some(focused) = self.focused() else {
+            return false;
+        };
+        self.focus_hitboxes
+            .iter()
+            .find_map(|(hitbox, id)| (*id == focused).then_some(*hitbox))
+            .is_some_and(|hitbox| self.dispatch.dispatch_input(hitbox, event))
     }
     pub fn schedule_timer(&mut self, delay: Duration) -> TimerHandle {
         self.timers.schedule(Instant::now(), delay)
@@ -554,5 +570,56 @@ mod tests {
             delta: [0.0, -20.0],
             modifiers: Modifiers::none(),
         })));
+    }
+
+    #[test]
+    fn focused_hitbox_receives_key_text_ime_and_modifier_events() {
+        let mut window = Window::new();
+        let root = window.dispatch_tree().root();
+        let node = window.dispatch_tree().new_node(Some(root));
+        let focus = FocusHandle::new();
+        window.register_focus_hitbox(
+            Hitbox {
+                id: HitboxId::from_raw(6),
+                bounds: Rect::from_origin_size([0.0, 0.0], [20.0, 20.0]),
+                z_index: 0,
+                order: 0,
+                hit_testable: true,
+            },
+            node,
+            focus,
+        );
+        assert!(window.focus(&focus));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        assert!(window.dispatch_tree().on_input(node, move |event| {
+            observed.borrow_mut().push(match event {
+                InputEvent::KeyDown(_) => "down",
+                InputEvent::KeyUp(_) => "up",
+                InputEvent::TextInput(_) => "text",
+                InputEvent::Ime(_) => "ime",
+                InputEvent::ModifiersChanged(_) => "modifiers",
+                _ => "other",
+            });
+            EventResult::HANDLED
+        }));
+        assert!(window.handle_input(InputEvent::KeyDown(KeyDownEvent::new(
+            "a",
+            Modifiers::none(),
+        ))));
+        assert!(window.handle_input(InputEvent::KeyUp(KeyUpEvent {
+            key: "a".into(),
+            modifiers: Modifiers::none(),
+        })));
+        assert!(window.handle_input(InputEvent::TextInput(TextInputEvent {
+            text: "あ".into(),
+        })));
+        assert!(window.handle_input(InputEvent::Ime(ImeEvent::Commit("語".into()))));
+        assert!(window.handle_input(InputEvent::ModifiersChanged(
+            ModifiersChangedEvent {
+                modifiers: Modifiers::shift(),
+            },
+        )));
+        assert_eq!(&*events.borrow(), &["down", "up", "text", "ime", "modifiers"]);
     }
 }

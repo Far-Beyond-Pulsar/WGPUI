@@ -10,6 +10,7 @@ path = "src/wgpui_wgpu.rs"
 doctest = false
 
 [dependencies]
+arboard = "3.6.1"
  wgpui-devtools = { path = "../wgpui-devtools", optional = true }
 # Phase 3's compute passes dispatch shader source and consume input encodings
 # that wgpui-core owns (§3.1: "shader source as text, buffer/binding layout

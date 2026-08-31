@@ -3,12 +3,18 @@
 The native 2.0 path currently provides a winit window, a validated wgpu
 surface, resize handling, rendering, and the core retained input model.
 
-The following OS integrations are not implemented: application menus, native
-keyboard dispatch, prompts, clipboard, IME, accessibility, and cursor shape
-hooks. They are intentionally not exported as placeholder APIs. Applications
-must not treat their absence as successful platform support; a future
-workstream must add each integration with an explicit error or capability
-report before it is documented as available.
+The native input seam now normalizes keyboard, text, IME, modifier, mouse,
+wheel, focus, and click-count events, and exposes text clipboard read/write
+with typed failures. IME preedit selections are converted to UTF-16 offsets as
+expected by native text systems. This seam does not provide a default text
+editor or input method UI; applications still own text-buffer behavior.
+
+The following OS integrations remain unimplemented: application menus,
+prompts, image/file clipboard formats, accessibility, and cursor shape hooks.
+Clipboard access is synchronous and text-only, and IME positioning/candidate
+window integration is not exposed. Applications must not treat these missing
+integrations as successful platform support; each needs an explicit capability
+or error contract before it is documented as available.
 
 Surface creation is supported only when the adapter/surface pair offers the
 pipeline's fixed `Rgba8Unorm` format, `COPY_SRC`, at least one alpha mode, and

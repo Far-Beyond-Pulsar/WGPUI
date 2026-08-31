@@ -6846,6 +6846,7 @@ dependencies = [
 name = "wgpui-wgpu"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "bytemuck",
  "etagere",
  "image",

@@ -19,11 +19,11 @@ pub use app::{
     WindowClosedSubscription, WindowId, WindowList,
 };
 pub use window::{
-    ClickEvent, CloseState, DispatchNodeId, DragData, DragHoverEvent, DropEvent, EventResult, FocusEvent, FocusHandle, FocusId, FocusManager,
+    ClipboardItem, ClickEvent, CloseState, DispatchNodeId, DragData, DragHoverEvent, DropEvent, EventResult, FocusEvent, FocusHandle, FocusId, FocusManager, ImeEvent,
     FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId, InputEvent, KeyBinding,
     KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu,
-    MenuItem, Modifiers, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TimerHandle, TimerId, TimerState,
+    MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TextInputEvent, TimerHandle, TimerId, TimerState,
     WindowOptions,
 };
 pub mod boundary;
