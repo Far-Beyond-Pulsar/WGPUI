@@ -11,7 +11,7 @@ mod example_prelude;
 
 use example_prelude::init_example;
 use wgpui::{
-    App, Application, Bounds, Colors, Context, Div, Hsla, Render, Rgba, Window, WindowBounds,
+    App, Application, ApplicationError, Bounds, Colors, Div, Hsla, Render, Rgba, WindowBounds,
     WindowOptions, div, prelude::*, px, size,
 };
 
@@ -391,8 +391,8 @@ fn stack_pattern(colors: &Colors) -> impl IntoElement {
 struct LayoutExample;
 
 impl Render for LayoutExample {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = Colors::for_appearance(window);
+    fn render(&mut self) -> impl IntoElement + 'static {
+        let colors = Colors::default();
 
         div()
             .id("main")
@@ -482,9 +482,9 @@ fn section(colors: &Colors, title: &'static str, content: impl IntoElement) -> i
         .child(content)
 }
 
-fn main() {
+fn main() -> Result<(), ApplicationError> {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(650.), px(700.)), cx);
+        let bounds = Bounds::centered(None::<()>, size(px(650.), px(700.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -495,5 +495,5 @@ fn main() {
         .expect("Failed to open window");
 
         init_example(cx, "Layout");
-    });
+    })
 }
