@@ -10,7 +10,7 @@ use std::sync::{
 };
 
 use crate::action::Action;
-use crate::element::{IntoElement, Render};
+use crate::element::{IntoElement, LegacyRender, Render, render_legacy_description};
 use crate::reconcile::description::Description;
 use crate::window::{KeyBinding, KeyDownEvent, Keymap, Menu, WindowOptions};
 use futures::channel::oneshot;
@@ -367,6 +367,39 @@ impl App {
                     render: Box::new(move |window, _app| {
                         entity.update_in(window, |value, _window, _context| {
                             value.render().into_description()
+                        })
+                    }),
+                }
+            }),
+        });
+        Ok(())
+    }
+
+    /// Queue a window whose root view uses the legacy context-aware render
+    /// contract. The legacy context is supplied only while producing each
+    /// frame's description; no runtime handle is retained in the description
+    /// or scene.
+    pub fn open_legacy_window<V: LegacyRender>(
+        &mut self,
+        options: WindowOptions,
+        build_root_view: impl FnOnce(&mut crate::window::Window, &mut App) -> Entity<V> + 'static,
+    ) -> Result<(), &'static str> {
+        if self.quit_requested() {
+            return Err("application is quitting");
+        }
+        if self.close_requested() {
+            return Err("application is closing");
+        }
+        let id = self.reserve_window();
+        self.state.borrow_mut().pending_windows.push(WindowRequest {
+            id,
+            options,
+            build: Box::new(move |window, app| {
+                let entity = build_root_view(window, app);
+                WindowRenderer {
+                    render: Box::new(move |window, _app| {
+                        entity.update_in(window, |value, window, context| {
+                            render_legacy_description(value, window, context)
                         })
                     }),
                 }
@@ -808,6 +841,25 @@ mod tests {
         }
     }
 
+    struct LegacyTestRoot {
+        expected_entity: Option<EntityId>,
+        received_window: bool,
+        received_context: bool,
+    }
+
+    impl LegacyRender for LegacyTestRoot {
+        fn render(
+            &mut self,
+            window: &mut crate::window::Window,
+            context: &mut Context<Self>,
+        ) -> impl IntoElement + 'static {
+            window.activate();
+            self.received_window = window.is_active();
+            self.received_context = self.expected_entity == Some(context.entity().entity_id());
+            Description::new::<Self>()
+        }
+    }
+
     #[test]
     fn open_window_queues_each_root_and_rejects_new_windows_after_quit() {
         let mut app = App::create();
@@ -821,6 +873,37 @@ mod tests {
             app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot)),
             Err("application is quitting")
         );
+    }
+
+    #[test]
+    fn legacy_window_entry_point_renders_with_live_window_and_context() {
+        let mut app = App::create();
+        let root = app.new_entity(LegacyTestRoot {
+            expected_entity: None,
+            received_window: false,
+            received_context: false,
+        });
+        let entity_id = root.entity_id();
+        root.update(|value, _| value.expected_entity = Some(entity_id));
+
+        app.open_legacy_window(WindowOptions::default(), {
+            let root = root.clone();
+            move |_, _| root
+        })
+        .expect("legacy window request should be accepted");
+
+        let mut requests = app.take_window_requests();
+        let request = requests.pop().expect("legacy request should be queued");
+        let mut build_window = crate::window::Window::new();
+        let mut renderer = (request.build)(&mut build_window, &mut app);
+        let mut frame_window = crate::window::Window::new();
+        let description = (renderer.render)(&mut frame_window, &mut app);
+
+        assert_eq!(description.type_id(), std::any::TypeId::of::<LegacyTestRoot>());
+        let root = root.read(&app);
+        assert!(root.received_window);
+        assert!(root.received_context);
+        assert!(frame_window.is_active());
     }
 }
 
