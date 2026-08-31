@@ -60,8 +60,9 @@
 //! correct *set* of primitives into a correct *layer* is what this phase needs
 //! and all it claims.
 
-use crate::boundary::compositor::{BoundaryComposite, Composite, Compositor};
+use crate::boundary::compositor::{BoundaryComposite, Composite, Compositor, TiledVisit};
 use crate::boundary::policy::BoundaryPolicy;
+use crate::geometry::Rect;
 use crate::invalidation::request::FrameSignals;
 use crate::patch::apply::ScenePatch;
 use crate::patch::primitive::{
@@ -70,6 +71,7 @@ use crate::patch::primitive::{
 use crate::patch::{PatchList, RecordKey};
 use crate::reconcile::instance::InstanceKey;
 use crate::reconcile::plan::FramePlan;
+use crate::reconcile::walk::shared_walk;
 use crate::scene::layer::{BoundaryId, LayerId, LayerKey, LayerTransform};
 use crate::scene::{PrimitiveStore, Scene};
 use std::collections::HashMap;
@@ -276,9 +278,9 @@ impl Emission {
             let bounds = LayoutRect {
                 x: sprite.origin[0],
                 y: sprite.origin[1],
-                    width: sprite.size[0],
-                    height: sprite.size[1],
-                };
+                width: sprite.size[0],
+                height: sprite.size[1],
+            };
             if let Some(cropped) = intersect_rect(bounds, clip) {
                 let scale_x = if sprite.size[0] > 0.0 {
                     sprite.atlas_size[0] / sprite.size[0]
@@ -305,9 +307,9 @@ impl Emission {
             let bounds = LayoutRect {
                 x: underline.origin[0],
                 y: underline.origin[1],
-                    width: underline.size[0],
-                    height: underline.size[1],
-                };
+                width: underline.size[0],
+                height: underline.size[1],
+            };
             if let Some(cropped) = intersect_rect(bounds, clip) {
                 underline.origin = [cropped.x, cropped.y];
                 underline.size = [cropped.width, cropped.height];
@@ -318,12 +320,15 @@ impl Emission {
         }
         for shadow in &mut self.shadows {
             let (origin, size) = shadow.drawn_bounds();
-            if !rects_intersect(LayoutRect {
-                x: origin[0],
-                y: origin[1],
-                width: size[0],
-                height: size[1],
-            }, clip) {
+            if !rects_intersect(
+                LayoutRect {
+                    x: origin[0],
+                    y: origin[1],
+                    width: size[0],
+                    height: size[1],
+                },
+                clip,
+            ) {
                 shadow.size = [0.0; 2];
                 shadow.color[3] = 0.0;
             }
@@ -470,6 +475,15 @@ pub struct FrameEmission {
     pub patch: ScenePatch,
     /// What each live boundary did, in ascending layer order.
     pub composites: Vec<BoundaryComposite>,
+    /// Tile visibility metadata for damage planning. Tiles are not scene
+    /// layers and do not own primitive records; they identify portions of the
+    /// retained presentation buffer that may need repainting.
+    pub tiled_visits: Vec<TiledVisit>,
+    /// Screen-space rectangles whose pixels no longer match the previous
+    /// presentation. This is presentation damage, not a second copy of the
+    /// scene: the GPU uses it to restrict rasterization while the retained
+    /// scene remains the only source of primitive data.
+    pub damage: Vec<Rect>,
     /// This frame's counters.
     pub stats: EmissionStats,
 }
@@ -501,6 +515,7 @@ struct EmittedNode {
     /// The inherited clip used when this node last emitted. A resize can
     /// change this without changing the node's own layout rectangle.
     clip: Option<LayoutRect>,
+    visible_bounds: Rect,
     shadows: u32,
     quads: u32,
     underlines: u32,
@@ -531,33 +546,6 @@ struct BoundaryFrame {
     content_dirty: bool,
     primitive_count: usize,
     transform_moved: bool,
-}
-
-/// One ancestor on the walk stack.
-#[derive(Copy, Clone, Debug)]
-struct WalkFrame {
-    depth: u32,
-    layer: LayerId,
-    boundary: BoundaryId,
-    origin: [f32; 2],
-    /// Displacement applied to this node's children's positions. Zero unless
-    /// this node scrolls and could not hand that displacement to a layer.
-    content_offset: [f32; 2],
-    clip: Option<LayoutRect>,
-}
-
-fn intersect_layout_rect(clip: Option<LayoutRect>, bounds: LayoutRect) -> LayoutRect {
-    let Some(clip) = clip else { return bounds };
-    let left = clip.x.max(bounds.x);
-    let top = clip.y.max(bounds.y);
-    let right = (clip.x + clip.width).min(bounds.x + bounds.width);
-    let bottom = (clip.y + clip.height).min(bounds.y + bounds.height);
-    LayoutRect {
-        x: left,
-        y: top,
-        width: (right - left).max(0.0),
-        height: (bottom - top).max(0.0),
-    }
 }
 
 /// One kind's pending operations, kept apart so removals can be emitted before
@@ -697,9 +685,13 @@ impl Emitter {
         let mut stats = EmissionStats::default();
         let mut pending = PendingOperations::default();
         let mut boundaries: HashMap<BoundaryId, BoundaryFrame> = HashMap::new();
+        let mut tiled_visits = Vec::new();
+        let mut damage = Vec::new();
+        let mut scroll_regions = HashMap::new();
         let mut emission = Emission::new();
+        let effective_signals = self.infer_clean_scrolls(plan, signals);
 
-        let root_layer = self.begin_boundary(
+        self.begin_boundary(
             BoundaryId::ROOT,
             BoundaryPolicy::default(),
             LayerTransform::IDENTITY,
@@ -707,91 +699,74 @@ impl Emitter {
             scene,
             &mut boundaries,
         );
-        let mut stack: Vec<WalkFrame> = Vec::new();
-        let root_frame = WalkFrame {
-            depth: 0,
-            layer: root_layer,
-            boundary: BoundaryId::ROOT,
-            origin: [0.0, 0.0],
-            content_offset: [0.0, 0.0],
-            clip: None,
-        };
+        let walked = shared_walk(plan, layout, &effective_signals, None)?;
 
         for (index, node) in plan.nodes().iter().enumerate() {
-            while stack.last().is_some_and(|frame| frame.depth >= node.depth) {
-                stack.pop();
-            }
-            let parent = *stack.last().unwrap_or(&root_frame);
-            if node.depth != u32::try_from(stack.len()).unwrap_or(u32::MAX) {
-                return Err(EmitError::MalformedPlan {
-                    index,
-                    depth: node.depth,
-                });
-            }
+            let geometry = walked.get(index).ok_or(EmitError::MalformedPlan {
+                index,
+                depth: node.depth,
+            })?;
             stats.nodes_visited += 1;
 
-            let rectangle = layout.layout_of(node.layout_node)?;
-            let origin = [
-                parent.origin[0] + rectangle.x + parent.content_offset[0],
-                parent.origin[1] + rectangle.y + parent.content_offset[1],
-            ];
-            let bounds = LayoutRect {
-                x: origin[0],
-                y: origin[1],
-                width: rectangle.width,
-                height: rectangle.height,
-            };
+            let bounds = geometry.emission_bounds;
 
             // A boundary root's own paint belongs to the layer around it, not to
             // the layer it declares — see `PlannedNode::boundary`.
-            let layer = parent.layer;
-            let (child_layer, child_boundary, content_offset) = match node.declared_boundary {
-                Some(declared) => {
-                    let policy = node.boundary_policy.unwrap_or_default();
-                    let declared_layer = LayerId::from_key(LayerKey::untiled(declared));
-                    // Decided from the signal alone, before the walk knows
-                    // whether the content is clean, because it changes where
-                    // the content is emitted: a boundary permitted the fast
-                    // path hands its displacement to its layer, and one that is
-                    // not folds it into its children exactly as an ordinary
-                    // element would.
-                    let slides = signals
-                        .reason_for_layer(declared_layer)
-                        .permits_transform_only();
-                    let transform = if slides {
-                        LayerTransform {
-                            translation: node.scroll_offset,
-                        }
-                    } else {
-                        LayerTransform::IDENTITY
-                    };
-                    let boundary_layer = self.begin_boundary(
+            let layer = geometry.layer;
+            if let Some(declared) = node.declared_boundary {
+                let policy = node.boundary_policy.unwrap_or_default();
+                let declared_layer = LayerId::from_key(LayerKey::untiled(declared));
+                // Decided from the signal alone, before the walk knows
+                // whether the content is clean, because it changes where
+                // the content is emitted: a boundary permitted the fast
+                // path hands its displacement to its layer, and one that is
+                // not folds it into its children exactly as an ordinary
+                // element would.
+                let slides = effective_signals
+                    .reason_for_layer(declared_layer)
+                    .permits_transform_only();
+                if slides {
+                    scroll_regions.insert(
                         declared,
-                        policy,
-                        transform,
-                        frame,
-                        scene,
-                        &mut boundaries,
+                        geometry
+                            .child_clip
+                            .unwrap_or(geometry.absolute_bounds),
                     );
-                    let folded = if slides {
-                        [0.0, 0.0]
-                    } else {
-                        node.scroll_offset
-                    };
-                    (boundary_layer, declared, folded)
                 }
-                None => (parent.layer, node.boundary, node.scroll_offset),
-            };
+                let transform = if slides {
+                    LayerTransform {
+                        translation: node.scroll_offset,
+                    }
+                } else {
+                    LayerTransform::IDENTITY
+                };
+                let declared_layer = self.begin_boundary(
+                    declared,
+                    policy,
+                    transform,
+                    frame,
+                    scene,
+                    &mut boundaries,
+                );
+                scene.layers.set_clip(declared_layer, geometry.child_clip);
+                if let Some(visit) = self.compositor.visit_tiled(
+                    declared,
+                    policy,
+                    frame,
+                    geometry.child_clip.unwrap_or(geometry.absolute_bounds),
+                ) {
+                    tiled_visits.push(visit);
+                }
+            }
 
             let previous = self.emitted.get(&node.address).copied();
             match plan.emitter(index) {
                 Some(emitter) => {
-                    let stale = previous
-                        .is_none_or(|record| {
-                            record.bounds != bounds
-                                || record.layer != layer
-                                || record.clip != parent.clip
-                        });
+                    let stale = previous.is_none_or(|record| {
+                        record.bounds != bounds
+                            || record.layer != layer
+                            || record.clip != geometry.emission_clip
+                    });
                     if node.skipped_prepaint_and_paint() && !stale {
                         stats.nodes_skipped += 1;
                         if let Some(record) = previous {
@@ -804,6 +779,10 @@ impl Emitter {
                             );
                         }
                     } else {
+                        if let Some(previous) = previous {
+                            damage.push(previous.visible_bounds);
+                        }
+                        damage.push(geometry.visible_bounds);
                         stats.nodes_emitted += 1;
                         emission.clear();
                         emitter.emit(
@@ -811,11 +790,11 @@ impl Emitter {
                                 bounds,
                                 layer,
                                 boundary: node.boundary,
-                                clip: parent.clip,
+                                clip: geometry.emission_clip,
                             },
                             &mut emission,
                         );
-                        if let Some(clip) = parent.clip {
+                        if let Some(clip) = geometry.emission_clip {
                             emission.clip_to(clip);
                         }
                         Self::reconcile_records(
@@ -870,7 +849,8 @@ impl Emitter {
                         let emitted = EmittedNode {
                             layer,
                             bounds,
-                            clip: parent.clip,
+                            clip: geometry.emission_clip,
+                            visible_bounds: geometry.visible_bounds,
                             shadows: u32::try_from(emission.shadows().len()).unwrap_or(u32::MAX),
                             quads: u32::try_from(emission.quads().len()).unwrap_or(u32::MAX),
                             underlines: u32::try_from(emission.underlines().len())
@@ -893,28 +873,16 @@ impl Emitter {
                     // with it, not leave them resident under an address nothing
                     // will address again.
                     if let Some(record) = previous {
+                        damage.push(record.visible_bounds);
                         Self::retire_records(node.address, record, &mut pending);
                         self.emitted.remove(&node.address);
                         Self::account(&mut boundaries, node.boundary, true, 0);
                     }
                 }
             }
-
-            stack.push(WalkFrame {
-                depth: node.depth,
-                layer: child_layer,
-                boundary: child_boundary,
-                origin,
-                content_offset,
-                clip: if node.clip_children {
-                    Some(intersect_layout_rect(parent.clip, bounds))
-                } else {
-                    parent.clip
-                },
-            });
         }
 
-        self.sweep_departed(frame, &mut pending, &mut boundaries);
+        self.sweep_departed(frame, &mut pending, &mut boundaries, &mut damage);
 
         let patch = ScenePatch {
             shadows: pending.shadows.into_patch_list(&scene.shadows, &mut stats),
@@ -937,7 +905,7 @@ impl Emitter {
 
         let mut composites = Vec::with_capacity(boundaries.len());
         for (boundary, state) in boundaries {
-            let reason = signals.reason_for_layer(state.layer);
+            let reason = effective_signals.reason_for_layer(state.layer);
             let Some(composite) = self.compositor.resolve(
                 boundary,
                 reason,
@@ -950,6 +918,9 @@ impl Emitter {
             scene.layers.set_transform(state.layer, composite.transform);
             if composite.composite == Composite::TransformOnly {
                 stats.transform_only += 1;
+                if let Some(region) = scroll_regions.get(&boundary) {
+                    damage.push(*region);
+                }
             }
             composites.push(composite);
         }
@@ -961,6 +932,8 @@ impl Emitter {
         Ok(FrameEmission {
             patch,
             composites,
+            tiled_visits,
+            damage,
             stats,
         })
     }
@@ -996,6 +969,40 @@ impl Emitter {
         });
         entry.transform_moved |= moved;
         layer
+    }
+
+    fn infer_clean_scrolls(&self, plan: &FramePlan, signals: &FrameSignals) -> FrameSignals {
+        if !signals.is_empty() {
+            return signals.clone();
+        }
+        let mut inferred = signals.clone();
+        for (index, node) in plan.nodes().iter().enumerate() {
+            let Some(boundary) = node.declared_boundary else {
+                continue;
+            };
+            if !node.skipped_prepaint_and_paint()
+                || !Self::subtree_is_clean(plan, index, node.depth)
+            {
+                continue;
+            }
+            let previous = self.compositor.transform(boundary).translation;
+            if previous != node.scroll_offset {
+                inferred.scrolled(LayerId::from_key(LayerKey::untiled(boundary)));
+            }
+        }
+        inferred
+    }
+
+    fn subtree_is_clean(plan: &FramePlan, root_index: usize, root_depth: u32) -> bool {
+        plan.nodes()
+            .get(root_index..)
+            .and_then(|nodes| nodes.first().map(|first| (nodes, first)))
+            .is_some_and(|(nodes, first)| {
+                nodes
+                    .iter()
+                    .take_while(|node| node.depth > root_depth || std::ptr::eq(*node, first))
+                    .all(|node| node.skipped_prepaint_and_paint())
+            })
     }
 
     fn account(
@@ -1118,6 +1125,7 @@ impl Emitter {
         frame: u64,
         pending: &mut PendingOperations,
         boundaries: &mut HashMap<BoundaryId, BoundaryFrame>,
+        damage: &mut Vec<Rect>,
     ) {
         let departed: Vec<(InstanceKey, EmittedNode)> = self
             .emitted
@@ -1126,6 +1134,7 @@ impl Emitter {
             .map(|(address, record)| (*address, *record))
             .collect();
         for (address, record) in departed {
+            damage.push(record.visible_bounds);
             Self::retire_records(address, record, pending);
             self.emitted.remove(&address);
             for entry in boundaries.values_mut() {
@@ -1140,7 +1149,7 @@ impl Emitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boundary::policy::Retention;
+    use crate::boundary::policy::{Buffering, Retention, Size};
     use crate::invalidation::axes::Invalidation;
     use crate::patch::apply::apply;
     use crate::patch::primitive::{Glyph, PathVertex};
@@ -1238,6 +1247,47 @@ mod tests {
             .diff_key(Fingerprint(revision))
             .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
             .child(container)
+    }
+
+    #[test]
+    fn tiled_boundary_reports_damage_tiles_without_promoting_them_to_layers() -> Result<(), FrameError> {
+        let policy = BoundaryPolicy {
+            buffering: Buffering::Tiled {
+                tile_size: Size::pixels(100.0, 100.0),
+                retain_radius: 0,
+            },
+            ..BoundaryPolicy::default()
+        };
+        let content = Description::new::<Panel>()
+            .diff_key(Fingerprint(1))
+            .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+            .emit(fill(0.25))
+            .children((0..4).map(|row| {
+                Description::new::<Panel>()
+                    .diff_key(Fingerprint(row))
+                    .style(fixed(80.0, 80.0))
+                    .emit(fill(0.5))
+            }))
+            .boundary_with_policy(policy);
+        let description = Description::new::<Panel>()
+            .diff_key(Fingerprint(1))
+            .style(column(VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+            .child(content);
+        let mut window = Window::new();
+        let frame = window.draw(description, &FrameSignals::new())?;
+        let boundary = boundary_of(&window);
+        assert_eq!(frame.emission.tiled_visits.len(), 1);
+        assert_eq!(frame.emission.tiled_visits[0].boundary, boundary);
+        assert!(!frame.emission.tiled_visits[0].visible.is_empty());
+        assert!(frame.emission.stats.records_inserted > 0);
+        assert!(!window.scene.layers.ids().iter().any(|layer| {
+            window
+                .scene
+                .layers
+                .get(*layer)
+                .is_some_and(|layer| layer.key().tile.is_some())
+        }));
+        Ok(())
     }
 
     /// Everything one window holds across frames, so a test drives real frames
@@ -1443,6 +1493,11 @@ mod tests {
             "every element that emits anything skipped emitting"
         );
         assert_eq!(scrolled.emission.stats.transform_only, 1);
+        assert_eq!(
+            scrolled.emission.damage,
+            vec![Rect::from_origin_size([0.0, 0.0], [VIEWPORT_WIDTH, VIEWPORT_HEIGHT])],
+            "a transform-only scroll damages only the scrolling boundary's viewport"
+        );
 
         // And the scene agrees: the layer moved, its residency did not.
         assert_eq!(
@@ -1462,6 +1517,20 @@ mod tests {
             Some(Invalidation::TRANSFORM)
         );
         assert_eq!(window.scene.quads.len(layer), ROW_COUNT);
+        Ok(())
+    }
+
+    #[test]
+    fn a_clean_scroll_is_inferred_when_the_native_input_path_has_no_signal() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let boundary = boundary_of(&window);
+        window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+        let frame = window.draw(scroller(true, -ROW_HEIGHT, 0), &FrameSignals::new())?;
+        assert!(frame.emission.patch.is_empty());
+        assert_eq!(
+            frame.emission.composite_for(boundary).map(|composite| composite.composite),
+            Some(Composite::TransformOnly)
+        );
         Ok(())
     }
 
@@ -1915,9 +1984,18 @@ mod tests {
         let mut emission = Emission::default();
         emission.paths.push(Path::new(
             vec![
-                PathVertex { position: [0.0, 0.0], st: [0.0, 0.0] },
-                PathVertex { position: [20.0, 0.0], st: [1.0, 0.0] },
-                PathVertex { position: [0.0, 20.0], st: [0.0, 1.0] },
+                PathVertex {
+                    position: [0.0, 0.0],
+                    st: [0.0, 0.0],
+                },
+                PathVertex {
+                    position: [20.0, 0.0],
+                    st: [1.0, 0.0],
+                },
+                PathVertex {
+                    position: [0.0, 20.0],
+                    st: [0.0, 1.0],
+                },
             ],
             [1.0; 4],
         ));

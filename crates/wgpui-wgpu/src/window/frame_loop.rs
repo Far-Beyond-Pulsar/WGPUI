@@ -30,7 +30,7 @@
 //! The resulting glyph runs still enter the ordinary retained patch protocol;
 //! no text-specific draw path bypasses reconciliation.
 
-use wgpui_core::boundary::compositor::CompositeEntry;
+use wgpui_core::boundary::compositor::{Composite, CompositeEntry, TiledVisit};
 use wgpui_core::geometry::Rect;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::invalidation::request::FrameSignals;
@@ -42,21 +42,24 @@ use wgpui_core::reconcile::description::{Description, DescriptionInteraction, Ra
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
+use wgpui_core::reconcile::walk::shared_walk;
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::LayerId;
+use wgpui_core::scene::tile::TileCoord;
 use wgpui_layout::taffy_tree::{
     Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
 };
 
+use crate::debug::{DebugTile, PerformanceDebug};
 use crate::render::atlas::{AtlasTileSource, GlyphAtlas};
 use crate::render::atlas_upload::AtlasTextures;
 use crate::render::draw::DrawMode;
-use crate::debug::{DebugTile, PerformanceDebug};
 use crate::render::frame::{
-    Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, RenderTarget,
+    Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, OffscreenTarget, RenderTarget,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
 use wgpui_text::patch::{RunPlacement, glyph_runs};
 use wgpui_text::raster::GlyphRasterizer;
@@ -141,6 +144,9 @@ pub struct LoopFrame {
     /// The GPU half.
     pub frame: FrameOutput,
     pub interactions: Vec<InteractionRegistration>,
+    /// Whether the native handler should schedule another frame for a fading
+    /// diagnostic overlay.
+    pub needs_redraw: bool,
 }
 
 #[derive(Debug)]
@@ -214,12 +220,15 @@ pub struct FrameLoop {
     text_rasterizer: GlyphRasterizer,
     text_atlas: GlyphAtlas,
     atlas_textures: AtlasTextures,
+    presentation_target: Option<OffscreenTarget>,
     prepared_text: HashMap<TextCacheKey, PreparedText>,
     frames: u64,
     last_viewport: Option<[f32; 2]>,
     viewport_recomputes: u64,
-    tile_flash_frames: HashMap<LayerId, u32>,
-    viewport_flash_frames: u32,
+    tile_flash_frames: HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), u32>,
+    tile_refresh_rates:
+        HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), TileRefreshRate>,
+    damage_refresh_regions: Vec<DamageRefreshRegion>,
     interaction_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     scale_factor: f32,
@@ -239,6 +248,35 @@ struct TextCacheKey {
     font_size_bits: u32,
 }
 
+#[derive(Clone, Copy)]
+struct TileRefreshRate {
+    window_start: Instant,
+    samples: u32,
+    updates: u32,
+    frames_per_second: f32,
+    regular: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DamageRefreshRegion {
+    rect: Rect,
+    frames_remaining: u32,
+    window_start: Instant,
+    samples: u32,
+    updates: u32,
+    frames_per_second: f32,
+    regular: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DebugRefreshRegion {
+    rect: Rect,
+    frames_remaining: u32,
+    updates: u32,
+    frames_per_second: f32,
+    regular: bool,
+}
+
 impl FrameLoop {
     /// Build every pipeline once, and start with an empty scene.
     pub fn new(device: &wgpu::Device) -> FrameLoop {
@@ -252,12 +290,14 @@ impl FrameLoop {
             text_rasterizer: GlyphRasterizer::new(),
             text_atlas: GlyphAtlas::default(),
             atlas_textures: AtlasTextures::new(GlyphAtlas::default().page_size()),
+            presentation_target: None,
             prepared_text: HashMap::new(),
             frames: 0,
             last_viewport: None,
             viewport_recomputes: 0,
             tile_flash_frames: HashMap::new(),
-            viewport_flash_frames: 0,
+            tile_refresh_rates: HashMap::new(),
+            damage_refresh_regions: Vec::new(),
             interaction_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             scale_factor: 1.0,
@@ -433,7 +473,11 @@ impl FrameLoop {
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
-        let interactions = self.collect_interactions(&mut plan)?;
+        let interactions = self.collect_interactions(
+            &mut plan,
+            input.signals,
+            Rect::from_origin_size([0.0, 0.0], [width, height]),
+        )?;
         let emission = self
             .emitter
             .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
@@ -446,15 +490,50 @@ impl FrameLoop {
             self.viewport_recomputes += 1;
         }
         let interaction_dirty_regions = self.interaction_dirty_regions.clone();
+        let transform_only = emission
+            .composites
+            .iter()
+            .any(|composite| composite.composite == Composite::TransformOnly);
         let debug_tiles = self.refresh_debug_tiles(
-            &emission.patch,
+            &emission,
             self.performance_debug.tile_refresh_flash(),
-            viewport,
+            Rect::from_origin_size([0.0, 0.0], viewport),
             viewport_changed,
             &interaction_dirty_regions,
         );
         self.interaction_dirty_regions.clear();
+        let debug_damage = debug_tiles.iter().fold(None, |damage, tile| {
+            Some(union_damage(
+                damage,
+                Rect::from_origin_size(
+                    [tile.origin_size[0], tile.origin_size[1]],
+                    [tile.origin_size[2], tile.origin_size[3]],
+                ),
+            ))
+        });
+        let has_debug_damage = debug_damage.is_some();
+        let needs_redraw = !debug_tiles.is_empty();
         self.renderer.set_debug_tiles(debug_tiles);
+        let can_preserve_presentation = input
+            .target
+            .source
+            .is_some_and(|source| source.usage().contains(wgpu::TextureUsages::COPY_DST));
+
+        let damage = if viewport_changed {
+            None
+        } else {
+            let mut damage = None;
+            for region in emission.damage.iter().copied() {
+                damage = Some(union_damage(damage, region));
+            }
+            for region in interaction_dirty_regions.iter().copied() {
+                damage = Some(union_damage(damage, region));
+            }
+            if let Some(debug_damage) = debug_damage {
+                damage = Some(union_damage(damage, debug_damage));
+            }
+            Some(damage.unwrap_or(Rect::EMPTY))
+        };
 
         self.atlas_textures
             .sync(device, queue, &mut self.text_atlas);
@@ -463,7 +542,11 @@ impl FrameLoop {
             scene: &self.scene,
             clip: Rect::from_origin_size([0.0, 0.0], [width, height]),
             poison: &[],
-            dirty: if viewport_changed {
+            dirty: if viewport_changed
+                || transform_only
+                || has_debug_damage
+                || !can_preserve_presentation
+            {
                 Dirty::All
             } else {
                 Dirty::Some(&dirty_layers)
@@ -475,9 +558,38 @@ impl FrameLoop {
             viewport: [width, height],
             mode: input.mode,
         };
-        let frame = self
-            .renderer
-            .render_to(device, queue, &frame_input, input.target)?;
+        let frame = if can_preserve_presentation {
+            let target_is_new = self.presentation_target.as_ref().is_none_or(|target| {
+                target.width != input.target.width || target.height != input.target.height
+            });
+            if target_is_new {
+                self.presentation_target = Some(OffscreenTarget::new(
+                    device,
+                    input.target.width,
+                    input.target.height,
+                ));
+            }
+            if let Some(retained_target) = self.presentation_target.as_ref() {
+                let retained_render_target = retained_target.target();
+                let frame = self.renderer.render_to_with_damage(
+                    device,
+                    queue,
+                    &frame_input,
+                    &retained_render_target,
+                    if target_is_new { None } else { damage },
+                )?;
+                if let Some(destination) = input.target.source {
+                    retained_target.copy_to_texture(device, queue, destination);
+                }
+                frame
+            } else {
+                self.renderer
+                    .render_to(device, queue, &frame_input, input.target)?
+            }
+        } else {
+            self.renderer
+                .render_to(device, queue, &frame_input, input.target)?
+        };
         self.frames += 1;
 
         Ok(LoopFrame {
@@ -488,132 +600,201 @@ impl FrameLoop {
             viewport_changed,
             frame,
             interactions,
+            needs_redraw,
         })
     }
 
     fn refresh_debug_tiles(
         &mut self,
-        patch: &wgpui_core::patch::apply::ScenePatch,
+        emission: &FrameEmission,
         flash: crate::debug::TileRefreshFlash,
-        viewport: [f32; 2],
+        viewport: Rect,
         viewport_changed: bool,
         interaction_dirty_regions: &[Rect],
     ) -> Vec<DebugTile> {
         if !flash.enabled {
             self.tile_flash_frames.clear();
-            self.viewport_flash_frames = 0;
+            self.tile_refresh_rates.clear();
+            self.damage_refresh_regions.clear();
             return Vec::new();
         }
         self.tile_flash_frames.retain(|_, frames| {
             *frames = frames.saturating_sub(1);
             *frames > 0
         });
-        self.viewport_flash_frames = self.viewport_flash_frames.saturating_sub(1);
-        let content_layers = patch.content_layers();
-        for layer_id in content_layers.iter().copied() {
-            let Some(layer) = self.scene.layers.get(layer_id) else {
-                continue;
-            };
-            let Some(tile) = layer.key().tile else {
-                continue;
-            };
-            let tile_rect = Rect::from_origin_size(
-                [
-                    tile.x as f32 * flash.tile_size[0] + layer.transform().translation[0],
-                    tile.y as f32 * flash.tile_size[1] + layer.transform().translation[1],
-                ],
-                flash.tile_size,
-            );
-            if !interaction_dirty_regions.is_empty()
-                && !interaction_dirty_regions
-                    .iter()
-                    .any(|region| tile_rect.intersects(region))
-            {
-                continue;
+        self.tile_refresh_rates.retain(|key, _| {
+            emission
+                .tiled_visits
+                .iter()
+                .any(|visit| visit.boundary == key.0 && visit.visible.contains(&key.1))
+        });
+        self.damage_refresh_regions.retain_mut(|region| {
+            region.frames_remaining = region.frames_remaining.saturating_sub(1);
+            region.frames_remaining > 0
+        });
+        let now = Instant::now();
+        if viewport_changed {
+            self.record_damage_refresh(viewport, flash.duration_frames.max(1), now);
+        }
+        if emission.tiled_visits.is_empty() {
+            for region in emission.damage.iter().copied() {
+                self.record_damage_refresh(region, flash.duration_frames.max(1), now);
             }
-            self.tile_flash_frames
-                .insert(layer_id, flash.duration_frames.max(1));
         }
-        if flash.viewport_grid
-            && (viewport_changed
-                || !interaction_dirty_regions.is_empty())
-        {
-            self.viewport_flash_frames = flash.duration_frames.max(1);
-        }
-        if flash.viewport_grid && self.viewport_flash_frames > 0 {
-            let columns = (viewport[0] / flash.tile_size[0]).ceil().max(0.0) as i32;
-            let rows = (viewport[1] / flash.tile_size[1]).ceil().max(0.0) as i32;
-            let mut tiles = Vec::new();
-            for y in 0..rows {
-                for x in 0..columns {
-                    let width = flash.tile_size[0].min(viewport[0] - x as f32 * flash.tile_size[0]);
-                    let height = flash.tile_size[1].min(viewport[1] - y as f32 * flash.tile_size[1]);
-                    let tile_rect = Rect::from_origin_size(
-                        [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1]],
-                        [width, height],
-                    );
-                    let region_matches = viewport_changed
-                        || interaction_dirty_regions.is_empty()
-                        || interaction_dirty_regions
-                            .iter()
-                            .any(|region| tile_rect.intersects(region));
-                    if width > 0.0 && height > 0.0 && region_matches {
-                        tiles.push(DebugTile {
-                            origin_size: [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1], width, height],
-                            color: flash.color,
-                            border_width: 3.0,
-                            _padding: [0.0; 7],
-                        });
-                    }
+        for visit in &emission.tiled_visits {
+            for tile in &visit.visible {
+                let key = (visit.boundary, *tile);
+                let tile_rect = screen_tile_rect(visit, *tile);
+                let presentation_changed = viewport_changed
+                    || emission.damage.iter().any(|region| region.intersects(&tile_rect));
+                let interaction_changed = interaction_dirty_regions
+                    .iter()
+                    .any(|region| region.intersects(&tile_rect));
+                if presentation_changed || interaction_changed {
+                    self.tile_flash_frames
+                        .insert(key, flash.duration_frames.max(1));
+                    self.record_tile_refresh(key, now);
                 }
             }
-            return tiles;
         }
-        self.tile_flash_frames
-            .keys()
-            .filter_map(|layer_id| {
-                let layer = self.scene.layers.get(*layer_id)?;
-                let tile = layer.key().tile?;
-                let origin = [
-                    tile.x as f32 * flash.tile_size[0] + layer.transform().translation[0],
-                    tile.y as f32 * flash.tile_size[1] + layer.transform().translation[1],
-                ];
-                Some(DebugTile {
-                    origin_size: [origin[0], origin[1], flash.tile_size[0], flash.tile_size[1]],
-                    color: flash.color,
-                    border_width: 3.0,
+        if self.tile_flash_frames.is_empty() && self.damage_refresh_regions.is_empty() {
+            return Vec::new();
+        }
+        let mut refresh_regions = Vec::new();
+        for refresh_region in &self.damage_refresh_regions {
+            let region = refresh_region.rect.intersect(&viewport);
+            if region.is_empty() {
+                continue;
+            }
+            refresh_regions.push(DebugRefreshRegion {
+                rect: region,
+                frames_remaining: refresh_region.frames_remaining,
+                updates: refresh_region.updates,
+                frames_per_second: refresh_region.frames_per_second,
+                regular: refresh_region.regular,
+            });
+        }
+        for visit in &emission.tiled_visits {
+            for tile in &visit.visible {
+                let key = (visit.boundary, *tile);
+                if !self.tile_flash_frames.contains_key(&key) && !flash.viewport_grid {
+                    continue;
+                }
+                let tile_rect = screen_tile_rect(visit, *tile).intersect(&viewport);
+                if tile_rect.is_empty() {
+                    continue;
+                }
+                let rate = self.tile_refresh_rates.get(&key);
+                refresh_regions.push(DebugRefreshRegion {
+                    rect: tile_rect,
+                    frames_remaining: self.tile_flash_frames.get(&key).copied().unwrap_or(0),
+                    updates: rate.map_or(0, |rate| rate.updates),
+                    frames_per_second: rate.map_or(0.0, |rate| rate.frames_per_second),
+                    regular: rate.is_some_and(|rate| rate.regular),
+                });
+            }
+        }
+        let refresh_regions = if flash.viewport_grid {
+            refresh_regions
+        } else {
+            select_debug_refresh_regions(refresh_regions)
+        };
+        refresh_regions
+            .into_iter()
+            .map(|refresh_region| {
+                let fade = tile_flash_fade(refresh_region.frames_remaining, flash.duration_frames);
+                let mut tile = DebugTile {
+                    origin_size: [
+                        refresh_region.rect.min_x,
+                        refresh_region.rect.min_y,
+                        refresh_region.rect.width(),
+                        refresh_region.rect.height(),
+                    ],
+                    color: faded_color(flash.color, fade),
+                    border_width: 2.0,
                     _padding: [0.0; 7],
-                })
+                };
+                if refresh_region.regular {
+                    tile = tile.with_refresh_rate(refresh_region.frames_per_second);
+                } else {
+                    tile = tile.with_refresh_count(refresh_region.updates);
+                }
+                tile
             })
             .collect()
+    }
+
+    fn record_tile_refresh(
+        &mut self,
+        key: (wgpui_core::scene::layer::BoundaryId, TileCoord),
+        now: Instant,
+    ) {
+        let rate = self.tile_refresh_rates.entry(key).or_insert(TileRefreshRate {
+            window_start: now,
+            samples: 0,
+            updates: 0,
+            frames_per_second: 0.0,
+            regular: false,
+        });
+        rate.samples = rate.samples.saturating_add(1);
+        rate.updates = rate.updates.saturating_add(1);
+        let elapsed = now.duration_since(rate.window_start).as_secs_f32();
+        if elapsed >= 0.25 {
+            rate.frames_per_second = rate.samples as f32 / elapsed;
+            rate.regular = rate.samples >= 10;
+            rate.window_start = now;
+            rate.samples = 0;
+        }
+    }
+
+    fn record_damage_refresh(&mut self, rect: Rect, duration_frames: u32, now: Instant) {
+        if rect.is_empty() {
+            return;
+        }
+        if let Some(region) = self
+            .damage_refresh_regions
+            .iter_mut()
+            .find(|region| same_rect(region.rect, rect))
+        {
+            region.frames_remaining = duration_frames;
+            region.samples = region.samples.saturating_add(1);
+            region.updates = region.updates.saturating_add(1);
+            let elapsed = now.duration_since(region.window_start).as_secs_f32();
+            if elapsed >= 0.25 {
+                region.frames_per_second = region.samples as f32 / elapsed;
+                region.regular = region.samples >= 10;
+                region.window_start = now;
+                region.samples = 0;
+            }
+        } else {
+            self.damage_refresh_regions.push(DamageRefreshRegion {
+                rect,
+                frames_remaining: duration_frames,
+                window_start: now,
+                samples: 1,
+                updates: 1,
+                frames_per_second: 0.0,
+                regular: false,
+            });
+        }
     }
 
     fn collect_interactions(
         &self,
         plan: &mut wgpui_core::reconcile::plan::FramePlan,
+        signals: &FrameSignals,
+        viewport: Rect,
     ) -> Result<Vec<InteractionRegistration>, LoopError> {
-        let mut frames = Vec::<([f32; 2], [f32; 2], Option<Rect>)>::new();
+        let walked =
+            shared_walk(plan, &self.layout, signals, Some(viewport)).map_err(EmitError::from)?;
         let mut result = Vec::new();
         for index in 0..plan.nodes().len() {
             let node = plan.nodes()[index];
-            let rectangle = self
-                .layout
-                .layout_of(node.layout_node)
-                .map_err(EmitError::from)?;
-            frames.truncate(node.depth as usize);
-            let (parent_origin, parent_offset, parent_clip) = frames
-                .last()
-                .copied()
-                .unwrap_or(([0.0, 0.0], [0.0, 0.0], None));
-            let origin = [
-                parent_origin[0] + parent_offset[0] + rectangle.x,
-                parent_origin[1] + parent_offset[1] + rectangle.y,
-            ];
-            let bounds = Rect::from_origin_size(origin, [rectangle.width, rectangle.height]);
             if let Some(interaction) = plan.take_interaction(index) {
-                let visible_bounds = parent_clip.map_or(bounds, |clip| bounds.intersect(&clip));
+                let geometry = walked.get(index).ok_or(LoopError::NoRoot)?;
+                let visible_bounds = geometry.visible_bounds;
                 if !visible_bounds.is_empty() {
-                result.push(InteractionRegistration {
+                    result.push(InteractionRegistration {
                         address: node.address,
                         bounds: visible_bounds,
                         order: index as u64,
@@ -621,12 +802,6 @@ impl FrameLoop {
                     });
                 }
             }
-            let clip = if node.clip_children {
-                Some(parent_clip.map_or(bounds, |parent| bounds.intersect(&parent)))
-            } else {
-                parent_clip
-            };
-            frames.push((origin, node.scroll_offset, clip));
         }
         Ok(result)
     }
@@ -646,7 +821,9 @@ impl FrameLoop {
             let (local_size, local_color) = description.text_metrics_value();
             let font_size = local_size.or(inherited_size);
             let color = local_color.or(inherited_color);
-            let font_size = font_size.filter(|size| size.is_finite() && *size > 0.0).unwrap_or(14.0)
+            let font_size = font_size
+                .filter(|size| size.is_finite() && *size > 0.0)
+                .unwrap_or(14.0)
                 * self.scale_factor;
             let key = TextCacheKey {
                 value: Arc::clone(&value),
@@ -693,7 +870,7 @@ impl FrameLoop {
     fn prepare_text(&mut self, raw: RawText, font_size: f32) -> Result<PreparedText, LoopError> {
         let value = raw.shared_value();
         let shared = SharedString::from(value.as_ref());
-        let font = wgpui_text::shaping::font("sans-serif");
+        let font = wgpui_text::shaping::font("Segoe UI");
         let font_id = self
             .text_shaper
             .resolve_font(&font)
@@ -729,6 +906,157 @@ impl FrameLoop {
         );
         Ok(prepared)
     }
+}
+
+fn union_damage(current: Option<Rect>, next: Rect) -> Rect {
+    match current {
+        Some(current) => current.union(&next),
+        None => next,
+    }
+}
+
+fn same_rect(first: Rect, second: Rect) -> bool {
+    const EPSILON: f32 = 0.5;
+    (first.min_x - second.min_x).abs() <= EPSILON
+        && (first.min_y - second.min_y).abs() <= EPSILON
+        && (first.max_x - second.max_x).abs() <= EPSILON
+        && (first.max_y - second.max_y).abs() <= EPSILON
+}
+
+fn select_debug_refresh_regions(candidates: Vec<DebugRefreshRegion>) -> Vec<DebugRefreshRegion> {
+    let mut unique: Vec<DebugRefreshRegion> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(existing) = unique
+            .iter_mut()
+            .find(|existing| same_rect(existing.rect, candidate.rect))
+        {
+            existing.frames_remaining = existing.frames_remaining.max(candidate.frames_remaining);
+            existing.updates = existing.updates.max(candidate.updates);
+            if candidate.regular
+                && (!existing.regular || candidate.frames_per_second > existing.frames_per_second)
+            {
+                existing.frames_per_second = candidate.frames_per_second;
+                existing.regular = true;
+            }
+        } else {
+            unique.push(candidate);
+        }
+    }
+
+    unique
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate_index, candidate)| {
+            let contained_by_active_parent =
+                unique.iter().enumerate().any(|(parent_index, parent)| {
+                    parent_index != candidate_index
+                        && !same_rect(parent.rect, candidate.rect)
+                        && parent.rect.contains(&candidate.rect)
+                        && !debug_child_is_meaningfully_faster(parent, candidate)
+                });
+            (!contained_by_active_parent).then_some(*candidate)
+        })
+        .collect()
+}
+
+fn debug_child_is_meaningfully_faster(
+    parent: &DebugRefreshRegion,
+    child: &DebugRefreshRegion,
+) -> bool {
+    const FASTER_LOOP_RATIO: f32 = 1.25;
+    parent.regular
+        && child.regular
+        && child.frames_per_second > parent.frames_per_second * FASTER_LOOP_RATIO
+}
+
+fn tile_flash_fade(frames_remaining: u32, duration_frames: u32) -> f32 {
+    if duration_frames == 0 {
+        return 0.0;
+    }
+    (frames_remaining as f32 / duration_frames as f32).clamp(0.0, 1.0)
+}
+
+fn faded_color(mut color: [f32; 4], fade: f32) -> [f32; 4] {
+    color[3] *= fade;
+    color
+}
+
+#[cfg(test)]
+mod debug_refresh_region_tests {
+    use super::*;
+
+    fn region(origin: [f32; 2], size: [f32; 2], frames_per_second: f32) -> DebugRefreshRegion {
+        DebugRefreshRegion {
+            rect: Rect::from_origin_size(origin, size),
+            frames_remaining: 3,
+            updates: 12,
+            frames_per_second,
+            regular: frames_per_second > 0.0,
+        }
+    }
+
+    #[test]
+    fn nested_regions_collapse_to_the_outermost_unless_the_child_is_faster() {
+        let selected = select_debug_refresh_regions(vec![
+            region([0.0, 0.0], [200.0, 200.0], 30.0),
+            region([20.0, 20.0], [80.0, 80.0], 60.0),
+        ]);
+
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn a_child_with_the_same_update_rate_does_not_add_a_recursive_box() {
+        let selected = select_debug_refresh_regions(vec![
+            region([0.0, 0.0], [200.0, 200.0], 60.0),
+            region([20.0, 20.0], [80.0, 80.0], 60.0),
+        ]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].rect,
+            Rect::from_origin_size([0.0, 0.0], [200.0, 200.0])
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_parent_keeps_the_outermost_fallback() {
+        let selected = select_debug_refresh_regions(vec![
+            region([0.0, 0.0], [200.0, 200.0], 0.0),
+            region([20.0, 20.0], [80.0, 80.0], 120.0),
+        ]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].rect,
+            Rect::from_origin_size([0.0, 0.0], [200.0, 200.0])
+        );
+    }
+
+    #[test]
+    fn disjoint_regions_remain_independent() {
+        let selected = select_debug_refresh_regions(vec![
+            region([0.0, 0.0], [80.0, 80.0], 30.0),
+            region([120.0, 0.0], [80.0, 80.0], 30.0),
+        ]);
+
+        assert_eq!(selected.len(), 2);
+    }
+}
+
+fn screen_tile_rect(visit: &TiledVisit, tile: TileCoord) -> Rect {
+    let content_rect = visit.grid.tile_bounds(tile);
+    let translation = [
+        visit.screen_viewport.min_x - visit.content_viewport.min_x,
+        visit.screen_viewport.min_y - visit.content_viewport.min_y,
+    ];
+    Rect::from_origin_size(
+        [
+            content_rect.min_x + translation[0],
+            content_rect.min_y + translation[1],
+        ],
+        [content_rect.width(), content_rect.height()],
+    )
 }
 
 /// Phase 6's reference scene: one solid quad and one line of shaped text.

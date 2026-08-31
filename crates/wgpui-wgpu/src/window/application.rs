@@ -17,8 +17,8 @@ use wgpui_core::window::{
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
 };
 
-use crate::render::draw::DrawMode;
 use crate::debug::PerformanceDebug;
+use crate::render::draw::DrawMode;
 use crate::render::frame::RenderTarget;
 use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
@@ -203,7 +203,8 @@ impl Window {
                 let hit = self.hit_interaction(mouse.position);
                 let mut handled = false;
                 if self.hovered_interaction != hit {
-                    if let Some(previous) = self.hovered_interaction
+                    if let Some(previous) = self
+                        .hovered_interaction
                         .and_then(|index| self.interactions.get(index))
                     {
                         self.hover_dirty_regions.push(previous.bounds);
@@ -212,10 +213,18 @@ impl Window {
                         self.hover_dirty_regions.push(current.bounds);
                     }
                     if let Some(previous) = self.hovered_interaction {
-                        handled |= self.dispatch_interaction(previous, &InputEvent::MouseLeave(*mouse), app);
+                        handled |= self.dispatch_interaction(
+                            previous,
+                            &InputEvent::MouseLeave(*mouse),
+                            app,
+                        );
                     }
                     if let Some(current) = hit {
-                        handled |= self.dispatch_interaction(current, &InputEvent::MouseEnter(*mouse), app);
+                        handled |= self.dispatch_interaction(
+                            current,
+                            &InputEvent::MouseEnter(*mouse),
+                            app,
+                        );
                     }
                     self.hovered_interaction = hit;
                 }
@@ -241,23 +250,22 @@ impl Window {
                 let Some(index) = pressed else { return false };
                 let mut handled = self.dispatch_interaction(index, &event, app);
                 if self.hit_interaction(mouse.position) == Some(index) {
-                    handled |= self.dispatch_interaction(index, &InputEvent::Click(
-                        wgpui_core::window::ClickEvent::Mouse(
-                            wgpui_core::window::MouseClickEvent {
-                                down,
-                                up: *mouse,
-                            },
-                        ),
-                    ), app);
+                    handled |= self.dispatch_interaction(
+                        index,
+                        &InputEvent::Click(wgpui_core::window::ClickEvent::Mouse(
+                            wgpui_core::window::MouseClickEvent { down, up: *mouse },
+                        )),
+                        app,
+                    );
                 }
                 handled
             }
             InputEvent::Scroll(scroll) => {
                 let mut handled = false;
                 for index in self.hit_interactions(scroll.position) {
-                    let result = self.dispatch_interaction(index, &event, app);
-                    handled |= result;
-                    if result {
+                    let result = self.dispatch_interaction_result(index, &event, app);
+                    handled |= result.handled;
+                    if !result.propagate {
                         break;
                     }
                 }
@@ -291,12 +299,25 @@ impl Window {
         self.hit_interactions(position).into_iter().next()
     }
     fn dispatch_interaction(&mut self, index: usize, event: &InputEvent, app: &mut App) -> bool {
+        self.dispatch_interaction_result(index, event, app).handled
+    }
+    fn dispatch_interaction_result(
+        &mut self,
+        index: usize,
+        event: &InputEvent,
+        app: &mut App,
+    ) -> wgpui_core::window::EventResult {
         let mut interactions = std::mem::take(&mut self.interactions);
-        let handled = interactions
-            .get_mut(index)
-            .is_some_and(|registration| registration.interaction.dispatch(event, &mut self.interaction, app).handled);
+        let result = interactions.get_mut(index).map_or(
+            wgpui_core::window::EventResult::IGNORED,
+            |registration| {
+                registration
+                    .interaction
+                    .dispatch(event, &mut self.interaction, app)
+            },
+        );
         self.interactions = interactions;
-        handled
+        result
     }
     fn set_interactions(&mut self, interactions: Vec<InteractionRegistration>, app: &mut App) {
         let previous_address = self
@@ -308,7 +329,10 @@ impl Window {
             .and_then(|index| self.interactions.get(index))
             .map(|registration| registration.bounds);
         let previous_interactions = std::mem::replace(&mut self.interactions, interactions);
-        let hit = self.cursor_inside.then(|| self.hit_interaction(self.cursor)).flatten();
+        let hit = self
+            .cursor_inside
+            .then(|| self.hit_interaction(self.cursor))
+            .flatten();
         let hit_address = hit
             .and_then(|index| self.interactions.get(index))
             .map(|registration| registration.address);
@@ -806,7 +830,8 @@ impl Handler {
         );
         match result {
             Ok(frame) => {
-                live.window.set_interactions(frame.interactions, &mut live.app);
+                live.window
+                    .set_interactions(frame.interactions, &mut live.app);
                 live.frames += 1;
                 let report = FrameReport {
                     frame_number: live.frames,
@@ -827,7 +852,7 @@ impl Handler {
                     && all_other_windows_reached_limit
                 {
                     event_loop.exit();
-                } else {
+                } else if self.max_frames.is_some() || frame.needs_redraw {
                     live.window.request_redraw();
                 }
             }
@@ -1072,8 +1097,10 @@ impl winit::application::ApplicationHandler for Handler {
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         self.create_pending_windows(event_loop);
-        for live in &self.live {
-            live.window.request_redraw();
+        if self.max_frames.is_some() {
+            for live in &self.live {
+                live.window.request_redraw();
+            }
         }
     }
 }

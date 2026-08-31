@@ -270,14 +270,16 @@ impl WindowSurface {
 
         let size = window.inner_size();
         let configuration = wgpu::SurfaceConfiguration {
-            // `COPY_SRC` is what makes Phase 6's Milestone D the strong proof
-            // rather than the fallback: it is what allows the *presented image
-            // itself* to be copied to a staging buffer and compared, instead of
-            // an offscreen render of the same scene standing in for it. It is
-            // requested unconditionally because a surface that cannot do it
-            // would fail here loudly rather than silently make the proof
-            // weaker; every desktop backend this crate targets reports it.
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            // `COPY_SRC` is what allows the *presented image itself* to be
+            // copied to a staging buffer and compared, instead of an offscreen
+            // render of the same scene standing in for it. It is requested
+            // unconditionally because the readback path requires it. `COPY_DST`
+            // is optional: when offered, FrameLoop uses it to copy the retained
+            // presentation buffer into this acquired image; otherwise it uses
+            // the correct untiled full-render fallback.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | (capabilities.usages & wgpu::TextureUsages::COPY_DST),
             format: TARGET_FORMAT,
             width: size.width.max(1),
             height: size.height.max(1),

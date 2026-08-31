@@ -70,8 +70,9 @@ struct Globals {
 struct SlotBase {
     base: u32,
     padding_0: u32,
-    padding_1: u32,
-    padding_2: u32,
+    translation: vec2<f32>,
+    clip_origin: vec2<f32>,
+    clip_size: vec2<f32>,
 };
 
 // 144 bytes, matching `wgpui_core::patch::primitive::Quad::SLOT_STRIDE` and the
@@ -127,7 +128,7 @@ fn vertex_main(
     let quad = quads[arena_index];
     // Four corners of a triangle strip: (0,0) (1,0) (0,1) (1,1).
     let unit = vec2<f32>(f32(corner & 1u), f32((corner >> 1u) & 1u));
-    let point = quad.origin_size.xy + unit * quad.origin_size.zw;
+    let point = quad.origin_size.xy + unit * quad.origin_size.zw + slot.translation;
     out.position = vec4<f32>(
         point.x / globals.viewport.x * 2.0 - 1.0,
         1.0 - point.y / globals.viewport.y * 2.0,
@@ -223,6 +224,13 @@ fn material_color(quad: QuadSlot, local: vec2<f32>) -> vec4<f32> {
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    if slot.clip_size.x >= 0.0 {
+        let clip_max = slot.clip_origin + slot.clip_size;
+        if in.position.x < slot.clip_origin.x || in.position.y < slot.clip_origin.y
+            || in.position.x >= clip_max.x || in.position.y >= clip_max.y {
+            discard;
+        }
+    }
     let quad = quads[in.arena_index];
 
     let background_color = material_color(quad, in.local);
@@ -251,7 +259,7 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // interpolation of a per-vertex value. Byte-exactness against the legacy
     // renderer is decided at the antialiased corner, where a one-ULP difference
     // in `point` is a different coverage value and a different byte.
-    let point = in.position.xy - quad.origin_size.xy;
+    let point = in.position.xy - quad.origin_size.xy - slot.translation;
     let center_to_point = point - half_size;
 
     let antialias_threshold = 0.5;

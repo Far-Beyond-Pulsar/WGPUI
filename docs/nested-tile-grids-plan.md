@@ -303,3 +303,34 @@ Scrolling, hover, and resize update only the pixels and retained records they
 actually affect. The correctness gates pass across all supported draw modes,
 the performance counters demonstrate the fast paths, and the implementation
 has a documented untiled fallback for unsupported or over-budget cases.
+
+## Implementation boundary
+
+The native backend now implements the shared retained walk, nested root and
+tile visibility/residency metadata, regional damage calculations, scroll
+bubbling, delta-only scene updates, layer translations in every native
+primitive shader, and the untiled fallback. The last presented frame is held
+in one presentation buffer when the target supports `COPY_DST`; tile metadata
+then restricts the damage raster region, rather than becoming a second scene
+or render cache. The existing GPU tile-visibility and indirect-argument
+passes remain covered by their differential integration tests. Retained
+boundary layers also carry their effective screen-space clip into the native
+primitive shaders, so scrolling can retain content outside the current
+viewport without allowing it to leak; resize updates that clip without
+re-emitting unchanged primitive bytes. The diagnostic overlay is driven by
+actual presentation damage or tiled visits, reports short-lived counts before
+switching to a measured refresh rate, and adds its own regions to the damage
+set only while it fades.
+
+Two pieces remain deliberately isolated because the current public frame
+protocol has no data path for them. `ScrollRootTable` is not yet the source of
+truth for ordinary overflow discovery: `PlannedNode::declared_boundary` is
+still populated only by an explicit boundary description. The GPU tile pass is
+also not yet driven by per-root descriptors from `FrameRenderer`; the native
+frame path currently uses ordinary indirect visibility passes plus a single
+union scissor over the presentation damage. This is conservative for
+disjoint regions and does not create per-tile scene layers or a secondary tile
+render cache. Wiring exact per-tile GPU visibility further requires extending
+the frame input protocol. Targets that do not offer `COPY_DST` use the untiled
+full-render fallback, preserving correctness while the presentation buffer
+cannot be retained.
