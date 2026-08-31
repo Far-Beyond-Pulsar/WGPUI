@@ -17,8 +17,10 @@ pub mod reference_viewer;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod render_stats;
 pub mod resource_snapshot;
-
-pub use capture::{Availability, CaptureBundle, CaptureError};
+pub mod protocol;
+#[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
+pub mod render_stats;
+pub mod transport;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use hooks::DevtoolsHooks;
 #[cfg(feature = "inspector")]
@@ -33,12 +35,21 @@ pub use reference_viewer::{CaptureViewerError, ReferenceViewer};
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use render_stats::{Scope, Snapshot, TimerSnapshot};
 pub use capture::{
-    CaptureConfig, CaptureExport, CaptureRecorder, CaptureSnapshot, FrameSnapshot, RecorderConfig,
+    Availability, CaptureBundle, CaptureConfig, CaptureController, CaptureError, CaptureExport,
+    CaptureRecorder, CaptureService, CaptureSnapshot, CaptureState, DEFAULT_MAX_CAPTURE_BYTES,
+    DEFAULT_MAX_RESOURCE_READBACK_BYTES, FrameSnapshot, FrozenCapture, RecorderConfig, ResourceId,
+    ResourceKind, ResourceReadback, ResourceSnapshot,
 };
+pub use protocol::{
+    BoundedMessageQueue, Capabilities, Capability, ClientMessage, DEFAULT_MAX_MESSAGE_BYTES,
+    ErrorCode, ProtocolError, Request, Response, SUPPORTED_PROTOCOL_VERSION, ServerMessage,
+    decode_message, encode_message, read_message, write_message,
+};
+pub use transport::{Endpoint, LocalIpcConfig, LocalIpcError, LocalIpcServer};
 pub use resource_snapshot::{
     AtlasPackingSnapshot, AtlasPageRecord, AtlasPlacementRecord, BufferElementType,
     BufferViewSnapshot, ByteRange, IndirectDrawRecord, IndirectDrawSnapshot, RedactionPolicy,
-    ResourceSnapshot, SlabAllocationRecord, SlabMapSnapshot, SnapshotError, SnapshotHeader,
-    SnapshotLimits, TileOccupancyRecord, TileOccupancySnapshot, TruncationMetadata,
+    ResourceSnapshot as TypedResourceSnapshot, SlabAllocationRecord, SlabMapSnapshot, SnapshotError,
+    SnapshotHeader, SnapshotLimits, TileOccupancyRecord, TileOccupancySnapshot, TruncationMetadata,
     TypedBufferView, TypedValue, SNAPSHOT_HEADER_BYTES, SNAPSHOT_MAGIC, SNAPSHOT_SCHEMA_VERSION,
 };
