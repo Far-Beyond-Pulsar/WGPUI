@@ -204,8 +204,8 @@ pub struct SurfaceStats {
 fn present_mode(
     capabilities: &wgpu::SurfaceCapabilities,
 ) -> Result<wgpu::PresentMode, WindowError> {
-    const PREFERENCE: [wgpu::PresentMode; 2] =
-        [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox];
+    const PREFERENCE: [wgpu::PresentMode; 3] =
+        [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo];
     PREFERENCE
         .into_iter()
         .find(|mode| capabilities.present_modes.contains(mode))
