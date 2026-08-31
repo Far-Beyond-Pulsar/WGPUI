@@ -157,6 +157,8 @@ pub struct InteractionRegistration {
     pub address: wgpui_core::reconcile::instance::InstanceKey,
     pub bounds: Rect,
     pub order: u64,
+    pub parent: Option<usize>,
+    pub focus: Option<wgpui_core::window::FocusHandle>,
     pub interaction: DescriptionInteraction,
 }
 
@@ -827,8 +829,13 @@ impl FrameLoop {
         let walked =
             shared_walk(plan, &self.layout, signals, Some(viewport)).map_err(EmitError::from)?;
         let mut result = Vec::new();
+        let mut ancestors = Vec::<Option<usize>>::new();
         for index in 0..plan.nodes().len() {
             let node = plan.nodes()[index];
+            let depth = usize::try_from(node.depth).unwrap_or(usize::MAX);
+            ancestors.truncate(depth);
+            let parent = ancestors.iter().rev().find_map(|candidate| *candidate);
+            ancestors.push(None);
             if let Some(interaction) = plan.take_interaction(index) {
                 let geometry = walked.get(index).ok_or(LoopError::NoRoot)?;
                 let visible_bounds = geometry.visible_bounds;
@@ -837,8 +844,13 @@ impl FrameLoop {
                         address: node.address,
                         bounds: visible_bounds,
                         order: index as u64,
+                        parent,
+                        focus: interaction.focus_handle(),
                         interaction,
                     });
+                    if let Some(ancestor) = ancestors.get_mut(depth) {
+                        *ancestor = Some(result.len() - 1);
+                    }
                 }
             }
         }

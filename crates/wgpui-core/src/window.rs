@@ -21,7 +21,7 @@ pub use dispatch::{DispatchNodeId, DispatchTree};
 pub use focus::{FocusHandle, FocusId, FocusManager, FocusTransition, Focusable};
 pub use hitbox::{HitTestIndex, Hitbox, HitboxId};
 pub use input::{
-    ClickEvent, EventResult, InputEvent, KeyDownEvent, KeyUpEvent, KeyboardButton,
+    ClickEvent, DragData, DragHoverEvent, DropEvent, EventResult, FocusEvent, InputEvent, KeyDownEvent, KeyUpEvent, KeyboardButton,
     KeyboardClickEvent, Modifiers, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
 };
@@ -133,17 +133,39 @@ impl Window {
         &self.focus
     }
     pub fn register_focus_handle(&mut self, handle: FocusHandle) {
-        self.focus.register(&handle, handle.tab_index_value());
+        self.focus
+            .register_ordered(&handle, handle.tab_index_value(), None);
+    }
+    pub fn register_focus_handle_ordered(&mut self, handle: FocusHandle, order: u64) {
+        self.focus
+            .register_ordered(&handle, handle.tab_index_value(), Some(order));
     }
     pub fn unregister_focus_handle(&mut self, handle: FocusHandle) {
         self.focus.unregister(handle.id());
     }
+    pub fn retain_focus_handles(&mut self, handles: impl IntoIterator<Item = FocusHandle>) {
+        self.focus.retain(handles.into_iter().map(FocusHandle::id));
+    }
+    pub fn resolve_action(&self, event: &KeyDownEvent) -> Option<Box<dyn Action>> {
+        self.keymap.resolve(event, None).map(Action::boxed_clone)
+    }
     pub fn focus(&mut self, handle: &FocusHandle) -> bool {
         self.focus.register(handle, handle.tab_index_value());
-        self.focus.focus(handle.id(), true)
+        self.focus_id(handle.id(), true)
+    }
+    pub fn focus_id(&mut self, id: FocusId, visible: bool) -> bool {
+        let changed = self.focus.focus(id, visible);
+        if changed {
+            self.interaction_revision = self.interaction_revision.wrapping_add(1);
+        }
+        changed
     }
     pub fn blur(&mut self) -> bool {
-        self.focus.blur()
+        let changed = self.focus.blur();
+        if changed {
+            self.interaction_revision = self.interaction_revision.wrapping_add(1);
+        }
+        changed
     }
     pub fn is_focused(&self, handle: &FocusHandle) -> bool {
         self.focus.focused() == Some(handle.id())
@@ -152,10 +174,18 @@ impl Window {
         self.focus.focused()
     }
     pub fn focus_next(&mut self) -> Option<FocusId> {
-        self.focus.next(false)
+        let focused = self.focus.next(false);
+        if focused.is_some() {
+            self.interaction_revision = self.interaction_revision.wrapping_add(1);
+        }
+        focused
     }
     pub fn focus_previous(&mut self) -> Option<FocusId> {
-        self.focus.next(true)
+        let focused = self.focus.next(true);
+        if focused.is_some() {
+            self.interaction_revision = self.interaction_revision.wrapping_add(1);
+        }
+        focused
     }
 
     pub fn take_focus_transition(&mut self) -> Option<FocusTransition> {
@@ -264,7 +294,7 @@ impl Window {
                 if let Some(id) = hit {
                     if mouse.is_focusing()
                         && let Some(focus_id) = self.focus_hitboxes.get(&id).copied()
-                        && self.focus.focus(focus_id, false)
+                        && self.focus_id(focus_id, false)
                     {
                         self.interaction_revision = self.interaction_revision.wrapping_add(1);
                         handled = true;
@@ -301,7 +331,10 @@ impl Window {
             InputEvent::KeyUp(_)
             | InputEvent::MouseEnter(_)
             | InputEvent::MouseLeave(_)
-            | InputEvent::Click(_) => false,
+            | InputEvent::Click(_)
+            | InputEvent::Focus(_)
+            | InputEvent::DragHover(_)
+            | InputEvent::Drop(_) => false,
         }
     }
     pub fn schedule_timer(&mut self, delay: Duration) -> TimerHandle {

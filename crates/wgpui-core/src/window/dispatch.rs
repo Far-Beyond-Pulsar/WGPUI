@@ -104,7 +104,7 @@ impl DispatchTree {
             };
             for handler in node.action_handlers.iter_mut().rev() {
                 let result = handler(action);
-                if result.handled && !result.propagate {
+                if !result.propagate {
                     return true;
                 }
             }
@@ -122,7 +122,7 @@ impl DispatchTree {
             };
             for handler in node.capture_handlers.iter_mut().rev() {
                 let result = handler(event);
-                if result.handled && !result.propagate {
+                if !result.propagate {
                     return true;
                 }
             }
@@ -133,7 +133,7 @@ impl DispatchTree {
             };
             for handler in node.input_handlers.iter_mut().rev() {
                 let result = handler(event);
-                if result.handled && !result.propagate {
+                if !result.propagate {
                     return true;
                 }
             }
@@ -182,5 +182,38 @@ mod tests {
             })
         ));
         assert_eq!(&*calls.borrow(), &["child", "root"]);
+    }
+
+    #[test]
+    fn an_unhandled_non_propagating_result_still_cancels_the_bubble() {
+        let mut tree = DispatchTree::new();
+        let root = tree.root();
+        let child = tree.new_node(Some(root));
+        let hitbox = HitboxId::from_raw(101);
+        assert!(tree.bind_hitbox(hitbox, child));
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let child_calls = calls.clone();
+        tree.on_input(child, move |_| {
+            child_calls.borrow_mut().push("child");
+            EventResult {
+                handled: false,
+                propagate: false,
+            }
+        });
+        let root_calls = calls.clone();
+        tree.on_input(root, move |_| {
+            root_calls.borrow_mut().push("root");
+            EventResult::HANDLED
+        });
+
+        assert!(tree.dispatch_input(
+            hitbox,
+            &InputEvent::MouseMove(crate::window::MouseMoveEvent {
+                position: [crate::boundary::Pixels(1.0); 2],
+                modifiers: crate::window::Modifiers::none(),
+                buttons: crate::window::MouseButtonState::default(),
+            })
+        ));
+        assert_eq!(&*calls.borrow(), &["child"]);
     }
 }

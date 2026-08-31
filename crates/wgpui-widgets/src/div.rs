@@ -17,16 +17,7 @@
 //! `ReconcileKey` split by what a change actually affects
 //! ([`diff::DivDiffKey`]).
 //!
-//! What is **not** here, named rather than implied, because §8's Phase 6.6 row
-//! scopes it out explicitly and a half-built version would be worse than an
-//! absent one:
-//!
-//! - `:hover` / `:active` / `:focus`. These need a cascade *above* `DivStyle`
-//!   and a hit-test to drive it, and the hit-test needs the input plumbing
-//!   §3.4's `div/interactivity/hitbox.rs` is a placeholder for.
-//! - Mouse and keyboard event binding (`InteractiveElement`, today's ~456-line
-//!   trait block). `div/events.rs` is still a placeholder.
-//! - Scroll containers. `Description::scroll_offset` already carries a
+//! Scroll containers remain outside this interaction seam. `Description::scroll_offset` already carries a
 //!   displacement and `.boundary()` already resolves one to a layer transform
 //!   (Phase 2), so the *mechanism* exists; what does not is a `ScrollHandle`
 //!   deciding what the offset should be, which is `div/scroll_state.rs`.
@@ -154,6 +145,107 @@ impl Div {
         + 'static,
     ) -> Self {
         self.interaction.on_mouse_down(button, handler);
+        self
+    }
+
+    pub fn on_mouse_up<R: events::IntoEventResult + 'static>(
+        mut self,
+        button: wgpui_core::window::MouseButton,
+        handler: impl FnMut(
+            &wgpui_core::window::MouseUpEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_mouse_up(button, handler);
+        self
+    }
+
+    pub fn on_mouse_move<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::MouseMoveEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_mouse_move(handler);
+        self
+    }
+
+    pub fn on_mouse_enter<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_mouse_enter(handler);
+        self
+    }
+
+    pub fn on_mouse_leave<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_mouse_leave(handler);
+        self
+    }
+
+    pub fn on_action<A: wgpui_core::action::Action, R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &A,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_action(handler);
+        self
+    }
+
+    pub fn on_drag<D: 'static, R: 'static>(
+        mut self,
+        data: D,
+        handler: impl FnMut(
+            &D,
+            [wgpui_core::boundary::Pixels; 2],
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_drag(data, handler);
+        self
+    }
+
+    pub fn on_drag_hover<D: 'static, R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(bool, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_drag_hover::<D, R>(handler);
+        self
+    }
+
+    pub fn on_drop<D: 'static, R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &D,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_drop(handler);
         self
     }
 
@@ -342,6 +434,7 @@ impl Div {
             scroll_offset,
             estimated_size,
             scroll_handle,
+            focus_handle,
             hover_style,
             active_style,
             focus_style,
@@ -352,8 +445,10 @@ impl Div {
             ..
         } = self;
 
-        let style = if interaction.is_focused() {
-            focus_style.or(focus_visible_style).unwrap_or(style)
+        let style = if interaction.is_focus_visible() {
+            focus_visible_style.or(focus_style).unwrap_or(style)
+        } else if interaction.is_focused() {
+            focus_style.unwrap_or(style)
         } else if interaction.is_active() {
             active_style.unwrap_or(style)
         } else if interaction.is_hovered() {
@@ -406,7 +501,7 @@ impl Div {
         if uncached {
             description = description.uncached();
         }
-        if let Some(interaction) = interaction.into_description_interaction() {
+        if let Some(interaction) = interaction.into_description_interaction(focus_handle) {
             description = description.interaction(interaction);
         }
 

@@ -13,7 +13,7 @@ use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
 pub use wgpui_core::window::WindowOptions;
 use wgpui_core::window::{
-    InputEvent, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton as CoreMouseButton,
+    DragData, FocusEvent, InputEvent, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton as CoreMouseButton,
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
 };
 
@@ -65,6 +65,8 @@ pub struct Window {
     hovered_interaction: Option<usize>,
     pressed_interaction: Option<usize>,
     pressed_event: Option<MouseDownEvent>,
+    active_drag: Option<DragData>,
+    drag_hovered: Option<usize>,
     hover_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
 }
@@ -119,10 +121,10 @@ impl Window {
 
     pub fn clear_hover_with_app(&mut self, app: &mut App) -> bool {
         self.cursor_inside = false;
-        let Some(index) = self.hovered_interaction.take() else {
-            return false;
-        };
-        if let Some(interaction) = self.interactions.get(index) {
+        let index = self.hovered_interaction.take();
+        if let Some(index) = index
+            && let Some(interaction) = self.interactions.get(index)
+        {
             self.hover_dirty_regions.push(interaction.bounds);
         }
         let event = InputEvent::MouseLeave(MouseMoveEvent {
@@ -130,7 +132,12 @@ impl Window {
             modifiers: self.modifiers(),
             buttons: self.mouse_buttons,
         });
-        self.dispatch_interaction(index, &event, app)
+        let mut handled = index.is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app));
+        if let (Some(index), Some(data)) = (self.drag_hovered.take(), self.active_drag.clone()) {
+            self.mark_interaction_dirty_for(index);
+            handled |= self.dispatch_drag_hover(index, false, &data, app);
+        }
+        handled
     }
     /// Access opt-in visual performance diagnostics for this window.
     pub fn performance_debug(&mut self) -> &mut PerformanceDebug {
@@ -221,10 +228,45 @@ impl Window {
             return self.interaction.handle_input(event);
         }
         match &event {
+            InputEvent::KeyDown(key) if key.key.eq_ignore_ascii_case("tab") => {
+                let handled = self.interaction.handle_input(event);
+                handled | self.apply_focus_transition(app)
+            }
+            InputEvent::KeyDown(key) => {
+                let action = self.interaction.resolve_action(key);
+                let mut handled = false;
+                if let Some(action) = action {
+                    if let Some(index) = self
+                        .interactions
+                        .iter()
+                        .position(|registration| registration.focus.is_some_and(|focus| {
+                            Some(focus.id()) == self.interaction.focused()
+                        }))
+                    {
+                        handled = self.dispatch_action_bubbled(index, &*action, app);
+                    }
+                    if !handled {
+                        handled = app.dispatch_action(&*action);
+                    }
+                }
+                handled | self.apply_focus_transition(app)
+            }
             InputEvent::MouseMove(mouse) => {
                 self.cursor_inside = true;
                 let hit = self.hit_interaction(mouse.position);
                 let mut handled = false;
+                if self.active_drag.is_none()
+                    && self.mouse_buttons.left
+                    && let Some(index) = self.pressed_interaction
+                    && let Some(registration) = self.interactions.get_mut(index)
+                    && let Some(data) = registration.interaction.drag_source()
+                {
+                    let data = data.with_position(mouse.position);
+                    registration
+                        .interaction
+                        .start_drag(&data, &mut self.interaction, app);
+                    self.active_drag = Some(data);
+                }
                 if self.hovered_interaction != hit {
                     if let Some(previous) = self
                         .hovered_interaction
@@ -236,14 +278,14 @@ impl Window {
                         self.hover_dirty_regions.push(current.bounds);
                     }
                     if let Some(previous) = self.hovered_interaction {
-                        handled |= self.dispatch_interaction(
+                        handled |= self.dispatch_interaction_bubbled(
                             previous,
                             &InputEvent::MouseLeave(*mouse),
                             app,
                         );
                     }
                     if let Some(current) = hit {
-                        handled |= self.dispatch_interaction(
+                        handled |= self.dispatch_interaction_bubbled(
                             current,
                             &InputEvent::MouseEnter(*mouse),
                             app,
@@ -252,15 +294,38 @@ impl Window {
                     self.hovered_interaction = hit;
                 }
                 if let Some(current) = hit {
-                    handled |= self.dispatch_interaction(current, &event, app);
+                    handled |= self.dispatch_interaction_bubbled(current, &event, app);
+                }
+                if let Some(data) = self.active_drag.clone() {
+                    let previous_drag = self.drag_hovered;
+                    if previous_drag != hit {
+                        if let Some(previous) = previous_drag {
+                            handled |= self.dispatch_drag_hover(previous, false, &data, app);
+                        }
+                        if let Some(current) = hit {
+                            handled |= self.dispatch_drag_hover(current, true, &data, app);
+                        }
+                        self.drag_hovered = hit;
+                    }
+                    self.active_drag = Some(data.with_position(mouse.position));
                 }
                 handled
             }
             InputEvent::MouseDown(mouse) => {
                 self.pressed_interaction = self.hit_interaction(mouse.position);
                 self.pressed_event = Some(*mouse);
-                self.pressed_interaction
-                    .is_some_and(|index| self.dispatch_interaction(index, &event, app))
+                let mut handled = false;
+                if let Some(index) = self.pressed_interaction {
+                    if mouse.is_focusing()
+                        && let Some(focus) = self.interactions[index].focus
+                        && self.interaction.focus_id(focus.id(), false)
+                    {
+                        self.mark_interaction_dirty_for(index);
+                        handled |= self.apply_focus_transition(app);
+                    }
+                    handled |= self.dispatch_interaction_bubbled(index, &event, app);
+                }
+                handled
             }
             InputEvent::MouseUp(mouse) => {
                 let pressed = self.pressed_interaction.take();
@@ -271,9 +336,21 @@ impl Window {
                     click_count: mouse.click_count,
                 });
                 let Some(index) = pressed else { return false };
-                let mut handled = self.dispatch_interaction(index, &event, app);
+                if let Some(data) = self.active_drag.take() {
+                    if let Some(previous) = self.drag_hovered.take() {
+                        self.mark_interaction_dirty_for(previous);
+                        let mut handled = self.dispatch_drag_hover(previous, false, &data, app);
+                        if self.hit_interaction(mouse.position) == Some(previous) {
+                            handled |= self.dispatch_drop(previous, &data, app);
+                        }
+                        return handled;
+                    }
+                    return false;
+                }
+                self.mark_interaction_dirty_for(index);
+                let mut handled = self.dispatch_interaction_bubbled(index, &event, app);
                 if self.hit_interaction(mouse.position) == Some(index) {
-                    handled |= self.dispatch_interaction(
+                    handled |= self.dispatch_interaction_bubbled(
                         index,
                         &InputEvent::Click(wgpui_core::window::ClickEvent::Mouse(
                             wgpui_core::window::MouseClickEvent { down, up: *mouse },
@@ -284,15 +361,8 @@ impl Window {
                 handled
             }
             InputEvent::Scroll(scroll) => {
-                let mut handled = false;
-                for index in self.hit_interactions(scroll.position) {
-                    let result = self.dispatch_interaction_result(index, &event, app);
-                    handled |= result.handled;
-                    if !result.propagate {
-                        break;
-                    }
-                }
-                handled
+                self.hit_interaction(scroll.position)
+                    .is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app))
             }
             _ => self.interaction.handle_input(event),
         }
@@ -324,6 +394,164 @@ impl Window {
     fn dispatch_interaction(&mut self, index: usize, event: &InputEvent, app: &mut App) -> bool {
         self.dispatch_interaction_result(index, event, app).handled
     }
+    fn dispatch_interaction_bubbled(
+        &mut self,
+        index: usize,
+        event: &InputEvent,
+        app: &mut App,
+    ) -> bool {
+        let mut current = Some(index);
+        let mut handled = false;
+        while let Some(index) = current {
+            let parent = self
+                .interactions
+                .get(index)
+                .and_then(|registration| registration.parent);
+            let result = self.dispatch_interaction_result(index, event, app);
+            handled |= result.handled;
+            if !result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        handled
+    }
+    fn dispatch_action_bubbled(
+        &mut self,
+        index: usize,
+        action: &dyn wgpui_core::Action,
+        app: &mut App,
+    ) -> bool {
+        let mut current = Some(index);
+        let mut handled = false;
+        while let Some(index) = current {
+            let parent = self
+                .interactions
+                .get(index)
+                .and_then(|registration| registration.parent);
+            let result = self
+                .interactions
+                .get_mut(index)
+                .map_or(wgpui_core::window::EventResult::IGNORED, |registration| {
+                    registration
+                        .interaction
+                        .dispatch_action(action, &mut self.interaction, app)
+                });
+            handled |= result.handled;
+            if !result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        handled
+    }
+    fn dispatch_drag_hover(
+        &mut self,
+        index: usize,
+        hovered: bool,
+        data: &DragData,
+        app: &mut App,
+    ) -> bool {
+        let mut current = Some(index);
+        let mut handled = false;
+        while let Some(index) = current {
+            let parent = self
+                .interactions
+                .get(index)
+                .and_then(|registration| registration.parent);
+            let result = self
+                .interactions
+                .get_mut(index)
+                .map_or(wgpui_core::window::EventResult::IGNORED, |registration| {
+                    registration.interaction.dispatch_drag_hover(
+                        hovered,
+                        data,
+                        &mut self.interaction,
+                        app,
+                    )
+                });
+            handled |= result.handled;
+            if !result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        handled
+    }
+    fn dispatch_drop(&mut self, index: usize, data: &DragData, app: &mut App) -> bool {
+        let mut current = Some(index);
+        let mut handled = false;
+        while let Some(index) = current {
+            let parent = self
+                .interactions
+                .get(index)
+                .and_then(|registration| registration.parent);
+            let result = self
+                .interactions
+                .get_mut(index)
+                .map_or(wgpui_core::window::EventResult::IGNORED, |registration| {
+                    registration
+                        .interaction
+                        .dispatch_drop(data, &mut self.interaction, app)
+                });
+            handled |= result.handled;
+            if !result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        handled
+    }
+    fn apply_focus_transition(&mut self, app: &mut App) -> bool {
+        let Some(transition) = self.interaction.take_focus_transition() else {
+            return false;
+        };
+        if transition.from == transition.to {
+            let Some(id) = transition.to else {
+                return false;
+            };
+            let Some(index) = self.interactions.iter().position(|registration| {
+                registration.focus.is_some_and(|focus| focus.id() == id)
+            }) else {
+                return false;
+            };
+            self.mark_interaction_dirty_for(index);
+            return self.dispatch_interaction_bubbled(
+                index,
+                &InputEvent::Focus(FocusEvent {
+                    focused: true,
+                    visible: transition.visible,
+                }),
+                app,
+            );
+        }
+        let mut handled = false;
+        for (id, focused, visible) in [
+            (transition.from, false, false),
+            (transition.to, true, transition.visible),
+        ] {
+            let Some(id) = id else {
+                continue;
+            };
+            let Some(index) = self.interactions.iter().position(|registration| {
+                registration.focus.is_some_and(|focus| focus.id() == id)
+            }) else {
+                continue;
+            };
+            self.mark_interaction_dirty_for(index);
+            handled |= self.dispatch_interaction_bubbled(
+                index,
+                &InputEvent::Focus(FocusEvent { focused, visible }),
+                app,
+            );
+        }
+        handled
+    }
+    fn mark_interaction_dirty_for(&mut self, index: usize) {
+        if let Some(registration) = self.interactions.get(index) {
+            self.hover_dirty_regions.push(registration.bounds);
+        }
+    }
     fn dispatch_interaction_result(
         &mut self,
         index: usize,
@@ -351,7 +579,44 @@ impl Window {
             .hovered_interaction
             .and_then(|index| self.interactions.get(index))
             .map(|registration| registration.bounds);
-        let previous_interactions = std::mem::replace(&mut self.interactions, interactions);
+        let previous_pressed_address = self
+            .pressed_interaction
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        let previous_drag_address = self
+            .drag_hovered
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        let pressed_event = self.pressed_event;
+        let mut previous_interactions = std::mem::replace(&mut self.interactions, interactions);
+        self.interaction.retain_focus_handles(
+            self.interactions
+                .iter()
+                .filter_map(|registration| registration.focus),
+        );
+        for (order, registration) in self.interactions.iter().enumerate() {
+            if let Some(focus) = registration.focus {
+                self.interaction
+                    .register_focus_handle_ordered(focus, order as u64);
+            }
+        }
+        let focused = self.interaction.focused();
+        let focus_visible = self.interaction.focus_manager().focus_visible();
+        for index in 0..self.interactions.len() {
+            if self.interactions[index]
+                .focus
+                .is_some_and(|focus| Some(focus.id()) == focused)
+            {
+                self.dispatch_interaction(
+                    index,
+                    &InputEvent::Focus(FocusEvent {
+                        focused: true,
+                        visible: focus_visible,
+                    }),
+                    app,
+                );
+            }
+        }
         let hit = self
             .cursor_inside
             .then(|| self.hit_interaction(self.cursor))
@@ -359,6 +624,22 @@ impl Window {
         let hit_address = hit
             .and_then(|index| self.interactions.get(index))
             .map(|registration| registration.address);
+        let hit_bounds = hit.and_then(|index| self.interactions.get(index)).map(|registration| registration.bounds);
+        self.pressed_interaction = previous_pressed_address.and_then(|address| {
+            self.interactions
+                .iter()
+                .position(|registration| registration.address == address)
+        });
+        self.pressed_event = self.pressed_interaction.and(pressed_event);
+        let drag_hit = self.active_drag.as_ref().and(hit);
+        let drag_hit_address = drag_hit
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        let old_drag_index = previous_drag_address.and_then(|address| {
+            previous_interactions
+                .iter()
+                .position(|registration| registration.address == address)
+        });
         if previous_address != hit_address {
             if let Some(bounds) = previous_bounds {
                 self.hover_dirty_regions.push(bounds);
@@ -377,23 +658,59 @@ impl Window {
                 && let Some(old_index) = previous_interactions
                     .iter()
                     .position(|registration| registration.address == old_address)
+                && let Some(registration) = previous_interactions.get_mut(old_index)
             {
-                let mut previous_interactions = previous_interactions;
-                if let Some(registration) = previous_interactions.get_mut(old_index) {
-                    registration.interaction.dispatch(
-                        &InputEvent::MouseLeave(mouse),
-                        &mut self.interaction,
-                        app,
-                    );
-                }
+                registration.interaction.dispatch(
+                    &InputEvent::MouseLeave(mouse),
+                    &mut self.interaction,
+                    app,
+                );
             }
             if let Some(index) = hit {
                 self.dispatch_interaction(index, &InputEvent::MouseEnter(mouse), app);
             }
+        } else if let Some(index) = hit {
+            self.dispatch_interaction(index, &InputEvent::MouseEnter(MouseMoveEvent {
+                position: self.cursor,
+                modifiers: self.modifiers(),
+                buttons: self.mouse_buttons,
+            }), app);
+        }
+        if previous_address == hit_address
+            && previous_bounds != hit_bounds
+        {
+            if let Some(bounds) = previous_bounds {
+                self.hover_dirty_regions.push(bounds);
+            }
+            if let Some(bounds) = hit_bounds {
+                self.hover_dirty_regions.push(bounds);
+            }
         }
         self.hovered_interaction = hit;
-        self.pressed_interaction = None;
-        self.pressed_event = None;
+        if self.active_drag.is_some() && previous_drag_address != drag_hit_address {
+            if let (Some(index), Some(data)) = (old_drag_index, self.active_drag.clone())
+                && let Some(registration) = previous_interactions.get_mut(index)
+            {
+                registration.interaction.dispatch_drag_hover(
+                    false,
+                    &data,
+                    &mut self.interaction,
+                    app,
+                );
+            }
+            if let Some(index) = drag_hit
+                && let Some(data) = self.active_drag.clone()
+            {
+                self.dispatch_drag_hover(index, true, &data, app);
+            }
+            self.drag_hovered = drag_hit;
+        } else {
+            self.drag_hovered = previous_drag_address.and_then(|address| {
+                self.interactions
+                    .iter()
+                    .position(|registration| registration.address == address)
+            });
+        }
     }
     pub fn cursor_position(&self) -> [Pixels; 2] {
         self.cursor
@@ -743,6 +1060,8 @@ impl Handler {
             hovered_interaction: None,
             pressed_interaction: None,
             pressed_event: None,
+            active_drag: None,
+            drag_hovered: None,
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
         };

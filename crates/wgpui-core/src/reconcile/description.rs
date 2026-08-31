@@ -25,7 +25,8 @@ use crate::boundary::compositor::ExternalSurfaceId;
 use crate::patch::emit::Emit;
 use crate::reconcile::diff_key::ReconcileKey;
 use crate::app::App;
-use crate::window::{EventResult, InputEvent, Window};
+use crate::action::Action;
+use crate::window::{DragData, EventResult, FocusHandle, InputEvent, Window};
 use std::any::TypeId;
 use std::sync::Arc;
 use wgpui_layout::taffy_tree::LayoutStyle;
@@ -100,9 +101,19 @@ pub struct ExternalSurfaceProperties {
 /// produced the element's actual bounds; registering it earlier would make
 /// hit testing use stale geometry after a resize or a retained relayout.
 type InteractionCallback = Box<dyn FnMut(&InputEvent, &mut Window, &mut App) -> EventResult>;
+type ActionCallback = Box<dyn FnMut(&dyn Action, &mut Window, &mut App) -> EventResult>;
+type DragStartCallback = Box<dyn FnMut(&DragData, &mut Window, &mut App)>;
+type DragHoverCallback = Box<dyn FnMut(bool, &DragData, &mut Window, &mut App) -> EventResult>;
+type DropCallback = Box<dyn FnMut(&DragData, &mut Window, &mut App) -> EventResult>;
 
 pub struct DescriptionInteraction {
     callback: InteractionCallback,
+    action_callback: Option<ActionCallback>,
+    focus_handle: Option<FocusHandle>,
+    drag_source: Option<DragData>,
+    drag_start_callback: Option<DragStartCallback>,
+    drag_hover_callback: Option<DragHoverCallback>,
+    drop_callback: Option<DropCallback>,
 }
 
 impl std::fmt::Debug for DescriptionInteraction {
@@ -115,7 +126,15 @@ impl DescriptionInteraction {
     pub fn new(
         callback: impl FnMut(&InputEvent, &mut Window, &mut App) -> EventResult + 'static,
     ) -> Self {
-        Self { callback: Box::new(callback) }
+        Self {
+            callback: Box::new(callback),
+            action_callback: None,
+            focus_handle: None,
+            drag_source: None,
+            drag_start_callback: None,
+            drag_hover_callback: None,
+            drop_callback: None,
+        }
     }
 
     pub fn dispatch(
@@ -126,6 +145,136 @@ impl DescriptionInteraction {
     ) -> EventResult {
         (self.callback)(event, window, app)
     }
+
+    pub fn with_focus(mut self, focus_handle: FocusHandle) -> Self {
+        self.focus_handle = Some(focus_handle);
+        self
+    }
+
+    pub fn focus_handle(&self) -> Option<FocusHandle> {
+        self.focus_handle
+    }
+
+    pub fn with_drag_source(
+        mut self,
+        data: DragData,
+        callback: impl FnMut(&DragData, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.drag_source = Some(data);
+        self.drag_start_callback = Some(Box::new(callback));
+        self
+    }
+
+    pub fn drag_source(&self) -> Option<DragData> {
+        self.drag_source.clone()
+    }
+
+    pub fn start_drag(&mut self, data: &DragData, window: &mut Window, app: &mut App) {
+        if let Some(callback) = self.drag_start_callback.as_deref_mut() {
+            callback(data, window, app);
+        }
+    }
+
+    pub fn with_drag_hover_handler(
+        mut self,
+        callback: impl FnMut(bool, &DragData, &mut Window, &mut App) -> EventResult + 'static,
+    ) -> Self {
+        self.drag_hover_callback = Some(Box::new(callback));
+        self
+    }
+
+    pub fn dispatch_drag_hover(
+        &mut self,
+        hovered: bool,
+        data: &DragData,
+        window: &mut Window,
+        app: &mut App,
+    ) -> EventResult {
+        self.drag_hover_callback.as_deref_mut().map_or(EventResult::IGNORED, |callback| {
+            callback(hovered, data, window, app)
+        })
+    }
+
+    pub fn with_drop_handler(
+        mut self,
+        callback: impl FnMut(&DragData, &mut Window, &mut App) -> EventResult + 'static,
+    ) -> Self {
+        self.drop_callback = Some(Box::new(callback));
+        self
+    }
+
+    pub fn dispatch_drop(
+        &mut self,
+        data: &DragData,
+        window: &mut Window,
+        app: &mut App,
+    ) -> EventResult {
+        self.drop_callback.as_deref_mut().map_or(EventResult::IGNORED, |callback| {
+            callback(data, window, app)
+        })
+    }
+
+    pub fn on_action<A: Action>(
+        mut self,
+        mut handler: impl FnMut(&A, &mut Window, &mut App) -> EventResult + 'static,
+    ) -> Self {
+        let mut previous = self.action_callback.take();
+        self.action_callback = Some(Box::new(move |action, window, app| {
+            let mut result = previous
+                .as_deref_mut()
+                .map_or(EventResult::IGNORED, |callback| callback(action, window, app));
+            if !result.propagate {
+                return result;
+            }
+            if let Some(action) = action.as_any().downcast_ref::<A>() {
+                let current = handler(action, window, app);
+                if current.handled {
+                    result = current;
+                } else {
+                    result.propagate |= current.propagate;
+                }
+            }
+            result
+        }));
+        self
+    }
+
+    pub fn with_action_handler(
+        mut self,
+        mut handler: impl FnMut(&dyn Action, &mut Window, &mut App) -> EventResult + 'static,
+    ) -> Self {
+        let mut previous = self.action_callback.take();
+        self.action_callback = Some(Box::new(move |action, window, app| {
+            let previous_result = previous
+                .as_deref_mut()
+                .map_or(EventResult::IGNORED, |callback| callback(action, window, app));
+            if !previous_result.propagate {
+                return previous_result;
+            }
+            let current_result = handler(action, window, app);
+            if current_result.handled {
+                current_result
+            } else {
+                EventResult {
+                    handled: previous_result.handled,
+                    propagate: previous_result.propagate || current_result.propagate,
+                }
+            }
+        }));
+        self
+    }
+
+    pub fn dispatch_action(
+        &mut self,
+        action: &dyn Action,
+        window: &mut Window,
+        app: &mut App,
+    ) -> EventResult {
+        self.action_callback
+            .as_deref_mut()
+            .map_or(EventResult::IGNORED, |callback| callback(action, window, app))
+    }
+
 }
 
 impl RawTextKey {

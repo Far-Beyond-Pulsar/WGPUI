@@ -184,6 +184,16 @@ mod tests {
     use wgpui_core::scene::Scene;
     use wgpui_layout::taffy_tree::{FlexDirection, LayoutTree, definite};
 
+    type SurfaceDrawResult = Result<
+        (
+            usize,
+            u64,
+            usize,
+            Option<wgpui_core::boundary::compositor::CompositeEntry>,
+        ),
+        Box<dyn std::error::Error>,
+    >;
+
     /// The ordinary reconciled element the surface is measured against.
     struct Panel;
 

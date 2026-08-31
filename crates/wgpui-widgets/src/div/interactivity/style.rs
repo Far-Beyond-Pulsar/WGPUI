@@ -1201,6 +1201,11 @@ mod tests {
             .expect("gradient emits a first band");
         assert_eq!(first.origin[0], 10.0);
         assert_eq!(first.origin[1], 20.0);
-        assert!(first.size[0] < first.size[1]);
+        assert!(matches!(first.material, Material::Linear { .. }));
+        if let Material::Linear { direction, .. } = first.material {
+            let angle = 30.0_f32.to_radians();
+            assert!((direction[0] - angle.cos()).abs() < 1e-6);
+            assert!((direction[1] - angle.sin()).abs() < 1e-6);
+        }
     }
 }

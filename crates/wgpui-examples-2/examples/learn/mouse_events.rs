@@ -1,193 +1,81 @@
-//! Mouse Events & Drag Hover Example — matches the style of interactive_elements.rs
+//! Native mouse and drag/drop event routing.
 
-#[path = "../prelude.rs"]
-mod example_prelude;
-use example_prelude::init_example;
+use std::cell::Cell;
+use std::rc::Rc;
 
 use wgpui::{
-    App, Application, Bounds, Context, Hsla, IntoElement, Render, Styled, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size,
+    ApplicationError, EventResult, MouseButton, NativeApplication, Styled, WindowOptions, div, px,
+    rgb,
 };
 
-#[derive(Clone, Copy)]
-struct DragPayload;
+fn main() -> Result<(), ApplicationError> {
+    let hovered = Rc::new(Cell::new(false));
+    let drag_hovered = Rc::new(Cell::new(false));
+    let drop_count = Rc::new(Cell::new(0));
 
-impl Render for DragPayload {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(120.))
-            .h(px(40.))
-            .bg(wgpui::rgb(0xe85d04))
-            .rounded_lg()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_color(wgpui::white())
-            .child("Dragging...")
-    }
-}
-
-struct MouseEventsExample {
-    hovered: bool,
-    mouse_inside: bool,
-    drag_hovered: bool,
-}
-
-impl Render for MouseEventsExample {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let target_bg: Hsla = if self.drag_hovered {
-            wgpui::rgb(0x22c55e).into()
-        } else if self.mouse_inside {
-            wgpui::rgb(0x3b82f6).into()
-        } else {
-            wgpui::rgb(0x1e3a5f).into()
-        };
-
-        let mi = cx.entity().downgrade();
-        let mo = cx.entity().downgrade();
-        let de = cx.entity().downgrade();
-        let dl = cx.entity().downgrade();
-
-        div()
-            .size_full()
-            .p_12()
-            .flex()
-            .flex_col()
-            .gap_8()
-            .bg(wgpui::rgb(0x1a1a2e))
-            .child(
-                div()
-                    .text_color(wgpui::white())
-                    .text_xl()
-                    .child("Mouse Events Playground"),
-            )
-            .child(
-                div()
-                    .text_color(wgpui::rgb(0x8888aa))
-                    .text_sm()
-                    .child("1. Hover target — on_hover AND on_mouse_enter fire")
-                    .child("2. Drag the orange box over target — on_hover STOPS, on_mouse_enter continues")
-                    .child("3. on_drag_hover fires ONLY when dragging over target"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_6()
-                    .items_start()
-                    .child(render_status_panel(
-                        self.hovered,
-                        self.mouse_inside,
-                        self.drag_hovered,
-                    ))
-                    .child(
-                        div()
-                            .id("target")
-                            .w(px(200.))
-                            .h(px(200.))
-                            .rounded_lg()
-                            .bg(target_bg)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(wgpui::white())
-                            .text_lg()
-                            .child(if self.drag_hovered {
-                                "DROP HERE"
-                            } else if self.mouse_inside {
-                                "INSIDE"
-                            } else {
-                                "TARGET"
-                            })
-                            .on_hover(cx.listener(|this, &h, _, _| {
-                                this.hovered = h;
-                            }))
-                            .on_mouse_enter(move |_, cx| {
-                                let _ = mi.update(cx, |this, _| this.mouse_inside = true);
-                            })
-                            .on_mouse_leave(move |_, cx| {
-                                let _ = mo.update(cx, |this, _| this.mouse_inside = false);
-                            })
-                            .on_drag_hover::<DragPayload>(move |&h, _, cx| {
-                                if h {
-                                    let _ = de.update(cx, |this, _| this.drag_hovered = true);
-                                } else {
-                                    let _ = dl.update(cx, |this, _| this.drag_hovered = false);
-                                }
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id("source")
-                            .w(px(120.))
-                            .h(px(120.))
-                            .rounded_lg()
-                            .bg(wgpui::rgb(0xe85d04))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(wgpui::white())
-                            .child("Drag Me")
-                            .on_drag(DragPayload, |data: &DragPayload, position, _, cx| {
-                                cx.new(|_| *data)
-                            }),
-                    ),
-            )
-    }
-}
-
-fn render_status_panel(hovered: bool, inside: bool, drag_hovered: bool) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .p_6()
-        .rounded_lg()
-        .bg(wgpui::rgb(0x16213e))
-        .border_1()
-        .border_color(wgpui::rgb(0x0f3460))
-        .child(div().text_color(wgpui::white()).child("Status"))
-        .child(status_row("on_hover", hovered))
-        .child(status_row("on_mouse_enter", inside))
-        .child(status_row("on_drag_hover", drag_hovered))
-}
-
-fn status_row(label: &str, active: bool) -> impl IntoElement {
-    let color: Hsla = if active {
-        wgpui::green()
-    } else {
-        wgpui::rgb(0x333333).into()
-    };
-    let text_color: Hsla = if active {
-        wgpui::white()
-    } else {
-        wgpui::rgb(0x666666).into()
-    };
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(div().w(px(12.)).h(px(12.)).rounded_full().bg(color))
-        .child(div().text_color(text_color).child(label.to_string()))
-}
-
-fn main() {
-    Application::new().run(|cx: &mut App| {
-        init_example(cx, "Mouse Events");
-        let bounds = Bounds::centered(None, size(px(800.), px(600.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, cx| {
-                cx.new(|_| MouseEventsExample {
-                    hovered: false,
-                    mouse_inside: false,
-                    drag_hovered: false,
-                })
-            },
-        )
-        .unwrap();
-    });
+    NativeApplication::with_window(WindowOptions::default(), {
+        let hovered = hovered.clone();
+        let drag_hovered = drag_hovered.clone();
+        let drop_count = drop_count.clone();
+        move |_| {
+            let hovered_for_style = hovered.get();
+            let drag_hovered_for_style = drag_hovered.get();
+            let hovered_for_callback = hovered.clone();
+            let drag_hovered_for_callback = drag_hovered.clone();
+            let drop_count_for_callback = drop_count.clone();
+            div()
+                .size_full()
+                .p_12()
+                .flex()
+                .flex_col()
+                .gap_6()
+                .bg(rgb(0x111827))
+                .child(
+                    div()
+                        .w(px(280.0))
+                        .h(px(180.0))
+                        .rounded_lg()
+                        .bg(if drag_hovered_for_style {
+                            rgb(0x16a34a)
+                        } else if hovered_for_style {
+                            rgb(0x2563eb)
+                        } else {
+                            rgb(0x1e3a5f)
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(rgb(0xffffff))
+                        .child("Move, click, or drop here")
+                        .on_hover(move |inside, _, _| {
+                            hovered_for_callback.set(inside);
+                            EventResult {
+                                handled: true,
+                                propagate: true,
+                            }
+                        })
+                        .on_drag_hover::<String, _>(move |inside, _, _| {
+                            drag_hovered_for_callback.set(inside);
+                        })
+                        .on_drop::<String, _>(move |_, _, _| {
+                            drop_count_for_callback.set(drop_count_for_callback.get() + 1);
+                        }),
+                )
+                .child(
+                    div()
+                        .w(px(220.0))
+                        .h(px(56.0))
+                        .rounded_md()
+                        .bg(rgb(0xea580c))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(rgb(0xffffff))
+                        .child(format!("Drag source · drops {}", drop_count.get()))
+                        .on_mouse_up(MouseButton::Left, move |_, _, _| {})
+                        .on_drag(String::from("native payload"), |_, _, _, _| {}),
+                )
+        }
+    })
+    .run()
 }

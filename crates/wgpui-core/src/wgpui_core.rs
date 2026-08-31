@@ -19,7 +19,7 @@ pub use app::{
     WindowClosedSubscription, WindowId, WindowList,
 };
 pub use window::{
-    ClickEvent, CloseState, DispatchNodeId, EventResult, FocusHandle, FocusId, FocusManager,
+    ClickEvent, CloseState, DispatchNodeId, DragData, DragHoverEvent, DropEvent, EventResult, FocusEvent, FocusHandle, FocusId, FocusManager,
     FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId, InputEvent, KeyBinding,
     KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu,
     MenuItem, Modifiers, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
