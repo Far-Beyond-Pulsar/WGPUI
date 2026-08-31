@@ -22,6 +22,8 @@
 
 use wgpui_core::scene::UploadRange;
 
+use crate::render::resources::{NativeResourceId, NativeResourceRegistry, NativeResourceRole};
+
 /// A kind's arena buffer, grown by high-water mark.
 pub struct SlabBuffer {
     buffer: wgpu::Buffer,
@@ -30,12 +32,26 @@ pub struct SlabBuffer {
     allocations: u64,
     uploaded_bytes: u64,
     upload_calls: u64,
+    resource_registry: NativeResourceRegistry,
+    resource_id: NativeResourceId,
+    generation: u64,
 }
 
 impl SlabBuffer {
     /// An empty arena.
     pub fn new(device: &wgpu::Device, label: &'static str) -> SlabBuffer {
         let capacity = 4096;
+        let resource_registry = NativeResourceRegistry;
+        let resource_id = resource_registry.register_buffer(
+            label,
+            NativeResourceRole::PrimitiveBuffer,
+            capacity,
+            (wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC)
+                .bits() as u64,
+            0,
+        );
         SlabBuffer {
             buffer: create(device, label, capacity),
             capacity,
@@ -43,6 +59,9 @@ impl SlabBuffer {
             allocations: 1,
             uploaded_bytes: 0,
             upload_calls: 0,
+            resource_registry,
+            resource_id,
+            generation: 0,
         }
     }
 
@@ -83,9 +102,22 @@ impl SlabBuffer {
             return false;
         }
         let capacity = bytes.max(self.capacity.saturating_mul(2)).max(4096);
+        self.resource_registry
+            .evict(self.resource_id, self.resource_registry.current_frame());
         self.buffer = create(device, self.label, capacity);
         self.capacity = capacity;
         self.allocations += 1;
+        self.generation = self.generation.saturating_add(1);
+        self.resource_id = self.resource_registry.register_buffer(
+            self.label,
+            NativeResourceRole::PrimitiveBuffer,
+            capacity,
+            (wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC)
+                .bits() as u64,
+            self.generation,
+        );
         true
     }
 
@@ -115,6 +147,14 @@ impl SlabBuffer {
                 continue;
             }
             queue.write_buffer(&self.buffer, range.byte_offset, bytes);
+            self.resource_registry.record_buffer_upload(
+                self.resource_id,
+                range.byte_offset,
+                bytes.len() as u64,
+                self.resource_registry.current_frame(),
+            );
+            self.resource_registry
+                .mark_used(self.resource_id, self.resource_registry.current_frame());
             self.uploaded_bytes += bytes.len() as u64;
             self.upload_calls += 1;
         }
@@ -127,8 +167,23 @@ impl SlabBuffer {
             return;
         }
         queue.write_buffer(&self.buffer, 0, resident);
+        self.resource_registry.record_buffer_upload(
+            self.resource_id,
+            0,
+            resident.len() as u64,
+            self.resource_registry.current_frame(),
+        );
+        self.resource_registry
+            .mark_used(self.resource_id, self.resource_registry.current_frame());
         self.uploaded_bytes += resident.len() as u64;
         self.upload_calls += 1;
+    }
+}
+
+impl Drop for SlabBuffer {
+    fn drop(&mut self) {
+        self.resource_registry
+            .evict(self.resource_id, self.resource_registry.current_frame());
     }
 }
 

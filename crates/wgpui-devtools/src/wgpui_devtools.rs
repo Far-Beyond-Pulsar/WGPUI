@@ -4,6 +4,7 @@
 //! builds and runs with this crate absent entirely).
 //! See docs/gpu-native-architecture.md §3.6, §8 Phase 7.
 pub mod capture;
+pub mod gpu_resources;
 #[cfg(any(feature = "flamegraph", feature = "render-stats"))]
 pub mod flamegraph;
 #[cfg(any(feature = "flamegraph", feature = "render-stats"))]
@@ -36,6 +37,12 @@ pub use inspector::{
 pub use memory::{
     AllocationCategory, AllocationCategorySnapshot, AllocationEntry, AllocationId,
     AllocationRegistry, AllocationSnapshot,
+};
+pub use gpu_resources::{
+    ByteRange as GpuByteRange, CaptureSnapshot as GpuCaptureSnapshot, EvictionRecord,
+    ResourceDescriptor, ResourceDimensions, ResourceFormat, ResourceId as GpuResourceId,
+    ResourceKind as GpuResourceKind,
+    ResourceRecord, ResourceRole, TextureRegion, TransferKind, UploadRecord,
 };
 #[cfg(feature = "perf-ab")]
 pub use perf_ab_tests::Sample;

@@ -42,6 +42,9 @@ use std::collections::HashMap;
 use wgpui_core::scene::layer::BoundaryId;
 
 use crate::render::pipelines::TARGET_FORMAT;
+use crate::render::resources::{
+    NativeResourceDimensions, NativeResourceId, NativeResourceRegistry, NativeResourceRole,
+};
 
 /// Frames a boundary's texture may go untouched before it is released.
 ///
@@ -76,6 +79,15 @@ struct Entry {
     height: u32,
     content_token: u64,
     last_used_frame: u64,
+    resource_registry: NativeResourceRegistry,
+    resource_id: NativeResourceId,
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        self.resource_registry
+            .evict(self.resource_id, self.resource_registry.current_frame());
+    }
 }
 
 /// What the pool has done, in the style `render_stats` established.
@@ -97,6 +109,8 @@ pub struct LayerTexturePool {
     frame: u64,
     idle_frames: u64,
     stats: LayerTextureStats,
+    generations: HashMap<BoundaryId, u64>,
+    resource_registry: NativeResourceRegistry,
 }
 
 impl Default for LayerTexturePool {
@@ -113,6 +127,8 @@ impl LayerTexturePool {
             frame: 0,
             idle_frames,
             stats: LayerTextureStats::default(),
+            generations: HashMap::new(),
+            resource_registry: NativeResourceRegistry,
         }
     }
 
@@ -166,6 +182,7 @@ impl LayerTexturePool {
             && entry.height == height
         {
             entry.last_used_frame = frame;
+            entry.resource_registry.mark_used(entry.resource_id, frame);
             if entry.content_token == content_token {
                 self.stats.reuses += 1;
                 return Bake::Reusable;
@@ -192,6 +209,29 @@ impl LayerTexturePool {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let generation = self.generations.entry(boundary).or_insert(0);
+        let generation_value = *generation;
+        *generation = generation.saturating_add(1);
+        let resource_registry = self.resource_registry;
+        let format_name = format!("{TARGET_FORMAT:?}");
+        let resource_id = resource_registry.register_texture(
+            "boundary layer texture",
+            NativeResourceRole::LayerTexture,
+            NativeResourceDimensions {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            &format_name,
+            u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(u64::from(TARGET_FORMAT.block_copy_size(None).unwrap_or(4))),
+            (wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC)
+                .bits() as u64,
+            generation_value,
+        );
         self.entries.insert(
             boundary,
             Entry {
@@ -201,6 +241,8 @@ impl LayerTexturePool {
                 height,
                 content_token,
                 last_used_frame: frame,
+                resource_registry,
+                resource_id,
             },
         );
         self.stats.allocations += 1;

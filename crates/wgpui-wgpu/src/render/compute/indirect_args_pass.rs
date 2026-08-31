@@ -56,6 +56,7 @@ use wgpui_core::indirect::{
 use wgpui_core::ordering::BLOCK_SIZE;
 
 use crate::render::readback::{ReadbackError, read_u32_buffer};
+use crate::render::resources::{NativeResourceId, NativeResourceRegistry, NativeResourceRole};
 
 /// Why an indirect-arg dispatch failed.
 #[derive(Debug)]
@@ -135,6 +136,13 @@ pub struct IndirectArgsBuffers {
     pub arena_slots: u32,
     /// Slots the argument buffers are sized for.
     pub slot_capacity: u32,
+    resource_registry: NativeResourceRegistry,
+    draw_order_resource: NativeResourceId,
+    culled_resource: NativeResourceId,
+    visible_resource: NativeResourceId,
+    args_resource: NativeResourceId,
+    packed_args_resource: NativeResourceId,
+    draw_count_resource: NativeResourceId,
 }
 
 impl IndirectArgsBuffers {
@@ -143,6 +151,16 @@ impl IndirectArgsBuffers {
     pub fn new(device: &wgpu::Device, arena_slots: u32, slot_capacity: u32) -> IndirectArgsBuffers {
         let arena_bytes = u64::from(arena_slots) * 4;
         let args_bytes = u64::from(slot_capacity) * DRAW_INDIRECT_ARGS_STRIDE as u64;
+        let resource_registry = NativeResourceRegistry;
+        let storage_usage = (wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC)
+            .bits() as u64;
+        let indirect_usage = (wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC)
+            .bits() as u64;
         IndirectArgsBuffers {
             draw_order: storage_buffer(device, "indirect draw order", arena_bytes),
             culled: storage_buffer(device, "indirect culled", arena_bytes),
@@ -152,6 +170,49 @@ impl IndirectArgsBuffers {
             draw_count: indirect_buffer(device, "indirect draw count", 4),
             arena_slots,
             slot_capacity,
+            draw_order_resource: resource_registry.register_buffer(
+                "indirect draw order",
+                NativeResourceRole::IndirectArguments,
+                arena_bytes.max(16),
+                storage_usage,
+                0,
+            ),
+            culled_resource: resource_registry.register_buffer(
+                "indirect culled",
+                NativeResourceRole::Visibility,
+                arena_bytes.max(16),
+                storage_usage,
+                0,
+            ),
+            visible_resource: resource_registry.register_buffer(
+                "indirect visible",
+                NativeResourceRole::Visibility,
+                arena_bytes.max(16),
+                storage_usage,
+                0,
+            ),
+            args_resource: resource_registry.register_buffer(
+                "indirect args",
+                NativeResourceRole::IndirectArguments,
+                args_bytes.max(DRAW_INDIRECT_ARGS_STRIDE as u64),
+                indirect_usage,
+                0,
+            ),
+            packed_args_resource: resource_registry.register_buffer(
+                "indirect args packed",
+                NativeResourceRole::IndirectArguments,
+                args_bytes.max(DRAW_INDIRECT_ARGS_STRIDE as u64),
+                indirect_usage,
+                0,
+            ),
+            draw_count_resource: resource_registry.register_buffer(
+                "indirect draw count",
+                NativeResourceRole::IndirectCount,
+                4,
+                indirect_usage,
+                0,
+            ),
+            resource_registry,
         }
     }
 
@@ -321,6 +382,19 @@ impl IndirectArgsPass {
             params_bytes.extend_from_slice(&value.to_le_bytes());
         }
         queue.write_buffer(&params, 0, &params_bytes);
+        let params_resource = NativeResourceRegistry.register_buffer(
+            "indirect args params",
+            NativeResourceRole::Uniform,
+            16,
+            (wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST).bits() as u64,
+            0,
+        );
+        NativeResourceRegistry.record_buffer_upload(
+            params_resource,
+            0,
+            params_bytes.len() as u64,
+            NativeResourceRegistry.current_frame(),
+        );
 
         let slot_buffer = storage_buffer(
             device,
@@ -329,6 +403,24 @@ impl IndirectArgsPass {
         );
         if !slots.is_empty() {
             queue.write_buffer(&slot_buffer, 0, slots);
+        }
+        let slot_resource = NativeResourceRegistry.register_buffer(
+            "indirect slots",
+            NativeResourceRole::SlotTable,
+            (slots.len() as u64).max(DRAW_SLOT_STRIDE as u64),
+            (wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC)
+                .bits() as u64,
+            0,
+        );
+        if !slots.is_empty() {
+            NativeResourceRegistry.record_buffer_upload(
+                slot_resource,
+                0,
+                slots.len() as u64,
+                NativeResourceRegistry.current_frame(),
+            );
         }
 
         self.dispatch_with_slots(
@@ -442,6 +534,17 @@ impl IndirectArgsPass {
         // compaction has to stay order-preserving across the whole table.
         dispatch(&mut encoder, &self.pack, &group, 1);
         queue.submit(Some(encoder.finish()));
+        let frame = buffers.resource_registry.current_frame();
+        for resource in [
+            buffers.draw_order_resource,
+            buffers.culled_resource,
+            buffers.visible_resource,
+            buffers.args_resource,
+            buffers.packed_args_resource,
+            buffers.draw_count_resource,
+        ] {
+            buffers.resource_registry.mark_used(resource, frame);
+        }
     }
 
     /// Read the argument records back — the differential harness's use, and the

@@ -33,6 +33,9 @@
 //! about the mapping, the polling, or the error vocabulary changes; the
 //! allocation does.
 
+use crate::render::resources::{NativeResourceId, NativeResourceRegistry, NativeResourceRole};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 /// Why a readback failed.
 #[derive(Debug)]
 pub enum ReadbackError {
@@ -41,7 +44,7 @@ pub enum ReadbackError {
     /// The buffer could not be mapped.
     Map(wgpu::BufferAsyncError),
     /// The mapping callback's channel closed before delivering a result — the
-    /// device was dropped or lost mid-map.
+    /// device was dropped or lost mid-map, or preflight rejected the request.
     Cancelled,
     /// The mapped range could not be viewed.
     Range(wgpu::MapRangeError),
@@ -83,15 +86,42 @@ pub fn read_texture_rgba8(
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>, ReadbackError> {
-    let unpadded = width * 4;
+    catch_unwind(AssertUnwindSafe(|| {
+        read_texture_rgba8_inner(device, queue, texture, width, height)
+    }))
+    .unwrap_or(Err(ReadbackError::Cancelled))
+}
+
+fn read_texture_rgba8_inner(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, ReadbackError> {
+    if !texture.usage().contains(wgpu::TextureUsages::COPY_SRC) {
+        return Err(ReadbackError::Cancelled);
+    }
+    let unpadded = width.checked_mul(4).ok_or(ReadbackError::Cancelled)?;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded = unpadded.div_ceil(align) * align;
+    let staging_size = u64::from(padded)
+        .checked_mul(u64::from(height))
+        .ok_or(ReadbackError::Cancelled)?;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("texture readback"),
-        size: u64::from(padded) * u64::from(height),
+        size: staging_size,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let resource_registry = NativeResourceRegistry;
+    let resource_id = resource_registry.register_buffer(
+        "texture readback",
+        NativeResourceRole::Readback,
+        staging_size,
+        (wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST).bits() as u64,
+        0,
+    );
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("texture readback"),
     });
@@ -115,6 +145,12 @@ pub fn read_texture_rgba8(
             height,
             depth_or_array_layers: 1,
         },
+    );
+    resource_registry.record_buffer_readback(
+        resource_id,
+        0,
+        u64::from(padded) * u64::from(height),
+        resource_registry.current_frame(),
     );
     queue.submit(Some(encoder.finish()));
 
@@ -160,20 +196,57 @@ pub fn read_u32_buffer(
     source: &wgpu::Buffer,
     count: usize,
 ) -> Result<Vec<u32>, ReadbackError> {
+    catch_unwind(AssertUnwindSafe(|| {
+        read_u32_buffer_inner(device, queue, source, count)
+    }))
+    .unwrap_or(Err(ReadbackError::Cancelled))
+}
+
+fn read_u32_buffer_inner(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    count: usize,
+) -> Result<Vec<u32>, ReadbackError> {
     if count == 0 {
         return Ok(Vec::new());
     }
-    let size = (count * std::mem::size_of::<u32>()) as u64;
+    let size = u64::try_from(
+        count
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(ReadbackError::Cancelled)?,
+    )
+    .map_err(|_| ReadbackError::Cancelled)?;
+    if !source.usage().contains(wgpu::BufferUsages::COPY_SRC) {
+        return Err(ReadbackError::Cancelled);
+    }
+    if source.size() < size {
+        return Err(ReadbackError::Cancelled);
+    }
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback staging"),
         size,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let resource_registry = NativeResourceRegistry;
+    let resource_id = resource_registry.register_buffer(
+        "readback staging",
+        NativeResourceRole::Readback,
+        size,
+        (wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST).bits() as u64,
+        0,
+    );
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("readback"),
     });
     encoder.copy_buffer_to_buffer(source, 0, &staging, 0, size);
+    resource_registry.record_buffer_readback(
+        resource_id,
+        0,
+        size,
+        resource_registry.current_frame(),
+    );
     queue.submit(Some(encoder.finish()));
 
     let slice = staging.slice(..);
@@ -203,6 +276,7 @@ pub fn read_u32_buffer(
         values
     };
     staging.unmap();
+    resource_registry.mark_used(resource_id, resource_registry.current_frame());
     Ok(values)
 }
 
@@ -220,6 +294,8 @@ pub struct StagingReader {
     /// in steady state must not keep growing this — asserted by
     /// `render/draw.rs`'s fallback test rather than left as an intention.
     allocations: u64,
+    resource_registry: NativeResourceRegistry,
+    resource_id: NativeResourceId,
 }
 
 impl StagingReader {
@@ -250,7 +326,18 @@ impl StagingReader {
         if count == 0 {
             return Ok(());
         }
-        let size = (count * std::mem::size_of::<u32>()) as u64;
+        let size = u64::try_from(
+            count
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or(ReadbackError::Cancelled)?,
+        )
+        .map_err(|_| ReadbackError::Cancelled)?;
+        if !source.usage().contains(wgpu::BufferUsages::COPY_SRC) {
+            return Err(ReadbackError::Cancelled);
+        }
+        if source.size() < size {
+            return Err(ReadbackError::Cancelled);
+        }
         let staging = match self.staging.as_ref() {
             Some(buffer) if self.capacity >= size => buffer,
             _ => {
@@ -263,6 +350,15 @@ impl StagingReader {
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
+                self.resource_registry
+                    .evict(self.resource_id, self.resource_registry.current_frame());
+                self.resource_id = self.resource_registry.register_buffer(
+                    "readback staging (reused)",
+                    NativeResourceRole::Staging,
+                    capacity,
+                    (wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST).bits() as u64,
+                    0,
+                );
                 self.capacity = capacity;
                 self.allocations += 1;
                 self.staging.as_ref().ok_or(ReadbackError::Cancelled)?
@@ -273,6 +369,12 @@ impl StagingReader {
             label: Some("readback (reused)"),
         });
         encoder.copy_buffer_to_buffer(source, 0, staging, 0, size);
+        self.resource_registry.record_buffer_readback(
+            self.resource_id,
+            0,
+            size,
+            self.resource_registry.current_frame(),
+        );
         queue.submit(Some(encoder.finish()));
 
         let slice = staging.slice(0..size);
@@ -298,7 +400,16 @@ impl StagingReader {
             }
         }
         staging.unmap();
+        self.resource_registry
+            .mark_used(self.resource_id, self.resource_registry.current_frame());
         Ok(())
+    }
+}
+
+impl Drop for StagingReader {
+    fn drop(&mut self) {
+        self.resource_registry
+            .evict(self.resource_id, self.resource_registry.current_frame());
     }
 }
 
@@ -313,4 +424,46 @@ impl StagingReader {
 /// earlier note here that the crate had no logger is no longer true.
 fn log_dropped_readback() {
     log::warn!("wgpui-wgpu: buffer map completed after its receiver was dropped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::device::context_or_report;
+
+    #[test]
+    fn readback_rejects_a_source_without_copy_src_before_encoding() {
+        let Some(context) = context_or_report("readback_capability_guard") else {
+            return;
+        };
+        let source = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback source without copy src"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let result = read_u32_buffer(&context.device, &context.queue, &source, 1);
+        assert!(matches!(result, Err(ReadbackError::Cancelled)));
+    }
+
+    #[test]
+    fn readback_reports_a_destroyed_device_without_panicking() {
+        let Some(context) = context_or_report("readback_device_loss") else {
+            return;
+        };
+        let source = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback device-loss source"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        context.device.destroy();
+        let error_scope = context.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let result = read_u32_buffer(&context.device, &context.queue, &source, 1);
+        let scoped_error = pollster::block_on(error_scope.pop());
+        assert!(
+            result.is_err() || scoped_error.is_some(),
+            "a destroyed device must not report a successful readback"
+        );
+    }
 }
