@@ -431,7 +431,11 @@ pub struct FrameRenderer {
     /// texture view which a destroyed page invalidates.
     page_params: HashMap<u32, wgpu::Buffer>,
     reader: StagingReader,
-    uploaded_generation: Option<u64>,
+    /// Identity of the scene whose resident bytes currently occupy the GPU
+    /// arenas. Upload ranges are deltas within one scene; they cannot describe
+    /// the first frame of a different scene, even when the two scenes happen
+    /// to have equal-sized arenas.
+    uploaded_scene: Option<usize>,
     backdrop_snapshot: Option<wgpu::Texture>,
     backdrop_snapshot_view: Option<wgpu::TextureView>,
     backdrop_sampler: wgpu::Sampler,
@@ -501,7 +505,7 @@ impl FrameRenderer {
             backdrop_plan_builds: 0,
             page_params: HashMap::new(),
             reader: StagingReader::new(),
-            uploaded_generation: None,
+            uploaded_scene: None,
             backdrop_snapshot: None,
             backdrop_snapshot_view: None,
             backdrop_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
@@ -846,6 +850,8 @@ impl FrameRenderer {
         let sprite_resident = input.scene.poly_sprites.resident_bytes();
         let path_resident = input.scene.paths.resident_bytes();
         let backdrop_resident = input.scene.backdrop_filters.resident_bytes();
+        let scene_identity = input.scene as *const Scene as usize;
+        let scene_changed = self.uploaded_scene != Some(scene_identity);
         let shadows_grew = self
             .shadow_arena
             .reserve(device, shadow_resident.len() as u64);
@@ -870,7 +876,7 @@ impl FrameRenderer {
             || sprites_grew
             || paths_grew
             || backdrops_grew
-            || self.uploaded_generation.is_none()
+            || scene_changed
         {
             self.shadow_arena.upload_all(device, queue, shadow_resident);
             self.arena.upload_all(device, queue, resident);
@@ -881,7 +887,7 @@ impl FrameRenderer {
             self.path_arena.upload_all(device, queue, path_resident);
             self.backdrop_arena
                 .upload_all(device, queue, backdrop_resident);
-            self.uploaded_generation = Some(0);
+            self.uploaded_scene = Some(scene_identity);
         } else {
             // Filtered by kind rather than handed the whole list: an
             // `UploadRange` is a byte span *within one kind's arena*, so
