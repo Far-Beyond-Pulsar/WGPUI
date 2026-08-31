@@ -39,7 +39,7 @@ use wgpui_core::color::{ColorSpace, GradientStop, Hsla, LinearColorStop};
 use wgpui_core::geometry::{Pixels, Point};
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::Emission;
-use wgpui_core::patch::primitive::{Material, Quad, Shadow};
+use wgpui_core::patch::primitive::{BackdropFilter, Material, Quad, Shadow};
 use wgpui_layout::taffy_tree::{LayoutRect, LayoutStyle};
 
 /// A per-corner value, in the legacy `Corners<T>` field order.
@@ -200,6 +200,10 @@ pub struct DivStyle {
     /// Opacity applied to every primitive emitted by this element, including
     /// shadows and borders.
     pub opacity: f32,
+    /// Gaussian blur radius applied to the already-rendered backdrop behind
+    /// this element. Content blur requires an offscreen compositing group and
+    /// is intentionally not represented by this field.
+    pub backdrop_blur: Option<f32>,
     /// Per-corner radii, before [`Corners::clamped_for`].
     pub corner_radii: Corners,
     /// `box-shadow` layers, painted in order, all *behind* the element.
@@ -237,6 +241,7 @@ impl Default for DivStyle {
             border_widths: Edges::default(),
             border_dashed: false,
             opacity: 1.0,
+            backdrop_blur: None,
             corner_radii: Corners::default(),
             box_shadow: Vec::new(),
             text_color: None,
@@ -379,6 +384,22 @@ impl DivStyle {
         let size = [bounds.width, bounds.height];
         let corner_radii = self.corner_radii.clamped_for(size);
 
+        if let Some(blur_radius) = self.backdrop_blur
+            && blur_radius.is_finite()
+            && blur_radius > 0.0
+            && self.opacity > 0.0
+        {
+            emission.backdrop_filter(BackdropFilter {
+                origin,
+                size,
+                clip_origin: origin,
+                clip_size: size,
+                corner_radii: corner_radii.to_array(),
+                blur_radius,
+                opacity: self.opacity,
+            });
+        }
+
         for shadow in &self.box_shadow {
             let mut primitive = self.shadow_primitive(shadow, origin, size, corner_radii);
             primitive.color[3] *= self.opacity;
@@ -492,6 +513,10 @@ impl DivStyle {
     /// appearing or disappearing is a structural change rather than a value one.
     pub fn primitive_count(&self) -> usize {
         self.box_shadow.len()
+            + usize::from(
+                self.backdrop_blur
+                    .is_some_and(|radius| radius.is_finite() && radius > 0.0 && self.opacity > 0.0),
+            )
             + if self.background_gradient.is_some() || self.background_radial_gradient.is_some() {
                 gradient_band_count()
             } else if self.background_pattern.is_some() {
@@ -931,6 +956,7 @@ pub fn classify_style_change(current: &DivStyle, previous: &DivStyle) -> Invalid
         || current.background_radial_gradient != previous.background_radial_gradient
         || current.background_pattern != previous.background_pattern
         || current.opacity != previous.opacity
+        || current.backdrop_blur != previous.backdrop_blur
     {
         axes |= Invalidation::DISPLAY;
     }
@@ -1151,6 +1177,27 @@ mod tests {
             classify_style_change(&base, &base),
             Invalidation::empty(),
             "an unchanged style must report nothing stale"
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_is_a_retained_filter_and_a_display_change() {
+        let style = DivStyle {
+            backdrop_blur: Some(12.0),
+            opacity: 0.75,
+            corner_radii: Corners::all(80.0),
+            ..DivStyle::default()
+        };
+        let mut emission = Emission::new();
+        style.paint(bounds(), &mut emission);
+        assert_eq!(style.primitive_count(), 1);
+        assert_eq!(emission.backdrop_filters().len(), 1);
+        assert_eq!(emission.backdrop_filters()[0].blur_radius, 12.0);
+        assert_eq!(emission.backdrop_filters()[0].opacity, 0.75);
+        assert_eq!(emission.backdrop_filters()[0].corner_radii, [30.0; 4]);
+        assert_eq!(
+            classify_style_change(&style, &DivStyle::default()),
+            Invalidation::DISPLAY
         );
     }
 

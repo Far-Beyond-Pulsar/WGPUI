@@ -10,6 +10,8 @@ path = "src/wgpui_widgets.rs"
 doctest = false
 
 [dependencies]
+anyhow = "1"
+lyon = "1.0"
 # Elements produce `Description`s and `ReconcileKey`s, and name the layout
 # style and resolved rectangle their emission is placed against. Both edges run
 # one way: neither core crate names anything in `wgpui-widgets`.

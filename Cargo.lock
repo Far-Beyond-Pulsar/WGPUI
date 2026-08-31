@@ -6866,7 +6866,9 @@ dependencies = [
 name = "wgpui-widgets"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "image",
+ "lyon",
  "resvg",
  "usvg",
  "wgpui-core",

@@ -29,7 +29,8 @@ pub use wgpui_core::invalidation;
 pub use wgpui_core::patch;
 pub use wgpui_core::patch::emit::{Emit, EmitContext, Emitter, FrameEmission};
 pub use wgpui_core::patch::primitive::{
-    AtlasTileId, Glyph, GlyphRun, Path, PolySprite, Quad, Shadow, Underline,
+    AtlasTileId, BackdropFilter, Glyph, GlyphRun, Path, PathVertex, PolySprite, Quad, Shadow,
+    Underline,
 };
 pub use wgpui_core::reconcile;
 pub use wgpui_core::reconcile::description::{
@@ -70,6 +71,9 @@ pub use wgpui_text::shaping::{
 pub use wgpui_widgets::animation::{
     Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline, ease_in_out,
     ease_out_quint, linear, quadratic,
+};
+pub use wgpui_widgets::canvas::{
+    Canvas, CanvasContext, IntoCanvasBounds, IntoCanvasColor, PathBuilder, PathStyle, canvas, fill,
 };
 pub use wgpui_widgets::div::StatefulDiv;
 pub use wgpui_widgets::div::interactivity::style::{

@@ -912,6 +912,19 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Blur the pixels already rendered behind this element.
+    fn backdrop_blur(mut self, radius: impl IntoStylePixels) -> Self {
+        let radius = radius.into_style_pixels();
+        self.style().backdrop_blur = radius.is_finite().then_some(radius.max(0.0));
+        self
+    }
+
+    /// Disable backdrop filtering.
+    fn backdrop_blur_none(mut self) -> Self {
+        self.style().backdrop_blur = None;
+        self
+    }
+
     /// Set the element opacity using the spelling used by the native examples.
     fn with_opacity(self, opacity: f32) -> Self {
         self.opacity(opacity)

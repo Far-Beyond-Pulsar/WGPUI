@@ -17,6 +17,9 @@ pub mod svg;
 pub mod text;
 pub mod wgpu_surface;
 
+pub use canvas::{
+    Canvas, CanvasContext, IntoCanvasBounds, IntoCanvasColor, PathBuilder, PathStyle, canvas, fill,
+};
 pub use div::interactivity::style::{
     BoxShadow, Corners, DivStyle, Edges, LinearGradient, Pattern, RadialGradient,
 };

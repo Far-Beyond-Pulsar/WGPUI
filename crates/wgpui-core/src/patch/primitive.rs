@@ -1079,6 +1079,12 @@ impl Path {
         self.clip_size = size;
         self
     }
+
+    /// Replace the straight-alpha colour carried by this path.
+    pub fn with_color(mut self, color: [f32; 4]) -> Self {
+        self.color = color;
+        self
+    }
 }
 
 impl Primitive for Path {
