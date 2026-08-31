@@ -1769,14 +1769,6 @@ impl winit::application::ApplicationHandler for Handler {
         };
         let live = &mut self.live[index];
         match event {
-            winit::event::WindowEvent::Focused(focused) => {
-                if focused {
-                    live.window.interaction.activate();
-                } else {
-                    live.window.interaction.deactivate();
-                }
-                live.window.request_redraw();
-            }
             winit::event::WindowEvent::CloseRequested => {
                 if live.window.try_close() {
                     let id = self.live.remove(index).id;
@@ -1907,15 +1899,17 @@ impl winit::application::ApplicationHandler for Handler {
                 }
             }
             winit::event::WindowEvent::Focused(focused) => {
-                let handled = live.window.handle_window_focus(focused, &mut live.app);
+                if focused {
+                    live.window.interaction.activate();
+                } else {
+                    live.window.interaction.deactivate();
+                }
+                live.window.handle_window_focus(focused, &mut live.app);
                 let dirty_regions = live.window.take_hover_dirty_regions();
-                let has_dirty_regions = !dirty_regions.is_empty();
                 for region in dirty_regions {
                     live.frame_loop.mark_interaction_dirty(region);
                 }
-                if handled || has_dirty_regions {
-                    live.window.request_redraw();
-                }
+                live.window.request_redraw();
             }
             winit::event::WindowEvent::RedrawRequested => self.draw(event_loop, window_id),
             winit::event::WindowEvent::CursorEntered { .. } => live.window.request_redraw(),
