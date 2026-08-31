@@ -8,6 +8,7 @@ struct SurfaceInner {
     queue: Arc<wgpu::Queue>,
     id: SurfaceId,
     format: wgpu::TextureFormat,
+    request_redraw: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Drop for SurfaceInner {
@@ -31,6 +32,7 @@ impl WgpuSurfaceHandle {
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
+        request_redraw: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         let id = registry.create(device, width, height, format);
         Self {
@@ -40,6 +42,7 @@ impl WgpuSurfaceHandle {
                 queue: Arc::new(queue.clone()),
                 id,
                 format,
+                request_redraw,
             }),
         }
     }
@@ -82,8 +85,38 @@ impl WgpuSurfaceHandle {
             .swap_rendering_ready_no_sync(self.inner.id);
     }
 
-    /// Alias for [`Self::swap_buffers`].
+    /// Publish a frame and request exactly one native redraw until the frame is
+    /// consumed. Multiple producer updates between display frames are folded
+    /// into the latest ready buffer.
     pub fn present(&self) {
-        self.swap_buffers();
+        self.inner
+            .registry
+            .swap_rendering_ready_no_sync(self.inner.id);
+        if !self.inner.registry.set_redraw_pending(self.inner.id) {
+            (self.inner.request_redraw)();
+        }
+    }
+
+    /// Publish a frame with its queue submission recorded for cross-thread
+    /// pacing diagnostics.
+    pub fn present_synced(&self, submission_index: wgpu::SubmissionIndex) {
+        self.inner
+            .registry
+            .swap_rendering_ready(self.inner.id, submission_index);
+        if !self.inner.registry.set_redraw_pending(self.inner.id) {
+            (self.inner.request_redraw)();
+        }
+    }
+
+    /// Publish a frame without scheduling a native redraw.
+    pub fn present_synced_silent(&self, submission_index: wgpu::SubmissionIndex) {
+        self.inner
+            .registry
+            .swap_rendering_ready(self.inner.id, submission_index);
+    }
+
+    /// Whether a published frame is waiting for the compositor.
+    pub fn has_unconsumed_frame(&self) -> bool {
+        self.inner.registry.has_unconsumed_frame(self.inner.id)
     }
 }

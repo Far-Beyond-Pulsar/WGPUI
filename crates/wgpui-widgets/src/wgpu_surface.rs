@@ -5,13 +5,15 @@
 //! samples the registry's current display buffer and the frame loop damages
 //! only the surface's resolved visible rectangle when a new buffer is ready.
 
+use crate::div::interactivity::style::DivStyle;
+use crate::styled::Styled;
 use std::any::Any;
 use wgpui_core::boundary::compositor::ExternalSurfaceId;
 use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::diff_key::ReconcileKey;
-use wgpui_layout::taffy_tree::{Dimension, LayoutRect, LayoutSize, LayoutStyle};
+use wgpui_layout::taffy_tree::{Dimension, LayoutRect};
 
 /// A handle to an externally-produced surface.
 ///
@@ -44,17 +46,19 @@ pub struct SurfaceStyle {
 
 /// The fingerprint a `WgpuSurface` presents to ambient reconciliation.
 ///
-/// §5.5: "A `diff_key` comparing only `(bounds, style, surface_id)` is
+/// §5.5: "A `diff_key` comparing only `(bounds, layout, style, surface_id)` is
 /// sufficient and correct by construction, because those are the only three
 /// things that affect *its own* composite entry (Taffy leaf, order-tree
 /// position, indirect-draw slot)." Nothing about the surface's pixels appears
 /// here, deliberately and permanently: the compositor always samples whatever
 /// the producer currently has ready, so the framework never has to ask whether
 /// the texture changed the way it asks that of a `div`'s children.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WgpuSurfaceKey {
     /// The rectangle the surface's own style asks for.
     pub bounds: LayoutRect,
+    /// Ambient layout modifiers such as absolute positioning and inset.
+    pub layout: wgpui_layout::taffy_tree::LayoutStyle,
     /// How its composite entry is drawn.
     pub style: SurfaceStyle,
     /// Which externally-produced surface it samples.
@@ -73,6 +77,10 @@ impl ReconcileKey for WgpuSurfaceKey {
             axes |= Invalidation::LAYOUT;
             axes |= Invalidation::DISPLAY;
         }
+        if previous.layout != self.layout {
+            axes |= Invalidation::LAYOUT;
+            axes |= Invalidation::DISPLAY;
+        }
         if previous.style != self.style || previous.surface_id != self.surface_id {
             axes |= Invalidation::DISPLAY;
         }
@@ -87,14 +95,38 @@ impl ReconcileKey for WgpuSurfaceKey {
 /// An externally-rendered surface composited into the scene.
 ///
 /// The retained description of an externally-produced surface.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WgpuSurface {
     surface_id: SurfaceId,
     requested_bounds: LayoutRect,
-    style: SurfaceStyle,
+    surface_style: SurfaceStyle,
+    div_style: DivStyle,
 }
 
 impl WgpuSurface {
+    fn layout_style(&self) -> wgpui_layout::taffy_tree::LayoutStyle {
+        let bounds = self.requested_bounds;
+        let mut layout = self.div_style.layout.clone();
+        if bounds.width > 0.0 {
+            layout.size.width = Dimension::length(bounds.width);
+        }
+        if bounds.height > 0.0 {
+            layout.size.height = Dimension::length(bounds.height);
+        }
+        layout.flex_shrink = 0.0;
+        layout
+    }
+
+    fn effective_surface_style(&self) -> SurfaceStyle {
+        SurfaceStyle {
+            opacity: self.surface_style.opacity * self.div_style.opacity,
+            corner_radius: self
+                .surface_style
+                .corner_radius
+                .max(self.div_style.corner_radii.max()),
+        }
+    }
+
     /// A surface sampling `surface_id`, requesting no particular size.
     pub fn new(surface_id: SurfaceId) -> Self {
         Self {
@@ -105,7 +137,8 @@ impl WgpuSurface {
                 width: 0.0,
                 height: 0.0,
             },
-            style: SurfaceStyle::default(),
+            surface_style: SurfaceStyle::default(),
+            div_style: DivStyle::default(),
         }
     }
 
@@ -124,15 +157,17 @@ impl WgpuSurface {
 
     /// Set how the composite entry is drawn.
     pub fn style(mut self, style: SurfaceStyle) -> Self {
-        self.style = style;
+        self.surface_style = style;
         self
     }
 
-    /// This surface's fingerprint: exactly `(bounds, style, surface_id)`.
+    /// This surface's fingerprint, including all ambient layout and composite
+    /// style that affect its retained node.
     pub fn diff_key(&self) -> WgpuSurfaceKey {
         WgpuSurfaceKey {
             bounds: self.requested_bounds,
-            style: self.style,
+            layout: self.layout_style(),
+            style: self.effective_surface_style(),
             surface_id: self.surface_id,
         }
     }
@@ -144,21 +179,14 @@ impl WgpuSurface {
     /// children, because a surface's content is produced outside the framework
     /// entirely (§5.5).
     pub fn describe(&self) -> Description {
-        let bounds = self.requested_bounds;
+        let style = self.effective_surface_style();
         Description::new::<WgpuSurface>()
             .diff_key(self.diff_key())
-            .style(LayoutStyle {
-                size: LayoutSize {
-                    width: Dimension::length(bounds.width),
-                    height: Dimension::length(bounds.height),
-                },
-                flex_shrink: 0.0,
-                ..LayoutStyle::default()
-            })
+            .style(self.layout_style())
             .external_surface(
                 ExternalSurfaceId::from_raw(self.surface_id.as_raw()),
-                self.style.opacity,
-                self.style.corner_radius,
+                style.opacity,
+                style.corner_radius,
             )
     }
 }
@@ -166,6 +194,12 @@ impl WgpuSurface {
 impl Element for WgpuSurface {
     fn into_description(self) -> Description {
         self.describe()
+    }
+}
+
+impl Styled for WgpuSurface {
+    fn style(&mut self) -> &mut DivStyle {
+        &mut self.div_style
     }
 }
 
@@ -182,7 +216,7 @@ mod tests {
     use wgpui_core::reconcile::plan::{FramePlan, NodeOutcome, PlannedNode, RebuildReason};
     use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
     use wgpui_core::scene::Scene;
-    use wgpui_layout::taffy_tree::{FlexDirection, LayoutTree, definite};
+    use wgpui_layout::taffy_tree::{FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite};
 
     type SurfaceDrawResult = Result<
         (
@@ -488,5 +522,32 @@ mod tests {
             base().diff_key().compare(&base().diff_key()),
             Invalidation::empty()
         );
+    }
+
+    #[test]
+    fn ambient_layout_and_composite_styles_reach_the_surface_entry() {
+        let mut reconciler = Reconciler::new();
+        let mut layout = LayoutTree::new();
+        let mut emitter = Emitter::new();
+        let mut scene = Scene::new();
+        let signals = FrameSignals::new();
+        let plan = reconciler
+            .reconcile(tree(base().rounded(12.0).opacity(0.5)), &mut layout)
+            .expect("surface description should reconcile");
+        let root = plan.nodes().first().map(|node| node.layout_node);
+        if let Some(root) = root {
+            layout
+                .compute_layout(root, definite(640.0, 520.0))
+                .expect("surface description should lay out");
+        }
+        let emission = emitter
+            .emit(&plan, &layout, &signals, &mut scene)
+            .expect("surface description should emit");
+        let entry = emission
+            .external_surfaces
+            .first()
+            .expect("surface should emit one composite entry");
+        assert_eq!(entry.opacity, 0.5);
+        assert_eq!(entry.corner_radius, 12.0);
     }
 }

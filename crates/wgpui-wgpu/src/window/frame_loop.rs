@@ -30,7 +30,9 @@
 //! The resulting glyph runs still enter the ordinary retained patch protocol;
 //! no text-specific draw path bypasses reconciliation.
 
-use wgpui_core::boundary::compositor::{Composite, CompositeEntry, CompositeSource, TiledVisit};
+use wgpui_core::boundary::compositor::{
+    Composite, CompositeEntry, CompositeSource, TiledVisit, visible_composites,
+};
 use wgpui_core::geometry::Rect;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::invalidation::request::FrameSignals;
@@ -64,11 +66,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
-use wgpui_text::patch::RunPlacement;
 use wgpui_text::line::WrappedLine;
 use wgpui_text::line_layout::x_for_index;
+use wgpui_text::patch::RunPlacement;
 use wgpui_text::raster::GlyphRasterizer;
-use wgpui_text::shaping::{Font, FontRun, FontStyle, FontWeight, SharedString, ShapedLine, TextShaper};
+use wgpui_text::shaping::{
+    Font, FontRun, FontStyle, FontWeight, ShapedLine, SharedString, TextShaper,
+};
 
 /// Why a frame could not be produced.
 #[derive(Debug)]
@@ -491,10 +495,7 @@ impl FrameLoop {
     ) -> Result<LoopFrame, LoopError> {
         let active_animation = description.has_active_animation();
         let mut description = description;
-        self.materialize_raw_text(
-            &mut description,
-            Some((input.target.width.max(1)) as f32),
-        )?;
+        self.materialize_raw_text(&mut description, Some((input.target.width.max(1)) as f32))?;
         let mut plan = self.reconciler.reconcile(description, &mut self.layout)?;
         let root = plan
             .root()
@@ -549,13 +550,24 @@ impl FrameLoop {
             self.viewport_recomputes += 1;
         }
         let interaction_dirty_regions = self.interaction_dirty_regions.clone();
+        let mut composite_entries = input.composites.to_vec();
+        composite_entries.extend(emission.external_surfaces.iter().copied());
+        let visible_composites = visible_composites(&composite_entries);
         let external_damage_regions: Vec<Rect> = emission
             .external_surfaces
             .iter()
-            .filter_map(|composite| {
+            .enumerate()
+            .filter_map(|(index, composite)| {
                 let CompositeSource::External(id) = composite.source else {
                     return None;
                 };
+                let visible = visible_composites
+                    .get(input.composites.len() + index)
+                    .copied()
+                    .unwrap_or(true);
+                if !visible {
+                    return None;
+                }
                 self.surface_registry
                     .has_unconsumed_frame(crate::render::surface_registry::SurfaceId::from_raw(
                         id.as_raw(),
@@ -592,8 +604,6 @@ impl FrameLoop {
             .iter()
             .copied()
             .fold(None, |damage, region| Some(union_damage(damage, region)));
-        let mut composite_entries = input.composites.to_vec();
-        composite_entries.extend(emission.external_surfaces.iter().copied());
         let can_preserve_presentation = input
             .target
             .source
@@ -990,12 +1000,10 @@ impl FrameLoop {
         available_width: Option<f32>,
     ) -> Result<RenderedText, LoopError> {
         let font_size = valid_text_size(options.size) * self.scale_factor;
-        let default_line_height = (font_size * 1.618_034).max(
-            prepared
-                .paragraphs
-                .first()
-                .map_or(0.0, |paragraph| paragraph.line.ascent + paragraph.line.descent),
-        );
+        let default_line_height =
+            (font_size * 1.618_034).max(prepared.paragraphs.first().map_or(0.0, |paragraph| {
+                paragraph.line.ascent + paragraph.line.descent
+            }));
         let line_height = options
             .line_height
             .filter(|height| height.is_finite() && *height > 0.0)
@@ -1048,8 +1056,7 @@ impl FrameLoop {
             } else {
                 alignment_width
             });
-            let baseline = (line_height - paragraph_line.ascent - paragraph_line.descent)
-                .max(0.0)
+            let baseline = (line_height - paragraph_line.ascent - paragraph_line.descent).max(0.0)
                 * 0.5
                 + paragraph_line.ascent;
             let line_offset = if options.alignment == Some(1) {
@@ -1092,7 +1099,8 @@ impl FrameLoop {
                             decoration,
                             line_offset,
                             widths.get(line_number).copied().unwrap_or(0.0),
-                            baseline + line_number as f32 * line_height
+                            baseline
+                                + line_number as f32 * line_height
                                 + paragraph_line.descent * 0.618,
                             text_color,
                         ));
@@ -1182,7 +1190,11 @@ impl FrameLoop {
         let font = Font {
             family: SharedString::from("Segoe UI"),
             weight,
-            style: if italic { FontStyle::Italic } else { FontStyle::Normal },
+            style: if italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
             ..Font::default()
         };
         let font_id = self
@@ -1206,9 +1218,7 @@ impl FrameLoop {
             });
         }
         let paragraphs = Arc::new(lines);
-        let prepared = PreparedText {
-            paragraphs,
-        };
+        let prepared = PreparedText { paragraphs };
         self.prepared_text.insert(
             TextCacheKey {
                 value,
@@ -1254,7 +1264,10 @@ fn resolve_text_width(description: &Description, inherited_width: Option<f32>) -
     }
     if dimension.tag() == Dimension::length(0.0).tag() {
         let width = dimension.value();
-        return width.is_finite().then_some(width).filter(|width| *width > 0.0);
+        return width
+            .is_finite()
+            .then_some(width)
+            .filter(|width| *width > 0.0);
     }
     if dimension.tag() == Dimension::percent(0.0).tag() {
         let percent = dimension.value();
@@ -1265,7 +1278,7 @@ fn resolve_text_width(description: &Description, inherited_width: Option<f32>) -
     inherited_width
 }
 
-fn gradient_color(stops: &[( [f32; 4], f32)], mut position: f32, fallback: [f32; 4]) -> [f32; 4] {
+fn gradient_color(stops: &[([f32; 4], f32)], mut position: f32, fallback: [f32; 4]) -> [f32; 4] {
     if stops.is_empty() {
         return fallback;
     }
@@ -1330,7 +1343,14 @@ fn underline_for_line(
     let thickness = decoration.thickness.max(1.0);
     Underline {
         origin: [x, y],
-        size: [width, if decoration.wavy { thickness * 3.0 } else { thickness }],
+        size: [
+            width,
+            if decoration.wavy {
+                thickness * 3.0
+            } else {
+                thickness
+            },
+        ],
         color: decoration.color.unwrap_or(fallback),
         thickness,
         wavy: decoration.wavy,
@@ -1500,10 +1520,7 @@ mod text_materialization_tests {
     #[test]
     fn a_text_gradient_interpolates_between_stops() {
         let color = gradient_color(
-            &[
-                ([1.0, 0.0, 0.0, 1.0], 0.0),
-                ([0.0, 0.0, 1.0, 1.0], 1.0),
-            ],
+            &[([1.0, 0.0, 0.0, 1.0], 0.0), ([0.0, 0.0, 1.0, 1.0], 1.0)],
             0.5,
             [0.0; 4],
         );
@@ -1514,14 +1531,17 @@ mod text_materialization_tests {
     fn a_gradient_keeps_every_glyph_while_assigning_per_glyph_color() {
         let run = CoreGlyphRun {
             color: [1.0; 4],
-            glyphs: vec![Glyph::ZERO, Glyph { position: [10.0, 0.0], ..Glyph::ZERO }],
+            glyphs: vec![
+                Glyph::ZERO,
+                Glyph {
+                    position: [10.0, 0.0],
+                    ..Glyph::ZERO
+                },
+            ],
         };
         let runs = colorize_glyph_runs(
             vec![run],
-            Some(&[
-                ([1.0, 0.0, 0.0, 1.0], 0.0),
-                ([0.0, 0.0, 1.0, 1.0], 1.0),
-            ]),
+            Some(&[([1.0, 0.0, 0.0, 1.0], 0.0), ([0.0, 0.0, 1.0, 1.0], 1.0)]),
             Some(90.0),
             10.0,
             10.0,

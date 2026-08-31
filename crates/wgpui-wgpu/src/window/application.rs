@@ -13,9 +13,9 @@ use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
 pub use wgpui_core::window::WindowOptions;
 use wgpui_core::window::{
-    AnimationClock,
-    DragData, FocusEvent, InputEvent, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton as CoreMouseButton,
-    MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
+    AnimationClock, DragData, FocusEvent, InputEvent, KeyDownEvent, KeyUpEvent, Modifiers,
+    MouseButton as CoreMouseButton, MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ScrollWheelEvent,
 };
 
 use crate::debug::PerformanceDebug;
@@ -134,7 +134,8 @@ impl Window {
             modifiers: self.modifiers(),
             buttons: self.mouse_buttons,
         });
-        let mut handled = index.is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app));
+        let mut handled =
+            index.is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app));
         if let (Some(index), Some(data)) = (self.drag_hovered.take(), self.active_drag.clone()) {
             self.mark_interaction_dirty_for(index);
             handled |= self.dispatch_drag_hover(index, false, &data, app);
@@ -161,6 +162,12 @@ impl Window {
             width,
             height,
             format,
+            {
+                let native = Arc::clone(&self.native);
+                Arc::new(move || {
+                    native.request_redraw();
+                })
+            },
         ))
     }
     pub fn set_title(&self, title: &str) {
@@ -238,13 +245,11 @@ impl Window {
                 let action = self.interaction.resolve_action(key);
                 let mut handled = false;
                 if let Some(action) = action {
-                    if let Some(index) = self
-                        .interactions
-                        .iter()
-                        .position(|registration| registration.focus.is_some_and(|focus| {
-                            Some(focus.id()) == self.interaction.focused()
-                        }))
-                    {
+                    if let Some(index) = self.interactions.iter().position(|registration| {
+                        registration
+                            .focus
+                            .is_some_and(|focus| Some(focus.id()) == self.interaction.focused())
+                    }) {
                         handled = self.dispatch_action_bubbled(index, &*action, app);
                     }
                     if !handled {
@@ -362,10 +367,9 @@ impl Window {
                 }
                 handled
             }
-            InputEvent::Scroll(scroll) => {
-                self.hit_interaction(scroll.position)
-                    .is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app))
-            }
+            InputEvent::Scroll(scroll) => self
+                .hit_interaction(scroll.position)
+                .is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app)),
             _ => self.interaction.handle_input(event),
         }
     }
@@ -431,14 +435,14 @@ impl Window {
                 .interactions
                 .get(index)
                 .and_then(|registration| registration.parent);
-            let result = self
-                .interactions
-                .get_mut(index)
-                .map_or(wgpui_core::window::EventResult::IGNORED, |registration| {
+            let result = self.interactions.get_mut(index).map_or(
+                wgpui_core::window::EventResult::IGNORED,
+                |registration| {
                     registration
                         .interaction
                         .dispatch_action(action, &mut self.interaction, app)
-                });
+                },
+            );
             handled |= result.handled;
             if !result.propagate {
                 break;
@@ -461,17 +465,17 @@ impl Window {
                 .interactions
                 .get(index)
                 .and_then(|registration| registration.parent);
-            let result = self
-                .interactions
-                .get_mut(index)
-                .map_or(wgpui_core::window::EventResult::IGNORED, |registration| {
+            let result = self.interactions.get_mut(index).map_or(
+                wgpui_core::window::EventResult::IGNORED,
+                |registration| {
                     registration.interaction.dispatch_drag_hover(
                         hovered,
                         data,
                         &mut self.interaction,
                         app,
                     )
-                });
+                },
+            );
             handled |= result.handled;
             if !result.propagate {
                 break;
@@ -488,14 +492,14 @@ impl Window {
                 .interactions
                 .get(index)
                 .and_then(|registration| registration.parent);
-            let result = self
-                .interactions
-                .get_mut(index)
-                .map_or(wgpui_core::window::EventResult::IGNORED, |registration| {
+            let result = self.interactions.get_mut(index).map_or(
+                wgpui_core::window::EventResult::IGNORED,
+                |registration| {
                     registration
                         .interaction
                         .dispatch_drop(data, &mut self.interaction, app)
-                });
+                },
+            );
             handled |= result.handled;
             if !result.propagate {
                 break;
@@ -512,9 +516,11 @@ impl Window {
             let Some(id) = transition.to else {
                 return false;
             };
-            let Some(index) = self.interactions.iter().position(|registration| {
-                registration.focus.is_some_and(|focus| focus.id() == id)
-            }) else {
+            let Some(index) = self
+                .interactions
+                .iter()
+                .position(|registration| registration.focus.is_some_and(|focus| focus.id() == id))
+            else {
                 return false;
             };
             self.mark_interaction_dirty_for(index);
@@ -535,9 +541,11 @@ impl Window {
             let Some(id) = id else {
                 continue;
             };
-            let Some(index) = self.interactions.iter().position(|registration| {
-                registration.focus.is_some_and(|focus| focus.id() == id)
-            }) else {
+            let Some(index) = self
+                .interactions
+                .iter()
+                .position(|registration| registration.focus.is_some_and(|focus| focus.id() == id))
+            else {
                 continue;
             };
             self.mark_interaction_dirty_for(index);
@@ -626,7 +634,9 @@ impl Window {
         let hit_address = hit
             .and_then(|index| self.interactions.get(index))
             .map(|registration| registration.address);
-        let hit_bounds = hit.and_then(|index| self.interactions.get(index)).map(|registration| registration.bounds);
+        let hit_bounds = hit
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.bounds);
         self.pressed_interaction = previous_pressed_address.and_then(|address| {
             self.interactions
                 .iter()
@@ -672,15 +682,17 @@ impl Window {
                 self.dispatch_interaction(index, &InputEvent::MouseEnter(mouse), app);
             }
         } else if let Some(index) = hit {
-            self.dispatch_interaction(index, &InputEvent::MouseEnter(MouseMoveEvent {
-                position: self.cursor,
-                modifiers: self.modifiers(),
-                buttons: self.mouse_buttons,
-            }), app);
+            self.dispatch_interaction(
+                index,
+                &InputEvent::MouseEnter(MouseMoveEvent {
+                    position: self.cursor,
+                    modifiers: self.modifiers(),
+                    buttons: self.mouse_buttons,
+                }),
+                app,
+            );
         }
-        if previous_address == hit_address
-            && previous_bounds != hit_bounds
-        {
+        if previous_address == hit_address && previous_bounds != hit_bounds {
             if let Some(bounds) = previous_bounds {
                 self.hover_dirty_regions.push(bounds);
             }

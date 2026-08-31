@@ -2,15 +2,15 @@
 //! direct API.
 
 use std::cell::Cell;
-use std::sync::Arc;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use wgpu::util::DeviceExt;
 
 use wgpui::{
-    ApplicationError, NativeApplication, Styled, SurfaceId, WindowOptions, WgpuSurface,
-    WgpuSurfaceHandle, div, rgb,
+    ApplicationError, NativeApplication, Styled, SurfaceId, WgpuSurface, WgpuSurfaceHandle,
+    WindowOptions, div, rgb,
 };
 
 fn main() -> Result<(), ApplicationError> {
@@ -31,7 +31,6 @@ fn main() -> Result<(), ApplicationError> {
         }
         if let Some(surface_demo) = surface_demo.as_mut() {
             surface_demo.render();
-            window.request_redraw();
         }
         let surface_description = surface_demo.as_ref().map(SurfaceDemo::description);
         window.performance_debug().set_tile_refresh_flash(
@@ -532,11 +531,8 @@ struct SurfaceDemo {
 
 impl SurfaceDemo {
     fn new(window: &mut wgpui::Window) -> Result<Self, wgpui::gpu::window::WindowError> {
-        let surface = window.create_wgpu_surface(
-            218,
-            140,
-            wgpui::gpu::render::pipelines::TARGET_FORMAT,
-        )?;
+        let surface =
+            window.create_wgpu_surface(218, 140, wgpui::gpu::render::pipelines::TARGET_FORMAT)?;
         Ok(Self {
             surface,
             renderer: None,
@@ -554,7 +550,7 @@ impl SurfaceDemo {
             renderer.resize(width, height);
         }
         renderer.render(&view);
-        self.surface.swap_buffers();
+        self.surface.present();
     }
 
     fn description(&self) -> wgpui::Description {

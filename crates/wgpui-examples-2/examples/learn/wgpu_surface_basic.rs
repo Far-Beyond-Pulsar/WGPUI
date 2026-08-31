@@ -3,8 +3,8 @@ use wgpu::util::DeviceExt;
 /// Example: WgpuSurface with a spinning cube
 /// Demonstrates raw wgpu rendering within a gpui WgpuSurface — no third-party renderers.
 use wgpui::{
-    App, Application, Context, Render, WgpuSurfaceHandle, Window, WindowOptions, div, prelude::*,
-    rgb, wgpu_surface,
+    ApplicationError, NativeApplication, Styled, WgpuSurfaceHandle, WindowOptions, div, rgb,
+    wgpu_surface,
 };
 
 const SHADER: &str = r#"
@@ -319,8 +319,8 @@ struct SurfaceExample {
     display_fps: f64,
 }
 
-impl Render for SurfaceExample {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl SurfaceExample {
+    fn render(&mut self) {
         // Render the cube into the back buffer this frame.
         if let Some((view, (w, h))) = self.surface.back_view_with_size() {
             let state = self.state.get_or_insert_with(|| {
@@ -340,7 +340,7 @@ impl Render for SurfaceExample {
             // Swap rendering→ready. The compositor (running right after this
             // method returns) calls swap_ready_display() and samples the texture
             // we just rendered into, within the same GPU submission sequence.
-            self.surface.swap_buffers();
+            self.surface.present();
 
             self.frame_count = self.frame_count.wrapping_add(1);
             let now = std::time::Instant::now();
@@ -350,10 +350,9 @@ impl Render for SurfaceExample {
                 self.last_fps_update = now;
             }
         }
+    }
 
-        // Mark the entity dirty so GPUI keeps scheduling redraws at vsync rate.
-        cx.notify();
-
+    fn description(&self) -> wgpui::Div {
         div()
             .w(wgpui::px(800.0))
             .h(wgpui::px(600.0))
@@ -370,24 +369,30 @@ impl Render for SurfaceExample {
     }
 }
 
-fn main() {
+fn main() -> Result<(), ApplicationError> {
     env_logger::init();
-    Application::new().run(|cx: &mut App| {
-        _ = cx.open_window(
-            WindowOptions::default(),
-            |window: &mut Window, cx: &mut App| {
-                let surface = window
-                    .create_wgpu_surface(800, 600, wgpu::TextureFormat::Rgba8UnormSrgb)
-                    .expect("WgpuSurface not supported on this platform");
-
-                cx.new(|_cx| SurfaceExample {
-                    surface,
-                    state: None,
-                    frame_count: 0,
-                    last_fps_update: std::time::Instant::now(),
-                    display_fps: 0.0,
-                })
-            },
-        );
-    });
+    let mut example = None;
+    NativeApplication::new(WindowOptions::default(), move |window| {
+        if example.is_none() {
+            let surface = window
+                .create_wgpu_surface(800, 600, wgpu::TextureFormat::Rgba8UnormSrgb)
+                .expect("WgpuSurface not supported on this platform");
+            example = Some(SurfaceExample {
+                surface,
+                state: None,
+                frame_count: 0,
+                last_fps_update: std::time::Instant::now(),
+                display_fps: 0.0,
+            });
+        }
+        example
+            .as_mut()
+            .expect("surface example initialized")
+            .render();
+        example
+            .as_ref()
+            .expect("surface example initialized")
+            .description()
+    })
+    .run()
 }
