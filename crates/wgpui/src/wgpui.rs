@@ -37,7 +37,7 @@ pub use wgpui_core::patch;
 pub use wgpui_core::patch::emit::{Emit, EmitContext, Emitter, FrameEmission};
 pub use wgpui_core::patch::primitive::{
     AtlasTileId, BackdropFilter, Glyph, GlyphRun, Path, PathVertex, PolySprite, Quad, Shadow,
-    Underline,
+    ShadowClip, Underline,
 };
 pub use wgpui_core::reconcile;
 pub use wgpui_core::reconcile::description::{
@@ -114,6 +114,7 @@ pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
 pub use wgpui_widgets::wgpu_surface::{SurfaceId, SurfaceStyle, WgpuSurface, WgpuSurfaceKey};
 pub use wgpui_widgets::assets::{AssetLoadError, AssetSource, ImageAssetLoader, Resource};
 
+pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 pub use wgpui_wgpu::window::application::{
     Application, ApplicationError, ClipboardError, ConfiguredApplication, DisplayId, FrameReport,
     NativeApplication, Window, WindowHandle, WindowOptions,

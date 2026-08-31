@@ -44,11 +44,11 @@
 //!    this test is in. The blend state matches: `wgpu::BlendState::ALPHA_BLENDING`
 //!    is what `renderer.rs:890` selects for a non-premultiplied surface, and it
 //!    is field-for-field `render/pipelines.rs`'s `ALPHA_OVER`.
-//! 3. **`content_mask` covers everything.** 2.0 has no per-primitive clip: the
-//!    frame's clip reaches the occlusion pass instead (§5.2). So the legacy arm
-//!    is given a mask far larger than the viewport and its clip-distance path
-//!    never rejects a fragment, which is what makes the two arms comparable at
-//!    all. **Per-fragment clipping is therefore outside this proof.**
+//! 3. **`content_mask` covers everything.** The legacy arm still receives a
+//!    mask far larger than the viewport so its clip-distance path is not part
+//!    of the differential. The native arm additionally checks a focused
+//!    per-fragment clip reference below, covering the retained `ShadowClip`
+//!    sidecar that the old shader cannot represent.
 //!
 //! # The colour, and why it is not simply passed through
 //!
@@ -65,7 +65,7 @@
 use wgpui_core::geometry::Rect;
 use wgpui_core::patch::RecordKey;
 use wgpui_core::patch::apply::{ScenePatch, apply};
-use wgpui_core::patch::primitive::{Quad, Shadow};
+use wgpui_core::patch::primitive::{Quad, Shadow, ShadowClip};
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::{BoundaryId, LayerKey};
 use wgpui_wgpu::render::device::{ComputeContext, context_or_report};
@@ -485,13 +485,35 @@ fn buffer_with(
 /// `shadow` is `None` for the empty-scene render the clear colour is measured
 /// from — see [`measured_clear_pixel`].
 fn render_2_0(context: &ComputeContext, shadow: Option<Shadow>, mode: DrawMode) -> Vec<u8> {
+    let shadows = shadow.into_iter().collect::<Vec<_>>();
+    render_2_0_with_layers(context, &shadows, None, mode)
+}
+
+fn render_2_0_with_clip(
+    context: &ComputeContext,
+    shadow: Option<Shadow>,
+    clip: Option<ShadowClip>,
+    mode: DrawMode,
+) -> Vec<u8> {
+    let shadows = shadow.into_iter().collect::<Vec<_>>();
+    render_2_0_with_layers(context, &shadows, clip, mode)
+}
+
+fn render_2_0_with_layers(
+    context: &ComputeContext,
+    shadows: &[Shadow],
+    clip: Option<ShadowClip>,
+    mode: DrawMode,
+) -> Vec<u8> {
     let mut scene = Scene::new();
     let layer = scene.layer(LayerKey::untiled(BoundaryId::from_raw(1)));
     let mut patch = ScenePatch::new();
-    if let Some(shadow) = shadow {
-        patch
-            .shadows
-            .append(layer, RecordKey::from_raw(1), 0, shadow);
+    for (index, shadow) in shadows.iter().copied().enumerate() {
+        let key = RecordKey::from_raw(index as u64 + 1);
+        patch.shadows.append(layer, key, index as u32, shadow);
+        if let Some(clip) = clip {
+            patch.shadow_clips.append(layer, key, index as u32, clip);
+        }
     }
     apply(&mut scene, &patch).expect("seeding one layer with a shadow must apply");
 
@@ -927,6 +949,99 @@ fn a_shadow_covered_by_an_opaque_quad_still_paints_its_falloff_outside_it() {
          sorts below `Quad`"
     );
     println!("all {lit} out-of-quad samples carry shadow falloff; the core is covered");
+}
+
+#[test]
+fn a_partially_clipped_shadow_keeps_its_falloff_inside_the_clip_only() {
+    let Some(context) = context_or_report("shadow_partial_clip") else {
+        return;
+    };
+    let clear = measured_clear_pixel(&context);
+    let shadow = Shadow {
+        origin: [48.0, 40.0],
+        size: [128.0, 96.0],
+        color: [1.0, 1.0, 1.0, 1.0],
+        corner_radii: [12.0; 4],
+        blur_radius: 16.0,
+    };
+    let clip = ShadowClip {
+        origin: [0.0, 0.0],
+        size: [WIDTH as f32, 80.0],
+    };
+    let pixels = render_2_0_with_clip(
+        &context,
+        Some(shadow),
+        Some(clip),
+        DrawMode::best_available(context.indirect),
+    );
+    let pixel = |bytes: &[u8], x: usize, y: usize| -> [u8; 4] {
+        let index = (y * WIDTH as usize + x) * 4;
+        [
+            bytes[index],
+            bytes[index + 1],
+            bytes[index + 2],
+            bytes[index + 3],
+        ]
+    };
+
+    for y in 80..HEIGHT as usize {
+        for x in 0..WIDTH as usize {
+            assert_eq!(
+                pixel(&pixels, x, y),
+                clear,
+                "a shadow fragment outside its inherited clip leaked at ({x}, {y})"
+            );
+        }
+    }
+    assert_ne!(
+        pixel(&pixels, 112, 72),
+        clear,
+        "the partial clip must not remove the shadow's visible interior"
+    );
+    println!("partial shadow clip preserved the visible region and rejected the clipped tail");
+}
+
+#[test]
+fn multiple_shadow_layers_composite_at_their_own_scales() {
+    let Some(context) = context_or_report("shadow_layers_and_scales") else {
+        return;
+    };
+    let large = Shadow {
+        origin: [48.0, 40.0],
+        size: [128.0, 96.0],
+        color: [1.0, 1.0, 1.0, 0.35],
+        corner_radii: [16.0; 4],
+        blur_radius: 12.0,
+    };
+    let small = Shadow {
+        origin: [80.0, 64.0],
+        size: [64.0, 48.0],
+        color: [0.0, 0.0, 1.0, 0.45],
+        corner_radii: [8.0; 4],
+        blur_radius: 4.0,
+    };
+    let mode = DrawMode::best_available(context.indirect);
+    let large_pixels = render_2_0_with_layers(&context, &[large], None, mode);
+    let small_pixels = render_2_0_with_layers(&context, &[small], None, mode);
+    let combined = render_2_0_with_layers(&context, &[large, small], None, mode);
+    let pixel = |bytes: &[u8], x: usize, y: usize| -> [u8; 4] {
+        let index = (y * WIDTH as usize + x) * 4;
+        [
+            bytes[index],
+            bytes[index + 1],
+            bytes[index + 2],
+            bytes[index + 3],
+        ]
+    };
+    let overlap = pixel(&combined, 112, 88);
+    assert_ne!(overlap, pixel(&large_pixels, 112, 88));
+    assert_ne!(overlap, pixel(&small_pixels, 112, 88));
+    assert_ne!(
+        pixel(&large_pixels, 56, 88),
+        pixel(&small_pixels, 56, 88),
+        "different primitive scales must produce different falloff footprints"
+    );
+    println!("two differently sized shadow layers composited independently at their scales");
 }
 
 /// The legacy file still has the shape this test's "no wrapper" argument rests

@@ -229,36 +229,42 @@ impl<'a> SlotWriter<'a> {
     /// Advance over `count` bytes of explicit padding, zeroing them so two
     /// encodings of equal values always produce equal bytes.
     fn write_padding(&mut self, count: usize) -> Result<(), EncodeError> {
-        let end = self.offset.checked_add(count).ok_or(EncodeError::DestinationSize {
-            expected: usize::MAX,
-            actual: self.destination.len(),
-        })?;
-        let available = self.destination.len();
-        let slice = self
-            .destination
-            .get_mut(self.offset..end)
+        let end = self
+            .offset
+            .checked_add(count)
             .ok_or(EncodeError::DestinationSize {
-                expected: end,
-                actual: available,
+                expected: usize::MAX,
+                actual: self.destination.len(),
             })?;
+        let available = self.destination.len();
+        let slice =
+            self.destination
+                .get_mut(self.offset..end)
+                .ok_or(EncodeError::DestinationSize {
+                    expected: end,
+                    actual: available,
+                })?;
         slice.fill(0);
         self.offset = end;
         Ok(())
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
-        let end = self.offset.checked_add(bytes.len()).ok_or(EncodeError::DestinationSize {
-            expected: usize::MAX,
-            actual: self.destination.len(),
-        })?;
-        let available = self.destination.len();
-        let slice = self
-            .destination
-            .get_mut(self.offset..end)
+        let end = self
+            .offset
+            .checked_add(bytes.len())
             .ok_or(EncodeError::DestinationSize {
-                expected: end,
-                actual: available,
+                expected: usize::MAX,
+                actual: self.destination.len(),
             })?;
+        let available = self.destination.len();
+        let slice =
+            self.destination
+                .get_mut(self.offset..end)
+                .ok_or(EncodeError::DestinationSize {
+                    expected: end,
+                    actual: available,
+                })?;
         slice.copy_from_slice(bytes);
         self.offset = end;
         Ok(())
@@ -439,23 +445,41 @@ impl Material {
         match *self {
             Self::Solid => true,
             Self::Linear { direction, colors } => {
-                finite(&direction) && finite(&colors[0]) && finite(&colors[1])
+                finite(&direction)
+                    && finite(&colors[0])
+                    && finite(&colors[1])
                     && direction[0].hypot(direction[1]) > f32::EPSILON
             }
-            Self::Radial { center, radius, colors } => {
-                finite(&center) && finite(&radius) && finite(&colors[0]) && finite(&colors[1])
-                    && radius[0] > f32::EPSILON && radius[1] > f32::EPSILON
+            Self::Radial {
+                center,
+                radius,
+                colors,
+            } => {
+                finite(&center)
+                    && finite(&radius)
+                    && finite(&colors[0])
+                    && finite(&colors[1])
+                    && radius[0] > f32::EPSILON
+                    && radius[1] > f32::EPSILON
             }
-            Self::Slash { color, width, interval } => {
-                finite(&color) && width.is_finite() && interval.is_finite()
-                    && width > f32::EPSILON && interval >= width
+            Self::Slash {
+                color,
+                width,
+                interval,
+            } => {
+                finite(&color)
+                    && width.is_finite()
+                    && interval.is_finite()
+                    && width > f32::EPSILON
+                    && interval >= width
             }
             Self::Checker { colors, cell } => {
-                finite(&colors[0]) && finite(&colors[1]) && cell.is_finite()
-                    && cell > f32::EPSILON
+                finite(&colors[0]) && finite(&colors[1]) && cell.is_finite() && cell > f32::EPSILON
             }
             Self::Stripes { colors, width } => {
-                finite(&colors[0]) && finite(&colors[1]) && width.is_finite()
+                finite(&colors[0])
+                    && finite(&colors[1])
+                    && width.is_finite()
                     && width > f32::EPSILON
             }
         }
@@ -470,30 +494,23 @@ impl Material {
                 colors[1],
                 [direction[0], direction[1], 0.0, 0.0],
             ),
-            Self::Radial { center, radius, colors } => (
+            Self::Radial {
+                center,
+                radius,
+                colors,
+            } => (
                 2,
                 colors[0],
                 colors[1],
                 [center[0], center[1], radius[0], radius[1]],
             ),
-            Self::Slash { color, width, interval } => (
-                3,
+            Self::Slash {
                 color,
-                [0.0; 4],
-                [width, interval, 0.0, 0.0],
-            ),
-            Self::Checker { colors, cell } => (
-                4,
-                colors[0],
-                colors[1],
-                [cell, 0.0, 0.0, 0.0],
-            ),
-            Self::Stripes { colors, width } => (
-                5,
-                colors[0],
-                colors[1],
-                [width, 0.0, 0.0, 0.0],
-            ),
+                width,
+                interval,
+            } => (3, color, [0.0; 4], [width, interval, 0.0, 0.0]),
+            Self::Checker { colors, cell } => (4, colors[0], colors[1], [cell, 0.0, 0.0, 0.0]),
+            Self::Stripes { colors, width } => (5, colors[0], colors[1], [width, 0.0, 0.0, 0.0]),
         };
         writer.write_u32(kind)?;
         writer.write_padding(12)?;
@@ -798,10 +815,9 @@ impl Primitive for PolySprite {
 /// The legacy `Shadow` (`src/scene.rs:1478`), reduced to what 2.0's protocol
 /// carries. What is deliberately absent is exactly what [`PolySprite`]'s doc
 /// lists and for the same reasons — `order` (§5.1 computes it on the GPU),
-/// `content_mask` (the clip reaches the occlusion pass as a
-/// [`crate::occlusion::CoverageItem`]), and per-corner radii ([`Quad`] carries
-/// one uniform radius in 2.0 and this matches it rather than inventing a second
-/// convention).
+/// `content_mask` (the inherited clip is retained as [`ShadowClip`] metadata),
+/// and per-corner radii ([`Quad`] carries one uniform radius in 2.0 and this
+/// matches it rather than inventing a second convention).
 ///
 /// # The one thing that is genuinely new about this kind
 ///
@@ -893,10 +909,11 @@ impl Shadow {
 impl Primitive for Shadow {
     const KIND: PrimitiveKind = PrimitiveKind::Shadow;
 
-    // 52 bytes of payload, padded to 64 so a slot boundary is also a 16-byte
-    // std430 boundary — `Quad`'s reasoning, one field set over. Phase 6.6 grew
-    // this from 48 by replacing one radius scalar with four.
-    const SLOT_STRIDE: usize = 64;
+    // 52 bytes of primitive data plus a 16-byte clip sidecar, padded to 80 so
+    // the clip is available to the fragment shader without changing the
+    // public `Shadow` struct. Phase 6.6 grew the primitive portion from 48 by
+    // replacing one radius scalar with four.
+    const SLOT_STRIDE: usize = 80;
 
     fn slot_count(&self) -> u32 {
         1
@@ -909,9 +926,38 @@ impl Primitive for Shadow {
         writer.write_f32_array(self.color)?;
         writer.write_f32_array(self.corner_radii)?;
         writer.write_f32(self.blur_radius)?;
-        writer.write_padding(12)?;
+        writer.write_padding(28)?;
         writer.finish()
     }
+}
+
+/// The inherited rectangular clip for one [`Shadow`] record.
+///
+/// Kept beside, rather than inside, [`Shadow`] so adding native clipping does
+/// not break callers that construct the public primitive with a struct literal.
+/// The renderer copies this sidecar into the slot bytes after the primitive has
+/// been encoded. A negative width marks an unbounded clip; a zero-sized clip
+/// intentionally discards every fragment while retaining the record address.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ShadowClip {
+    /// Top-left of the clip in the same coordinate space as the shadow.
+    pub origin: [f32; 2],
+    /// Width and height, or a negative width for no clip.
+    pub size: [f32; 2],
+}
+
+impl ShadowClip {
+    /// A clip that imposes no additional restriction.
+    pub const UNCLIPPED: ShadowClip = ShadowClip {
+        origin: [0.0, 0.0],
+        size: [-1.0, -1.0],
+    };
+
+    /// A zero-area clip that preserves the retained record but paints nothing.
+    pub const EMPTY: ShadowClip = ShadowClip {
+        origin: [0.0, 0.0],
+        size: [0.0, 0.0],
+    };
 }
 
 /// One underline or strikethrough rule: a straight or wavy band under a run of
@@ -1283,7 +1329,14 @@ mod tests {
         ] {
             assert!(!material.is_valid());
             let mut bytes = [0u8; Quad::SLOT_STRIDE];
-            assert!(Quad { material, ..Quad::ZERO }.encode(&mut bytes).is_err());
+            assert!(
+                Quad {
+                    material,
+                    ..Quad::ZERO
+                }
+                .encode(&mut bytes)
+                .is_err()
+            );
         }
     }
 
