@@ -265,7 +265,9 @@ impl From<NativeResourceDimensions> for wgpui_devtools::gpu_resources::ResourceD
 #[cfg(all(test, feature = "devtools"))]
 mod tests {
     use super::*;
-    use wgpui_devtools::{CaptureRequest, ResourceKind, ResourceRole, start_capture, stop_capture};
+    use wgpui_devtools::{
+        CaptureRequest, GpuResourceKind, ResourceRole, start_capture, stop_capture,
+    };
 
     #[test]
     fn native_adapter_preserves_resource_categories_and_transfer_metadata() {
@@ -300,7 +302,10 @@ mod tests {
 
         let snapshot = stop_capture().expect("the capture was started");
         assert_eq!(snapshot.resources.len(), 3);
-        assert_eq!(snapshot.resources[0].descriptor.kind, ResourceKind::Buffer);
+        assert_eq!(
+            snapshot.resources[0].descriptor.kind,
+            GpuResourceKind::Buffer
+        );
         assert_eq!(
             snapshot.resources[0].descriptor.role,
             ResourceRole::PrimitiveBuffer

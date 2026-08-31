@@ -49,6 +49,10 @@ impl ScrollHandle {
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.state.borrow().viewport
     }
+
+    pub fn viewport(&self) -> Bounds<Pixels> {
+        self.bounds()
+    }
     pub fn content_size(&self) -> Size<Pixels> {
         self.state.borrow().content_size
     }
@@ -99,8 +103,16 @@ impl ScrollHandle {
     }
 
     pub fn scroll_wheel(&self, event: &ScrollWheelEvent) -> EventResult {
-        let delta_x = event.delta[0].is_finite().then_some(event.delta[0]).unwrap_or(0.0);
-        let delta_y = event.delta[1].is_finite().then_some(event.delta[1]).unwrap_or(0.0);
+        let delta_x = if event.delta[0].is_finite() {
+            event.delta[0]
+        } else {
+            0.0
+        };
+        let delta_y = if event.delta[1].is_finite() {
+            event.delta[1]
+        } else {
+            0.0
+        };
         let before = self.offset();
         self.set_offset(point(
             Pixels(before.x.value() - delta_x),
@@ -151,6 +163,10 @@ impl ScrollHandle {
             state.revision = state.revision.wrapping_add(1);
         }
         changed
+    }
+
+    pub fn set_content_size(&self, content_size: Size<Pixels>) -> bool {
+        self.set_viewport(self.bounds(), content_size)
     }
 
     pub fn request_scroll_to(&self, offset: Point<Pixels>) {

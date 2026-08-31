@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn app_keeps_configured_client_outside_core() {
-        let mut app = App::new();
+        let mut app = App::create();
         let client: BoxedHttpClient = Arc::new(NullHttpClient);
         app.set_http_client(Arc::clone(&client));
         assert_eq!(app.http_client().type_name(), "NullHttpClient");
@@ -262,7 +262,7 @@ mod tests {
         let proxy = Url::parse("http://proxy.example:8080").expect("proxy URL");
         let configured: BoxedHttpClient =
             Arc::new(HttpClientWithProxy::new_url(client, Some(proxy.clone())));
-        let mut app = App::new();
+        let mut app = App::create();
         app.set_http_client(configured);
         let selected = app.http_client();
         assert_eq!(
@@ -289,7 +289,7 @@ mod tests {
         let client: BoxedHttpClient = Arc::new(PendingClient {
             dropped: Arc::clone(&dropped),
         });
-        let app = App::new();
+        let app = App::create();
         let mut task = app.spawn(async move {
             client
                 .get("http://test.example/pending", AsyncBody::empty(), true)
