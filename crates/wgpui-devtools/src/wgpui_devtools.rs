@@ -27,9 +27,10 @@ pub use hooks::DevtoolsHooks;
 pub use inspector::{
     BOXED_SNAPSHOT_VERSION, BoundaryPolicySnapshot, BoundarySnapshot, BoxModelSnapshot,
     BufferingSnapshot, ClipSnapshot, ComputedStyle, ElementInfo, ElementMetadata, ElementSnapshot,
-    FrozenCapture, FrozenInspectorSnapshot, INSPECTOR_SNAPSHOT_SCHEMA_VERSION, Inspector,
+    FrozenInspectorSnapshot, INSPECTOR_SNAPSHOT_SCHEMA_VERSION, Inspector,
     InspectorSnapshot, InvalidationSnapshot, LastPresentedState, LayoutSnapshot, PaintRecord,
-    RectSnapshot, ScrollRootSnapshot, SnapshotError, SourceLocation, StableAddress,
+    RectSnapshot, ScrollRootSnapshot, SnapshotError as InspectorSnapshotError, SourceLocation,
+    StableAddress,
     TileOwnershipSnapshot, TileSnapshot, TransformSnapshot,
 };
 pub use memory::{
