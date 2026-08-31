@@ -13,8 +13,8 @@ mod example_prelude;
 use std::time::Duration;
 
 use wgpui::{
-    App, Application, Bounds, Colors, Context, Entity, Render, Task, WindowBounds, WindowOptions,
-    div, prelude::*, px, size,
+    App, Application, Bounds, Colors, Context, Entity, Render, Task, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, size,
 };
 
 // Example 1: Simple Foreground Task
@@ -41,23 +41,17 @@ impl ForegroundTaskDemo {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            if cx
-                .background_spawn(async {
-                    std::thread::sleep(Duration::from_secs(1));
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
+            cx.background_spawn(async {
+                std::thread::sleep(Duration::from_secs(1));
+            })
+            .await;
 
-            if let Err(error) = this.update(|this, cx| {
+            this.update(cx, |this, cx| {
                 this.message = "Task completed!".into();
                 this.is_loading = false;
                 cx.notify();
-            }) {
-                eprintln!("foreground task update failed: {error}");
-            }
+            })
+            .ok();
         })
         .detach();
     }
@@ -96,27 +90,21 @@ impl BackgroundTaskDemo {
                     (i + 1) as u64
                 });
 
-                let partial_result = match computation.await {
-                    Ok(result) => result,
-                    Err(_) => break,
-                };
+                let partial_result = computation.await;
 
-                if let Err(error) = this.update(|this, cx| {
+                this.update(cx, |this, cx| {
                     this.progress = i as u32 + 1;
                     this.result = Some(partial_result);
                     cx.notify();
-                }) {
-                    eprintln!("background task update failed: {error}");
-                    break;
-                }
+                })
+                .ok();
             }
 
-            if let Err(error) = this.update(|this, cx| {
+            this.update(cx, |this, cx| {
                 this.is_computing = false;
                 cx.notify();
-            }) {
-                eprintln!("background task completion update failed: {error}");
-            }
+            })
+            .ok();
         })
         .detach();
     }
@@ -151,18 +139,13 @@ impl CancellableTaskDemo {
         } else {
             self.counting_task = Some(cx.spawn(async move |this, cx| {
                 loop {
-                    if cx
-                        .background_spawn(async {
-                            std::thread::sleep(Duration::from_millis(100));
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                    cx.background_spawn(async {
+                        std::thread::sleep(Duration::from_millis(100));
+                    })
+                    .await;
 
                     let should_continue = this
-                        .update(|this, cx| {
+                        .update(cx, |this, cx| {
                             this.counter += 1;
                             cx.notify();
                             true
@@ -205,24 +188,19 @@ impl ReturnValueDemo {
         let numbers = self.numbers.clone();
 
         cx.spawn(async move |this, cx| {
-            let result = match cx
+            let result = cx
                 .background_spawn(async move {
                     std::thread::sleep(Duration::from_millis(500));
                     numbers.iter().sum::<i32>()
                 })
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => return,
-            };
+                .await;
 
-            if let Err(error) = this.update(|this, cx| {
+            this.update(cx, |this, cx| {
                 this.sum = Some(result);
                 this.is_calculating = false;
                 cx.notify();
-            }) {
-                eprintln!("return-value task update failed: {error}");
-            }
+            })
+            .ok();
         })
         .detach();
     }
@@ -242,7 +220,6 @@ impl ReturnValueDemo {
 // Main Application
 
 struct AsyncTasksExample {
-    app: App,
     foreground_demo: Entity<ForegroundTaskDemo>,
     background_demo: Entity<BackgroundTaskDemo>,
     cancellable_demo: Entity<CancellableTaskDemo>,
@@ -252,7 +229,6 @@ struct AsyncTasksExample {
 impl AsyncTasksExample {
     fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            app: cx.app(),
             foreground_demo: cx.new(|_| ForegroundTaskDemo::new()),
             background_demo: cx.new(|_| BackgroundTaskDemo::new()),
             cancellable_demo: cx.new(|_| CancellableTaskDemo::new()),
@@ -262,17 +238,12 @@ impl AsyncTasksExample {
 }
 
 impl Render for AsyncTasksExample {
-    fn render(&mut self) -> impl IntoElement + 'static {
-        let colors = Colors::for_appearance(&());
-        let foreground = self.foreground_demo.read(&self.app);
-        let background = self.background_demo.read(&self.app);
-        let cancellable = self.cancellable_demo.read(&self.app);
-        let return_demo = self.return_demo.read(&self.app);
-        let foreground_demo = self.foreground_demo.clone();
-        let background_demo = self.background_demo.clone();
-        let cancellable_demo = self.cancellable_demo.clone();
-        let calculate_demo = self.return_demo.clone();
-        let return_demo_entity = self.return_demo.clone();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = Colors::for_appearance(window);
+        let foreground = self.foreground_demo.read(cx);
+        let background = self.background_demo.read(cx);
+        let cancellable = self.cancellable_demo.read(cx);
+        let return_demo = self.return_demo.read(cx);
 
         div()
             .id("main")
@@ -321,11 +292,11 @@ impl Render for AsyncTasksExample {
                             )
                             .child(
                                 button(&colors, "foreground-btn", "Start Task", foreground.is_loading)
-                                    .on_click(move |_, _, _| {
-                                        foreground_demo.update(|demo, cx| {
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.foreground_demo.update(cx, |demo, cx| {
                                             demo.start_task(cx);
                                         });
-                                    }),
+                                    })),
                             ),
                     ))
                     .child(demo_section(
@@ -352,11 +323,11 @@ impl Render for AsyncTasksExample {
                             )
                             .child(
                                 button(&colors, "background-btn", "Compute", background.is_computing)
-                                    .on_click(move |_, _, _| {
-                                        background_demo.update(|demo, cx| {
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.background_demo.update(cx, |demo, cx| {
                                             demo.start_computation(cx);
                                         });
-                                    }),
+                                    })),
                             ),
                     ))
                     .child(demo_section(
@@ -392,11 +363,11 @@ impl Render for AsyncTasksExample {
                                     .bg(bg)
                                     .hover(move |style| style.bg(bg_hover))
                                     .child(if is_running { "Stop" } else { "Start Counter" })
-                                    .on_click(move |_, _, _| {
-                                        cancellable_demo.update(|demo, cx| {
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancellable_demo.update(cx, |demo, cx| {
                                             demo.toggle(cx);
                                         });
-                                    })
+                                    }))
                             }),
                     ))
                     .child(demo_section(
@@ -440,19 +411,19 @@ impl Render for AsyncTasksExample {
                                             "Calculate Sum",
                                             return_demo.is_calculating,
                                         )
-                                        .on_click(move |_, _, _| {
-                                            calculate_demo.update(|demo, cx| {
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.return_demo.update(cx, |demo, cx| {
                                                 demo.calculate_sum(cx);
                                             });
-                                        }),
+                                        })),
                                     )
                                     .child(
                                         secondary_button(&colors, "random-btn", "Randomize")
-                                            .on_click(move |_, _, _| {
-                                                return_demo_entity.update(|demo, cx| {
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.return_demo.update(cx, |demo, cx| {
                                                     demo.randomize(cx);
                                                 });
-                                            }),
+                                            })),
                                     ),
                             ),
                     ))
@@ -505,7 +476,7 @@ fn button(
     id: impl Into<wgpui::ElementId>,
     label: &'static str,
     disabled: bool,
-) -> wgpui::Div {
+) -> wgpui::Stateful<wgpui::Div> {
     let disabled_bg = colors.surface_hover;
     let bg = colors.accent;
     let bg_hover = colors.accent_hover;
@@ -513,6 +484,7 @@ fn button(
     let text = colors.selected_text;
 
     div()
+        .id(id)
         .px_3()
         .py_1p5()
         .rounded_md()
@@ -528,19 +500,19 @@ fn button(
                 .active(move |style| style.bg(bg_active))
         })
         .child(label)
-        .id(id)
 }
 
 fn secondary_button(
     colors: &Colors,
     id: impl Into<wgpui::ElementId>,
     label: &'static str,
-) -> wgpui::Div {
+) -> wgpui::Stateful<wgpui::Div> {
     let bg = colors.surface_hover;
     let bg_hover = colors.border;
     let text = colors.text;
 
     div()
+        .id(id)
         .px_3()
         .py_1p5()
         .rounded_md()
@@ -550,7 +522,6 @@ fn secondary_button(
         .cursor_pointer()
         .hover(move |style| style.bg(bg_hover))
         .child(label)
-        .id(id)
 }
 
 fn progress_bar(colors: &Colors, progress: u32) -> impl IntoElement {
@@ -574,22 +545,17 @@ fn progress_bar(colors: &Colors, progress: u32) -> impl IntoElement {
 }
 
 fn main() {
-    if let Err(error) = Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None::<()>, size(px(550.), px(850.)), cx);
-        if let Err(error) = cx.open_window(
+    Application::new().run(|cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(550.), px(850.)), cx);
+        cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(AsyncTasksExample::new),
-        ) {
-            eprintln!("failed to open async-tasks window: {error}");
-            cx.quit();
-            return;
-        }
+            |_, cx| cx.new(|cx| AsyncTasksExample::new(cx)),
+        )
+        .expect("Failed to open window");
 
         example_prelude::init_example(cx, "Async Tasks");
-    }) {
-        eprintln!("native application failed: {error}");
-    }
+    });
 }

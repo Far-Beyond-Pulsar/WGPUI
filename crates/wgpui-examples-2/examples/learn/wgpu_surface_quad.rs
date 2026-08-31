@@ -4,8 +4,8 @@ use wgpu::util::DeviceExt;
 ///
 /// This is intended for validating multi-surface composition and fast-blit behavior.
 use wgpui::{
-    ApplicationError, NativeApplication, Styled, WgpuSurfaceHandle, WindowOptions, div, px, rgb,
-    rgba, wgpu_surface,
+    App, Application, Context, Render, WgpuSurfaceHandle, Window, WindowOptions, div, prelude::*,
+    px, rgb, rgba, wgpu_surface,
 };
 
 const SHADER: &str = r#"
@@ -365,7 +365,7 @@ impl QuadSurfaceExample {
 
             state.render(&view);
             drop(view);
-            tile.surface.present();
+            tile.surface.swap_buffers();
 
             tile.frame_count = tile.frame_count.wrapping_add(1);
             let now = std::time::Instant::now();
@@ -377,7 +377,7 @@ impl QuadSurfaceExample {
         }
     }
 
-    fn tile_element(tile: &SurfaceTile) -> wgpui::Div {
+    fn tile_element(tile: &SurfaceTile) -> impl IntoElement {
         div()
             .relative()
             .h(px(320.0))
@@ -402,14 +402,13 @@ impl QuadSurfaceExample {
     }
 }
 
-impl QuadSurfaceExample {
-    fn render(&mut self) {
+impl Render for QuadSurfaceExample {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         for tile in &mut self.tiles {
             Self::render_tile(tile);
         }
-    }
+        cx.notify();
 
-    fn description(&self) -> wgpui::Div {
         div().size_full().p_3().bg(rgb(0x0b0e14)).child(
             div()
                 .size_full()
@@ -425,66 +424,60 @@ impl QuadSurfaceExample {
     }
 }
 
-fn main() -> Result<(), ApplicationError> {
+fn main() {
     env_logger::init();
-    let mut example = None;
-    NativeApplication::new(WindowOptions::default(), move |window| {
-        if example.is_none() {
-            let surfaces = [
-                window
-                    .create_wgpu_surface(640, 360, wgpu::TextureFormat::Rgba8UnormSrgb)
-                    .expect("WgpuSurface not supported on this platform"),
-                window
-                    .create_wgpu_surface(640, 360, wgpu::TextureFormat::Rgba8UnormSrgb)
-                    .expect("WgpuSurface not supported on this platform"),
-                window
-                    .create_wgpu_surface(640, 360, wgpu::TextureFormat::Rgba8UnormSrgb)
-                    .expect("WgpuSurface not supported on this platform"),
-                window
-                    .create_wgpu_surface(640, 360, wgpu::TextureFormat::Rgba8UnormSrgb)
-                    .expect("WgpuSurface not supported on this platform"),
-            ];
-            example = Some(QuadSurfaceExample {
-                tiles: [
-                    SurfaceTile::new(
-                        "Surface A",
-                        surfaces[0].clone(),
-                        1.10,
-                        0.0,
-                        [0.06, 0.08, 0.14],
-                    ),
-                    SurfaceTile::new(
-                        "Surface B",
-                        surfaces[1].clone(),
-                        1.45,
-                        0.8,
-                        [0.12, 0.05, 0.10],
-                    ),
-                    SurfaceTile::new(
-                        "Surface C",
-                        surfaces[2].clone(),
-                        0.85,
-                        1.5,
-                        [0.05, 0.11, 0.08],
-                    ),
-                    SurfaceTile::new(
-                        "Surface D",
-                        surfaces[3].clone(),
-                        1.75,
-                        2.2,
-                        [0.10, 0.09, 0.04],
-                    ),
-                ],
-            });
-        }
-        example
-            .as_mut()
-            .expect("surface example initialized")
-            .render();
-        example
-            .as_ref()
-            .expect("surface example initialized")
-            .description()
-    })
-    .run()
+    Application::new().run(|cx: &mut App| {
+        _ = cx.open_window(
+            WindowOptions::default(),
+            |window: &mut Window, cx: &mut App| {
+                let surfaces = [
+                    window
+                        .create_wgpu_surface(640, 360, wgpu::TextureFormat::Rgba8UnormSrgb)
+                        .expect("WgpuSurface not supported on this platform"),
+                    window
+                        .create_wgpu_surface(640, 360, wgpu::TextureFormat::Rgba8UnormSrgb)
+                        .expect("WgpuSurface not supported on this platform"),
+                    window
+                        .create_wgpu_surface(640, 360, wgpu::TextureFormat::Rgba8UnormSrgb)
+                        .expect("WgpuSurface not supported on this platform"),
+                    window
+                        .create_wgpu_surface(640, 360, wgpu::TextureFormat::Rgba8UnormSrgb)
+                        .expect("WgpuSurface not supported on this platform"),
+                ];
+
+                cx.new(|_cx| QuadSurfaceExample {
+                    tiles: [
+                        SurfaceTile::new(
+                            "Surface A",
+                            surfaces[0].clone(),
+                            1.10,
+                            0.0,
+                            [0.06, 0.08, 0.14],
+                        ),
+                        SurfaceTile::new(
+                            "Surface B",
+                            surfaces[1].clone(),
+                            1.45,
+                            0.8,
+                            [0.12, 0.05, 0.10],
+                        ),
+                        SurfaceTile::new(
+                            "Surface C",
+                            surfaces[2].clone(),
+                            0.85,
+                            1.5,
+                            [0.05, 0.11, 0.08],
+                        ),
+                        SurfaceTile::new(
+                            "Surface D",
+                            surfaces[3].clone(),
+                            1.75,
+                            2.2,
+                            [0.10, 0.09, 0.04],
+                        ),
+                    ],
+                })
+            },
+        );
+    });
 }
