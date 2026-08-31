@@ -6,6 +6,8 @@
 pub mod capture;
 #[cfg(any(feature = "flamegraph", feature = "render-stats"))]
 pub mod flamegraph;
+#[cfg(any(feature = "flamegraph", feature = "render-stats"))]
+pub use flamegraph::capture::{begin_global_backend_frame, present_global_backend_frame};
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod hooks;
 #[cfg(feature = "inspector")]

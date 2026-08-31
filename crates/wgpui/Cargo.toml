@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [lib]
-path = "src/wgpui.rs"
+path = "src/lib.rs"
 doctest = false
 
 [dependencies]
