@@ -15,7 +15,7 @@ use crate::geometry::{Bounds, Pixels, Size, point};
 use crate::reconcile::{ElementStateStore, StateKey, StateScope};
 use std::time::{Duration, Instant};
 
-pub use animation::{AnimationScheduler, WindowTimers};
+pub use animation::{AnimationClock, AnimationScheduler, WindowTimers};
 pub use close::CloseState;
 pub use dispatch::{DispatchNodeId, DispatchTree};
 pub use focus::{FocusHandle, FocusId, FocusManager, FocusTransition, Focusable};

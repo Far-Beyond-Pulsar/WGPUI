@@ -13,6 +13,7 @@ use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
 pub use wgpui_core::window::WindowOptions;
 use wgpui_core::window::{
+    AnimationClock,
     DragData, FocusEvent, InputEvent, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton as CoreMouseButton,
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
 };
@@ -69,6 +70,7 @@ pub struct Window {
     drag_hovered: Option<usize>,
     hover_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
+    animation_clock: AnimationClock,
 }
 
 /// A clonable handle for scheduling work on a native window.
@@ -1064,6 +1066,7 @@ impl Handler {
             drag_hovered: None,
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
+            animation_clock: AnimationClock::new(),
         };
         let mut frame_loop = FrameLoop::new(&context.device);
         frame_loop.set_surface_registry(surface_registry);
@@ -1158,7 +1161,12 @@ impl Handler {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let (width, height) = live.surface.size();
         live.window.begin_frame();
-        let description = (live.build)(&mut live.window);
+        let animation_clock = std::mem::take(&mut live.window.animation_clock);
+        let (animation_clock, description) =
+            wgpui_core::window::animation::with_animation_clock(animation_clock, || {
+                (live.build)(&mut live.window)
+            });
+        live.window.animation_clock = animation_clock;
         live.window.end_frame();
         live.frame_loop
             .set_performance_debug(*live.window.performance_debug());
@@ -1321,6 +1329,7 @@ impl winit::application::ApplicationHandler for Handler {
             pressed_event: None,
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
+            animation_clock: AnimationClock::new(),
         };
         let mut frame_loop = FrameLoop::new(&context.device);
         frame_loop.set_surface_registry(surface_registry);

@@ -467,6 +467,7 @@ pub struct Description {
     pub(crate) interaction: Option<DescriptionInteraction>,
     pub(crate) layout_callback: Option<DescriptionLayout>,
     pub(crate) external_surface: Option<ExternalSurfaceProperties>,
+    pub(crate) active_animation: bool,
 }
 
 impl std::fmt::Debug for Description {
@@ -483,6 +484,7 @@ impl std::fmt::Debug for Description {
             .field("children", &self.children.len())
             .field("clip_children", &self.clip_children)
             .field("has_layout_callback", &self.layout_callback.is_some())
+            .field("active_animation", &self.active_animation)
             .finish()
     }
 }
@@ -516,6 +518,7 @@ impl Description {
             interaction: None,
             layout_callback: None,
             external_surface: None,
+            active_animation: false,
         }
     }
 
@@ -771,6 +774,23 @@ impl Description {
     /// The external texture metadata, if this description is a surface leaf.
     pub fn external_surface_properties(&self) -> Option<ExternalSurfaceProperties> {
         self.external_surface
+    }
+
+    /// Mark this description as needing another frame while an animation is
+    /// active. This metadata does not participate in reconciliation; the
+    /// sampled style or primitive remains the source of display invalidation.
+    pub fn active_animation(mut self) -> Self {
+        self.active_animation = true;
+        self
+    }
+
+    /// Whether this description or one of its descendants is still animating.
+    pub fn has_active_animation(&self) -> bool {
+        self.active_animation
+            || self
+                .children
+                .iter()
+                .any(Description::has_active_animation)
     }
 
     /// The tuning this element's boundary was declared with, if any.

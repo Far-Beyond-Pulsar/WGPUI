@@ -529,10 +529,15 @@ fn material_quad(
 
 fn gradient_material(gradient: &LinearGradient, opacity: f32) -> Material {
     let angle = gradient.angle.to_radians();
-    let mut colors: [[f32; 4]; 2] = [
-        gradient.stops[0].color.into(),
-        gradient.stops[1].color.into(),
-    ];
+    let first_color = gradient
+        .stops
+        .first()
+        .map_or([0.0; 4], |stop| stop.color.into());
+    let second_color = gradient
+        .stops
+        .get(1)
+        .map_or(first_color, |stop| stop.color.into());
+    let mut colors: [[f32; 4]; 2] = [first_color, second_color];
     colors[0][3] *= opacity;
     colors[1][3] *= opacity;
     Material::Linear {
@@ -1214,6 +1219,29 @@ mod tests {
             classify_style_change(&gradient, &DivStyle::default()),
             Invalidation::DISPLAY
         );
+    }
+
+    #[test]
+    fn linear_gradients_with_fewer_than_two_stops_do_not_panic() {
+        for stops in [
+            Vec::new(),
+            vec![LinearColorStop {
+                color: red(),
+                percentage: 0.0,
+            }],
+        ] {
+            let style = DivStyle {
+                background_gradient: Some(LinearGradient {
+                    stops,
+                    angle: 0.0,
+                    color_space: ColorSpace::Srgb,
+                }),
+                ..DivStyle::default()
+            };
+            let mut emission = Emission::new();
+            style.paint(bounds(), &mut emission);
+            assert_eq!(style.primitive_count(), emission.quads().len());
+        }
     }
 
     #[test]

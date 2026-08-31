@@ -39,7 +39,7 @@ pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey,
 pub use wgpui_core::reconcile::{StateKey, StateScope};
 pub use wgpui_core::scene;
 pub use wgpui_core::window::{
-    AnimationScheduler, DispatchTree, FocusManager, Keymap, WindowTimers,
+    AnimationClock, AnimationScheduler, DispatchTree, FocusManager, Keymap, WindowTimers,
 };
 pub use wgpui_core::{
     Action, App, ClickEvent, CloseState, Context, DispatchNodeId, DragData, DragHoverEvent,

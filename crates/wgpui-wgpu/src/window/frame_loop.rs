@@ -149,8 +149,8 @@ pub struct LoopFrame {
     /// The GPU half.
     pub frame: FrameOutput,
     pub interactions: Vec<InteractionRegistration>,
-    /// Whether the native handler should schedule another frame for a fading
-    /// diagnostic overlay.
+    /// Whether the native handler should schedule another frame for an active
+    /// animation or a fading diagnostic overlay.
     pub needs_redraw: bool,
 }
 
@@ -489,6 +489,7 @@ impl FrameLoop {
         description: Description,
         input: &LoopInput<'_>,
     ) -> Result<LoopFrame, LoopError> {
+        let active_animation = description.has_active_animation();
         let mut description = description;
         self.materialize_raw_text(
             &mut description,
@@ -585,7 +586,7 @@ impl FrameLoop {
                 ),
             ))
         });
-        let needs_redraw = layout_changed || !debug_tiles.is_empty();
+        let needs_redraw = active_animation || layout_changed || !debug_tiles.is_empty();
         self.renderer.set_debug_tiles(debug_tiles);
         let external_damage = external_damage_regions
             .iter()
