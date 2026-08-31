@@ -268,6 +268,15 @@ struct DamageRefreshRegion {
     regular: bool,
 }
 
+#[derive(Clone, Copy)]
+struct DebugRefreshRegion {
+    rect: Rect,
+    frames_remaining: u32,
+    updates: u32,
+    frames_per_second: f32,
+    regular: bool,
+}
+
 impl FrameLoop {
     /// Build every pipeline once, and start with an empty scene.
     pub fn new(device: &wgpu::Device) -> FrameLoop {
@@ -651,33 +660,19 @@ impl FrameLoop {
         if self.tile_flash_frames.is_empty() && self.damage_refresh_regions.is_empty() {
             return Vec::new();
         }
-        let mut tiles = Vec::new();
+        let mut refresh_regions = Vec::new();
         for refresh_region in &self.damage_refresh_regions {
             let region = refresh_region.rect.intersect(&viewport);
             if region.is_empty() {
                 continue;
             }
-            let fade = tile_flash_fade(
-                refresh_region.frames_remaining,
-                flash.duration_frames,
-            );
-            let mut tile = DebugTile {
-                origin_size: [
-                    region.min_x,
-                    region.min_y,
-                    region.width(),
-                    region.height(),
-                ],
-                color: faded_color(flash.color, fade),
-                border_width: 3.0,
-                _padding: [0.0; 7],
-            };
-            if refresh_region.regular {
-                tile = tile.with_refresh_rate(refresh_region.frames_per_second);
-            } else {
-                tile = tile.with_refresh_count(refresh_region.updates);
-            }
-            tiles.push(tile);
+            refresh_regions.push(DebugRefreshRegion {
+                rect: region,
+                frames_remaining: refresh_region.frames_remaining,
+                updates: refresh_region.updates,
+                frames_per_second: refresh_region.frames_per_second,
+                regular: refresh_region.regular,
+            });
         }
         for visit in &emission.tiled_visits {
             for tile in &visit.visible {
@@ -689,34 +684,44 @@ impl FrameLoop {
                 if tile_rect.is_empty() {
                     continue;
                 }
-                let mut debug_tile = DebugTile {
-                        origin_size: [
-                            tile_rect.min_x,
-                            tile_rect.min_y,
-                            tile_rect.width(),
-                            tile_rect.height(),
-                        ],
-                        color: faded_color(
-                            flash.color,
-                            tile_flash_fade(
-                                self.tile_flash_frames.get(&key).copied().unwrap_or(0),
-                                flash.duration_frames,
-                            ),
-                        ),
-                        border_width: 3.0,
-                        _padding: [0.0; 7],
-                    };
-                if let Some(rate) = self.tile_refresh_rates.get(&key) {
-                    if rate.regular {
-                        debug_tile = debug_tile.with_refresh_rate(rate.frames_per_second);
-                    } else {
-                        debug_tile = debug_tile.with_refresh_count(rate.updates);
-                    }
-                }
-                tiles.push(debug_tile);
+                let rate = self.tile_refresh_rates.get(&key);
+                refresh_regions.push(DebugRefreshRegion {
+                    rect: tile_rect,
+                    frames_remaining: self.tile_flash_frames.get(&key).copied().unwrap_or(0),
+                    updates: rate.map_or(0, |rate| rate.updates),
+                    frames_per_second: rate.map_or(0.0, |rate| rate.frames_per_second),
+                    regular: rate.is_some_and(|rate| rate.regular),
+                });
             }
         }
-        tiles
+        let refresh_regions = if flash.viewport_grid {
+            refresh_regions
+        } else {
+            select_debug_refresh_regions(refresh_regions)
+        };
+        refresh_regions
+            .into_iter()
+            .map(|refresh_region| {
+                let fade = tile_flash_fade(refresh_region.frames_remaining, flash.duration_frames);
+                let mut tile = DebugTile {
+                    origin_size: [
+                        refresh_region.rect.min_x,
+                        refresh_region.rect.min_y,
+                        refresh_region.rect.width(),
+                        refresh_region.rect.height(),
+                    ],
+                    color: faded_color(flash.color, fade),
+                    border_width: 3.0,
+                    _padding: [0.0; 7],
+                };
+                if refresh_region.regular {
+                    tile = tile.with_refresh_rate(refresh_region.frames_per_second);
+                } else {
+                    tile = tile.with_refresh_count(refresh_region.updates);
+                }
+                tile
+            })
+            .collect()
     }
 
     fn record_tile_refresh(
@@ -918,6 +923,52 @@ fn same_rect(first: Rect, second: Rect) -> bool {
         && (first.max_y - second.max_y).abs() <= EPSILON
 }
 
+fn select_debug_refresh_regions(candidates: Vec<DebugRefreshRegion>) -> Vec<DebugRefreshRegion> {
+    let mut unique: Vec<DebugRefreshRegion> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(existing) = unique
+            .iter_mut()
+            .find(|existing| same_rect(existing.rect, candidate.rect))
+        {
+            existing.frames_remaining = existing.frames_remaining.max(candidate.frames_remaining);
+            existing.updates = existing.updates.max(candidate.updates);
+            if candidate.regular
+                && (!existing.regular || candidate.frames_per_second > existing.frames_per_second)
+            {
+                existing.frames_per_second = candidate.frames_per_second;
+                existing.regular = true;
+            }
+        } else {
+            unique.push(candidate);
+        }
+    }
+
+    unique
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate_index, candidate)| {
+            let contained_by_active_parent =
+                unique.iter().enumerate().any(|(parent_index, parent)| {
+                    parent_index != candidate_index
+                        && !same_rect(parent.rect, candidate.rect)
+                        && parent.rect.contains(&candidate.rect)
+                        && !debug_child_is_meaningfully_faster(parent, candidate)
+                });
+            (!contained_by_active_parent).then_some(*candidate)
+        })
+        .collect()
+}
+
+fn debug_child_is_meaningfully_faster(
+    parent: &DebugRefreshRegion,
+    child: &DebugRefreshRegion,
+) -> bool {
+    const FASTER_LOOP_RATIO: f32 = 1.25;
+    parent.regular
+        && child.regular
+        && child.frames_per_second > parent.frames_per_second * FASTER_LOOP_RATIO
+}
+
 fn tile_flash_fade(frames_remaining: u32, duration_frames: u32) -> f32 {
     if duration_frames == 0 {
         return 0.0;
@@ -928,6 +979,69 @@ fn tile_flash_fade(frames_remaining: u32, duration_frames: u32) -> f32 {
 fn faded_color(mut color: [f32; 4], fade: f32) -> [f32; 4] {
     color[3] *= fade;
     color
+}
+
+#[cfg(test)]
+mod debug_refresh_region_tests {
+    use super::*;
+
+    fn region(origin: [f32; 2], size: [f32; 2], frames_per_second: f32) -> DebugRefreshRegion {
+        DebugRefreshRegion {
+            rect: Rect::from_origin_size(origin, size),
+            frames_remaining: 3,
+            updates: 12,
+            frames_per_second,
+            regular: frames_per_second > 0.0,
+        }
+    }
+
+    #[test]
+    fn nested_regions_collapse_to_the_outermost_unless_the_child_is_faster() {
+        let selected = select_debug_refresh_regions(vec![
+            region([0.0, 0.0], [200.0, 200.0], 30.0),
+            region([20.0, 20.0], [80.0, 80.0], 60.0),
+        ]);
+
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn a_child_with_the_same_update_rate_does_not_add_a_recursive_box() {
+        let selected = select_debug_refresh_regions(vec![
+            region([0.0, 0.0], [200.0, 200.0], 60.0),
+            region([20.0, 20.0], [80.0, 80.0], 60.0),
+        ]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].rect,
+            Rect::from_origin_size([0.0, 0.0], [200.0, 200.0])
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_parent_keeps_the_outermost_fallback() {
+        let selected = select_debug_refresh_regions(vec![
+            region([0.0, 0.0], [200.0, 200.0], 0.0),
+            region([20.0, 20.0], [80.0, 80.0], 120.0),
+        ]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].rect,
+            Rect::from_origin_size([0.0, 0.0], [200.0, 200.0])
+        );
+    }
+
+    #[test]
+    fn disjoint_regions_remain_independent() {
+        let selected = select_debug_refresh_regions(vec![
+            region([0.0, 0.0], [80.0, 80.0], 30.0),
+            region([120.0, 0.0], [80.0, 80.0], 30.0),
+        ]);
+
+        assert_eq!(selected.len(), 2);
+    }
 }
 
 fn screen_tile_rect(visit: &TiledVisit, tile: TileCoord) -> Rect {
