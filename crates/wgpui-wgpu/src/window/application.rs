@@ -25,6 +25,7 @@ use wgpui_core::window::{
 use wgpui_core::window::{
     WindowAppearance, WindowBackgroundAppearance, WindowDecorations, WindowKind,
 };
+use wgpui_http_client::{AppHttpClientExt, BoxedHttpClient};
 
 use crate::debug::PerformanceDebug;
 use crate::render::draw::DrawMode;
@@ -1145,6 +1146,7 @@ pub struct NativeApplication<F, R> {
     options: WindowOptions,
     build: F,
     max_frames: Option<u64>,
+    http_client: Option<BoxedHttpClient>,
     marker: std::marker::PhantomData<fn() -> R>,
 }
 
@@ -1158,6 +1160,7 @@ where
             options,
             build,
             max_frames: None,
+            http_client: None,
             marker: std::marker::PhantomData,
         }
     }
@@ -1183,6 +1186,12 @@ where
         initialize: impl FnOnce(&mut App) + 'static,
     ) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
+        let mut app = App::create();
+        if let Some(client) = self.http_client {
+            app.set_http_client(client);
+        } else {
+            app.install_default_http_client();
+        }
         let mut handler = Handler {
             initial: Some((
                 self.options,
@@ -1192,7 +1201,7 @@ where
             initialize: Some(Box::new(initialize)),
             live: Vec::new(),
             failure: None,
-            app: App::create(),
+            app,
         };
         event_loop
             .run_app(&mut handler)
@@ -1210,8 +1219,20 @@ where
         self
     }
 
+    /// Configures the client used by URI resource loading in this application.
+    pub fn with_http_client(mut self, client: BoxedHttpClient) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
     pub fn run(mut self) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
+        let mut app = App::create();
+        if let Some(client) = self.http_client {
+            app.set_http_client(client);
+        } else {
+            app.install_default_http_client();
+        }
         let mut handler = Handler {
             initial: Some((
                 self.options,
@@ -1221,7 +1242,7 @@ where
             initialize: None,
             live: Vec::new(),
             failure: None,
-            app: App::create(),
+            app,
         };
         event_loop
             .run_app(&mut handler)
@@ -1237,6 +1258,11 @@ impl Application {
         Self
     }
 
+    /// Configures the client used by URI resource loading in this application.
+    pub fn with_http_client(self, client: BoxedHttpClient) -> ConfiguredApplication {
+        ConfiguredApplication { http_client: client }
+    }
+
     pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
@@ -1247,6 +1273,34 @@ impl Application {
             max_frames: None,
             initialize: Some(Box::new(initialize)),
             app: App::create(),
+            live: Vec::new(),
+            failure: None,
+        };
+        event_loop
+            .run_app(&mut handler)
+            .map_err(ApplicationError::from)?;
+        handler.failure.map_or(Ok(()), Err)
+    }
+}
+
+/// An [`Application`] with an explicitly configured native HTTP client.
+pub struct ConfiguredApplication {
+    http_client: BoxedHttpClient,
+}
+
+impl ConfiguredApplication {
+    pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
+        let event_loop = event_loop()?;
+        let mut app = App::create();
+        app.set_http_client(self.http_client);
+        let mut handler = Handler {
+            initial: Some((
+                WindowOptions::default(),
+                Box::new(|_| Description::new::<()>()),
+            )),
+            max_frames: None,
+            initialize: Some(Box::new(initialize)),
+            app,
             live: Vec::new(),
             failure: None,
         };

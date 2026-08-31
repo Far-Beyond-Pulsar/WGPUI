@@ -1,0 +1,22 @@
+[package]
+name = "wgpui-http-client"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "wgpui_http_client"
+path = "src/wgpui_http_client.rs"
+doctest = false
+
+[dependencies]
+anyhow = "1.0"
+gpui_http_client = { package = "gpui_http_client", version = "0.2.2" }
+wgpui-core = { path = "../wgpui-core" }
+futures = "0.3"
+
+[dev-dependencies]
+bytes = "1.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

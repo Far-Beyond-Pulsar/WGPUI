@@ -9,6 +9,13 @@ pub use wgpui_layout as layout;
 pub use wgpui_text as text;
 pub use wgpui_wgpu as gpu;
 pub use wgpui_widgets as widgets;
+pub use wgpui_http_client as http_client;
+
+pub use wgpui_http_client::{
+    AppHttpClientExt, AsyncBody, BoxedHttpClient, Builder, FollowRedirects, HttpBody,
+    HttpClient, HttpClientService, HttpClientWithProxy, HttpClientWithUrl, HttpRequestExt, Inner,
+    Method, NullHttpClient, RedirectPolicy, Request, Response, Result, StatusCode, Uri, Url,
+};
 
 pub use wgpui_core::actions;
 pub use wgpui_core::boundary;
@@ -105,10 +112,11 @@ pub use wgpui_widgets::styled_text::{
 };
 pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
 pub use wgpui_widgets::wgpu_surface::{SurfaceId, SurfaceStyle, WgpuSurface, WgpuSurfaceKey};
+pub use wgpui_widgets::assets::{AssetLoadError, AssetSource, ImageAssetLoader, Resource};
 
 pub use wgpui_wgpu::window::application::{
-    Application, ApplicationError, ClipboardError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
-    WindowOptions,
+    Application, ApplicationError, ClipboardError, ConfiguredApplication, DisplayId, FrameReport,
+    NativeApplication, Window, WindowHandle, WindowOptions,
 };
 pub use wgpui_wgpu::window::surface::WgpuSurfaceHandle;
 

@@ -17,6 +17,7 @@ arboard = "3.6.1"
 # descriptors as plain Rust structs"). The edge runs one way only — wgpui-core
 # names nothing here, and cannot, since it is forbidden a live device.
 wgpui-core = { path = "../wgpui-core" }
+wgpui-http-client = { path = "../wgpui-http-client" }
 # Phase 6's `window/frame_loop.rs` drives the whole of §2's picture, which means
 # it holds the `LayoutTree` the reconciler builds and `Emitter::emit` reads.
 # `wgpui-core` already depends on this crate for exactly that type; naming it

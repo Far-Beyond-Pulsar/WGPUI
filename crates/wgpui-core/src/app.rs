@@ -1,6 +1,6 @@
 //! `App`/`Context<T>` root context assembly. See
 //! docs/gpu-native-architecture.md §1, §3.1.
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -38,6 +38,7 @@ struct AppState {
     observers: HashMap<EntityId, Vec<(u64, Observer)>>,
     next_observer: u64,
     next_entity: u64,
+    globals: HashMap<TypeId, Rc<dyn Any>>,
     keymap: Keymap,
     action_handlers: HashMap<TypeId, Vec<ActionHandler>>,
     propagate_actions: bool,
@@ -106,7 +107,8 @@ impl App {
             state: Rc::new(RefCell::new(AppState {
                 observers: HashMap::new(),
                 next_observer: 0,
-                next_entity: 0,
+            next_entity: 0,
+            globals: HashMap::new(),
                 keymap: Keymap::default(),
                 action_handlers: HashMap::new(),
                 propagate_actions: false,
@@ -180,6 +182,33 @@ impl App {
 
     pub fn has_pending_tasks(&self) -> bool {
         self.pending_tasks.load(Ordering::Acquire) != 0
+    }
+
+    /// Installs application-scoped state shared by cloned application handles.
+    pub fn set_global<T: 'static>(&mut self, value: T) {
+        self.state
+            .borrow_mut()
+            .globals
+            .insert(TypeId::of::<T>(), Rc::new(value));
+    }
+
+    /// Reads application-scoped state installed with [`Self::set_global`].
+    pub fn global<T: 'static>(&self) -> Option<Rc<T>> {
+        self.state
+            .borrow()
+            .globals
+            .get(&TypeId::of::<T>())
+            .and_then(|value| Rc::clone(value).downcast::<T>().ok())
+    }
+
+    /// Removes application-scoped state and returns it when uniquely owned.
+    pub fn remove_global<T: 'static>(&mut self) -> Option<T> {
+        self.state
+            .borrow_mut()
+            .globals
+            .remove(&TypeId::of::<T>())
+            .and_then(|value| Rc::downcast::<T>(value).ok())
+            .and_then(|value| Rc::try_unwrap(value).ok())
     }
 
     pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
