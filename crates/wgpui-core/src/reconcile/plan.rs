@@ -16,7 +16,7 @@ use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::axes::Invalidation;
 use crate::patch::emit::Emit;
 use crate::reconcile::description::{
-    DescriptionInteraction, DescriptionLayout, ExternalSurfaceProperties,
+    DescriptionInteraction, DescriptionLayout, ExternalSurfaceProperties, ScrollInfo,
 };
 use crate::reconcile::instance::InstanceKey;
 use crate::reconcile::state::StateScope;
@@ -175,6 +175,7 @@ pub struct FramePlan {
     nodes: Vec<PlannedNode>,
     emitters: Vec<Option<Box<dyn Emit>>>,
     interactions: Vec<Option<DescriptionInteraction>>,
+    scroll_infos: Vec<Option<ScrollInfo>>,
     layout_callbacks: Vec<Option<DescriptionLayout>>,
     scroll_axes: Vec<[bool; 2]>,
     automatic_scroll: Vec<bool>,
@@ -208,6 +209,7 @@ impl FramePlan {
         self.nodes.push(node);
         self.emitters.push(None);
         self.interactions.push(None);
+        self.scroll_infos.push(None);
         self.layout_callbacks.push(None);
         self.scroll_axes.push([false, false]);
         self.automatic_scroll.push(false);
@@ -269,6 +271,16 @@ impl FramePlan {
         if let Some(slot) = self.interactions.get_mut(index) {
             *slot = interaction;
         }
+    }
+
+    pub(crate) fn set_scroll_info(&mut self, index: usize, scroll_info: Option<ScrollInfo>) {
+        if let Some(slot) = self.scroll_infos.get_mut(index) {
+            *slot = scroll_info;
+        }
+    }
+
+    pub fn scroll_info(&self, index: usize) -> Option<ScrollInfo> {
+        self.scroll_infos.get(index).copied().flatten()
     }
 
     pub fn take_interaction(&mut self, index: usize) -> Option<DescriptionInteraction> {

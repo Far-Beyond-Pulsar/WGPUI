@@ -35,7 +35,7 @@ pub mod state;
 pub mod uncached;
 pub mod walk;
 
-pub use description::{Description, ElementId};
+pub use description::{Description, ElementId, ScrollInfo};
 pub use diff_key::{AlwaysDirty, ReconcileKey, compare_by_equality};
 pub use instance::{ElementInstance, InstanceKey, InstanceTable, RetainedElement};
 pub use plan::{FramePlan, FrameStats, NodeOutcome, PlannedNode, RebuildReason};

@@ -602,6 +602,10 @@ impl Div {
             .automatic_scroll(automatic_scroll)
             .children(children);
 
+        if let Some(scroll_handle) = scroll_handle.as_ref() {
+            description = description.scroll_info(scroll_handle.inspector_info());
+        }
+
         if clips_children {
             description = description.clip_children();
         }

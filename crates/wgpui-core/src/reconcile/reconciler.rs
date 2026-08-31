@@ -254,6 +254,7 @@ impl Reconciler {
             automatic_scroll,
             emitter,
             interaction,
+            scroll_info,
             layout_callback,
             external_surface,
             layout_style,
@@ -332,6 +333,7 @@ impl Reconciler {
             .set_scroll_metadata(plan_index, scroll_axes, automatic_scroll);
         context.plan.set_emitter(plan_index, emitter);
         context.plan.set_interaction(plan_index, interaction);
+        context.plan.set_scroll_info(plan_index, scroll_info);
         context
             .plan
             .set_layout_callback(plan_index, layout_callback);
@@ -463,6 +465,9 @@ impl Reconciler {
         context
             .plan
             .set_interaction(plan_index, description.interaction.take());
+        context
+            .plan
+            .set_scroll_info(plan_index, description.scroll_info);
         context
             .plan
             .set_layout_callback(plan_index, description.layout_callback.take());

@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod focus;
 pub mod hitbox;
 pub mod input;
+pub mod inspector;
 pub mod keymap;
 pub mod menu;
 pub mod scroll;
@@ -25,6 +26,11 @@ pub use input::{
     ClipboardItem, ClickEvent, DragData, DragHoverEvent, DropEvent, EventResult, FocusEvent, ImeEvent, InputEvent, KeyDownEvent, KeyUpEvent, KeyboardButton,
     KeyboardClickEvent, Modifiers, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ModifiersChangedEvent, ScrollWheelEvent, TextInputEvent,
+};
+pub use inspector::{
+    DispatchNodeInfo, DispatchPhase, DispatchTreeSnapshot, ElementInteractionInfo,
+    FrameInteractionSnapshot, HitboxInfo, InputEventFamily, InputRejection, InputRejectionReason,
+    InteractionSnapshot, ListenerInfo,
 };
 pub use keymap::{KeyBinding, KeyParseError, Keymap, Keystroke};
 pub use menu::{Menu, MenuItem};
@@ -120,6 +126,7 @@ pub struct Window {
     hovered: Option<HitboxId>,
     pressed: Option<(HitboxId, MouseDownEvent)>,
     focus_hitboxes: std::collections::HashMap<HitboxId, FocusId>,
+    hitbox_clips: std::collections::HashMap<HitboxId, crate::geometry::Rect>,
     timers: WindowTimers,
     close: CloseState,
     interaction_revision: u64,
@@ -145,6 +152,7 @@ impl Window {
             hovered: None,
             pressed: None,
             focus_hitboxes: std::collections::HashMap::new(),
+            hitbox_clips: std::collections::HashMap::new(),
             timers: WindowTimers::default(),
             close: CloseState::default(),
             interaction_revision: 0,
@@ -257,6 +265,30 @@ impl Window {
         self.dispatch.bind_hitbox(hitbox.id, node);
         self.hit_test
             .set_hit_testable(hitbox.id, hitbox.hit_testable);
+        self.hitbox_clips.remove(&hitbox.id);
+    }
+    pub fn register_hitbox_with_clip(
+        &mut self,
+        hitbox: Hitbox,
+        clip: crate::geometry::Rect,
+        node: DispatchNodeId,
+    ) {
+        self.register_hitbox(hitbox, node);
+        self.hitbox_clips.insert(hitbox.id, clip);
+    }
+    pub fn update_hitbox_clip(&mut self, id: HitboxId, clip: Option<crate::geometry::Rect>) {
+        if let Some(clip) = clip {
+            self.hitbox_clips.insert(id, clip);
+        } else {
+            self.hitbox_clips.remove(&id);
+        }
+    }
+    pub fn bind_dispatch_address(
+        &mut self,
+        node: DispatchNodeId,
+        address: crate::reconcile::InstanceKey,
+    ) -> bool {
+        self.dispatch.bind_address(node, address)
     }
     pub fn register_focus_hitbox(
         &mut self,
@@ -270,6 +302,7 @@ impl Window {
     }
     pub fn unregister_hitbox(&mut self, id: HitboxId) {
         self.hit_test.remove(id);
+        self.hitbox_clips.remove(&id);
         self.dispatch.unbind_hitbox(id);
         self.focus_hitboxes.remove(&id);
         if self.hovered == Some(id) {
@@ -297,6 +330,26 @@ impl Window {
     pub fn clear_hover(&mut self) -> Option<HitboxId> {
         self.hovered.take()
     }
+
+    fn hit_test_point(&self, point: [f32; 2]) -> Option<HitboxId> {
+        self.hit_test
+            .entries()
+            .iter()
+            .filter(|hitbox| {
+                hitbox.hit_testable
+                    && hitbox.contains(point)
+                    && self.hitbox_clips.get(&hitbox.id).is_none_or(|clip| {
+                        !clip.is_empty()
+                            && point[0] >= clip.min_x
+                            && point[0] < clip.max_x
+                            && point[1] >= clip.min_y
+                            && point[1] < clip.max_y
+                    })
+                    && self.dispatch.node_for_hitbox(hitbox.id).is_some()
+            })
+            .max_by_key(|hitbox| (hitbox.z_index, hitbox.order))
+            .map(|hitbox| hitbox.id)
+    }
     pub fn dispatch_action(&mut self, target: DispatchNodeId, action: &dyn Action) -> bool {
         self.dispatch.dispatch_action(target, action)
     }
@@ -322,9 +375,8 @@ impl Window {
                 })
             }
             InputEvent::MouseMove(mouse) => {
-                let hit = self
-                    .hit_test
-                    .hit_test([mouse.position[0].value(), mouse.position[1].value()]);
+                let hit =
+                    self.hit_test_point([mouse.position[0].value(), mouse.position[1].value()]);
                 let previous = self.hovered;
                 self.hovered = hit;
                 let mut handled = false;
@@ -345,9 +397,8 @@ impl Window {
                 handled
             }
             InputEvent::MouseDown(mouse) => {
-                let hit = self
-                    .hit_test
-                    .hit_test([mouse.position[0].value(), mouse.position[1].value()]);
+                let hit =
+                    self.hit_test_point([mouse.position[0].value(), mouse.position[1].value()]);
                 self.pressed = hit.map(|id| (id, *mouse));
                 let mut handled = false;
                 if let Some(id) = hit {
@@ -363,9 +414,8 @@ impl Window {
                 handled
             }
             InputEvent::MouseUp(mouse) => {
-                let hit = self
-                    .hit_test
-                    .hit_test([mouse.position[0].value(), mouse.position[1].value()]);
+                let hit =
+                    self.hit_test_point([mouse.position[0].value(), mouse.position[1].value()]);
                 let pressed = self.pressed.take();
                 let Some((pressed_id, down)) = pressed else {
                     return false;
@@ -379,9 +429,8 @@ impl Window {
                 handled
             }
             InputEvent::Scroll(scroll) => {
-                let hit = self
-                    .hit_test
-                    .hit_test([scroll.position[0].value(), scroll.position[1].value()]);
+                let hit =
+                    self.hit_test_point([scroll.position[0].value(), scroll.position[1].value()]);
                 if hit.is_some() {
                     self.interaction_revision = self.interaction_revision.wrapping_add(1);
                 }

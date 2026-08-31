@@ -154,6 +154,14 @@ pub struct DescriptionInteraction {
     drop_callback: Option<DropCallback>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScrollInfo {
+    pub handle_id: u64,
+    pub content_size: [f32; 2],
+    pub max_offset: [f32; 2],
+    pub offset: [f32; 2],
+}
+
 pub struct DescriptionLayout {
     callback: LayoutCallback,
 }
@@ -467,6 +475,7 @@ pub struct Description {
     pub(crate) text_color: Option<[f32; 4]>,
     pub(crate) text_options: TextOptions,
     pub(crate) interaction: Option<DescriptionInteraction>,
+    pub(crate) scroll_info: Option<ScrollInfo>,
     pub(crate) layout_callback: Option<DescriptionLayout>,
     pub(crate) external_surface: Option<ExternalSurfaceProperties>,
     pub(crate) active_animation: bool,
@@ -522,6 +531,7 @@ impl Description {
             text_color: None,
             text_options: TextOptions::default(),
             interaction: None,
+            scroll_info: None,
             layout_callback: None,
             external_surface: None,
             active_animation: false,
@@ -594,6 +604,11 @@ impl Description {
     /// something an element's fingerprint can see.
     pub fn scroll_offset(mut self, offset: [f32; 2]) -> Self {
         self.scroll_offset = offset;
+        self
+    }
+
+    pub fn scroll_info(mut self, scroll_info: ScrollInfo) -> Self {
+        self.scroll_info = Some(scroll_info);
         self
     }
 
