@@ -972,9 +972,6 @@ impl Emitter {
     }
 
     fn infer_clean_scrolls(&self, plan: &FramePlan, signals: &FrameSignals) -> FrameSignals {
-        if !signals.is_empty() {
-            return signals.clone();
-        }
         let mut inferred = signals.clone();
         for (index, node) in plan.nodes().iter().enumerate() {
             let Some(boundary) = node.declared_boundary else {
@@ -986,7 +983,7 @@ impl Emitter {
                 continue;
             }
             let previous = self.compositor.transform(boundary).translation;
-            if previous != node.scroll_offset {
+            if previous != [0.0; 2] || node.scroll_offset != [0.0; 2] {
                 inferred.scrolled(LayerId::from_key(LayerKey::untiled(boundary)));
             }
         }
@@ -1531,6 +1528,57 @@ mod tests {
             frame.emission.composite_for(boundary).map(|composite| composite.composite),
             Some(Composite::TransformOnly)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_settled_nonzero_scroll_does_not_reemit_its_contents() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let boundary = boundary_of(&window);
+        let offset = -ROW_HEIGHT * 3.0;
+
+        window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+        let scrolled = window.draw(scroller(true, offset, 0), &FrameSignals::new())?;
+        assert_eq!(
+            scrolled.emission.composite_for(boundary).map(|composite| composite.composite),
+            Some(Composite::TransformOnly)
+        );
+
+        let settled = window.draw(scroller(true, offset, 0), &FrameSignals::new())?;
+        assert!(settled.emission.patch.is_empty());
+        assert!(settled.emission.damage.is_empty());
+        assert_eq!(settled.emission.stats.nodes_emitted, 0);
+        assert_eq!(settled.uploaded_bytes, 0);
+        assert_eq!(settled.upload_calls, 0);
+        assert_eq!(
+            settled.emission.composite_for(boundary).map(|composite| composite.composite),
+            Some(Composite::Clean)
+        );
+
+        let mut unrelated_signal = FrameSignals::new();
+        unrelated_signal.data_changed(LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT)));
+        let signaled = window.draw(scroller(true, offset, 0), &unrelated_signal)?;
+        assert!(signaled.emission.patch.is_empty());
+        assert_eq!(signaled.emission.stats.nodes_emitted, 0);
+        assert_eq!(
+            signaled
+                .emission
+                .composite_for(boundary)
+                .map(|composite| composite.composite),
+            Some(Composite::Clean)
+        );
+
+        let returned = window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+        assert!(returned.emission.patch.is_empty());
+        assert_eq!(
+            returned.emission.composite_for(boundary).map(|composite| composite.composite),
+            Some(Composite::TransformOnly)
+        );
+
+        let idle = window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+        assert!(idle.emission.patch.is_empty());
+        assert!(idle.emission.damage.is_empty());
+        assert_eq!(idle.emission.stats.nodes_emitted, 0);
         Ok(())
     }
 
