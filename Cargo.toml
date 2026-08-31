@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "old",
     "crates/wgpui-core",
     "crates/wgpui-layout",
     "crates/wgpui-text",
@@ -9,7 +8,6 @@ members = [
     "crates/wgpui",
     "crates/wgpui-devtools",
     "crates/wgpui-examples-2",
-    "crates/wgpui-compat",
     "crates/wgpui-compat-macros",
     "crates/wgpui-macros",
 ]

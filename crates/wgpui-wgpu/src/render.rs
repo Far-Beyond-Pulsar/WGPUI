@@ -7,6 +7,8 @@ pub mod compute;
 pub mod device;
 pub mod draw;
 pub mod frame;
+#[cfg(feature = "devtools")]
+pub mod capture;
 pub mod pipelines;
 pub mod readback;
 pub mod shaders;

@@ -444,6 +444,8 @@ pub struct FrameRenderer {
     debug_buffer_capacity: u64,
     debug_bind_group: Option<wgpu::BindGroup>,
     debug_tiles: Vec<DebugTile>,
+    #[cfg(feature = "devtools")]
+    capture: Option<crate::render::capture::GpuCaptureAdapter>,
 }
 
 impl FrameRenderer {
@@ -528,7 +530,38 @@ impl FrameRenderer {
             debug_buffer_capacity,
             debug_bind_group: None,
             debug_tiles: Vec::new(),
+            #[cfg(feature = "devtools")]
+            capture: None,
         }
+    }
+
+    /// Arm one capture for the next rendered frame.
+    #[cfg(feature = "devtools")]
+    pub fn arm_capture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        request: crate::render::capture::CaptureRequest,
+    ) -> Result<(), crate::render::capture::CaptureError> {
+        let capture = self
+            .capture
+            .get_or_insert_with(|| crate::render::capture::GpuCaptureAdapter::new(device, queue));
+        capture.arm(device, request)
+    }
+
+    /// Poll a capture's delayed timestamp results without blocking rendering.
+    #[cfg(feature = "devtools")]
+    pub fn poll_capture(&mut self, device: &wgpu::Device) -> Result<(), crate::render::capture::CaptureError> {
+        let Some(capture) = self.capture.as_mut() else {
+            return Ok(());
+        };
+        capture.poll(device)
+    }
+
+    /// Take the most recently frozen capture, if one was armed.
+    #[cfg(feature = "devtools")]
+    pub fn take_capture(&mut self) -> Option<crate::render::capture::GpuCapture> {
+        self.capture.as_mut()?.take_capture()
     }
 
     /// Set transient diagnostic rectangles for the next render.
@@ -1555,12 +1588,75 @@ impl FrameRenderer {
             self.atlas_page_bind_groups(device, queue, input.atlas, AtlasKind::Polychrome);
         let composite_frame_group = self.composite.frame_bind_group(device, &self.globals);
 
+        #[cfg(feature = "devtools")]
+        let capture_frame = self.capture.as_mut().and_then(|capture| capture.begin_frame());
+        #[cfg(feature = "devtools")]
+        let capture_resources = if capture_frame.is_some() {
+            self.capture.as_mut().map(|capture| {
+                let pipelines = [
+                    "damage clear",
+                    "shadows",
+                    "quads",
+                    "paths",
+                    "underlines",
+                    "glyphs",
+                    "sprites",
+                    "composites",
+                ]
+                .into_iter()
+                .filter_map(|label| {
+                    capture.register_resource(
+                        crate::render::capture::ResourceKind::Pipeline,
+                        label,
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+                let bind_groups = [
+                    "frame bind groups",
+                    "slot-base bind groups",
+                    "atlas-page bind groups",
+                ]
+                .into_iter()
+                .filter_map(|label| {
+                    capture.register_resource(
+                        crate::render::capture::ResourceKind::BindGroup,
+                        label,
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+                let arguments = capture.register_resource(
+                    crate::render::capture::ResourceKind::Buffer,
+                    "indirect arguments",
+                    None,
+                );
+                (pipelines, bind_groups, arguments)
+            })
+        } else {
+            None
+        };
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
+        let scissor = damage.map(|damage| scissor_rect(damage, target.width, target.height));
+        #[cfg(feature = "devtools")]
+        let capture_scope = self.capture.as_mut().and_then(|capture| {
+            capture.record_begin_render_pass(
+                "frame",
+                Vec::new(),
+                [0, 0, target.width, target.height],
+                scissor,
+            );
+            capture.write_timestamp_scope(
+                &mut encoder,
+                "frame",
+                crate::render::capture::Attribution::Unknown,
+            )
+        });
         let debug_tiles = self.debug_tiles.clone();
         let mut stats;
-        let scissor = damage.map(|damage| scissor_rect(damage, target.width, target.height));
         if scissor.is_some_and(|[_, _, width, height]| width > 0 && height > 0) {
             let clear_color = [
                 target.clear.r as f32,
@@ -1605,6 +1701,20 @@ impl FrameRenderer {
                 pass.set_pipeline(&self.damage_clear_pipeline);
                 pass.set_bind_group(0, &self.damage_clear_bind_group, &[]);
                 pass.draw(0..3, 0..1);
+            }
+            #[cfg(feature = "devtools")]
+            if let Some((pipelines, bind_groups, arguments)) = capture_resources.as_ref()
+                && let Some(capture) = self.capture.as_mut()
+            {
+                for pipeline in pipelines {
+                    capture.record_set_pipeline(*pipeline);
+                }
+                for (index, bind_group) in bind_groups.iter().enumerate() {
+                    capture.record_set_bind_group(index as u32, *bind_group, &[]);
+                }
+                if let Some(arguments) = arguments {
+                    capture.record_multi_draw_indirect(*arguments, 0, 1, None);
+                }
             }
             let started = Instant::now();
             // First, and under everything: `PrimitiveKind::ALL` declares
@@ -1742,7 +1852,21 @@ impl FrameRenderer {
             }
             timing.draw_issue = started.elapsed();
         }
+        #[cfg(feature = "devtools")]
+        if let Some(capture) = self.capture.as_mut() {
+            capture.end_timestamp_scope(&mut encoder, capture_scope);
+            capture.record_end_render_pass();
+            capture.resolve_readback(device, &mut encoder);
+            capture.record_submit(1);
+        }
         queue.submit(Some(encoder.finish()));
+        #[cfg(feature = "devtools")]
+        if capture_frame.is_some()
+            && let Some(capture) = self.capture.as_mut()
+        {
+            capture.start_readback_maps();
+            capture.finish_frame();
+        }
         self.shadow_plan = Some(shadow_plan);
         self.quad_plan = Some(quad_plan);
         self.underline_plan = Some(underline_plan);
