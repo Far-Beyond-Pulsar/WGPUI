@@ -89,12 +89,12 @@ pub struct Div {
     interaction: events::InteractionState,
     focus_handle: Option<wgpui_core::window::FocusHandle>,
     scroll_handle: Option<scroll_state::ScrollHandle>,
-    hover_style: Option<DivStyle>,
-    active_style: Option<DivStyle>,
-    focus_style: Option<DivStyle>,
-    focus_visible_style: Option<DivStyle>,
+    hover_style: Option<Box<DivStyle>>,
+    active_style: Option<Box<DivStyle>>,
+    focus_style: Option<Box<DivStyle>>,
+    focus_visible_style: Option<Box<DivStyle>>,
     group_name: Option<wgpui_text::shaping::SharedString>,
-    group_hover_style: Option<(wgpui_text::shaping::SharedString, DivStyle)>,
+    group_hover_style: Option<(wgpui_text::shaping::SharedString, Box<DivStyle>)>,
 }
 
 /// A new, unstyled, childless `div`.
@@ -351,12 +351,12 @@ impl Div {
 
     /// Resolve a hover style against the element's current resolved style.
     pub fn hover(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
-        self.hover_style = Some(apply(self.style.clone()));
+        self.hover_style = Some(Box::new(apply(self.style.clone())));
         self
     }
 
     pub fn active(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
-        self.active_style = Some(apply(self.style.clone()));
+        self.active_style = Some(Box::new(apply(self.style.clone())));
         self
     }
 
@@ -372,17 +372,17 @@ impl Div {
         name: impl Into<wgpui_text::shaping::SharedString>,
         apply: impl FnOnce(DivStyle) -> DivStyle,
     ) -> Self {
-        self.group_hover_style = Some((name.into(), apply(self.style.clone())));
+        self.group_hover_style = Some((name.into(), Box::new(apply(self.style.clone()))));
         self
     }
 
     pub fn focus(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
-        self.focus_style = Some(apply(self.style.clone()));
+        self.focus_style = Some(Box::new(apply(self.style.clone())));
         self
     }
 
     pub fn focus_visible(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
-        self.focus_visible_style = Some(apply(self.style.clone()));
+        self.focus_visible_style = Some(Box::new(apply(self.style.clone())));
         self
     }
 
@@ -514,14 +514,18 @@ impl Div {
         } = self;
 
         let style = if interaction.is_focus_visible() {
-            focus_visible_style.or(focus_style).unwrap_or(style)
+            focus_visible_style
+                .map(|style| *style)
+                .or_else(|| focus_style.map(|style| *style))
+                .unwrap_or(style)
         } else if interaction.is_focused() {
-            focus_style.unwrap_or(style)
+            focus_style.map(|style| *style).unwrap_or(style)
         } else if interaction.is_active() {
-            active_style.unwrap_or(style)
+            active_style.map(|style| *style).unwrap_or(style)
         } else if interaction.is_hovered() {
             hover_style
-                .or_else(|| group_hover_style.map(|(_, style)| style))
+                .map(|style| *style)
+                .or_else(|| group_hover_style.map(|(_, style)| *style))
                 .unwrap_or(style)
         } else {
             style
@@ -697,6 +701,15 @@ mod tests {
     use wgpui_layout::taffy_tree::{LayoutTree, definite};
 
     const VIEWPORT: [f32; 2] = [400.0, 300.0];
+
+    #[test]
+    fn conditional_styles_do_not_make_each_div_stack_heavy() {
+        assert!(
+            std::mem::size_of::<Div>() <= 2048,
+            "Div grew to {} bytes; conditional styles must remain heap-owned",
+            std::mem::size_of::<Div>()
+        );
+    }
 
     #[derive(Debug)]
     enum FrameError {
