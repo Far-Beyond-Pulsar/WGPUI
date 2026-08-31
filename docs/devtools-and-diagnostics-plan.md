@@ -15,6 +15,17 @@ system:
 - The legacy backend contains substantially more flamegraph and inspector
   behavior, but it cannot be used as the native backend's runtime dependency.
 
+The legacy application also has a network seam that the native crates do not
+currently expose. `old::App::with_http_client`, `http_client`, and
+`set_http_client` store an `Arc<dyn gpui_http_client::HttpClient>`. The trait's
+primary operation is
+`send(Request<AsyncBody>) -> BoxFuture<Result<Response<AsyncBody>>>`, with
+helpers for GET, JSON POST, redirects, proxy, user-agent, and multipart
+requests. The legacy image asset loader uses that client directly. This is a
+real extension point, not a browser-network implementation: DNS, connection,
+TLS, protocol, and cache phases are only observable when the supplied client
+reports them.
+
 Two user-visible correctness issues must be handled before profiling results
 are trusted:
 
@@ -51,6 +62,91 @@ it must not introduce a second scene, render cache, or a full-frame redraw.
   intentionally opaque.
 - The external inspector consumes a versioned, length-delimited snapshot
   protocol. It must work from a file capture when no inspector is connected.
+- Runtime builds do not install an instrumented client, trace recorder, GPU
+  query pool, allocation observer, or inspector transport. Capture mode may
+  replace/adapt those components at an explicit safe boundary and may pay for
+  readback, command recording, serialization, and synchronization only while
+  the capture is active.
+
+## Capture-only session model
+
+The backend uses an explicit state machine:
+
+```text
+Disabled -> Armed -> Collecting -> Frozen -> Exported
+              ^          |            |
+              +----------+------------+
+                   discard / reset
+```
+
+`Disabled` is the normal state. The fast path must not call a recorder, acquire
+a mutex, allocate an event object, or branch through a feature-rich observer.
+`Armed` is a small atomic request that becomes `Collecting` at a frame or
+network safe point. `Collecting` enables the slow hooks and any GPU command
+markers/readback needed by the requested capture. At the presentation boundary
+the session becomes `Frozen`; all data is then immutable and can be serialized
+or inspected without holding the application or renderer live. A capture may
+request one frame, a frame plus preceding input/network context, or a bounded
+sequence, but the default remains one frame.
+
+This distinction matters for GPU captures. A RenderDoc-like capture cannot be
+reconstructed from ordinary retained scene bytes after the fact: command
+encoders, render passes, bind groups, pipeline state, indirect arguments,
+resource versions, and synchronization points must be recorded while the
+capture is active. The native renderer therefore needs a capture adapter around
+its command submission path, not a permanent shadow command log.
+
+## Inspector scope
+
+The external inspector backend should expose the following framework-native
+equivalents. The UI may resemble RenderDoc and Chrome DevTools, but the backend
+must report unsupported concepts instead of manufacturing them.
+
+| Inspector area | Native data the backend must provide |
+| --- | --- |
+| Frame/event timeline | CPU spans, element attribution, input, invalidation, damage, uploads, command encoders, render passes, submits, presents, and calibrated GPU timestamps |
+| Render passes | Attachments, load/store operations, viewport/scissor, pipeline, bind groups, vertex/index/indirect buffers, draw/dispatch arguments, and pass ordering |
+| Resource browser | Primitive slabs, indirect buffers, atlases, layer/tile textures, surfaces, staging/readback buffers, generations, ownership, and last-use frame |
+| Texture/buffer viewer | Format-aware metadata, bounded readback, mip/layer data, tile occupancy, byte ranges, and safe typed decoding |
+| Pipeline/shader view | Stable pipeline IDs, shader stage/source identifiers, WGSL source when available, specialization/configuration, and bind-layout metadata |
+| Element/DOM view | Retained element tree, type and source metadata, IDs, layout/box model, transforms, clips, scroll roots, boundaries, tile ownership, computed style, and paint records |
+| Interaction view | Hitboxes, z/order, focus/hover/active state, listeners, capture/bubble phase, dispatch ancestry, and the reason an input was clipped or rejected |
+| Performance view | Frame stages, inclusive/exclusive element time, rebuild reasons, invalidation axes, damage regions, tile work, upload ranges, CPU/GPU overlap, and dropped events |
+| Memory view | Owned CPU allocations and GPU resources, live/capacity/high-water bytes, allocation maps, residency, evictions, generations, and bounded content readback |
+| Capture/replay | Immutable frame inputs, resource versions, command/state records, retained scene/patch data, presentation target metadata, and deterministic replay diagnostics |
+
+Browser-only concepts such as JavaScript heap objects, CSS source maps, or
+service workers are not silently mapped to unrelated WGPUI objects. If an
+application supplies an equivalent subsystem, it may register a typed provider
+with the same snapshot protocol.
+
+## Network diagnostics and the legacy HTTP seam
+
+The native API should recover the legacy HTTP client seam behind a small core
+trait or an optional compatibility crate, without forcing a particular HTTP
+implementation into WGPUI. The minimum compatibility surface is:
+
+- an owned request/response type with method, URL, headers, body metadata,
+  redirect policy, status, and streaming body boundaries;
+- an async `send` operation matching the legacy `HttpClient` semantics;
+- application configuration equivalent to `with_http_client`, `http_client`,
+  and `set_http_client`;
+- asset loaders using the configured client rather than bypassing it;
+- optional capability hooks for DNS, socket connect, proxy, TLS, protocol,
+  cache, redirect, request queue, upload, download, and decompression phases.
+
+Capture mode wraps the configured client with a recording decorator only after
+capture is armed. The decorator records request start, headers subject to
+redaction, body chunk timing/size, response headers/status, body chunk timing,
+errors, redirects, and cancellation. It can capture bounded body bytes for a
+preview, but never assumes that credentials or arbitrary response data are safe
+to export. A transport that exposes phase hooks can add the Chrome-style
+waterfall breakdown; otherwise the inspector marks those phases unavailable.
+
+Network requests already in flight when capture starts are reported as
+`partially observed` unless the client itself supports a capture-safe tap. The
+backend must not buffer every request or add a permanent wrapper just to make
+this case look complete.
 
 ## Target architecture
 
@@ -237,6 +333,35 @@ scoped reference fixtures or compatibility evidence.
    - Run `cargo check`, targeted tests, and warnings-denied clippy. Document
      unsupported GPU timestamp/readback paths instead of silently faking data.
 
+### Phase 7 — network waterfall, replay, and provider capabilities
+
+1. **Native HTTP compatibility seam**
+   - Introduce the native equivalent of the legacy `HttpClient` configuration
+     and accessors, keeping the existing application API source-compatible
+     where it already exists.
+   - Route asset loading through that seam and add fake-client tests for
+     redirects, failures, streaming bodies, cancellation, and response status.
+   - Keep the HTTP implementation out of the core framework contract.
+
+2. **Capture-only network recorder**
+   - Add a decorator that is installed only for an armed capture and emits
+     request/response metadata, timing, transfer sizes, redirects, errors, and
+     bounded redacted body previews.
+   - Add optional transport phase callbacks for DNS/connect/TLS/protocol/cache
+     timing, with explicit unavailable markers when the user client cannot
+     provide those phases.
+   - Test that disabled mode makes no request recording calls or allocations,
+     and that in-flight requests are correctly marked partially observed.
+
+3. **Network inspector and deterministic replay**
+   - Add a Chrome-style request list/waterfall schema with initiator, resource
+     type, headers, status, transfer/cache information, timing, and body
+     preview metadata.
+   - Record replay fixtures without silently replaying credentials or mutating
+     live application state.
+   - Integrate network events into the same frozen capture bundle and external
+     inspector transport.
+
 ## Dispatch order and dependencies
 
 Dispatch Phase 0 first. Its three tasks are independent enough to run in
@@ -260,3 +385,8 @@ The first three worktree prompts should therefore be:
 
 No profiler result should be called authoritative until the first two tasks
 pass their pixel and interaction/resize gates.
+
+The advanced RenderDoc/DevTools work is not a license to add permanent
+instrumentation. Every task must include an off-mode assertion or benchmark;
+capture-mode overhead is expected and must be reported as part of the capture
+metadata.
