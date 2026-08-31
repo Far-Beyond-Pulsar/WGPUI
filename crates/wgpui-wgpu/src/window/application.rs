@@ -1,6 +1,9 @@
 //! Native application lifecycle for the retained WGPUI renderer.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use wgpui_core::app::App;
@@ -18,6 +21,9 @@ use wgpui_core::window::{
     KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton as CoreMouseButton,
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
     TextInputEvent,
+};
+use wgpui_core::window::{
+    WindowAppearance, WindowBackgroundAppearance, WindowDecorations, WindowKind,
 };
 
 use crate::debug::PerformanceDebug;
@@ -54,7 +60,9 @@ pub struct Window {
     gpu_queue: wgpu::Queue,
     surface_registry: Arc<SurfaceRegistry>,
     scale_factor: f64,
-    close_requested: bool,
+    close_requested: Arc<AtomicBool>,
+    background_appearance: WindowBackgroundAppearance,
+    decorations: bool,
     last_frame: Option<FrameReport>,
     state: ElementStateStore,
     state_frame: u64,
@@ -86,7 +94,10 @@ struct ClickState {
 
 /// A clonable handle for scheduling work on a native window.
 #[derive(Clone)]
-pub struct WindowHandle(Arc<winit::window::Window>);
+pub struct WindowHandle {
+    native: Arc<winit::window::Window>,
+    close_requested: Arc<AtomicBool>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardError {
@@ -226,14 +237,89 @@ impl Window {
     pub fn set_title(&self, title: &str) {
         self.native.set_title(title);
     }
+    pub fn appearance(&self) -> WindowAppearance {
+        match self.native.theme() {
+            Some(winit::window::Theme::Dark) => WindowAppearance::Dark,
+            Some(winit::window::Theme::Light) | None => WindowAppearance::Light,
+        }
+    }
+    pub fn window_bounds(&self) -> WindowBounds {
+        let bounds = self.bounds();
+        if self.native.fullscreen().is_some() {
+            WindowBounds::Fullscreen(bounds)
+        } else if self.native.is_maximized() {
+            WindowBounds::Maximized(bounds)
+        } else {
+            WindowBounds::Windowed(bounds)
+        }
+    }
+    pub fn content_size(&self) -> Size<Pixels> {
+        self.bounds().size
+    }
+    pub fn is_active(&self) -> bool {
+        self.native.has_focus()
+    }
+    pub fn set_background_appearance(&mut self, appearance: WindowBackgroundAppearance) {
+        self.native
+            .set_transparent(appearance != WindowBackgroundAppearance::Opaque);
+        self.native
+            .set_blur(appearance == WindowBackgroundAppearance::Blurred);
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::{BackdropType, WindowExtWindows};
+            let backdrop = match appearance {
+                WindowBackgroundAppearance::Opaque | WindowBackgroundAppearance::Transparent => {
+                    BackdropType::None
+                }
+                WindowBackgroundAppearance::Blurred => BackdropType::TransientWindow,
+                WindowBackgroundAppearance::MicaBackdrop => BackdropType::MainWindow,
+                WindowBackgroundAppearance::MicaAltBackdrop => BackdropType::TabbedWindow,
+            };
+            self.native.set_system_backdrop(backdrop);
+        }
+        self.background_appearance = appearance;
+    }
+    pub fn background_appearance(&self) -> WindowBackgroundAppearance {
+        self.background_appearance
+    }
+    pub fn set_decorations(&mut self, decorations: bool) {
+        self.native.set_decorations(decorations);
+        self.decorations = decorations;
+    }
+    pub fn has_decorations(&self) -> bool {
+        self.decorations
+    }
     pub fn set_resizable(&self, resizable: bool) {
         self.native.set_resizable(resizable);
+    }
+    pub fn set_minimizable(&self, minimizable: bool) {
+        let mut buttons = self.native.enabled_buttons();
+        buttons.set(winit::window::WindowButtons::MINIMIZE, minimizable);
+        self.native.set_enabled_buttons(buttons);
+    }
+    pub fn set_min_inner_size(&self, size: Option<Size<Pixels>>) {
+        self.native.set_min_inner_size(
+            size.map(|size| winit::dpi::LogicalSize::new(size.width.value(), size.height.value())),
+        );
+    }
+    pub fn set_outer_position(&self, position: Point<Pixels>) {
+        self.native
+            .set_outer_position(winit::dpi::LogicalPosition::new(
+                position.x.value(),
+                position.y.value(),
+            ));
     }
     pub fn set_visible(&self, visible: bool) {
         self.native.set_visible(visible);
     }
     pub fn focus_window(&self) {
         self.native.focus_window();
+    }
+    pub fn minimize(&self) {
+        self.native.set_minimized(true);
+    }
+    pub fn zoom(&self) {
+        self.native.set_maximized(!self.native.is_maximized());
     }
     pub fn set_minimized(&self, minimized: bool) {
         self.native.set_minimized(minimized);
@@ -254,19 +340,26 @@ impl Window {
         self.native.outer_position().ok()
     }
     pub fn handle(&self) -> WindowHandle {
-        WindowHandle(Arc::clone(&self.native))
+        WindowHandle {
+            native: Arc::clone(&self.native),
+            close_requested: Arc::clone(&self.close_requested),
+        }
     }
     pub fn current_monitor(&self) -> Option<DisplayId> {
         self.native.current_monitor()
     }
     pub fn close(&mut self) {
-        self.close_requested = true;
+        self.close_requested.store(true, Ordering::Release);
+        self.native.request_redraw();
+    }
+    pub fn close_requested(&self) -> bool {
+        self.close_requested.load(Ordering::Acquire)
     }
     pub fn on_close_requested(&mut self, handler: impl FnMut(&mut Self) -> bool + 'static) {
         self.close_handler = Some(Box::new(handler));
     }
     pub fn try_close(&mut self) -> bool {
-        if self.close_requested {
+        if self.close_requested() {
             return true;
         }
         let allowed = self.close_handler.take().is_none_or(|mut handler| {
@@ -275,7 +368,7 @@ impl Window {
             allowed
         });
         if allowed {
-            self.close_requested = true;
+            self.close();
         }
         allowed
     }
@@ -920,22 +1013,88 @@ impl Window {
 
 impl WindowHandle {
     pub fn id(&self) -> winit::window::WindowId {
-        self.0.id()
+        self.native.id()
+    }
+    pub fn inner_size(&self) -> winit::dpi::PhysicalSize<u32> {
+        self.native.inner_size()
+    }
+    pub fn outer_position(&self) -> Option<winit::dpi::PhysicalPosition<i32>> {
+        self.native.outer_position().ok()
+    }
+    pub fn scale_factor(&self) -> f64 {
+        self.native.scale_factor()
+    }
+    pub fn appearance(&self) -> WindowAppearance {
+        match self.native.theme() {
+            Some(winit::window::Theme::Dark) => WindowAppearance::Dark,
+            Some(winit::window::Theme::Light) | None => WindowAppearance::Light,
+        }
+    }
+    pub fn has_focus(&self) -> bool {
+        self.native.has_focus()
+    }
+    pub fn is_visible(&self) -> Option<bool> {
+        self.native.is_visible()
+    }
+    pub fn is_maximized(&self) -> bool {
+        self.native.is_maximized()
+    }
+    pub fn is_fullscreen(&self) -> bool {
+        self.native.fullscreen().is_some()
     }
     pub fn request_redraw(&self) {
-        self.0.request_redraw();
+        self.native.request_redraw();
     }
     pub fn set_title(&self, title: &str) {
-        self.0.set_title(title);
+        self.native.set_title(title);
     }
     pub fn focus_window(&self) {
-        self.0.focus_window();
+        self.native.focus_window();
+    }
+    pub fn set_visible(&self, visible: bool) {
+        self.native.set_visible(visible);
+    }
+    pub fn set_resizable(&self, resizable: bool) {
+        self.native.set_resizable(resizable);
+    }
+    pub fn set_decorations(&self, decorations: bool) {
+        self.native.set_decorations(decorations);
+    }
+    pub fn set_minimizable(&self, minimizable: bool) {
+        let mut buttons = self.native.enabled_buttons();
+        buttons.set(winit::window::WindowButtons::MINIMIZE, minimizable);
+        self.native.set_enabled_buttons(buttons);
+    }
+    pub fn set_min_inner_size(&self, size: Option<Size<Pixels>>) {
+        self.native.set_min_inner_size(
+            size.map(|size| winit::dpi::LogicalSize::new(size.width.value(), size.height.value())),
+        );
+    }
+    pub fn set_outer_position(&self, position: Point<Pixels>) {
+        self.native
+            .set_outer_position(winit::dpi::LogicalPosition::new(
+                position.x.value(),
+                position.y.value(),
+            ));
     }
     pub fn set_minimized(&self, minimized: bool) {
-        self.0.set_minimized(minimized);
+        self.native.set_minimized(minimized);
     }
     pub fn set_maximized(&self, maximized: bool) {
-        self.0.set_maximized(maximized);
+        self.native.set_maximized(maximized);
+    }
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        self.native.set_fullscreen(
+            fullscreen
+                .then(|| winit::window::Fullscreen::Borderless(self.native.current_monitor())),
+        );
+    }
+    pub fn close(&self) {
+        self.close_requested.store(true, Ordering::Release);
+        self.native.request_redraw();
+    }
+    pub fn close_requested(&self) -> bool {
+        self.close_requested.load(Ordering::Acquire)
     }
 }
 
@@ -1155,15 +1314,36 @@ impl Handler {
         options: WindowOptions,
         build: WindowBuildCallback,
     ) -> Result<(), ApplicationError> {
+        let title = options
+            .titlebar
+            .as_ref()
+            .and_then(|titlebar| titlebar.title.as_deref())
+            .unwrap_or(&options.title);
+        let resizable = options.resizable && options.is_resizable;
+        let decorations = options
+            .window_decorations
+            .map(|decorations| decorations == WindowDecorations::Server)
+            .unwrap_or(options.titlebar.is_some());
         let attributes = winit::window::Window::default_attributes()
-            .with_title(options.title.clone())
-            .with_resizable(options.resizable)
-            .with_visible(options.show);
+            .with_title(title)
+            .with_resizable(resizable)
+            .with_visible(options.show)
+            .with_decorations(decorations)
+            .with_enabled_buttons(enabled_window_buttons(resizable, options.is_minimizable))
+            .with_window_level(window_level(&options.kind));
+        let attributes = apply_titlebar_attributes(attributes, options.titlebar.as_ref());
+        let attributes = apply_background_attributes(attributes, options.window_background);
         let bounds = initial_bounds(&options);
         let mut attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(
             bounds.size.width.value(),
             bounds.size.height.value(),
         ));
+        if let Some(min_size) = options.window_min_size {
+            attributes = attributes.with_min_inner_size(winit::dpi::LogicalSize::new(
+                min_size.width.value(),
+                min_size.height.value(),
+            ));
+        }
         if options.window_bounds.is_some() {
             attributes = attributes.with_position(winit::dpi::LogicalPosition::new(
                 bounds.origin.x.value(),
@@ -1200,7 +1380,9 @@ impl Handler {
             gpu_queue: context.queue.clone(),
             surface_registry: Arc::clone(&surface_registry),
             scale_factor,
-            close_requested: false,
+            close_requested: Arc::new(AtomicBool::new(false)),
+            background_appearance: options.window_background,
+            decorations,
             last_frame: None,
             state: ElementStateStore::new(),
             state_frame: 0,
@@ -1359,7 +1541,7 @@ impl Handler {
                 live.window.last_frame = Some(report.clone());
                 live.last_report = Some(report);
                 live.surface.present(&live.context.queue, texture);
-                if live.window.close_requested || live.app.close_requested() {
+                if live.window.close_requested() || live.app.close_requested() {
                     let closed = if live.app.close_requested() {
                         self.live.drain(..).map(|live| live.id).collect::<Vec<_>>()
                     } else {
@@ -1381,6 +1563,68 @@ impl Handler {
             }
             Err(error) => self.fail(event_loop, ApplicationError::Render(error.to_string())),
         }
+    }
+}
+
+fn enabled_window_buttons(resizable: bool, minimizable: bool) -> winit::window::WindowButtons {
+    let mut buttons = winit::window::WindowButtons::CLOSE;
+    if minimizable {
+        buttons.insert(winit::window::WindowButtons::MINIMIZE);
+    }
+    if resizable {
+        buttons.insert(winit::window::WindowButtons::MAXIMIZE);
+    }
+    buttons
+}
+
+fn apply_titlebar_attributes(
+    attributes: winit::window::WindowAttributes,
+    titlebar: Option<&wgpui_core::window::TitlebarOptions>,
+) -> winit::window::WindowAttributes {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowAttributesExtMacOS;
+        attributes.with_titlebar_transparent(
+            titlebar.is_some_and(|titlebar| titlebar.appears_transparent),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = titlebar;
+        attributes
+    }
+}
+
+fn window_level(kind: &WindowKind) -> winit::window::WindowLevel {
+    match kind {
+        WindowKind::Normal => winit::window::WindowLevel::Normal,
+        WindowKind::PopUp | WindowKind::Floating => winit::window::WindowLevel::AlwaysOnTop,
+    }
+}
+
+fn apply_background_attributes(
+    attributes: winit::window::WindowAttributes,
+    appearance: WindowBackgroundAppearance,
+) -> winit::window::WindowAttributes {
+    let attributes = attributes
+        .with_transparent(appearance != WindowBackgroundAppearance::Opaque)
+        .with_blur(appearance == WindowBackgroundAppearance::Blurred);
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::{BackdropType, WindowAttributesExtWindows};
+        let backdrop = match appearance {
+            WindowBackgroundAppearance::Opaque | WindowBackgroundAppearance::Transparent => {
+                BackdropType::None
+            }
+            WindowBackgroundAppearance::Blurred => BackdropType::TransientWindow,
+            WindowBackgroundAppearance::MicaBackdrop => BackdropType::MainWindow,
+            WindowBackgroundAppearance::MicaAltBackdrop => BackdropType::TabbedWindow,
+        };
+        attributes.with_system_backdrop(backdrop)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        attributes
     }
 }
 
@@ -1525,6 +1769,14 @@ impl winit::application::ApplicationHandler for Handler {
         };
         let live = &mut self.live[index];
         match event {
+            winit::event::WindowEvent::Focused(focused) => {
+                if focused {
+                    live.window.interaction.activate();
+                } else {
+                    live.window.interaction.deactivate();
+                }
+                live.window.request_redraw();
+            }
             winit::event::WindowEvent::CloseRequested => {
                 if live.window.try_close() {
                     let id = self.live.remove(index).id;
@@ -1806,6 +2058,27 @@ mod tests {
     }
 
     #[test]
+    fn window_options_translate_to_supported_winit_controls() {
+        let buttons = enabled_window_buttons(false, false);
+        assert!(buttons.contains(winit::window::WindowButtons::CLOSE));
+        assert!(!buttons.contains(winit::window::WindowButtons::MINIMIZE));
+        assert!(!buttons.contains(winit::window::WindowButtons::MAXIMIZE));
+
+        assert_eq!(
+            window_level(&WindowKind::Normal),
+            winit::window::WindowLevel::Normal
+        );
+        assert_eq!(
+            window_level(&WindowKind::PopUp),
+            winit::window::WindowLevel::AlwaysOnTop
+        );
+        assert_eq!(
+            window_level(&WindowKind::Floating),
+            winit::window::WindowLevel::AlwaysOnTop
+        );
+    }
+
+    #[test]
     fn native_modifiers_preserve_command_and_alt_without_losing_shift() {
         let state = winit::keyboard::ModifiersState::SUPER
             | winit::keyboard::ModifiersState::ALT
@@ -1819,5 +2092,25 @@ mod tests {
                 command: true,
             }
         );
+    }
+
+    #[test]
+    fn background_options_preserve_transparency_and_blur_contract() {
+        for appearance in [
+            WindowBackgroundAppearance::Opaque,
+            WindowBackgroundAppearance::Transparent,
+            WindowBackgroundAppearance::Blurred,
+            WindowBackgroundAppearance::MicaBackdrop,
+            WindowBackgroundAppearance::MicaAltBackdrop,
+        ] {
+            let attributes = apply_background_attributes(
+                winit::window::Window::default_attributes(),
+                appearance,
+            );
+            assert_eq!(
+                attributes.transparent(),
+                appearance != WindowBackgroundAppearance::Opaque
+            );
+        }
     }
 }

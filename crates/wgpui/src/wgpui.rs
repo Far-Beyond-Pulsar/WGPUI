@@ -50,7 +50,8 @@ pub use wgpui_core::{
     KeyboardClickEvent, Keystroke, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseButtonState,
     MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Subscription, TextInputEvent,
     Task, TaskError, TimerHandle, TimerId, TimerState, WeakEntity, WindowClosedSubscription,
-    WindowId, WindowList,
+    TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowDecorations, WindowId,
+    WindowKind, WindowList,
 };
 pub use wgpui_core::{
     Component, Element, IntoElement, Render, RenderOnce, Stateful, render_description,

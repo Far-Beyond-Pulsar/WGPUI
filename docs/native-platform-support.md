@@ -27,3 +27,21 @@ The native path has been exercised on Windows with Vulkan and DX12. Other
 platforms are not claimed as supported by this document; backend availability,
 surface formats, and OS integration requirements must be verified on the
 target platform.
+
+## Window service subset
+
+The native window service maps the supported `WindowOptions` subset into winit:
+title and titlebar title, initial size and bounds, visibility, focus,
+resizability, minimizability, server/client decorations, minimum inner size,
+transparent or blurred backgrounds, Windows Mica backdrops, and popup/floating
+always-on-top window level. `Window` and `WindowHandle` expose corresponding
+native state queries and runtime operations for size, position, theme, focus,
+visibility, maximize/fullscreen state, title, redraw, minimize, maximize,
+fullscreen, and close requests.
+
+Prompt/dialog APIs, menus, clipboard, IME, accessibility, cursor hooks, and
+movable-window controls remain intentionally unavailable until they have real
+platform implementations and explicit error behavior. Titlebar transparency is
+currently honored only on macOS. Blur and system backdrop requests are
+best-effort and may be ignored by the target window manager or operating-system
+version; Mica values are Windows-specific.

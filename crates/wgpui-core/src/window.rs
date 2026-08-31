@@ -29,15 +29,60 @@ pub use keymap::{KeyBinding, KeyParseError, Keymap, Keystroke};
 pub use menu::{Menu, MenuItem};
 pub use timer::{TimerHandle, TimerId, TimerState};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TitlebarOptions {
+    pub title: Option<String>,
+    pub appears_transparent: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum WindowKind {
+    #[default]
+    Normal,
+    PopUp,
+    Floating,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum WindowAppearance {
+    #[default]
+    Light,
+    Dark,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum WindowBackgroundAppearance {
+    #[default]
+    Opaque,
+    Transparent,
+    Blurred,
+    MicaBackdrop,
+    MicaAltBackdrop,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum WindowDecorations {
+    #[default]
+    Server,
+    Client,
+}
+
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
     pub title: String,
     pub width: u32,
     pub height: u32,
     pub resizable: bool,
+    pub is_resizable: bool,
     pub window_bounds: Option<crate::geometry::WindowBounds>,
     pub focus: bool,
     pub show: bool,
+    pub titlebar: Option<TitlebarOptions>,
+    pub kind: WindowKind,
+    pub is_minimizable: bool,
+    pub window_background: WindowBackgroundAppearance,
+    pub window_min_size: Option<Size<Pixels>>,
+    pub window_decorations: Option<WindowDecorations>,
 }
 
 impl Default for WindowOptions {
@@ -47,9 +92,16 @@ impl Default for WindowOptions {
             width: 800,
             height: 600,
             resizable: true,
+            is_resizable: true,
             window_bounds: None,
             focus: true,
             show: true,
+            titlebar: Some(TitlebarOptions::default()),
+            kind: WindowKind::Normal,
+            is_minimizable: true,
+            window_background: WindowBackgroundAppearance::Opaque,
+            window_min_size: None,
+            window_decorations: None,
         }
     }
 }
@@ -411,6 +463,24 @@ mod tests {
         );
         assert!(window.is_active());
         assert!(window.should_close());
+    }
+
+    #[test]
+    fn window_options_default_to_a_visible_decorated_resizable_window() {
+        let options = WindowOptions::default();
+
+        assert_eq!(options.title, "WGPUI");
+        assert_eq!((options.width, options.height), (800, 600));
+        assert!(options.resizable && options.is_resizable);
+        assert!(options.focus && options.show && options.is_minimizable);
+        assert_eq!(options.titlebar, Some(TitlebarOptions::default()));
+        assert_eq!(options.kind, WindowKind::Normal);
+        assert_eq!(
+            options.window_background,
+            WindowBackgroundAppearance::Opaque
+        );
+        assert_eq!(options.window_decorations, None);
+        assert_eq!(options.window_min_size, None);
     }
 
     fn hitbox(window: &mut Window, id: u64, node: DispatchNodeId) -> Hitbox {

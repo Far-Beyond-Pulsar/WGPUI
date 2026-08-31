@@ -22,8 +22,10 @@ pub use window::{
     ClipboardItem, ClickEvent, CloseState, DispatchNodeId, DragData, DragHoverEvent, DropEvent, EventResult, FocusEvent, FocusHandle, FocusId, FocusManager, ImeEvent,
     FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId, InputEvent, KeyBinding,
     KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu,
-    MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TextInputEvent, TimerHandle, TimerId, TimerState,
+    MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseButtonState, MouseClickEvent,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TextInputEvent,
+    TimerHandle, TimerId, TimerState, TitlebarOptions, WindowAppearance,
+    WindowBackgroundAppearance, WindowDecorations, WindowKind,
     WindowOptions,
 };
 pub mod boundary;
