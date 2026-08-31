@@ -28,10 +28,6 @@ pub use wgpui_core::color::{
 };
 pub use wgpui_core::geometry;
 pub use wgpui_core::geometry::Rect;
-pub use wgpui_core::diagnostics::{
-    DamageMap, DamageReason, DamageRegion, DamageTracker, FrozenDamage, FrozenFrameReport,
-    InputRecorder, ReplayInputRecord, SingleFrameInput,
-};
 pub use wgpui_core::geometry::{
     AbsoluteLength, Bounds, DefiniteLength, Half, Length, Pixels, Point, Rems, Size, WindowBounds,
     phi, point, px, relative, rems, size,

@@ -31,7 +31,6 @@ pub use window::{
 pub mod boundary;
 pub mod color;
 pub mod damage;
-pub mod diagnostics;
 pub mod element;
 pub mod geometry;
 pub mod hooks;
