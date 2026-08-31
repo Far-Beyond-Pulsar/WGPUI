@@ -31,6 +31,7 @@
 //! no text-specific draw path bypasses reconciliation.
 
 use wgpui_core::boundary::compositor::CompositeEntry;
+use wgpui_core::boundary::diagnostics::DebugSnapshot;
 use wgpui_core::geometry::Rect;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::invalidation::request::FrameSignals;
@@ -48,10 +49,10 @@ use wgpui_layout::taffy_tree::{
     Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
 };
 
+use crate::debug::{DebugTile, DebugVisualization, PerformanceDebug};
 use crate::render::atlas::{AtlasTileSource, GlyphAtlas};
 use crate::render::atlas_upload::AtlasTextures;
 use crate::render::draw::DrawMode;
-use crate::debug::{DebugTile, PerformanceDebug};
 use crate::render::frame::{
     Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, RenderTarget,
 };
@@ -222,6 +223,7 @@ pub struct FrameLoop {
     viewport_flash_frames: u32,
     interaction_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
+    debug_snapshot: DebugSnapshot,
     scale_factor: f32,
 }
 
@@ -237,6 +239,15 @@ struct PreparedText {
 struct TextCacheKey {
     value: Arc<str>,
     font_size_bits: u32,
+}
+
+struct DebugRefreshInput<'a> {
+    flash: crate::debug::TileRefreshFlash,
+    visualization: DebugVisualization,
+    snapshot: &'a DebugSnapshot,
+    viewport: [f32; 2],
+    viewport_changed: bool,
+    interaction_dirty_regions: &'a [Rect],
 }
 
 impl FrameLoop {
@@ -260,6 +271,7 @@ impl FrameLoop {
             viewport_flash_frames: 0,
             interaction_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
+            debug_snapshot: DebugSnapshot::default(),
             scale_factor: 1.0,
         }
     }
@@ -305,6 +317,11 @@ impl FrameLoop {
     /// Update the opt-in diagnostics used by subsequent frames.
     pub fn set_performance_debug(&mut self, debug: PerformanceDebug) {
         self.performance_debug = debug;
+    }
+
+    /// Set the device-free metadata rendered by the opt-in diagnostic pass.
+    pub fn set_debug_snapshot(&mut self, snapshot: DebugSnapshot) {
+        self.debug_snapshot = snapshot;
     }
 
     /// Mark a hitbox region whose hover state changed. This is consumed by the
@@ -446,12 +463,18 @@ impl FrameLoop {
             self.viewport_recomputes += 1;
         }
         let interaction_dirty_regions = self.interaction_dirty_regions.clone();
+        let performance_debug = self.performance_debug;
+        let debug_snapshot = self.debug_snapshot.clone();
         let debug_tiles = self.refresh_debug_tiles(
             &emission.patch,
-            self.performance_debug.tile_refresh_flash(),
-            viewport,
-            viewport_changed,
-            &interaction_dirty_regions,
+            DebugRefreshInput {
+                flash: performance_debug.tile_refresh_flash(),
+                visualization: performance_debug.visualization(),
+                snapshot: &debug_snapshot,
+                viewport,
+                viewport_changed,
+                interaction_dirty_regions: &interaction_dirty_regions,
+            },
         );
         self.interaction_dirty_regions.clear();
         self.renderer.set_debug_tiles(debug_tiles);
@@ -494,12 +517,17 @@ impl FrameLoop {
     fn refresh_debug_tiles(
         &mut self,
         patch: &wgpui_core::patch::apply::ScenePatch,
-        flash: crate::debug::TileRefreshFlash,
-        viewport: [f32; 2],
-        viewport_changed: bool,
-        interaction_dirty_regions: &[Rect],
+        input: DebugRefreshInput<'_>,
     ) -> Vec<DebugTile> {
-        if !flash.enabled {
+        let DebugRefreshInput {
+            flash,
+            visualization,
+            snapshot,
+            viewport,
+            viewport_changed,
+            interaction_dirty_regions,
+        } = input;
+        if !flash.enabled && !visualization.enabled {
             self.tile_flash_frames.clear();
             self.viewport_flash_frames = 0;
             return Vec::new();
@@ -534,20 +562,18 @@ impl FrameLoop {
             self.tile_flash_frames
                 .insert(layer_id, flash.duration_frames.max(1));
         }
-        if flash.viewport_grid
-            && (viewport_changed
-                || !interaction_dirty_regions.is_empty())
-        {
+        if flash.viewport_grid && (viewport_changed || !interaction_dirty_regions.is_empty()) {
             self.viewport_flash_frames = flash.duration_frames.max(1);
         }
+        let mut result = Vec::new();
         if flash.viewport_grid && self.viewport_flash_frames > 0 {
             let columns = (viewport[0] / flash.tile_size[0]).ceil().max(0.0) as i32;
             let rows = (viewport[1] / flash.tile_size[1]).ceil().max(0.0) as i32;
-            let mut tiles = Vec::new();
             for y in 0..rows {
                 for x in 0..columns {
                     let width = flash.tile_size[0].min(viewport[0] - x as f32 * flash.tile_size[0]);
-                    let height = flash.tile_size[1].min(viewport[1] - y as f32 * flash.tile_size[1]);
+                    let height =
+                        flash.tile_size[1].min(viewport[1] - y as f32 * flash.tile_size[1]);
                     let tile_rect = Rect::from_origin_size(
                         [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1]],
                         [width, height],
@@ -558,8 +584,13 @@ impl FrameLoop {
                             .iter()
                             .any(|region| tile_rect.intersects(region));
                     if width > 0.0 && height > 0.0 && region_matches {
-                        tiles.push(DebugTile {
-                            origin_size: [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1], width, height],
+                        result.push(DebugTile {
+                            origin_size: [
+                                x as f32 * flash.tile_size[0],
+                                y as f32 * flash.tile_size[1],
+                                width,
+                                height,
+                            ],
                             color: flash.color,
                             border_width: 3.0,
                             _padding: [0.0; 7],
@@ -567,11 +598,8 @@ impl FrameLoop {
                     }
                 }
             }
-            return tiles;
-        }
-        self.tile_flash_frames
-            .keys()
-            .filter_map(|layer_id| {
+        } else if flash.enabled {
+            result.extend(self.tile_flash_frames.keys().filter_map(|layer_id| {
                 let layer = self.scene.layers.get(*layer_id)?;
                 let tile = layer.key().tile?;
                 let origin = [
@@ -584,8 +612,12 @@ impl FrameLoop {
                     border_width: 3.0,
                     _padding: [0.0; 7],
                 })
-            })
-            .collect()
+            }));
+        }
+        if visualization.enabled {
+            append_snapshot_debug_tiles(&mut result, snapshot, viewport, visualization);
+        }
+        result
     }
 
     fn collect_interactions(
@@ -613,7 +645,7 @@ impl FrameLoop {
             if let Some(interaction) = plan.take_interaction(index) {
                 let visible_bounds = parent_clip.map_or(bounds, |clip| bounds.intersect(&clip));
                 if !visible_bounds.is_empty() {
-                result.push(InteractionRegistration {
+                    result.push(InteractionRegistration {
                         address: node.address,
                         bounds: visible_bounds,
                         order: index as u64,
@@ -728,6 +760,92 @@ impl FrameLoop {
             prepared.clone(),
         );
         Ok(prepared)
+    }
+}
+
+fn append_snapshot_debug_tiles(
+    destination: &mut Vec<DebugTile>,
+    snapshot: &DebugSnapshot,
+    viewport: [f32; 2],
+    visualization: DebugVisualization,
+) {
+    let window = Rect::from_origin_size([0.0, 0.0], viewport);
+    let mut append = |rectangle: Rect, color: [f32; 4], border_width: f32| {
+        let rectangle = rectangle.intersect(&window);
+        if !rectangle.is_empty() {
+            destination.push(DebugTile {
+                origin_size: [
+                    rectangle.min_x,
+                    rectangle.min_y,
+                    rectangle.width(),
+                    rectangle.height(),
+                ],
+                color,
+                border_width,
+                _padding: [0.0; 7],
+            });
+        }
+    };
+
+    for tile in &snapshot.tiles {
+        let bounds = tile.screen_bounds.intersect(&tile.effective_clip);
+        if visualization.show_ownership && tile.owns_content {
+            append(bounds, visualization.ownership_color, 2.0);
+        }
+        if visualization.show_visibility && tile.visible {
+            append(bounds, visualization.visibility_color, 3.0);
+        }
+        if visualization.show_residency && tile.resident && !tile.visible {
+            append(bounds, visualization.residency_color, 2.0);
+        }
+        if visualization.show_newly_exposed && tile.newly_exposed {
+            append(bounds, visualization.newly_exposed_color, 5.0);
+        }
+    }
+    for root in &snapshot.roots {
+        if visualization.show_clips {
+            append(root.effective_clip, visualization.clip_color, 5.0);
+        }
+        if visualization.show_transforms {
+            append(root.viewport, visualization.transform_color, 2.0);
+        }
+    }
+    if visualization.show_damage {
+        for plan in &snapshot.damage {
+            let translation = snapshot
+                .roots
+                .iter()
+                .find(|root| root.id == plan.damage.root)
+                .map(|root| root.transform.translation)
+                .unwrap_or([0.0, 0.0]);
+            for rectangle in &plan.raster_rects {
+                append(
+                    Rect::from_origin_size(
+                        [
+                            rectangle.min_x + translation[0],
+                            rectangle.min_y + translation[1],
+                        ],
+                        [rectangle.width(), rectangle.height()],
+                    ),
+                    visualization.damage_color,
+                    4.0,
+                );
+            }
+            append(
+                Rect::from_origin_size(
+                    [
+                        plan.compositing_rect.min_x + translation[0],
+                        plan.compositing_rect.min_y + translation[1],
+                    ],
+                    [
+                        plan.compositing_rect.width(),
+                        plan.compositing_rect.height(),
+                    ],
+                ),
+                visualization.damage_color,
+                1.0,
+            );
+        }
     }
 }
 

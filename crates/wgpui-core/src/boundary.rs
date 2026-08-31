@@ -19,9 +19,14 @@
 //! [`crate::invalidation::reason::Reason`].
 
 pub mod compositor;
+pub mod diagnostics;
 pub mod identity;
 pub mod policy;
 
 pub use compositor::{BoundaryComposite, BoundaryState, Composite, Compositor, TiledVisit};
+pub use diagnostics::{
+    DamagePlan, DamageReason, DamageRegion, DebugCapture, DebugRoot, DebugRootInput, DebugSnapshot,
+    DebugTile, ScrollRootId,
+};
 pub use identity::BoundaryIdentity;
 pub use policy::{BoundaryPolicy, Buffering, Pixels, Retention, Size};

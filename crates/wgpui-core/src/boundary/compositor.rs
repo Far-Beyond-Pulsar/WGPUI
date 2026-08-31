@@ -59,6 +59,9 @@
 //! [`visible_composites`] is that compositor growing it, and it calls exactly
 //! that routine rather than a second copy of the rule.
 
+use crate::boundary::diagnostics::{
+    DamageReason, DamageRegion, DebugCapture, DebugSnapshot, ScrollRootId,
+};
 use crate::boundary::policy::{BoundaryPolicy, Retention};
 use crate::geometry::Rect;
 use crate::invalidation::axes::Invalidation;
@@ -439,12 +442,47 @@ impl TiledVisit {
 #[derive(Debug, Default)]
 pub struct Compositor {
     boundaries: HashMap<BoundaryId, BoundaryState>,
+    debug_capture: DebugCapture,
 }
 
 impl Compositor {
     /// A compositor holding no boundaries.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the optional diagnostic collector used by subsequent visits.
+    ///
+    /// The collector contains metadata only. It does not participate in layer
+    /// invalidation or retain any primitive or GPU storage.
+    pub fn set_debug_capture(&mut self, capture: DebugCapture) {
+        self.debug_capture = capture;
+    }
+
+    /// The current diagnostic collector.
+    pub fn debug_capture(&self) -> &DebugCapture {
+        &self.debug_capture
+    }
+
+    /// A stable copy of the diagnostic data captured so far.
+    pub fn debug_snapshot(&self) -> DebugSnapshot {
+        self.debug_capture.snapshot()
+    }
+
+    /// Record content or interaction damage without broadening the compositor's
+    /// invalidation. The returned plan is available through
+    /// [`Self::debug_snapshot`].
+    pub fn record_debug_damage(
+        &mut self,
+        boundary: BoundaryId,
+        content_rect: Rect,
+        reason: DamageReason,
+    ) {
+        self.debug_capture.record_damage(DamageRegion {
+            root: ScrollRootId::from_raw(boundary.as_raw()),
+            content_rect,
+            reason,
+        });
     }
 
     /// Declare that `boundary` exists this frame with `policy`, returning the
@@ -534,33 +572,78 @@ impl Compositor {
         frame: u64,
         viewport: Rect,
     ) -> Option<TiledVisit> {
+        self.visit_tiled_nested(boundary, None, policy, frame, viewport)
+    }
+
+    /// Resolve a tiled boundary while describing its parent root to the
+    /// diagnostics collector. Rendering remains compatible with
+    /// [`Self::visit_tiled`]; the parent is metadata used for clip and damage
+    /// visualization only.
+    pub fn visit_tiled_nested(
+        &mut self,
+        boundary: BoundaryId,
+        parent: Option<BoundaryId>,
+        policy: BoundaryPolicy,
+        frame: u64,
+        viewport: Rect,
+    ) -> Option<TiledVisit> {
         self.visit(boundary, policy, frame);
         let grid = policy.buffering.tile_grid()?;
-        let state = self.boundaries.get_mut(&boundary)?;
+        let (visit, transform, resident_tiles) = {
+            let state = self.boundaries.get_mut(&boundary)?;
+            let content_viewport = TileGrid::content_viewport(viewport, state.transform);
+            let span = grid.visible_span(content_viewport, policy.buffering.retain_radius())?;
 
-        let content_viewport = TileGrid::content_viewport(viewport, state.transform);
-        let span = grid.visible_span(content_viewport, policy.buffering.retain_radius())?;
-
-        let residency = state
-            .tiles
-            .get_or_insert_with(|| TileResidency::new(policy.resident_tile_budget));
-        // Re-applied every frame for the same reason `state.policy = policy`
-        // above is: a re-declared boundary's policy is the one it was declared
-        // with this frame, not the one it happened to be created with.
-        residency.set_budget(policy.resident_tile_budget);
-        let revealed = residency.mark(span, frame);
-        let evicted = residency.sweep(frame, policy.evict_after_frames);
-
-        Some(TiledVisit {
-            boundary,
-            grid,
-            content_viewport,
-            visible: span.tiles(),
-            revealed,
-            evicted,
-            over_budget: residency.over_budget(),
-            resident: residency.len(),
-        })
+            let residency = state
+                .tiles
+                .get_or_insert_with(|| TileResidency::new(policy.resident_tile_budget));
+            // Re-applied every frame for the same reason `state.policy = policy`
+            // above is: a re-declared boundary's policy is the one it was declared
+            // with this frame, not the one it happened to be created with.
+            residency.set_budget(policy.resident_tile_budget);
+            let revealed = residency.mark(span, frame);
+            let evicted = residency.sweep(frame, policy.evict_after_frames);
+            let resident_tiles = residency.resident();
+            (
+                TiledVisit {
+                    boundary,
+                    grid,
+                    content_viewport,
+                    visible: span.tiles(),
+                    revealed,
+                    evicted,
+                    over_budget: residency.over_budget(),
+                    resident: residency.len(),
+                },
+                state.transform,
+                resident_tiles,
+            )
+        };
+        if self.debug_capture.is_enabled() {
+            let root = ScrollRootId::from_raw(boundary.as_raw());
+            let parent = parent.map(|parent| ScrollRootId::from_raw(parent.as_raw()));
+            self.debug_capture
+                .record_root(crate::boundary::diagnostics::DebugRootInput {
+                    id: root,
+                    parent,
+                    viewport,
+                    clip: viewport,
+                    transform,
+                    grid: Some(grid),
+                    content_viewport: Some(visit.content_viewport),
+                    visible_tiles: &visit.visible,
+                    resident_tiles: &resident_tiles,
+                    newly_exposed_tiles: &visit.revealed,
+                });
+            for tile in &visit.revealed {
+                self.debug_capture.record_damage(DamageRegion {
+                    root,
+                    content_rect: grid.tile_bounds(*tile),
+                    reason: DamageReason::ScrollReveal,
+                });
+            }
+        }
+        Some(visit)
     }
 
     /// Move a boundary's content to `transform`, reporting whether that is a
@@ -695,6 +778,7 @@ impl Compositor {
 mod tests {
     use super::*;
     use crate::boundary::policy::Buffering;
+    use crate::boundary::{DamageReason, DebugCapture};
 
     const PANEL: BoundaryId = BoundaryId::from_raw(7);
 
@@ -1162,5 +1246,38 @@ mod tests {
         );
         assert_eq!(compositor.transform(PANEL), LayerTransform::IDENTITY);
         assert!(compositor.is_empty());
+    }
+
+    #[test]
+    fn tiled_visits_feed_opt_in_capture_without_changing_the_visit() {
+        let mut compositor = Compositor::new();
+        compositor.set_debug_capture(DebugCapture::enabled());
+        let policy = tiled_policy();
+        let viewport = canvas_viewport();
+        let first = compositor
+            .visit_tiled(PANEL, policy, 1, viewport)
+            .expect("valid tiled policy");
+        let mut first_visible = first.visible.clone();
+        first_visible.sort_unstable();
+        assert_eq!(first.revealed, first_visible);
+        assert!(first.visible.len() > 4);
+        let damage = compositor.debug_snapshot().damage;
+        assert_eq!(damage.len(), first.visible.len());
+        assert!(damage
+            .iter()
+            .all(|plan| plan.damage.reason == DamageReason::ScrollReveal));
+        compositor.set_transform(PANEL, LayerTransform::translated(-256.0, 0.0));
+        let second = compositor
+            .visit_tiled_nested(PANEL, None, policy, 2, viewport)
+            .expect("valid tiled policy");
+        assert!(
+            second
+                .revealed
+                .iter()
+                .all(|tile| !first.visible.contains(tile))
+        );
+        let snapshot = compositor.debug_snapshot();
+        assert_eq!(snapshot.roots.len(), 1);
+        assert!(snapshot.tiles.iter().any(|tile| tile.newly_exposed));
     }
 }

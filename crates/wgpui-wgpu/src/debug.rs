@@ -38,6 +38,79 @@ pub struct TileRefreshFlash {
     pub viewport_grid: bool,
 }
 
+/// Categories rendered by the opt-in retained tile visualizer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DebugVisualization {
+    /// Whether the visualizer contributes an overlay.
+    pub enabled: bool,
+    /// Draw the root/tile ownership boundaries.
+    pub show_ownership: bool,
+    /// Draw tiles eligible to draw after visibility and clip tests.
+    pub show_visibility: bool,
+    /// Draw tiles with retained content, including tiles outside the viewport.
+    pub show_residency: bool,
+    /// Draw effective root clips.
+    pub show_clips: bool,
+    /// Draw root transforms and transformed tile bounds.
+    pub show_transforms: bool,
+    /// Draw tiles exposed by the latest visit.
+    pub show_newly_exposed: bool,
+    /// Draw raster and compositing damage regions.
+    pub show_damage: bool,
+    /// Ownership color.
+    pub ownership_color: [f32; 4],
+    /// Visibility color.
+    pub visibility_color: [f32; 4],
+    /// Residency color.
+    pub residency_color: [f32; 4],
+    /// Clip color.
+    pub clip_color: [f32; 4],
+    /// Transform color.
+    pub transform_color: [f32; 4],
+    /// Newly exposed color.
+    pub newly_exposed_color: [f32; 4],
+    /// Damage color.
+    pub damage_color: [f32; 4],
+}
+
+impl Default for DebugVisualization {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_ownership: true,
+            show_visibility: true,
+            show_residency: true,
+            show_clips: true,
+            show_transforms: true,
+            show_newly_exposed: true,
+            show_damage: true,
+            ownership_color: [0.1, 0.7, 1.0, 0.55],
+            visibility_color: [0.2, 1.0, 0.2, 0.45],
+            residency_color: [1.0, 0.7, 0.1, 0.35],
+            clip_color: [0.9, 0.2, 1.0, 0.7],
+            transform_color: [0.2, 0.9, 0.9, 0.7],
+            newly_exposed_color: [1.0, 0.2, 0.1, 0.75],
+            damage_color: [1.0, 0.0, 0.6, 0.65],
+        }
+    }
+}
+
+impl DebugVisualization {
+    /// Enable all categories with the default diagnostic colors.
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
+    /// Disable the overlay while preserving category and color choices.
+    pub fn disabled(mut self) -> Self {
+        self.enabled = false;
+        self
+    }
+}
+
 impl Default for TileRefreshFlash {
     fn default() -> Self {
         Self {
@@ -95,6 +168,7 @@ impl TileRefreshFlash {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PerformanceDebug {
     tile_refresh: TileRefreshFlash,
+    visualization: DebugVisualization,
 }
 
 impl PerformanceDebug {
@@ -111,6 +185,7 @@ impl PerformanceDebug {
     /// Disable all visual diagnostics.
     pub fn disable(&mut self) {
         self.tile_refresh.enabled = false;
+        self.visualization.enabled = false;
     }
 
     /// Configure the tile refresh visualizer.
@@ -121,6 +196,16 @@ impl PerformanceDebug {
     /// Current tile refresh configuration.
     pub const fn tile_refresh_flash(&self) -> TileRefreshFlash {
         self.tile_refresh
+    }
+
+    /// Configure the retained tile/root/damage visualizer.
+    pub fn set_visualization(&mut self, visualization: DebugVisualization) {
+        self.visualization = visualization;
+    }
+
+    /// Current retained tile/root/damage visualization configuration.
+    pub const fn visualization(&self) -> DebugVisualization {
+        self.visualization
     }
 }
 
@@ -146,5 +231,16 @@ mod tests {
     fn invalid_tile_dimensions_do_not_replace_a_valid_configuration() {
         let flash = TileRefreshFlash::enabled().with_tile_size(64.0, 32.0);
         assert_eq!(flash.with_tile_size(f32::NAN, 0.0).tile_size, [64.0, 32.0]);
+    }
+
+    #[test]
+    fn visualization_is_opt_in_and_disable_turns_off_both_overlays() {
+        let mut debug = PerformanceDebug::default();
+        assert!(!debug.visualization().enabled);
+        debug.set_visualization(DebugVisualization::enabled());
+        debug.flash_tile_refreshes();
+        debug.disable();
+        assert!(!debug.visualization().enabled);
+        assert!(!debug.tile_refresh_flash().enabled);
     }
 }
