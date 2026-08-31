@@ -45,6 +45,7 @@ pub mod application;
 pub use crate::debug::{PerformanceDebug, TileRefreshFlash};
 pub mod frame_loop;
 pub mod resize_detector;
+pub mod surface;
 
 use std::sync::Arc;
 
@@ -463,6 +464,8 @@ impl WindowSurface {
         self.window.pre_present_notify();
         queue.present(texture);
         self.stats.presents += 1;
+        #[cfg(feature = "devtools")]
+        wgpui_devtools::present_global_backend_frame();
     }
 }
 

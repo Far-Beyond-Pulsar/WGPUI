@@ -1,0 +1,396 @@
+[package]
+name = "gpui-ce-legacy"
+version = "1.0.0"
+edition = "2024"
+authors = [
+    "Nathan Sobo <nathan@zed.dev>",
+    "Tristan J. Poland <me@tridentforu.com>",
+    "Maxine DeAndrade (@mdeand)",
+]
+description = "A community fork of Zed's GPU-accelerated UI framework"
+repository = "https://github.com/gpui-ce/gpui-ce"
+publish = true
+license = "Apache-2.0"
+homepage = "https://gpui-ce.github.io/"
+readme = "README.md"
+keywords = ["desktop", "gui", "immediate"]
+categories = ["gui"]
+autoexamples = false
+
+[features]
+default = ["font-kit"]
+test-support = [
+    "leak-detection",
+    "collections/test-support",
+    "util/test-support",
+    "http_client/test-support",
+]
+inspector = ["gpui_macros/inspector"]
+    leak-detection = ["backtrace"]
+    flamegraph = ["dep:bincode"]
+    profile-tracy = ["profiling/profile-with-tracy"]
+
+[lib]
+name = "gpui"
+path = "src/gpui.rs"
+doctest = false
+
+[dependencies]
+anyhow = "1.0.86"
+async-task = "4.7"
+backtrace = { version = "0.3", optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
+bytemuck = { version = "1.24", features = ["derive"] }
+circular-buffer = "1.0"
+collections = { package = "gpui_collections", version = "0.2.2" }
+cosmic-text = "0.18.2"
+ctor = "0.6.3"
+derive_more = { version = "2.1.1", features = ["full"] }
+etagere = "0.2"
+flume = "0.12"
+futures = "0.3"
+futures-concurrency = "7.7.1"
+gpui_macros = { package = "gpui-macros", version = "0.2.2" }
+image = { version = "0.25.1", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
+inventory = "0.3.19"
+itertools = "0.14.0"
+log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+lyon = "1.0"
+parking_lot = "0.12.1"
+pathfinder_geometry = "0.5"
+pin-project = "1.1.10"
+pollster = "0.4.0"
+# Default features provide only the proc-macros (`scope!`/`function` compile
+# to nothing until a backend like `profile-tracy` is activated).
+profiling = "1"
+rand = "0.10"
+raw-window-handle = "0.6"
+refineable = { package = "gpui_refineable", version = "0.2.2" }
+schemars = { version = "1.0", features = ["indexmap2"] }
+seahash = "4.1"
+semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0.221", features = ["derive", "rc"] }
+serde_json = { version = "1.0.144", features = ["preserve_order", "raw_value"] }
+slotmap = "1.0.6"
+smallvec = { version = "1.6", features = ["union"] }
+smol_str = "0.3.6"
+spin = "0.10.0"
+stacksafe = "1.0"
+strum = { version = "0.28.0", features = ["derive"] }
+sum_tree = { package = "gpui_sum_tree", version = "0.2.2" }
+taffy = "=0.9.0"
+thiserror = "2.0.12"
+util_macros = { package = "gpui_util_macros", version = "0.2.2" }
+uuid = { version = "1.23.2", features = ["v4", "v5", "v7", "serde", "js"] }
+waker-fn = "1.2.0"
+ordered-float = "5.3.0"
+
+# WASM-specific (optional, gated by `wasm` feature)
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+winit = "0.30.12"
+wgpu = { version = "30", default-features = false, features = [
+    "web",
+    "webgpu",
+    "wgsl",
+    "fragile-send-sync-non-atomic-wasm",
+] }
+web-sys = { version = "0.3", features = [
+    "VideoFrame",
+    "Window",
+    "Performance",
+] }
+js-sys = { version = "0.3" }
+wasm-bindgen-futures = "0.4"
+wasm-bindgen = "0.2"
+web-time = "1.0"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+device_query = "2.1"
+winit = "0.30.12"
+wgpu = { version = "30", default-features = false, features = [
+    "web",
+    "webgpu",
+    "dx12",
+    "vulkan",
+    "wgsl",
+    "fragile-send-sync-non-atomic-wasm",
+] }
+priority-threadpool = { git = "https://github.com/tristanpoland/priority-threadpool", rev = "bb1ab91" }
+arboard = "3.6.1"
+font-kit = { version = "0.14.3", optional = true }
+http_client = { package = "gpui_http_client", version = "0.2.2" }
+libc = "0.2"
+num_cpus = "1.13"
+open = "5.3.5"
+opener = { version = "0.8.4", features = ["reveal"] }
+parking = "2.0.0"
+postage = { version = "0.5", features = ["futures-traits"] }
+resvg = { version = "0.47.0", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "memmap-fonts",
+] }
+rfd = "0.17.2"
+smol = "2.0"
+util = { package = "gpui_util", version = "0.2.2" }
+util_macros = { package = "gpui_util_macros", version = "0.2.2" }
+usvg = { version = "0.47.0", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-video = "0.5.2"
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.2", features = ["NSData"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11-dl = "2.21.0"
+
+[dev-dependencies]
+backtrace = "0.3"
+helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "04a38328c6d1329272072ade89d07098737df6b8" }
+helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "04a38328c6d1329272072ade89d07098737df6b8" }
+glam = "0.33"
+env_logger = "0.11"
+collections = { package = "gpui_collections", version = "0.2.2", features = [
+    "test-support",
+] }
+http_client = { package = "gpui_http_client", version = "0.2.2", features = [
+    "test-support",
+] }
+lyon = { version = "1.0", features = ["extra"] }
+pretty_assertions = { version = "1.3.0", features = ["unstable"] }
+rand = "0.10"
+unicode-segmentation = "1.10"
+util = { package = "gpui_util", version = "0.2.2", features = ["test-support"] }
+
+[[example]]
+name = "karaoke_text"
+path = "examples/karaoke_text.rs"
+
+[[example]]
+name = "karaoke_app"
+path = "examples/karaoke_app.rs"
+
+[[example]]
+name = "text_gradients"
+path = "examples/text_gradients.rs"
+
+# ============================================================================
+# Learn Examples - Educational examples for learning GPUI
+# ============================================================================
+
+[[example]]
+name = "interactive_elements"
+path = "examples/learn/interactive_elements.rs"
+
+[[example]]
+name = "creating_components"
+path = "examples/learn/creating_components.rs"
+
+[[example]]
+name = "layout"
+path = "examples/learn/layout.rs"
+
+[[example]]
+name = "styling"
+path = "examples/learn/styling.rs"
+
+[[example]]
+name = "async_tasks"
+path = "examples/learn/async_tasks.rs"
+
+[[example]]
+name = "custom_drawing"
+path = "examples/learn/custom_drawing.rs"
+
+[[example]]
+name = "animation"
+path = "examples/learn/animation.rs"
+
+[[example]]
+name = "text"
+path = "examples/learn/text.rs"
+
+[[example]]
+name = "emoji_display"
+path = "examples/learn/emoji_display.rs"
+
+[[example]]
+name = "wgpu_surface"
+path = "examples/learn/wgpu_surface.rs"
+
+[[example]]
+name = "wgpu_surface_basic"
+path = "examples/learn/wgpu_surface_basic.rs"
+
+[[example]]
+name = "wgpu_surface_quad"
+path = "examples/learn/wgpu_surface_quad.rs"
+
+[[example]]
+name = "wgpu_surface_stress"
+path = "examples/learn/wgpu_surface_stress.rs"
+
+[[example]]
+name = "mouse_events"
+path = "examples/learn/mouse_events.rs"
+
+[[example]]
+name = "blur_showcase"
+path = "examples/learn/blur_showcase.rs"
+
+[[example]]
+name = "smooth_scrolling"
+path = "examples/learn/smooth_scrolling.rs"
+
+[[example]]
+name = "virtual_list"
+path = "examples/learn/virtual_list.rs"
+
+# ============================================================================
+# Bench Examples - Performance benchmarks
+# ============================================================================
+
+[[example]]
+name = "data_table"
+path = "examples/bench/data_table.rs"
+
+[[example]]
+name = "plain_scroll_10k"
+path = "examples/bench/plain_scroll_10k.rs"
+
+[[example]]
+name = "paths_bench"
+path = "examples/bench/paths_bench.rs"
+
+[[example]]
+name = "pattern"
+path = "examples/bench/pattern.rs"
+
+[[example]]
+name = "shadow"
+path = "examples/bench/shadow.rs"
+
+# ============================================================================
+# Legacy Examples - Original examples (to be updated)
+# ============================================================================
+
+[[example]]
+name = "focus_visible"
+path = "examples/legacy/focus_visible.rs"
+
+[[example]]
+name = "gif_viewer"
+path = "examples/legacy/gif_viewer.rs"
+
+[[example]]
+name = "gradient"
+path = "examples/legacy/gradient.rs"
+
+[[example]]
+name = "hello_world"
+path = "examples/legacy/hello_world.rs"
+
+[[example]]
+name = "image_loading"
+path = "examples/legacy/image_loading.rs"
+
+[[example]]
+name = "input"
+path = "examples/legacy/input.rs"
+
+[[example]]
+name = "on_window_close_quit"
+path = "examples/legacy/on_window_close_quit.rs"
+
+[[example]]
+name = "opacity"
+path = "examples/legacy/opacity.rs"
+
+[[example]]
+name = "scrollable"
+path = "examples/legacy/scrollable.rs"
+
+[[example]]
+name = "svg"
+path = "examples/legacy/svg/svg.rs"
+
+[[example]]
+name = "tab_stop"
+path = "examples/legacy/tab_stop.rs"
+
+[[example]]
+name = "tree"
+path = "examples/legacy/tree.rs"
+
+[[example]]
+name = "uniform_list"
+path = "examples/legacy/uniform_list.rs"
+
+[[example]]
+name = "window"
+path = "examples/legacy/window.rs"
+
+[[example]]
+name = "window_positioning"
+path = "examples/legacy/window_positioning.rs"
+
+[[example]]
+name = "window_shadow"
+path = "examples/legacy/window_shadow.rs"
+
+[profile.dev]
+split-debuginfo = "unpacked"
+incremental = false
+codegen-units = 16
+
+[profile.dev.build-override]
+codegen-units = 16
+
+[profile.dev.package]
+quote = { opt-level = 3 }
+syn = { opt-level = 3 }
+proc-macro2 = { opt-level = 3 }
+taffy = { opt-level = 3 }
+resvg = { opt-level = 3 }
+
+[profile.release]
+debug = "limited"
+lto = "thin"
+codegen-units = 1
+
+[profile.release-fast]
+inherits = "release"
+debug = "full"
+lto = false
+codegen-units = 16
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+declare_interior_mutable_const = "deny"
+redundant_clone = "deny"
+disallowed_methods = "deny"
+style = { level = "allow", priority = -1 }
+type_complexity = "allow"
+let_underscore_future = "allow"
+single_range_in_vec_init = "allow"
+too_many_arguments = "allow"
+large_enum_variant = "allow"
+nonminimal_bool = "allow"
+

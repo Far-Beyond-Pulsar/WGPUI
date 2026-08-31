@@ -32,7 +32,7 @@
 
 use crate::invalidation::axes::Invalidation;
 use crate::patch::primitive::{
-    BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, Underline,
+    BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, ShadowClip, Underline,
 };
 use crate::patch::{PatchError, PatchList};
 use crate::scene::layer::LayerId;
@@ -43,15 +43,17 @@ use std::collections::HashSet;
 
 /// One frame's patches, across every record category §2 names.
 ///
-/// The five lists are independent: a frame that changes only a hover colour
-/// carries one quad update and four empty lists, and applying it uploads
-/// exactly one quad's bytes.
+/// The drawable lists are independent: a frame that changes only a hover
+/// colour carries one quad update and empty lists for every other category,
+/// and applying it uploads exactly one quad's bytes.
 // Not `Eq`: primitive payloads carry `f32` fields, so the whole protocol is
 // `PartialEq` and stops there rather than inventing a total order for floats.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScenePatch {
     /// Blurred rounded rectangles, painted under everything else in their layer.
     pub shadows: PatchList<Shadow>,
+    /// Per-shadow inherited clips, keyed and ordered like [`Self::shadows`].
+    pub shadow_clips: PatchList<ShadowClip>,
     /// Fixed-size primitives.
     pub quads: PatchList<Quad>,
     /// Underline and strikethrough rules, painted under their layer's text.
@@ -87,13 +89,30 @@ impl ScenePatch {
                 layers.push(layer);
             }
         };
-        for patch in self.shadows.patches() { add(patch.layer); }
-        for patch in self.quads.patches() { add(patch.layer); }
-        for patch in self.underlines.patches() { add(patch.layer); }
-        for patch in self.glyph_runs.patches() { add(patch.layer); }
-        for patch in self.poly_sprites.patches() { add(patch.layer); }
-        for patch in self.paths.patches() { add(patch.layer); }
-        for patch in self.backdrop_filters.patches() { add(patch.layer); }
+        for patch in self.shadows.patches() {
+            add(patch.layer);
+        }
+        for patch in self.shadow_clips.patches() {
+            add(patch.layer);
+        }
+        for patch in self.quads.patches() {
+            add(patch.layer);
+        }
+        for patch in self.underlines.patches() {
+            add(patch.layer);
+        }
+        for patch in self.glyph_runs.patches() {
+            add(patch.layer);
+        }
+        for patch in self.poly_sprites.patches() {
+            add(patch.layer);
+        }
+        for patch in self.paths.patches() {
+            add(patch.layer);
+        }
+        for patch in self.backdrop_filters.patches() {
+            add(patch.layer);
+        }
         layers.sort_unstable();
         layers
     }
@@ -106,6 +125,7 @@ impl ScenePatch {
     /// Whether every list is empty.
     pub fn is_empty(&self) -> bool {
         self.shadows.is_empty()
+            && self.shadow_clips.is_empty()
             && self.quads.is_empty()
             && self.underlines.is_empty()
             && self.glyph_runs.is_empty()
@@ -120,6 +140,7 @@ impl ScenePatch {
     /// Total operations across every list.
     pub fn len(&self) -> usize {
         self.shadows.len()
+            + self.shadow_clips.len()
             + self.quads.len()
             + self.underlines.len()
             + self.glyph_runs.len()
@@ -134,6 +155,7 @@ impl ScenePatch {
     /// Drop every operation, keeping the allocations for the next frame.
     pub fn clear(&mut self) {
         self.shadows.clear();
+        self.shadow_clips.clear();
         self.quads.clear();
         self.underlines.clear();
         self.glyph_runs.clear();
@@ -155,6 +177,9 @@ impl ScenePatch {
             }
         };
         for patch in self.shadows.patches() {
+            note(patch.layer);
+        }
+        for patch in self.shadow_clips.patches() {
             note(patch.layer);
         }
         for patch in self.quads.patches() {
@@ -247,6 +272,7 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     scene
         .shadows
         .apply(&patch.shadows, &mut scene.allocator, &mut entries)?;
+    scene.shadow_clips.apply(&patch.shadow_clips)?;
     scene
         .quads
         .apply(&patch.quads, &mut scene.allocator, &mut entries)?;
@@ -275,6 +301,7 @@ pub fn apply(scene: &mut Scene, patch: &ScenePatch) -> Result<UploadPlan, PatchE
     for layer in touched {
         let mut axes = Invalidation::empty();
         if names(&patch.shadows, layer)
+            || names(&patch.shadow_clips, layer)
             || names(&patch.quads, layer)
             || names(&patch.underlines, layer)
             || names(&patch.glyph_runs, layer)

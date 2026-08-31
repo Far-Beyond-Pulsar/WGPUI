@@ -193,9 +193,12 @@ fn quad_materials_use_the_three_final_protocol_rows() -> Result<(), Box<dyn std:
         assert_eq!(&bytes[..80], &[0; 80]);
         assert_eq!(&bytes[80..84], &(kind[0] as u32).to_le_bytes());
         assert_eq!(&bytes[84..96], &[0; 12]);
-        assert_eq!(&bytes[96..112], bytemuck::cast_slice(&first));
-        assert_eq!(&bytes[112..128], bytemuck::cast_slice(&second));
-        assert_eq!(&bytes[128..144], bytemuck::cast_slice(&parameters));
+        assert_eq!(&bytes[96..112], bytemuck::cast_slice::<f32, u8>(&first));
+        assert_eq!(&bytes[112..128], bytemuck::cast_slice::<f32, u8>(&second));
+        assert_eq!(
+            &bytes[128..144],
+            bytemuck::cast_slice::<f32, u8>(&parameters)
+        );
     }
     Ok(())
 }

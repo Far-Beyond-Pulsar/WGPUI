@@ -39,7 +39,7 @@ use wgpui_core::color::{ColorSpace, GradientStop, Hsla, LinearColorStop};
 use wgpui_core::geometry::{Pixels, Point};
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::Emission;
-use wgpui_core::patch::primitive::{Material, Quad, Shadow};
+use wgpui_core::patch::primitive::{BackdropFilter, Material, Quad, Shadow};
 use wgpui_layout::taffy_tree::{LayoutRect, LayoutStyle};
 
 /// A per-corner value, in the legacy `Corners<T>` field order.
@@ -200,6 +200,10 @@ pub struct DivStyle {
     /// Opacity applied to every primitive emitted by this element, including
     /// shadows and borders.
     pub opacity: f32,
+    /// Gaussian blur radius applied to the already-rendered backdrop behind
+    /// this element. Content blur requires an offscreen compositing group and
+    /// is intentionally not represented by this field.
+    pub backdrop_blur: Option<f32>,
     /// Per-corner radii, before [`Corners::clamped_for`].
     pub corner_radii: Corners,
     /// `box-shadow` layers, painted in order, all *behind* the element.
@@ -237,6 +241,7 @@ impl Default for DivStyle {
             border_widths: Edges::default(),
             border_dashed: false,
             opacity: 1.0,
+            backdrop_blur: None,
             corner_radii: Corners::default(),
             box_shadow: Vec::new(),
             text_color: None,
@@ -379,6 +384,22 @@ impl DivStyle {
         let size = [bounds.width, bounds.height];
         let corner_radii = self.corner_radii.clamped_for(size);
 
+        if let Some(blur_radius) = self.backdrop_blur
+            && blur_radius.is_finite()
+            && blur_radius > 0.0
+            && self.opacity > 0.0
+        {
+            emission.backdrop_filter(BackdropFilter {
+                origin,
+                size,
+                clip_origin: origin,
+                clip_size: size,
+                corner_radii: corner_radii.to_array(),
+                blur_radius,
+                opacity: self.opacity,
+            });
+        }
+
         for shadow in &self.box_shadow {
             let mut primitive = self.shadow_primitive(shadow, origin, size, corner_radii);
             primitive.color[3] *= self.opacity;
@@ -386,11 +407,26 @@ impl DivStyle {
         }
 
         if let Some(gradient) = &self.background_gradient {
-            emission.quad(material_quad(origin, size, corner_radii, gradient_material(gradient, self.opacity)));
+            emission.quad(material_quad(
+                origin,
+                size,
+                corner_radii,
+                gradient_material(gradient, self.opacity),
+            ));
         } else if let Some(gradient) = &self.background_radial_gradient {
-            emission.quad(material_quad(origin, size, corner_radii, radial_material(gradient, self.opacity)));
+            emission.quad(material_quad(
+                origin,
+                size,
+                corner_radii,
+                radial_material(gradient, self.opacity),
+            ));
         } else if let Some(pattern) = &self.background_pattern {
-            emission.quad(material_quad(origin, size, corner_radii, pattern_material(pattern, self.opacity)));
+            emission.quad(material_quad(
+                origin,
+                size,
+                corner_radii,
+                pattern_material(pattern, self.opacity),
+            ));
         } else if self.is_background_visible() {
             let mut background = self.background.unwrap_or([0.0; 4]);
             background[3] *= self.opacity;
@@ -477,6 +513,10 @@ impl DivStyle {
     /// appearing or disappearing is a structural change rather than a value one.
     pub fn primitive_count(&self) -> usize {
         self.box_shadow.len()
+            + usize::from(
+                self.backdrop_blur
+                    .is_some_and(|radius| radius.is_finite() && radius > 0.0 && self.opacity > 0.0),
+            )
             + if self.background_gradient.is_some() || self.background_radial_gradient.is_some() {
                 gradient_band_count()
             } else if self.background_pattern.is_some() {
@@ -514,7 +554,15 @@ fn material_quad(
 
 fn gradient_material(gradient: &LinearGradient, opacity: f32) -> Material {
     let angle = gradient.angle.to_radians();
-    let mut colors: [[f32; 4]; 2] = [gradient.stops[0].color.into(), gradient.stops[1].color.into()];
+    let first_color = gradient
+        .stops
+        .first()
+        .map_or([0.0; 4], |stop| stop.color.into());
+    let second_color = gradient
+        .stops
+        .get(1)
+        .map_or(first_color, |stop| stop.color.into());
+    let mut colors: [[f32; 4]; 2] = [first_color, second_color];
     colors[0][3] *= opacity;
     colors[1][3] *= opacity;
     Material::Linear {
@@ -524,7 +572,10 @@ fn gradient_material(gradient: &LinearGradient, opacity: f32) -> Material {
 }
 
 fn radial_material(gradient: &RadialGradient, opacity: f32) -> Material {
-    let mut colors: [[f32; 4]; 2] = [gradient.stops[0].color.into(), gradient.stops[1].color.into()];
+    let mut colors: [[f32; 4]; 2] = [
+        gradient.stops[0].color.into(),
+        gradient.stops[1].color.into(),
+    ];
     colors[0][3] *= opacity;
     colors[1][3] *= opacity;
     Material::Radial {
@@ -536,22 +587,44 @@ fn radial_material(gradient: &RadialGradient, opacity: f32) -> Material {
 
 fn pattern_material(pattern: &Pattern, opacity: f32) -> Material {
     match pattern {
-        Pattern::Slash { color, width, interval } => {
+        Pattern::Slash {
+            color,
+            width,
+            interval,
+        } => {
             let mut color = *color;
             color[3] *= opacity;
-            Material::Slash { color, width: *width, interval: *interval }
+            Material::Slash {
+                color,
+                width: *width,
+                interval: *interval,
+            }
         }
-        Pattern::Checker { first, second, cell } => {
+        Pattern::Checker {
+            first,
+            second,
+            cell,
+        } => {
             let mut colors = [*first, *second];
             colors[0][3] *= opacity;
             colors[1][3] *= opacity;
-            Material::Checker { colors, cell: *cell }
+            Material::Checker {
+                colors,
+                cell: *cell,
+            }
         }
-        Pattern::Stripes { first, second, width } => {
+        Pattern::Stripes {
+            first,
+            second,
+            width,
+        } => {
             let mut colors = [*first, *second];
             colors[0][3] *= opacity;
             colors[1][3] *= opacity;
-            Material::Stripes { colors, width: *width }
+            Material::Stripes {
+                colors,
+                width: *width,
+            }
         }
     }
 }
@@ -883,6 +956,7 @@ pub fn classify_style_change(current: &DivStyle, previous: &DivStyle) -> Invalid
         || current.background_radial_gradient != previous.background_radial_gradient
         || current.background_pattern != previous.background_pattern
         || current.opacity != previous.opacity
+        || current.backdrop_blur != previous.backdrop_blur
     {
         axes |= Invalidation::DISPLAY;
     }
@@ -1107,6 +1181,27 @@ mod tests {
     }
 
     #[test]
+    fn backdrop_blur_is_a_retained_filter_and_a_display_change() {
+        let style = DivStyle {
+            backdrop_blur: Some(12.0),
+            opacity: 0.75,
+            corner_radii: Corners::all(80.0),
+            ..DivStyle::default()
+        };
+        let mut emission = Emission::new();
+        style.paint(bounds(), &mut emission);
+        assert_eq!(style.primitive_count(), 1);
+        assert_eq!(emission.backdrop_filters().len(), 1);
+        assert_eq!(emission.backdrop_filters()[0].blur_radius, 12.0);
+        assert_eq!(emission.backdrop_filters()[0].opacity, 0.75);
+        assert_eq!(emission.backdrop_filters()[0].corner_radii, [30.0; 4]);
+        assert_eq!(
+            classify_style_change(&style, &DivStyle::default()),
+            Invalidation::DISPLAY
+        );
+    }
+
+    #[test]
     fn opacity_is_a_display_change_and_applies_to_every_paint_layer() {
         let mut style = styled();
         style.box_shadow = vec![BoxShadow {
@@ -1174,6 +1269,29 @@ mod tests {
     }
 
     #[test]
+    fn linear_gradients_with_fewer_than_two_stops_do_not_panic() {
+        for stops in [
+            Vec::new(),
+            vec![LinearColorStop {
+                color: red(),
+                percentage: 0.0,
+            }],
+        ] {
+            let style = DivStyle {
+                background_gradient: Some(LinearGradient {
+                    stops,
+                    angle: 0.0,
+                    color_space: ColorSpace::Srgb,
+                }),
+                ..DivStyle::default()
+            };
+            let mut emission = Emission::new();
+            style.paint(bounds(), &mut emission);
+            assert_eq!(style.primitive_count(), emission.quads().len());
+        }
+    }
+
+    #[test]
     fn linear_gradient_angles_are_public_degrees() {
         let gradient = DivStyle {
             background_gradient: Some(LinearGradient {
@@ -1201,6 +1319,11 @@ mod tests {
             .expect("gradient emits a first band");
         assert_eq!(first.origin[0], 10.0);
         assert_eq!(first.origin[1], 20.0);
-        assert!(first.size[0] < first.size[1]);
+        assert!(matches!(first.material, Material::Linear { .. }));
+        if let Material::Linear { direction, .. } = first.material {
+            let angle = 30.0_f32.to_radians();
+            assert!((direction[0] - angle.cos()).abs() < 1e-6);
+            assert!((direction[1] - angle.sin()).abs() < 1e-6);
+        }
     }
 }

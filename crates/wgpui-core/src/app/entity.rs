@@ -12,7 +12,7 @@ impl EntityId {
 
 pub struct Entity<T> {
     id: EntityId,
-    value: Rc<RefCell<T>>,
+    value: Rc<RefCell<Option<T>>>,
     app: App,
 }
 impl<T> Clone for Entity<T> {
@@ -28,15 +28,29 @@ impl<T> Entity<T> {
     pub(crate) fn new(id: EntityId, value: T, app: App) -> Self {
         Self {
             id,
-            value: Rc::new(RefCell::new(value)),
+            value: Rc::new(RefCell::new(Some(value))),
             app,
         }
+    }
+    pub(crate) fn new_uninitialized(id: EntityId, app: App) -> Self {
+        Self {
+            id,
+            value: Rc::new(RefCell::new(None)),
+            app,
+        }
+    }
+    pub(crate) fn initialize(&self, value: T) {
+        let mut stored = self.value.borrow_mut();
+        *stored = Some(value);
     }
     pub fn entity_id(&self) -> EntityId {
         self.id
     }
     pub(crate) fn app(&self) -> App {
         self.app.clone()
+    }
+    pub(crate) fn app_ref(&self) -> &App {
+        &self.app
     }
     pub(crate) fn notify(&self) {
         self.app.notify_entity(self.id);
@@ -49,16 +63,31 @@ impl<T> Entity<T> {
         }
     }
     pub fn read(&self, _app: &App) -> Ref<'_, T> {
-        self.value.borrow()
+        Ref::map(self.value.borrow(), |value| {
+            value
+                .as_ref()
+                .expect("an entity cannot be read before its constructor completes")
+        })
     }
     pub fn read_with<R>(&self, _app: &App, access: impl FnOnce(&T, &App) -> R) -> R {
-        access(&self.value.borrow(), &self.app)
+        access(
+            self.value
+                .borrow()
+                .as_ref()
+                .expect("an entity cannot be read before its constructor completes"),
+            &self.app,
+        )
     }
     pub fn update<R>(&self, access: impl FnOnce(&mut T, &mut Context<T>) -> R) -> R {
         let result = {
             let mut value = self.value.borrow_mut();
-            let mut context = Context::new(self.clone());
-            access(&mut value, &mut context)
+            let mut context = Context::from_entity(self.clone());
+            access(
+                value
+                    .as_mut()
+                    .expect("an entity cannot be updated before its constructor completes"),
+                &mut context,
+            )
         };
         self.app.notify_entity(self.id);
         result
@@ -70,8 +99,14 @@ impl<T> Entity<T> {
     ) -> R {
         let result = {
             let mut value = self.value.borrow_mut();
-            let mut context = Context::new(self.clone());
-            access(&mut value, window, &mut context)
+            let mut context = Context::from_entity(self.clone());
+            access(
+                value
+                    .as_mut()
+                    .expect("an entity cannot be updated before its constructor completes"),
+                window,
+                &mut context,
+            )
         };
         self.app.notify_entity(self.id);
         result
@@ -84,7 +119,7 @@ impl<T> Entity<T> {
 
 pub struct WeakEntity<T> {
     id: EntityId,
-    value: Weak<RefCell<T>>,
+    value: Weak<RefCell<Option<T>>>,
     app: App,
 }
 impl<T> Clone for WeakEntity<T> {

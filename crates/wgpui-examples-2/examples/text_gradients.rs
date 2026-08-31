@@ -4,7 +4,7 @@ use wgpui::*;
 struct GradientTest;
 
 impl Render for GradientTest {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self) -> impl IntoElement + 'static {
         div()
             .flex()
             .flex_col()
@@ -32,9 +32,9 @@ impl Render for GradientTest {
     }
 }
 
-fn main() {
+fn main() -> Result<(), ApplicationError> {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(800.0), px(400.0)), cx);
+        let bounds = Bounds::centered(None::<()>, size(px(800.0), px(400.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -43,5 +43,5 @@ fn main() {
             |_, cx| cx.new(|_| GradientTest),
         )
         .expect("Failed to open window");
-    });
+    })
 }

@@ -90,6 +90,7 @@ impl CompositeConsumer<'_> {
                 // last composite, or `display` rotates to a stale buffer
                 // whenever the producer skipped a frame and the canvas strobes.
                 registry.swap_ready_display_if_new(id);
+                registry.clear_redraw_pending(id);
                 registry.front_view(id)
             }
             CompositeSource::BoundaryTexture(boundary) => self.textures?.view(boundary).cloned(),

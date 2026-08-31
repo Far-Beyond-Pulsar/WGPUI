@@ -36,6 +36,30 @@ use crate::reconcile::description::ElementId;
 use crate::scene::layer::{BoundaryId, LayerId, LayerKey};
 use std::hash::{Hash, Hasher};
 
+/// Stable identity of a retained scrolling root.
+///
+/// A scrolling root is distinct from its compositing boundary. Keeping the
+/// identity separate lets an inspector describe an untiled root, a tiled
+/// root, and a root that currently happens to share a layer without making
+/// those implementation details part of the query contract.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ScrollRootId(u64);
+
+impl ScrollRootId {
+    /// The window's scrolling root.
+    pub const ROOT: ScrollRootId = ScrollRootId(0);
+
+    /// Wrap a raw retained identity.
+    pub const fn from_raw(raw: u64) -> Self {
+        ScrollRootId(raw)
+    }
+
+    /// Return the raw retained identity.
+    pub const fn as_raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Derives a compositing boundary's cross-frame identity from where it sits.
 pub struct BoundaryIdentity;
 

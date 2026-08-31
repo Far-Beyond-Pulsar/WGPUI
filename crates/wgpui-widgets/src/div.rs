@@ -1,7 +1,7 @@
 //! `Div` — the element nearly every example in this repository is built out of.
 //! See docs/gpu-native-architecture.md §3.4 and §8's Phase 6.6 row.
 //!
-//! # What Phase 6.6 built here, and what it deliberately left for later
+//! # What Phase 6.6 built here
 //!
 //! Before this phase `div.rs` and its four submodules were 33 lines in total: a
 //! `pub struct Div;` with no fields, no builder, no emission and no layout. Five
@@ -17,19 +17,20 @@
 //! `ReconcileKey` split by what a change actually affects
 //! ([`diff::DivDiffKey`]).
 //!
-//! What is **not** here, named rather than implied, because §8's Phase 6.6 row
-//! scopes it out explicitly and a half-built version would be worse than an
-//! absent one:
+//! Scroll containers remain outside this interaction seam. `Description::scroll_offset` already carries a
+//!   displacement and `.boundary()` already resolves one to a layer transform
+//!   (Phase 2), so the *mechanism* exists; what does not is a `ScrollHandle`
+//!   deciding what the offset should be, which is `div/scroll_state.rs`.
+//!
+//! Input state and richer platform interaction remain separate concerns:
 //!
 //! - `:hover` / `:active` / `:focus`. These need a cascade *above* `DivStyle`
 //!   and a hit-test to drive it, and the hit-test needs the input plumbing
 //!   §3.4's `div/interactivity/hitbox.rs` is a placeholder for.
 //! - Mouse and keyboard event binding (`InteractiveElement`, today's ~456-line
-//!   trait block). `div/events.rs` is still a placeholder.
-//! - Scroll containers. `Description::scroll_offset` already carries a
-//!   displacement and `.boundary()` already resolves one to a layer transform
-//!   (Phase 2), so the *mechanism* exists; what does not is a `ScrollHandle`
-//!   deciding what the offset should be, which is `div/scroll_state.rs`.
+//!   trait block) remains in `div/events.rs`.
+//! - Scroll containers use overflow metadata and are connected by the native
+//!   backend after layout establishes their actual content extent.
 //!
 //! # Why `describe` consumes `self`
 //!
@@ -55,7 +56,7 @@ use crate::div::interactivity::style::DivStyle;
 use crate::styled::Styled;
 use wgpui_core::element::Element;
 use wgpui_core::patch::emit::{Emission, EmitContext};
-use wgpui_core::reconcile::description::{Description, ElementId};
+use wgpui_core::reconcile::description::{Description, ElementId, TextDecoration, TextOptions};
 
 /// Anything that can become one node of a description tree.
 ///
@@ -90,12 +91,12 @@ pub struct Div {
     interaction: events::InteractionState,
     focus_handle: Option<wgpui_core::window::FocusHandle>,
     scroll_handle: Option<scroll_state::ScrollHandle>,
-    hover_style: Option<DivStyle>,
-    active_style: Option<DivStyle>,
-    focus_style: Option<DivStyle>,
-    focus_visible_style: Option<DivStyle>,
+    hover_style: Option<Box<DivStyle>>,
+    active_style: Option<Box<DivStyle>>,
+    focus_style: Option<Box<DivStyle>>,
+    focus_visible_style: Option<Box<DivStyle>>,
     group_name: Option<wgpui_text::shaping::SharedString>,
-    group_hover_style: Option<(wgpui_text::shaping::SharedString, DivStyle)>,
+    group_hover_style: Option<(wgpui_text::shaping::SharedString, Box<DivStyle>)>,
 }
 
 /// A new, unstyled, childless `div`.
@@ -157,6 +158,107 @@ impl Div {
         self
     }
 
+    pub fn on_mouse_up<R: events::IntoEventResult + 'static>(
+        mut self,
+        button: wgpui_core::window::MouseButton,
+        handler: impl FnMut(
+            &wgpui_core::window::MouseUpEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_mouse_up(button, handler);
+        self
+    }
+
+    pub fn on_mouse_move<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::MouseMoveEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_mouse_move(handler);
+        self
+    }
+
+    pub fn on_mouse_enter<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_mouse_enter(handler);
+        self
+    }
+
+    pub fn on_mouse_leave<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_mouse_leave(handler);
+        self
+    }
+
+    pub fn on_action<A: wgpui_core::action::Action, R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &A,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_action(handler);
+        self
+    }
+
+    pub fn on_drag<D: 'static, R: 'static>(
+        mut self,
+        data: D,
+        handler: impl FnMut(
+            &D,
+            [wgpui_core::boundary::Pixels; 2],
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_drag(data, handler);
+        self
+    }
+
+    pub fn on_drag_hover<D: 'static, R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(bool, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_drag_hover::<D, R>(handler);
+        self
+    }
+
+    pub fn on_drop<D: 'static, R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &D,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_drop(handler);
+        self
+    }
+
     pub fn on_hover<R: events::IntoEventResult + 'static>(
         mut self,
         handler: impl FnMut(bool, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R
@@ -179,6 +281,71 @@ impl Div {
         self
     }
 
+    pub fn on_key_down<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::KeyDownEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_key_down(handler);
+        self
+    }
+
+    pub fn on_key_up<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::KeyUpEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_key_up(handler);
+        self
+    }
+
+    pub fn on_text_input<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::TextInputEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_text_input(handler);
+        self
+    }
+
+    pub fn on_ime<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::ImeEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_ime(handler);
+        self
+    }
+
+    pub fn on_modifiers_changed<R: events::IntoEventResult + 'static>(
+        mut self,
+        handler: impl FnMut(
+            &wgpui_core::window::ModifiersChangedEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.interaction.on_modifiers_changed(handler);
+        self
+    }
+
     pub fn track_focus(mut self, handle: &wgpui_core::window::FocusHandle) -> Self {
         self.focus_handle = Some(*handle);
         self
@@ -186,12 +353,12 @@ impl Div {
 
     /// Resolve a hover style against the element's current resolved style.
     pub fn hover(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
-        self.hover_style = Some(apply(self.style.clone()));
+        self.hover_style = Some(Box::new(apply(self.style.clone())));
         self
     }
 
     pub fn active(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
-        self.active_style = Some(apply(self.style.clone()));
+        self.active_style = Some(Box::new(apply(self.style.clone())));
         self
     }
 
@@ -207,17 +374,17 @@ impl Div {
         name: impl Into<wgpui_text::shaping::SharedString>,
         apply: impl FnOnce(DivStyle) -> DivStyle,
     ) -> Self {
-        self.group_hover_style = Some((name.into(), apply(self.style.clone())));
+        self.group_hover_style = Some((name.into(), Box::new(apply(self.style.clone()))));
         self
     }
 
     pub fn focus(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
-        self.focus_style = Some(apply(self.style.clone()));
+        self.focus_style = Some(Box::new(apply(self.style.clone())));
         self
     }
 
     pub fn focus_visible(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
-        self.focus_visible_style = Some(apply(self.style.clone()));
+        self.focus_visible_style = Some(Box::new(apply(self.style.clone())));
         self
     }
 
@@ -251,6 +418,7 @@ impl Div {
 
     pub fn track_scroll(mut self, handle: &scroll_state::ScrollHandle) -> Self {
         self.scroll_handle = Some(handle.clone());
+        self.boundary = true;
         self
     }
 
@@ -289,15 +457,9 @@ impl Div {
         self
     }
 
-    /// Displace this element's children by `offset`.
-    ///
-    /// The raw mechanism, not a scroll container: nothing here decides what the
-    /// offset should be, subscribes to a wheel event, or clamps to a content
-    /// extent. That is `div/scroll_state.rs`'s job and it is out of scope for
-    /// this phase — see this module's doc. Exposed anyway because
-    /// `Description::scroll_offset` has carried it since Phase 1 and a `Div`
-    /// that could not reach it would make Phase 2's boundary gates unreachable
-    /// from a real element.
+    /// Displace this element's children by `offset` without attaching a
+    /// scroll handle. Use [`Self::track_scroll`] when input and clamping are
+    /// needed as well.
     pub fn scroll_offset(mut self, offset: [f32; 2]) -> Self {
         self.scroll_offset = offset;
         self
@@ -337,28 +499,35 @@ impl Div {
             element_id,
             style,
             children,
-            boundary,
+            mut boundary,
             uncached,
             scroll_offset,
             estimated_size,
             scroll_handle,
+            focus_handle,
             hover_style,
             active_style,
             focus_style,
             focus_visible_style,
             group_name: _,
             group_hover_style,
-            interaction,
+            mut interaction,
             ..
         } = self;
 
-        let style = if interaction.is_focused() {
-            focus_style.or(focus_visible_style).unwrap_or(style)
+        let style = if interaction.is_focus_visible() {
+            focus_visible_style
+                .map(|style| *style)
+                .or_else(|| focus_style.map(|style| *style))
+                .unwrap_or(style)
+        } else if interaction.is_focused() {
+            focus_style.map(|style| *style).unwrap_or(style)
         } else if interaction.is_active() {
-            active_style.unwrap_or(style)
+            active_style.map(|style| *style).unwrap_or(style)
         } else if interaction.is_hovered() {
             hover_style
-                .or_else(|| group_hover_style.map(|(_, style)| style))
+                .map(|style| *style)
+                .or_else(|| group_hover_style.map(|(_, style)| *style))
                 .unwrap_or(style)
         } else {
             style
@@ -374,13 +543,50 @@ impl Div {
             }
         }
         let paint = style;
+        let text_options = TextOptions {
+            size: paint.text_size,
+            line_height: paint.text_line_height,
+            color: paint.text_color,
+            weight: paint.text_weight.map(|weight| weight.0 as u16),
+            italic: paint.text_italic.then_some(true),
+            alignment: (paint.text_alignment != 0).then_some(paint.text_alignment),
+            nowrap: paint.text_white_space_nowrap.then_some(true),
+            ellipsis: paint.text_ellipsis.then_some(true),
+            line_clamp: paint.text_line_clamp,
+            letter_spacing: paint.text_letter_spacing,
+            underline: paint.text_underline.map(|decoration| TextDecoration {
+                thickness: decoration.thickness,
+                color: decoration.color,
+                wavy: decoration.wavy,
+            }),
+            strikethrough: paint.text_strikethrough.map(|decoration| TextDecoration {
+                thickness: decoration.thickness,
+                color: decoration.color,
+                wavy: false,
+            }),
+            gradient: paint.text_gradient.clone(),
+            gradient_angle: paint.text_gradient_angle,
+        };
         let clips_children = matches!(
             layout_style.overflow.x,
             wgpui_layout::taffy_tree::Overflow::Hidden | wgpui_layout::taffy_tree::Overflow::Scroll
         ) || matches!(
             layout_style.overflow.y,
             wgpui_layout::taffy_tree::Overflow::Hidden | wgpui_layout::taffy_tree::Overflow::Scroll
-        );
+        ) || scroll_handle.is_some();
+
+        if let Some(handle) = scroll_handle.as_ref() {
+            boundary = true;
+            let handle = handle.clone();
+            interaction.on_scroll(move |event, _, _| handle.scroll_wheel(event));
+        }
+        let scroll_axes = [
+            layout_style.overflow.x == wgpui_layout::taffy_tree::Overflow::Scroll,
+            layout_style.overflow.y == wgpui_layout::taffy_tree::Overflow::Scroll,
+        ];
+        let automatic_scroll = scroll_axes != [false, false]
+            && scroll_handle.is_none()
+            && !interaction.has_scroll_handler();
 
         let scroll_offset = scroll_handle
             .as_ref()
@@ -390,11 +596,44 @@ impl Div {
             .diff_key(key)
             .style(layout_style)
             .text_metrics(paint.text_size, paint.text_color)
+            .text_options(text_options)
             .scroll_offset(scroll_offset)
+            .with_scroll_axes(scroll_axes)
+            .automatic_scroll(automatic_scroll)
             .children(children);
+
+        if let Some(scroll_handle) = scroll_handle.as_ref() {
+            description = description.scroll_info(scroll_handle.inspector_info());
+        }
 
         if clips_children {
             description = description.clip_children();
+        }
+
+        if let Some(handle) = scroll_handle.as_ref() {
+            let content = estimated_size;
+            let handle = handle.clone();
+            description =
+                description.on_layout_with_content_changed(move |bounds, content_bounds| {
+                    let viewport = wgpui_core::geometry::Bounds::new(
+                        wgpui_core::geometry::Point::new(
+                            wgpui_core::geometry::Pixels(bounds.x),
+                            wgpui_core::geometry::Pixels(bounds.y),
+                        ),
+                        wgpui_core::geometry::Size::pixels(bounds.width, bounds.height),
+                    );
+                    let measured_content = wgpui_core::geometry::Size::pixels(
+                        content_bounds.width.max(viewport.size.width.value()),
+                        content_bounds.height.max(viewport.size.height.value()),
+                    );
+                    let content = content.map_or(measured_content, |size| {
+                        wgpui_core::geometry::Size::pixels(
+                            measured_content.width.value().max(size[0]),
+                            measured_content.height.value().max(size[1]),
+                        )
+                    });
+                    handle.set_viewport(viewport, content)
+                });
         }
 
         if let Some(element_id) = element_id {
@@ -406,7 +645,7 @@ impl Div {
         if uncached {
             description = description.uncached();
         }
-        if let Some(interaction) = interaction.into_description_interaction() {
+        if let Some(interaction) = interaction.into_description_interaction(focus_handle) {
             description = description.interaction(interaction);
         }
 
@@ -421,6 +660,32 @@ impl Div {
         description.emit(move |context: &EmitContext, emission: &mut Emission| {
             paint.paint(context.bounds, emission);
         })
+    }
+}
+
+pub trait StatefulDiv {
+    fn on_click<R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(
+            &wgpui_core::window::ClickEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+        + 'static,
+    ) -> Self;
+}
+
+impl StatefulDiv for wgpui_core::element::Stateful<Div> {
+    fn on_click<R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(
+            &wgpui_core::window::ClickEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+        + 'static,
+    ) -> Self {
+        self.map_inner(|element| element.on_click(handler))
     }
 }
 
@@ -451,6 +716,15 @@ mod tests {
     use wgpui_layout::taffy_tree::{LayoutTree, definite};
 
     const VIEWPORT: [f32; 2] = [400.0, 300.0];
+
+    #[test]
+    fn conditional_styles_do_not_make_each_div_stack_heavy() {
+        assert!(
+            std::mem::size_of::<Div>() <= 2048,
+            "Div grew to {} bytes; conditional styles must remain heap-owned",
+            std::mem::size_of::<Div>()
+        );
+    }
 
     #[derive(Debug)]
     enum FrameError {
@@ -686,6 +960,52 @@ mod tests {
             4,
             "two shadow layers, one background, one border"
         );
+    }
+
+    #[test]
+    fn overflow_scroll_declares_an_automatic_root_without_an_id() {
+        let description = div()
+            .size_full()
+            .overflow_y_scroll()
+            .child(div().h(800.0))
+            .describe();
+        assert_eq!(description.element_id(), None);
+        assert_eq!(description.scroll_axes(), [false, true]);
+        assert!(description.has_automatic_scroll());
+    }
+
+    #[test]
+    fn shadow_example_shape_keeps_overflow_scroll_automatic() {
+        let description = div()
+            .id("shadow-example")
+            .overflow_y_scroll()
+            .size_full()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(div().h(800.0)),
+            )
+            .describe();
+        assert_eq!(
+            description.element_id(),
+            Some(&ElementId::from("shadow-example"))
+        );
+        assert_eq!(description.scroll_axes(), [false, true]);
+        assert!(description.has_automatic_scroll());
+    }
+
+    #[test]
+    fn explicit_scroll_callbacks_and_handles_remain_manual() {
+        let callback = div().overflow_y_scroll().on_scroll(|_, _, _| ());
+        assert!(!callback.describe().has_automatic_scroll());
+        let handle = scroll_state::ScrollHandle::new();
+        assert!(!div()
+            .overflow_y_scroll()
+            .track_scroll(&handle)
+            .describe()
+            .has_automatic_scroll());
     }
 
     #[test]

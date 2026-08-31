@@ -3,22 +3,78 @@
 //! move-and-decouple, zero behavior change (Phase 7's gate: `wgpui-core`
 //! builds and runs with this crate absent entirely).
 //! See docs/gpu-native-architecture.md §3.6, §8 Phase 7.
-#[cfg(feature = "flamegraph")]
+pub mod capture;
+pub mod gpu_resources;
+#[cfg(any(feature = "flamegraph", feature = "render-stats"))]
 pub mod flamegraph;
+#[cfg(any(feature = "flamegraph", feature = "render-stats"))]
+pub use flamegraph::capture::{begin_global_backend_frame, present_global_backend_frame};
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod hooks;
 #[cfg(feature = "inspector")]
 pub mod inspector;
+pub mod memory;
+pub mod network;
 #[cfg(feature = "perf-ab")]
 pub mod perf_ab_tests;
+pub mod reference_viewer;
+pub mod resource_snapshot;
+pub mod protocol;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod render_stats;
-
+pub mod transport;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use hooks::DevtoolsHooks;
 #[cfg(feature = "inspector")]
-pub use inspector::{ElementInfo, Inspector};
+pub use inspector::{
+    BOXED_SNAPSHOT_VERSION, BoundaryPolicySnapshot, BoundarySnapshot, BoxModelSnapshot,
+    BufferingSnapshot, ClipSnapshot, ComputedStyle, ElementInfo, ElementMetadata, ElementSnapshot,
+    FrozenInspectorSnapshot, INSPECTOR_SNAPSHOT_SCHEMA_VERSION, Inspector,
+    InspectorSnapshot, InvalidationSnapshot, LastPresentedState, LayoutSnapshot, PaintRecord,
+    RectSnapshot, ScrollRootSnapshot, SnapshotError as InspectorSnapshotError, SourceLocation,
+    StableAddress,
+    TileOwnershipSnapshot, TileSnapshot, TransformSnapshot,
+};
+pub use memory::{
+    AllocationCategory, AllocationCategorySnapshot, AllocationEntry, AllocationId,
+    AllocationRegistry, AllocationSnapshot,
+};
+pub use gpu_resources::{
+    ByteRange as GpuByteRange, CaptureSnapshot as GpuCaptureSnapshot, EvictionRecord,
+    ResourceDescriptor, ResourceDimensions, ResourceFormat, ResourceId as GpuResourceId,
+    ResourceKind as GpuResourceKind,
+    ResourceRecord, ResourceRole, TextureRegion, TransferKind, UploadRecord,
+};
+pub use network::{
+    BodyChunkRecord, BodyDirection, BodyPreview, CaptureNetworkClient, NetworkBody, NetworkCapture,
+    NetworkCaptureConfig, NetworkCaptureSnapshot, NetworkClient, NetworkError, NetworkEvent,
+    NetworkFuture, NetworkHeaders, NetworkPhase, NetworkPhaseRecord, NetworkRecordingClient,
+    NetworkRedirectRecord, NetworkRequest, NetworkRequestMetadata, NetworkRequestRecord,
+    NetworkResponse, NetworkResponseRecord, NetworkTransportObserver, ObservationStatus,
+    PhaseAvailability, RecordingNetworkClient, RedirectPolicy,
+};
 #[cfg(feature = "perf-ab")]
 pub use perf_ab_tests::Sample;
+pub use reference_viewer::{CaptureViewerError, ReferenceViewer};
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use render_stats::{Scope, Snapshot, TimerSnapshot};
+pub use capture::{
+    Availability, CaptureBundle, CaptureConfig, CaptureController, CaptureError, CaptureExport,
+    CaptureRecorder, CaptureService, CaptureSnapshot, CaptureState, DEFAULT_MAX_CAPTURE_BYTES,
+    DEFAULT_MAX_RESOURCE_READBACK_BYTES, FrameSnapshot, FrozenCapture, RecorderConfig, ResourceId,
+    ResourceKind, ResourceReadback, ResourceSnapshot, CaptureRequest,
+    active as capture_active, start as start_capture, stop as stop_capture,
+};
+pub use protocol::{
+    BoundedMessageQueue, Capabilities, Capability, ClientMessage, DEFAULT_MAX_MESSAGE_BYTES,
+    ErrorCode, ProtocolError, Request, Response, SUPPORTED_PROTOCOL_VERSION, ServerMessage,
+    decode_message, encode_message, read_message, write_message,
+};
+pub use transport::{Endpoint, LocalIpcConfig, LocalIpcError, LocalIpcServer};
+pub use resource_snapshot::{
+    AtlasPackingSnapshot, AtlasPageRecord, AtlasPlacementRecord, BufferElementType,
+    BufferViewSnapshot, ByteRange, IndirectDrawRecord, IndirectDrawSnapshot, RedactionPolicy,
+    ResourceSnapshot as TypedResourceSnapshot, SlabAllocationRecord, SlabMapSnapshot, SnapshotError,
+    SnapshotHeader, SnapshotLimits, TileOccupancyRecord, TileOccupancySnapshot, TruncationMetadata,
+    TypedBufferView, TypedValue, SNAPSHOT_HEADER_BYTES, SNAPSHOT_MAGIC, SNAPSHOT_SCHEMA_VERSION,
+};

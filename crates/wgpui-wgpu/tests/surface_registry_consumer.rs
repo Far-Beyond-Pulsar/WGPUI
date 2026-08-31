@@ -228,6 +228,38 @@ fn a_culled_entry_leaves_the_producers_frame_unconsumed() {
     assert!(registry.has_unconsumed_frame(surface));
 }
 
+#[test]
+fn a_visible_composite_releases_one_coalesced_redraw_request() {
+    let Some(context) = context_or_report("surface_registry_redraw_coalescing") else {
+        return;
+    };
+    let pipeline = CompositePipeline::new(&context.device);
+    let registry = SurfaceRegistry::new();
+    let surface = registry.create(&context.device, 64, 64, TARGET_FORMAT);
+    registry.swap_rendering_ready_no_sync(surface);
+    assert!(!registry.set_redraw_pending(surface));
+
+    let entry = CompositeEntry::sampled(
+        CompositeSource::External(ExternalSurfaceId::from_raw(surface.as_raw())),
+        Rect::from_origin_size([0.0, 0.0], [64.0, 64.0]),
+        window(),
+    );
+    let plan = plan_composites(
+        &context.device,
+        &context.queue,
+        &pipeline,
+        &CompositeConsumer {
+            registry: Some(&registry),
+            textures: None,
+        },
+        &[entry],
+    );
+
+    assert_eq!(plan.prepared.len(), 1);
+    assert!(registry.get_pending_surfaces().is_empty());
+    assert!(!registry.has_unconsumed_frame(surface));
+}
+
 /// **A real cross-thread run.** A producer thread presenting at its own pace
 /// against the unified consumer, with the two backpressure properties
 /// `WgpuSurfaceHandle`'s documentation states asserted rather than assumed.

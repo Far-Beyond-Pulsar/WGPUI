@@ -14,17 +14,23 @@
 
 pub mod app;
 pub use app::entity::EntityError;
-pub use app::{App, Context, Entity, EntityId, Subscription, Task, TaskError, WeakEntity};
+pub use app::{
+    App, Context, Entity, EntityFactory, EntityId, Subscription, Task, TaskError, WeakEntity,
+    WindowClosedSubscription, WindowId, WindowList,
+};
 pub use window::{
-    ClickEvent, CloseState, DispatchNodeId, EventResult, FocusHandle, FocusId, FocusManager,
+    ClipboardItem, ClickEvent, CloseState, DispatchNodeId, DragData, DragHoverEvent, DropEvent, EventResult, FocusEvent, FocusHandle, FocusId, FocusManager, ImeEvent,
     FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId, InputEvent, KeyBinding,
     KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu,
-    MenuItem, Modifiers, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TimerHandle, TimerId, TimerState,
-    WindowOptions,
+    MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseButtonState, MouseClickEvent,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TextInputEvent,
+    TimerHandle, TimerId, TimerState, TitlebarOptions, WindowAppearance,
+    WindowBackgroundAppearance, WindowDecorations, WindowKind,
+    ScrollRootHandle, WindowOptions,
 };
 pub mod boundary;
 pub mod color;
+pub mod damage;
 pub mod element;
 pub mod geometry;
 pub mod hooks;

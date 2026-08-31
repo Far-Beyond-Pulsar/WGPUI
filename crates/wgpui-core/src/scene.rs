@@ -24,7 +24,10 @@ pub use layer::{BoundaryId, Layer, LayerId, LayerKey, LayerTable};
 pub use primitive_store::{DrawRange, PrimitiveStore};
 pub use record::{DispatchNode, Hitbox, LayoutInput, RecordStore};
 pub use slab::{Reallocation, SlabAllocator, SlabOverflow};
-pub use slab_range::{SlabRange, UploadRange, coalesce_uploads, uploaded_byte_count};
+pub use slab_range::{
+    PrimitiveSlotDiff, SlotChange, SlotSpan, SlabRange, UploadRange, coalesce_uploads,
+    uploaded_byte_count,
+};
 pub use tile::{
     EvictedTile, TILE_DESCRIPTOR_STRIDE, TileCoord, TileDescriptor, TileEviction, TileGrid,
     TilePlacement, TileResidency, TileSpan, TileVisibility, encode_tiles, tile_visibility,
@@ -32,7 +35,7 @@ pub use tile::{
 
 use crate::indirect::{DrawSlot, SlotTable};
 use crate::patch::primitive::{
-    BackdropFilter, GlyphRun, Path, PolySprite, PrimitiveKind, Quad, Shadow, Underline,
+    BackdropFilter, GlyphRun, Path, PolySprite, PrimitiveKind, Quad, Shadow, ShadowClip, Underline,
 };
 
 /// The persistent, patched-not-rebuilt scene (R-N Pillar III, §2's picture).
@@ -55,6 +58,8 @@ pub struct Scene {
     /// Blurred rounded rectangles, painted under everything else in their layer
     /// (Phase 6.3).
     pub shadows: PrimitiveStore<Shadow>,
+    /// Per-shadow inherited clips, kept outside the public primitive payload.
+    pub shadow_clips: RecordStore<ShadowClip>,
     /// Fixed-size primitives (§2's "primitives").
     pub quads: PrimitiveStore<Quad>,
     /// Underline and strikethrough rules, painted under their layer's text
@@ -191,6 +196,7 @@ impl Scene {
     /// the reservation, never its owner.
     pub fn remove_layer(&mut self, layer: LayerId) -> bool {
         self.shadows.remove_layer(layer, &mut self.allocator);
+        self.shadow_clips.remove_layer(layer);
         self.quads.remove_layer(layer, &mut self.allocator);
         self.underlines.remove_layer(layer, &mut self.allocator);
         self.glyph_runs.remove_layer(layer, &mut self.allocator);

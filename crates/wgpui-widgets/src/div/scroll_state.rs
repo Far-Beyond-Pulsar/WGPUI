@@ -2,7 +2,11 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use wgpui_core::geometry::{Bounds, Pixels, Point, Size, point, size};
+use wgpui_core::window::{EventResult, ScrollWheelEvent};
+
+static NEXT_SCROLL_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Default)]
 struct ScrollState {
@@ -17,31 +21,69 @@ struct ScrollState {
 /// A cloneable handle for reading and changing a scroll container's retained
 /// offset. Offsets are negative in the direction of scrolling, matching the
 /// coordinates consumed by `Description::scroll_offset`.
-#[derive(Clone, Debug, Default)]
-pub struct ScrollHandle(Rc<RefCell<ScrollState>>);
+#[derive(Clone, Debug)]
+pub struct ScrollHandle {
+    state: Rc<RefCell<ScrollState>>,
+    id: u64,
+}
+
+impl Default for ScrollHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ScrollHandle {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: Rc::new(RefCell::new(ScrollState::default())),
+            id: NEXT_SCROLL_HANDLE_ID.fetch_add(1, Ordering::Relaxed),
+        }
     }
     pub fn offset(&self) -> Point<Pixels> {
-        self.0.borrow().offset
+        self.state.borrow().offset
     }
     pub fn max_offset(&self) -> Size<Pixels> {
-        self.0.borrow().max_offset
+        self.state.borrow().max_offset
     }
     pub fn bounds(&self) -> Bounds<Pixels> {
-        self.0.borrow().viewport
+        self.state.borrow().viewport
+    }
+
+    pub fn viewport(&self) -> Bounds<Pixels> {
+        self.bounds()
     }
     pub fn content_size(&self) -> Size<Pixels> {
-        self.0.borrow().content_size
+        self.state.borrow().content_size
     }
     pub fn revision(&self) -> u64 {
-        self.0.borrow().revision
+        self.state.borrow().revision
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Copy-only state for the native inspector. The handle itself stays
+    /// application-owned and is never exposed through a capture.
+    pub fn inspector_info(&self) -> wgpui_core::reconcile::ScrollInfo {
+        let state = self.state.borrow();
+        wgpui_core::reconcile::ScrollInfo {
+            handle_id: self.id,
+            content_size: [
+                state.content_size.width.value(),
+                state.content_size.height.value(),
+            ],
+            max_offset: [
+                state.max_offset.width.value(),
+                state.max_offset.height.value(),
+            ],
+            offset: [state.offset.x.value(), state.offset.y.value()],
+        }
     }
 
     pub fn set_offset(&self, offset: Point<Pixels>) -> bool {
-        let mut state = self.0.borrow_mut();
+        let mut state = self.state.borrow_mut();
         let clamped = Point {
             x: offset.x.clamp(-state.max_offset.width, Pixels::ZERO),
             y: offset.y.clamp(-state.max_offset.height, Pixels::ZERO),
@@ -59,6 +101,37 @@ impl ScrollHandle {
         let offset = self.offset();
         self.set_offset(point(offset.x + delta.x, offset.y + delta.y))
     }
+
+    pub fn scroll_wheel(&self, event: &ScrollWheelEvent) -> EventResult {
+        let delta_x = if event.delta[0].is_finite() {
+            event.delta[0]
+        } else {
+            0.0
+        };
+        let delta_y = if event.delta[1].is_finite() {
+            event.delta[1]
+        } else {
+            0.0
+        };
+        let before = self.offset();
+        self.set_offset(point(
+            Pixels(before.x.value() - delta_x),
+            Pixels(before.y.value() - delta_y),
+        ));
+        let after = self.offset();
+        let consumed_x = before.x.value() - after.x.value();
+        let consumed_y = before.y.value() - after.y.value();
+        let remaining = (delta_x - consumed_x).abs() > f32::EPSILON
+            || (delta_y - consumed_y).abs() > f32::EPSILON;
+        if consumed_x.abs() > f32::EPSILON || consumed_y.abs() > f32::EPSILON {
+            EventResult {
+                handled: true,
+                propagate: remaining,
+            }
+        } else {
+            EventResult::IGNORED
+        }
+    }
     pub fn scroll_to_top(&self) -> bool {
         self.set_offset(Point::default())
     }
@@ -68,7 +141,7 @@ impl ScrollHandle {
     }
 
     pub fn set_viewport(&self, viewport: Bounds<Pixels>, content_size: Size<Pixels>) -> bool {
-        let mut state = self.0.borrow_mut();
+        let mut state = self.state.borrow_mut();
         let max_offset = size(
             (content_size.width - viewport.size.width).max(Pixels::ZERO),
             (content_size.height - viewport.size.height).max(Pixels::ZERO),
@@ -92,11 +165,15 @@ impl ScrollHandle {
         changed
     }
 
+    pub fn set_content_size(&self, content_size: Size<Pixels>) -> bool {
+        self.set_viewport(self.bounds(), content_size)
+    }
+
     pub fn request_scroll_to(&self, offset: Point<Pixels>) {
-        self.0.borrow_mut().pending = Some(offset);
+        self.state.borrow_mut().pending = Some(offset);
     }
     pub fn take_pending_scroll(&self) -> Option<Point<Pixels>> {
-        let pending = self.0.borrow_mut().pending.take();
+        let pending = self.state.borrow_mut().pending.take();
         pending.map(|offset| {
             self.set_offset(offset);
             self.offset()
@@ -130,5 +207,18 @@ mod tests {
         assert!(first.scroll_by(point(px(-10.0), px(-4.0))));
         assert!(!second.scroll_by(point(px(0.0), px(0.0))));
         assert_eq!(second.offset(), point(px(-10.0), px(-4.0)));
+    }
+
+    #[test]
+    fn inspector_info_is_copy_only_and_keeps_clone_identity() {
+        let first = ScrollHandle::new();
+        let second = first.clone();
+        first.set_viewport(Bounds::default(), size(px(300.0), px(240.0)));
+        first.set_offset(point(px(-20.0), px(-10.0)));
+        let info = first.inspector_info();
+        assert_eq!(info.handle_id, second.id());
+        assert_eq!(info.content_size, [300.0, 240.0]);
+        assert_eq!(info.max_offset, [300.0, 240.0]);
+        assert_eq!(info.offset, [-20.0, -10.0]);
     }
 }

@@ -20,14 +20,16 @@
 //! a scope flag, and children. Every element type in `wgpui-widgets` will
 //! produce one of these; nothing here knows or cares which.
 
+use crate::app::App;
+use crate::boundary::compositor::ExternalSurfaceId;
 use crate::boundary::policy::BoundaryPolicy;
 use crate::patch::emit::Emit;
 use crate::reconcile::diff_key::ReconcileKey;
-use crate::app::App;
-use crate::window::{EventResult, InputEvent, Window};
+use crate::action::Action;
+use crate::window::{DragData, EventResult, FocusHandle, InputEvent, Window};
 use std::any::TypeId;
 use std::sync::Arc;
-use wgpui_layout::taffy_tree::LayoutStyle;
+use wgpui_layout::taffy_tree::{LayoutRect, LayoutStyle};
 
 /// One segment of an element's path identity.
 ///
@@ -83,14 +85,149 @@ pub struct RawTextKey {
     value: Arc<str>,
 }
 
+/// Renderer-neutral text properties inherited by raw string children.
+///
+/// The core description must not depend on a font or glyph atlas, but it does
+/// need to carry the resolved style far enough for the renderer to measure raw
+/// text before laying out the tree. `None` means that the renderer should use
+/// the inherited value or its platform default.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextOptions {
+    pub size: Option<f32>,
+    pub line_height: Option<f32>,
+    pub color: Option<[f32; 4]>,
+    pub weight: Option<u16>,
+    pub italic: Option<bool>,
+    pub alignment: Option<u8>,
+    pub nowrap: Option<bool>,
+    pub ellipsis: Option<bool>,
+    pub line_clamp: Option<usize>,
+    pub letter_spacing: Option<f32>,
+    pub underline: Option<TextDecoration>,
+    pub strikethrough: Option<TextDecoration>,
+    pub gradient: Option<Vec<([f32; 4], f32)>>,
+    pub gradient_angle: Option<f32>,
+}
+
+/// A renderer-neutral text decoration.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TextDecoration {
+    pub thickness: f32,
+    pub color: Option<[f32; 4]>,
+    pub wavy: bool,
+}
+
+/// Metadata for a texture produced outside the retained scene.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ExternalSurfaceProperties {
+    /// The registry identity of the producer-owned texture.
+    pub id: ExternalSurfaceId,
+    /// Straight alpha applied while compositing the texture.
+    pub opacity: f32,
+    /// Uniform corner radius applied while compositing the texture.
+    pub corner_radius: f32,
+}
+
 /// Input callbacks carried from an element description to the native window.
 /// The callback is deliberately stored beside the description until layout has
 /// produced the element's actual bounds; registering it earlier would make
 /// hit testing use stale geometry after a resize or a retained relayout.
 type InteractionCallback = Box<dyn FnMut(&InputEvent, &mut Window, &mut App) -> EventResult>;
+type ActionCallback = Box<dyn FnMut(&dyn Action, &mut Window, &mut App) -> EventResult>;
+type DragStartCallback = Box<dyn FnMut(&DragData, &mut Window, &mut App)>;
+type DragHoverCallback = Box<dyn FnMut(bool, &DragData, &mut Window, &mut App) -> EventResult>;
+type DropCallback = Box<dyn FnMut(&DragData, &mut Window, &mut App) -> EventResult>;
+enum LayoutCallback {
+    Bounds(Box<dyn FnMut(LayoutRect)>),
+    BoundsChanged(Box<dyn FnMut(LayoutRect) -> bool>),
+    Content(Box<dyn FnMut(LayoutRect, LayoutRect)>),
+    ContentChanged(Box<dyn FnMut(LayoutRect, LayoutRect) -> bool>),
+}
 
 pub struct DescriptionInteraction {
     callback: InteractionCallback,
+    action_callback: Option<ActionCallback>,
+    focus_handle: Option<FocusHandle>,
+    drag_source: Option<DragData>,
+    drag_start_callback: Option<DragStartCallback>,
+    drag_hover_callback: Option<DragHoverCallback>,
+    drop_callback: Option<DropCallback>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScrollInfo {
+    pub handle_id: u64,
+    pub content_size: [f32; 2],
+    pub max_offset: [f32; 2],
+    pub offset: [f32; 2],
+}
+
+pub struct DescriptionLayout {
+    callback: LayoutCallback,
+}
+
+impl std::fmt::Debug for DescriptionLayout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DescriptionLayout(..)")
+    }
+}
+
+impl DescriptionLayout {
+    pub fn new(callback: impl FnMut(LayoutRect) + 'static) -> Self {
+        Self {
+            callback: LayoutCallback::Bounds(Box::new(callback)),
+        }
+    }
+
+    pub fn apply(&mut self, bounds: LayoutRect) -> bool {
+        match &mut self.callback {
+            LayoutCallback::Bounds(callback) => {
+                callback(bounds);
+                false
+            }
+            LayoutCallback::BoundsChanged(callback) => callback(bounds),
+            LayoutCallback::Content(callback) => {
+                callback(bounds, bounds);
+                false
+            }
+            LayoutCallback::ContentChanged(callback) => callback(bounds, bounds),
+        }
+    }
+
+    pub fn new_changed(callback: impl FnMut(LayoutRect) -> bool + 'static) -> Self {
+        Self {
+            callback: LayoutCallback::BoundsChanged(Box::new(callback)),
+        }
+    }
+
+    pub fn with_content(callback: impl FnMut(LayoutRect, LayoutRect) + 'static) -> Self {
+        Self {
+            callback: LayoutCallback::Content(Box::new(callback)),
+        }
+    }
+
+    pub fn apply_with_content(&mut self, bounds: LayoutRect, content: LayoutRect) -> bool {
+        match &mut self.callback {
+            LayoutCallback::Bounds(callback) => {
+                callback(bounds);
+                false
+            }
+            LayoutCallback::BoundsChanged(callback) => callback(bounds),
+            LayoutCallback::Content(callback) => {
+                callback(bounds, content);
+                false
+            }
+            LayoutCallback::ContentChanged(callback) => callback(bounds, content),
+        }
+    }
+
+    pub fn with_content_changed(
+        callback: impl FnMut(LayoutRect, LayoutRect) -> bool + 'static,
+    ) -> Self {
+        Self {
+            callback: LayoutCallback::ContentChanged(Box::new(callback)),
+        }
+    }
 }
 
 impl std::fmt::Debug for DescriptionInteraction {
@@ -103,7 +240,15 @@ impl DescriptionInteraction {
     pub fn new(
         callback: impl FnMut(&InputEvent, &mut Window, &mut App) -> EventResult + 'static,
     ) -> Self {
-        Self { callback: Box::new(callback) }
+        Self {
+            callback: Box::new(callback),
+            action_callback: None,
+            focus_handle: None,
+            drag_source: None,
+            drag_start_callback: None,
+            drag_hover_callback: None,
+            drop_callback: None,
+        }
     }
 
     pub fn dispatch(
@@ -114,6 +259,136 @@ impl DescriptionInteraction {
     ) -> EventResult {
         (self.callback)(event, window, app)
     }
+
+    pub fn with_focus(mut self, focus_handle: FocusHandle) -> Self {
+        self.focus_handle = Some(focus_handle);
+        self
+    }
+
+    pub fn focus_handle(&self) -> Option<FocusHandle> {
+        self.focus_handle
+    }
+
+    pub fn with_drag_source(
+        mut self,
+        data: DragData,
+        callback: impl FnMut(&DragData, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.drag_source = Some(data);
+        self.drag_start_callback = Some(Box::new(callback));
+        self
+    }
+
+    pub fn drag_source(&self) -> Option<DragData> {
+        self.drag_source.clone()
+    }
+
+    pub fn start_drag(&mut self, data: &DragData, window: &mut Window, app: &mut App) {
+        if let Some(callback) = self.drag_start_callback.as_deref_mut() {
+            callback(data, window, app);
+        }
+    }
+
+    pub fn with_drag_hover_handler(
+        mut self,
+        callback: impl FnMut(bool, &DragData, &mut Window, &mut App) -> EventResult + 'static,
+    ) -> Self {
+        self.drag_hover_callback = Some(Box::new(callback));
+        self
+    }
+
+    pub fn dispatch_drag_hover(
+        &mut self,
+        hovered: bool,
+        data: &DragData,
+        window: &mut Window,
+        app: &mut App,
+    ) -> EventResult {
+        self.drag_hover_callback.as_deref_mut().map_or(EventResult::IGNORED, |callback| {
+            callback(hovered, data, window, app)
+        })
+    }
+
+    pub fn with_drop_handler(
+        mut self,
+        callback: impl FnMut(&DragData, &mut Window, &mut App) -> EventResult + 'static,
+    ) -> Self {
+        self.drop_callback = Some(Box::new(callback));
+        self
+    }
+
+    pub fn dispatch_drop(
+        &mut self,
+        data: &DragData,
+        window: &mut Window,
+        app: &mut App,
+    ) -> EventResult {
+        self.drop_callback.as_deref_mut().map_or(EventResult::IGNORED, |callback| {
+            callback(data, window, app)
+        })
+    }
+
+    pub fn on_action<A: Action>(
+        mut self,
+        mut handler: impl FnMut(&A, &mut Window, &mut App) -> EventResult + 'static,
+    ) -> Self {
+        let mut previous = self.action_callback.take();
+        self.action_callback = Some(Box::new(move |action, window, app| {
+            let mut result = previous
+                .as_deref_mut()
+                .map_or(EventResult::IGNORED, |callback| callback(action, window, app));
+            if !result.propagate {
+                return result;
+            }
+            if let Some(action) = action.as_any().downcast_ref::<A>() {
+                let current = handler(action, window, app);
+                if current.handled {
+                    result = current;
+                } else {
+                    result.propagate |= current.propagate;
+                }
+            }
+            result
+        }));
+        self
+    }
+
+    pub fn with_action_handler(
+        mut self,
+        mut handler: impl FnMut(&dyn Action, &mut Window, &mut App) -> EventResult + 'static,
+    ) -> Self {
+        let mut previous = self.action_callback.take();
+        self.action_callback = Some(Box::new(move |action, window, app| {
+            let previous_result = previous
+                .as_deref_mut()
+                .map_or(EventResult::IGNORED, |callback| callback(action, window, app));
+            if !previous_result.propagate {
+                return previous_result;
+            }
+            let current_result = handler(action, window, app);
+            if current_result.handled {
+                current_result
+            } else {
+                EventResult {
+                    handled: previous_result.handled,
+                    propagate: previous_result.propagate || current_result.propagate,
+                }
+            }
+        }));
+        self
+    }
+
+    pub fn dispatch_action(
+        &mut self,
+        action: &dyn Action,
+        window: &mut Window,
+        app: &mut App,
+    ) -> EventResult {
+        self.action_callback
+            .as_deref_mut()
+            .map_or(EventResult::IGNORED, |callback| callback(action, window, app))
+    }
+
 }
 
 impl RawTextKey {
@@ -189,6 +464,8 @@ pub struct Description {
     pub(crate) uncached: bool,
     pub(crate) boundary: Option<BoundaryPolicy>,
     pub(crate) scroll_offset: [f32; 2],
+    pub(crate) scroll_axes: [bool; 2],
+    pub(crate) automatic_scroll: bool,
     pub(crate) emitter: Option<Box<dyn Emit>>,
     pub(crate) layout_style: LayoutStyle,
     pub(crate) children: Vec<Description>,
@@ -196,7 +473,12 @@ pub struct Description {
     pub(crate) raw_text: Option<RawText>,
     pub(crate) text_size: Option<f32>,
     pub(crate) text_color: Option<[f32; 4]>,
+    pub(crate) text_options: TextOptions,
     pub(crate) interaction: Option<DescriptionInteraction>,
+    pub(crate) scroll_info: Option<ScrollInfo>,
+    pub(crate) layout_callback: Option<DescriptionLayout>,
+    pub(crate) external_surface: Option<ExternalSurfaceProperties>,
+    pub(crate) active_animation: bool,
 }
 
 impl std::fmt::Debug for Description {
@@ -209,9 +491,13 @@ impl std::fmt::Debug for Description {
             .field("uncached", &self.uncached)
             .field("boundary", &self.boundary)
             .field("scroll_offset", &self.scroll_offset)
+            .field("scroll_axes", &self.scroll_axes)
+            .field("automatic_scroll", &self.automatic_scroll)
             .field("has_emitter", &self.emitter.is_some())
             .field("children", &self.children.len())
             .field("clip_children", &self.clip_children)
+            .field("has_layout_callback", &self.layout_callback.is_some())
+            .field("active_animation", &self.active_animation)
             .finish()
     }
 }
@@ -234,6 +520,8 @@ impl Description {
             uncached: false,
             boundary: None,
             scroll_offset: [0.0, 0.0],
+            scroll_axes: [false, false],
+            automatic_scroll: false,
             emitter: None,
             layout_style: LayoutStyle::default(),
             children: Vec::new(),
@@ -241,7 +529,12 @@ impl Description {
             raw_text: None,
             text_size: None,
             text_color: None,
+            text_options: TextOptions::default(),
             interaction: None,
+            scroll_info: None,
+            layout_callback: None,
+            external_surface: None,
+            active_animation: false,
         }
     }
 
@@ -314,6 +607,24 @@ impl Description {
         self
     }
 
+    pub fn scroll_info(mut self, scroll_info: ScrollInfo) -> Self {
+        self.scroll_info = Some(scroll_info);
+        self
+    }
+
+    /// Declare which overflow axes may establish an automatic scroll root.
+    pub fn with_scroll_axes(mut self, axes: [bool; 2]) -> Self {
+        self.scroll_axes = axes;
+        self
+    }
+
+    /// Allow the native backend to retain and route scroll input for this
+    /// element when its configured overflow has a scrollable extent.
+    pub fn automatic_scroll(mut self, automatic: bool) -> Self {
+        self.automatic_scroll = automatic;
+        self
+    }
+
     /// Give this element something to emit into the scene, given its resolved
     /// bounds.
     ///
@@ -371,8 +682,65 @@ impl Description {
         (self.text_size, self.text_color)
     }
 
+    /// Carry the complete resolved text style to a renderer-owned materializer.
+    pub fn text_options(mut self, options: TextOptions) -> Self {
+        self.text_options = options;
+        self
+    }
+
+    /// Read the local text style during renderer materialization.
+    pub fn text_options_value(&self) -> &TextOptions {
+        &self.text_options
+    }
+
     pub fn interaction(mut self, interaction: DescriptionInteraction) -> Self {
         self.interaction = Some(interaction);
+        self
+    }
+
+    pub fn on_layout(mut self, callback: impl FnMut(LayoutRect) + 'static) -> Self {
+        self.layout_callback = Some(DescriptionLayout::new(callback));
+        self
+    }
+
+    pub fn on_layout_with_content(
+        mut self,
+        callback: impl FnMut(LayoutRect, LayoutRect) + 'static,
+    ) -> Self {
+        self.layout_callback = Some(DescriptionLayout::with_content(callback));
+        self
+    }
+
+    pub fn on_layout_changed(mut self, callback: impl FnMut(LayoutRect) -> bool + 'static) -> Self {
+        self.layout_callback = Some(DescriptionLayout::new_changed(callback));
+        self
+    }
+
+    pub fn on_layout_with_content_changed(
+        mut self,
+        callback: impl FnMut(LayoutRect, LayoutRect) -> bool + 'static,
+    ) -> Self {
+        self.layout_callback = Some(DescriptionLayout::with_content_changed(callback));
+        self
+    }
+
+    /// Make this leaf sample a texture produced by an external renderer.
+    ///
+    /// The texture is not copied into the scene and its pixels are not part of
+    /// reconciliation. The emitter turns the resolved geometry into one
+    /// compositor entry, so a producer update only damages that entry's
+    /// visible rectangle.
+    pub fn external_surface(
+        mut self,
+        id: ExternalSurfaceId,
+        opacity: f32,
+        corner_radius: f32,
+    ) -> Self {
+        self.external_surface = Some(ExternalSurfaceProperties {
+            id,
+            opacity,
+            corner_radius,
+        });
         self
     }
 
@@ -437,6 +805,28 @@ impl Description {
         self.boundary.is_some()
     }
 
+    /// The external texture metadata, if this description is a surface leaf.
+    pub fn external_surface_properties(&self) -> Option<ExternalSurfaceProperties> {
+        self.external_surface
+    }
+
+    /// Mark this description as needing another frame while an animation is
+    /// active. This metadata does not participate in reconciliation; the
+    /// sampled style or primitive remains the source of display invalidation.
+    pub fn active_animation(mut self) -> Self {
+        self.active_animation = true;
+        self
+    }
+
+    /// Whether this description or one of its descendants is still animating.
+    pub fn has_active_animation(&self) -> bool {
+        self.active_animation
+            || self
+                .children
+                .iter()
+                .any(Description::has_active_animation)
+    }
+
     /// The tuning this element's boundary was declared with, if any.
     ///
     /// `Some(BoundaryPolicy::default())` is what a bare `.boundary()` produces,
@@ -449,6 +839,14 @@ impl Description {
     /// The displacement this element applies to its children.
     pub fn scroll_offset_of(&self) -> [f32; 2] {
         self.scroll_offset
+    }
+
+    pub fn scroll_axes(&self) -> [bool; 2] {
+        self.scroll_axes
+    }
+
+    pub fn has_automatic_scroll(&self) -> bool {
+        self.automatic_scroll
     }
 
     /// Whether this element emits anything of its own.

@@ -1,7 +1,7 @@
 //! Behavioral gate for the native W1 lifecycle.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -11,9 +11,18 @@ use wgpui_wgpu::window::application::{Application, WindowOptions};
 #[test]
 fn application_renders_two_independent_native_windows() {
     let frames = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let closed_windows = Arc::new(Mutex::new(Vec::new()));
     let result = Application::new().run({
         let frames = Arc::clone(&frames);
+        let closed_windows = Arc::clone(&closed_windows);
         move |app| {
+            let closed_windows = Arc::clone(&closed_windows);
+            app.on_window_closed(move |_, id| {
+                if let Ok(mut closed_windows) = closed_windows.lock() {
+                    closed_windows.push(id.as_raw());
+                }
+            })
+            .detach();
             for index in 0..2 {
                 let frames = Arc::clone(&frames);
                 app.open_window(WindowOptions::default(), move |_, app| {
@@ -40,6 +49,11 @@ fn application_renders_two_independent_native_windows() {
             .sum::<u64>()
             >= 4
     );
+    let closed_windows = closed_windows
+        .lock()
+        .expect("close callbacks should finish");
+    assert_eq!(closed_windows.len(), 2);
+    assert!(closed_windows[0] < closed_windows[1]);
 }
 
 struct TwoWindowRoot {

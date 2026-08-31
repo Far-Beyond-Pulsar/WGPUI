@@ -10,6 +10,8 @@ path = "src/wgpui_widgets.rs"
 doctest = false
 
 [dependencies]
+anyhow = "1"
+lyon = "1.0"
 # Elements produce `Description`s and `ReconcileKey`s, and name the layout
 # style and resolved rectangle their emission is placed against. Both edges run
 # one way: neither core crate names anything in `wgpui-widgets`.
@@ -19,6 +21,7 @@ wgpui-layout = { path = "../wgpui-layout" }
 # payloads with it (§3.3, §3.4). One-way, like the others: `wgpui-text` knows
 # nothing about elements.
 wgpui-text = { path = "../wgpui-text" }
+wgpui-http-client = { path = "../wgpui-http-client" }
 
 # Image decoding lives here because §3.4 puts `image_cache.rs` here — "image
 # loading/decoding cache" — and because the thing that needs decoded pixels is
@@ -40,6 +43,7 @@ image = { version = "0.25.1", default-features = false, features = [
     "tiff",
     "webp",
 ] }
+futures = "0.3"
 # SVG rasterises to a bitmap on the CPU and is uploaded through the same
 # polychrome tile path as any other image (§8's Phase 6.2 row). Same crates, same
 # versions, and the same features as the root crate's `SvgRenderer`, for the same
