@@ -251,6 +251,7 @@ impl Reconciler {
             scroll_offset,
             emitter,
             interaction,
+            external_surface,
             layout_style,
             children,
             ..
@@ -320,6 +321,7 @@ impl Reconciler {
             depth: position.depth,
             outcome,
             invalidation,
+            external_surface,
         });
         context.plan.set_emitter(plan_index, emitter);
         context.plan.set_interaction(plan_index, interaction);
@@ -437,6 +439,7 @@ impl Reconciler {
             depth: position.depth,
             outcome,
             invalidation: Invalidation::all(),
+            external_surface: description.external_surface,
         });
         context
             .plan

@@ -23,6 +23,8 @@ use crate::render::frame::RenderTarget;
 use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
 use crate::window::{Acquired, WindowError, WindowSurface};
+use crate::window::surface::WgpuSurfaceHandle;
+use crate::render::surface_registry::SurfaceRegistry;
 
 fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
     let fallback = size(Pixels(options.width as f32), Pixels(options.height as f32));
@@ -45,6 +47,9 @@ type WindowBuildCallback = Box<dyn FnMut(&mut Window) -> Description>;
 
 pub struct Window {
     native: Arc<winit::window::Window>,
+    gpu_device: wgpu::Device,
+    gpu_queue: wgpu::Queue,
+    surface_registry: Arc<SurfaceRegistry>,
     scale_factor: f64,
     close_requested: bool,
     last_frame: Option<FrameReport>,
@@ -130,6 +135,24 @@ impl Window {
     /// Access opt-in visual performance diagnostics for this window.
     pub fn performance_debug(&mut self) -> &mut PerformanceDebug {
         &mut self.performance_debug
+    }
+
+    /// Create a producer-owned texture set that can be placed in this window's
+    /// retained scene with `WgpuSurface`.
+    pub fn create_wgpu_surface(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<WgpuSurfaceHandle, WindowError> {
+        Ok(WgpuSurfaceHandle::new(
+            Arc::clone(&self.surface_registry),
+            &self.gpu_device,
+            &self.gpu_queue,
+            width,
+            height,
+            format,
+        ))
     }
     pub fn set_title(&self, title: &str) {
         self.native.set_title(title);
@@ -693,12 +716,16 @@ impl Handler {
             native.focus_window();
         }
         let (surface, context) = WindowSurface::new(Arc::clone(&native))?;
+        let surface_registry = Arc::new(SurfaceRegistry::new());
         let (width, height) = surface.size();
         let mut resizes = ResizeDetector::new();
         resizes.seed(width, height);
         let mode = DrawMode::best_available(context.indirect);
         let window = Window {
             native,
+            gpu_device: context.device.clone(),
+            gpu_queue: context.queue.clone(),
+            surface_registry: Arc::clone(&surface_registry),
             scale_factor,
             close_requested: false,
             last_frame: None,
@@ -717,8 +744,10 @@ impl Handler {
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
         };
+        let mut frame_loop = FrameLoop::new(&context.device);
+        frame_loop.set_surface_registry(surface_registry);
         self.live.push(Live {
-            frame_loop: FrameLoop::new(&context.device),
+            frame_loop,
             surface,
             context,
             window,
@@ -923,12 +952,16 @@ impl winit::application::ApplicationHandler for Handler {
                 return;
             }
         };
+        let surface_registry = Arc::new(SurfaceRegistry::new());
         let (width, height) = surface.size();
         let mut resizes = ResizeDetector::new();
         resizes.seed(width, height);
         let mode = DrawMode::best_available(context.indirect);
         let window = Window {
             native,
+            gpu_device: context.device.clone(),
+            gpu_queue: context.queue.clone(),
+            surface_registry: Arc::clone(&surface_registry),
             scale_factor,
             close_requested: false,
             last_frame: None,
@@ -947,8 +980,10 @@ impl winit::application::ApplicationHandler for Handler {
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
         };
+        let mut frame_loop = FrameLoop::new(&context.device);
+        frame_loop.set_surface_registry(surface_registry);
         self.live = Some(Live {
-            frame_loop: FrameLoop::new(&context.device),
+            frame_loop,
             surface,
             context,
             window,

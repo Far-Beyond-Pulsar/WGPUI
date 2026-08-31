@@ -1,64 +1,21 @@
-//! Real identity + trivial `diff_key` (§5.5, Gap 1) — today's
-//! `src/elements/wgpu_surface.rs` (545 lines), whose `id()` is hardcoded to
-//! `None`; this is where that gets fixed. See
-//! docs/gpu-native-architecture.md §3.4, §5.5.
-//!
-//! # Scope: this is the description shape, not the element
-//!
-//! Stated plainly up front, because the distinction matters more here than
-//! anywhere else in Phase 2. What this module contains is the *shape* a
-//! `WgpuSurface` presents to reconciliation: a positional identity, no
-//! children, and a fingerprint over exactly `(bounds, style, surface_id)`. What
-//! it does **not** contain is the element: no `WgpuSurfaceHandle`, no
-//! `SurfaceRegistry`, no triple buffer, no external render thread, no texture,
-//! no `wgpu` dependency of any kind. Building those means wiring
-//! `wgpui-widgets` to `wgpui-wgpu`, which §8 places in Phase 4 alongside Gap
-//! 2's compositing unification.
-//!
-//! So [`SurfaceId`] here is a plain opaque handle standing in for the real
-//! one, and [`SurfaceStyle`] carries two representative visual properties
-//! standing in for the frozen `Style` (§7). Both are placeholders, marked as
-//! such, and neither is a design decision a later phase has to live with.
-//!
-//! # What is genuinely proved, and why it is worth proving now
-//!
-//! §5.5's Gap 1 is not "this element lacks a fingerprint." It is that
-//! `WgpuSurface::id()` returns `None`, so the element "can never be addressed
-//! by `InstanceKey`/`GlobalElementId` and so never participates in
-//! reconciliation, Taffy-node reuse, or `.boundary()` at all" — there is no
-//! identity to hang a `diff_key` on. Under R-N/SFD's model that was a real
-//! blocker, because identity came only from an explicit `.id()`.
-//!
-//! Under 2.0 it is not a blocker and this module is the demonstration:
-//! [`crate::wgpu_surface::WgpuSurface::describe`] calls no `.id()` anywhere, and
-//! the element is addressed anyway, positionally (SFD §1.0, implemented in
-//! `wgpui-core::boundary::identity` and in the reconciler's own walk). The
-//! fingerprint is then exactly the trivial one §5.5 argues is "sufficient and
-//! correct by construction," because a surface's pixel content is produced by
-//! someone else's render loop and is never part of the CPU description at all.
-//!
-//! The gate below drives a real reconciler over a tree holding one of these
-//! beside an ordinary reconciled element, and asserts the two get the same
-//! treatment — which is §8's Phase 2 wording ("skips
-//! `request_layout`/`prepaint`/`paint` across frames exactly like a reconciled
-//! `div` would") measured against a live control rather than an asserted
-//! constant.
+//! A retained leaf describing a texture produced by a WGPU surface renderer.
+//! The producer handle lives in `wgpui-wgpu`; this crate only carries the
+//! renderer-independent surface identity, style, and layout description.
+//! Reconciliation never fingerprints the surface pixels. The GPU compositor
+//! samples the registry's current display buffer and the frame loop damages
+//! only the surface's resolved visible rectangle when a new buffer is ready.
 
 use std::any::Any;
+use wgpui_core::boundary::compositor::ExternalSurfaceId;
+use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
-use wgpui_core::patch::emit::{Emission, EmitContext};
-use wgpui_core::patch::primitive::Quad;
 use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_layout::taffy_tree::{Dimension, LayoutRect, LayoutSize, LayoutStyle};
 
 /// A handle to an externally-produced surface.
 ///
-/// **Placeholder.** The real handle is `WgpuSurfaceHandle`, which owns a
-/// triple-buffered texture and a cross-thread producer protocol
-/// (`surface_registry.rs`, 772 lines) that §9's risk table forbids this work
-/// from touching. All reconciliation needs from it is an identity that is equal
-/// to itself and unequal to a different surface, which is what this is.
+/// An opaque identity for a producer-owned surface.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SurfaceId(u64);
 
@@ -76,10 +33,7 @@ impl SurfaceId {
 
 /// The visual properties of a surface's own composite entry.
 ///
-/// **Placeholder.** §7 freezes the real `Style`, which lives in the legacy
-/// crate; these two fields stand in for it because they are enough to exercise
-/// the one thing the fingerprint has to get right — that a style change is a
-/// `DISPLAY` change and not a `LAYOUT` one.
+/// The visual properties that affect this surface's composite entry.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct SurfaceStyle {
     /// Uniform corner radius the surface is clipped to.
@@ -132,7 +86,7 @@ impl ReconcileKey for WgpuSurfaceKey {
 
 /// An externally-rendered surface composited into the scene.
 ///
-/// See this module's doc: this is the description shape, not the element.
+/// The retained description of an externally-produced surface.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct WgpuSurface {
     surface_id: SurfaceId,
@@ -191,8 +145,6 @@ impl WgpuSurface {
     /// entirely (§5.5).
     pub fn describe(&self) -> Description {
         let bounds = self.requested_bounds;
-        let opacity = self.style.opacity;
-        let corner_radius = self.style.corner_radius;
         Description::new::<WgpuSurface>()
             .diff_key(self.diff_key())
             .style(LayoutStyle {
@@ -203,24 +155,24 @@ impl WgpuSurface {
                 flex_shrink: 0.0,
                 ..LayoutStyle::default()
             })
-            .emit(move |context: &EmitContext, emission: &mut Emission| {
-                // One composite entry, standing in for the surface draw. §5.5's
-                // Gap 2 replaces this with the unified indirect-draw entry that
-                // `.boundary()`'s texture-retained layers use, in Phase 4.
-                emission.quad(Quad {
-                    origin: [context.bounds.x, context.bounds.y],
-                    size: [context.bounds.width, context.bounds.height],
-                    background: [0.0, 0.0, 0.0, opacity],
-                    corner_radii: [corner_radius; 4],
-                    ..Quad::ZERO
-                });
-            })
+            .external_surface(
+                ExternalSurfaceId::from_raw(self.surface_id.as_raw()),
+                self.style.opacity,
+                self.style.corner_radius,
+            )
+    }
+}
+
+impl Element for WgpuSurface {
+    fn into_description(self) -> Description {
+        self.describe()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wgpui_core::boundary::compositor::{CompositeSource, ExternalSurfaceId};
     use wgpui_core::invalidation::request::FrameSignals;
     use wgpui_core::patch::apply::apply;
     use wgpui_core::patch::emit::Emitter;
@@ -430,9 +382,9 @@ mod tests {
         Ok(())
     }
 
-    /// The `paint` half of §8's Phase 2 wording, which in this workspace is
-    /// emission: an unchanged surface is never asked to produce its composite
-    /// entry again, and nothing is uploaded on its account.
+    /// The `paint` half of §8's Phase 2 wording: an unchanged surface does not
+    /// emit scene primitives or upload anything. Its composite entry is
+    /// retained separately for the GPU texture consumer.
     #[test]
     fn an_unchanged_surface_is_never_asked_to_emit_again() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -447,7 +399,7 @@ mod tests {
                     layout: &mut LayoutTree,
                     emitter: &mut Emitter,
                     scene: &mut Scene|
-         -> Result<(usize, u64), Box<dyn std::error::Error>> {
+         -> Result<(usize, u64, usize, Option<wgpui_core::boundary::compositor::CompositeEntry>), Box<dyn std::error::Error>> {
             let plan = reconciler.reconcile(description, layout)?;
             let root = plan.nodes().first().map(|node| node.layout_node);
             if let Some(root) = root {
@@ -455,20 +407,30 @@ mod tests {
             }
             let emission = emitter.emit(&plan, layout, &signals, scene)?;
             let uploads = apply(scene, &emission.patch)?;
-            Ok((emission.stats.nodes_emitted, uploads.byte_count()))
+            Ok((
+                emission.stats.nodes_emitted,
+                uploads.byte_count(),
+                emission.external_surfaces.len(),
+                emission.external_surfaces.first().copied(),
+            ))
         };
 
-        let (built, first_bytes) = draw(
+        let (built, first_bytes, first_surfaces, first_surface) = draw(
             tree(base()),
             &mut reconciler,
             &mut layout,
             &mut emitter,
             &mut scene,
         )?;
-        assert_eq!(built, 1, "only the surface emits anything in this tree");
-        assert!(first_bytes > 0);
+        assert_eq!(built, 0, "the external surface does not emit scene primitives");
+        assert_eq!(first_bytes, 0);
+        assert_eq!(first_surfaces, 1);
+        assert_eq!(
+            first_surface.map(|entry| entry.source),
+            Some(CompositeSource::External(ExternalSurfaceId::from_raw(1)))
+        );
 
-        let (again, bytes) = draw(
+        let (again, bytes, again_surfaces, again_surface) = draw(
             tree(base()),
             &mut reconciler,
             &mut layout,
@@ -477,6 +439,8 @@ mod tests {
         )?;
         assert_eq!(again, 0, "an unchanged surface costs nothing per frame");
         assert_eq!(bytes, 0);
+        assert_eq!(again_surfaces, 1);
+        assert_eq!(again_surface, first_surface);
         Ok(())
     }
 

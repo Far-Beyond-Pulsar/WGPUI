@@ -21,6 +21,7 @@
 //! produce one of these; nothing here knows or cares which.
 
 use crate::boundary::policy::BoundaryPolicy;
+use crate::boundary::compositor::ExternalSurfaceId;
 use crate::patch::emit::Emit;
 use crate::reconcile::diff_key::ReconcileKey;
 use crate::app::App;
@@ -81,6 +82,17 @@ impl RawText {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawTextKey {
     value: Arc<str>,
+}
+
+/// Metadata for a texture produced outside the retained scene.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ExternalSurfaceProperties {
+    /// The registry identity of the producer-owned texture.
+    pub id: ExternalSurfaceId,
+    /// Straight alpha applied while compositing the texture.
+    pub opacity: f32,
+    /// Uniform corner radius applied while compositing the texture.
+    pub corner_radius: f32,
 }
 
 /// Input callbacks carried from an element description to the native window.
@@ -197,6 +209,7 @@ pub struct Description {
     pub(crate) text_size: Option<f32>,
     pub(crate) text_color: Option<[f32; 4]>,
     pub(crate) interaction: Option<DescriptionInteraction>,
+    pub(crate) external_surface: Option<ExternalSurfaceProperties>,
 }
 
 impl std::fmt::Debug for Description {
@@ -242,6 +255,7 @@ impl Description {
             text_size: None,
             text_color: None,
             interaction: None,
+            external_surface: None,
         }
     }
 
@@ -376,6 +390,26 @@ impl Description {
         self
     }
 
+    /// Make this leaf sample a texture produced by an external renderer.
+    ///
+    /// The texture is not copied into the scene and its pixels are not part of
+    /// reconciliation. The emitter turns the resolved geometry into one
+    /// compositor entry, so a producer update only damages that entry's
+    /// visible rectangle.
+    pub fn external_surface(
+        mut self,
+        id: ExternalSurfaceId,
+        opacity: f32,
+        corner_radius: f32,
+    ) -> Self {
+        self.external_surface = Some(ExternalSurfaceProperties {
+            id,
+            opacity,
+            corner_radius,
+        });
+        self
+    }
+
     /// Set the style this element's layout node is laid out with.
     pub fn style(mut self, style: LayoutStyle) -> Self {
         self.layout_style = style;
@@ -435,6 +469,11 @@ impl Description {
     /// Whether this element declared itself a compositing boundary.
     pub fn is_boundary(&self) -> bool {
         self.boundary.is_some()
+    }
+
+    /// The external texture metadata, if this description is a surface leaf.
+    pub fn external_surface_properties(&self) -> Option<ExternalSurfaceProperties> {
+        self.external_surface
     }
 
     /// The tuning this element's boundary was declared with, if any.

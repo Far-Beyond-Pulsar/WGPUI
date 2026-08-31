@@ -60,7 +60,10 @@
 //! correct *set* of primitives into a correct *layer* is what this phase needs
 //! and all it claims.
 
-use crate::boundary::compositor::{BoundaryComposite, Composite, Compositor, TiledVisit};
+use crate::boundary::compositor::{
+    BoundaryComposite, Composite, CompositeEntry, CompositeSource, Compositor,
+    ExternalSurfaceId, TiledVisit,
+};
 use crate::boundary::policy::BoundaryPolicy;
 use crate::geometry::Rect;
 use crate::invalidation::request::FrameSignals;
@@ -475,6 +478,9 @@ pub struct FrameEmission {
     pub patch: ScenePatch,
     /// What each live boundary did, in ascending layer order.
     pub composites: Vec<BoundaryComposite>,
+    /// External textures in tree paint order. Their pixels remain outside the
+    /// retained scene and are consumed by the GPU compositor directly.
+    pub external_surfaces: Vec<CompositeEntry>,
     /// Tile visibility metadata for damage planning. Tiles are not scene
     /// layers and do not own primitive records; they identify portions of the
     /// retained presentation buffer that may need repainting.
@@ -686,6 +692,7 @@ impl Emitter {
         let mut pending = PendingOperations::default();
         let mut boundaries: HashMap<BoundaryId, BoundaryFrame> = HashMap::new();
         let mut tiled_visits = Vec::new();
+        let mut external_surfaces = Vec::new();
         let mut damage = Vec::new();
         let mut scroll_regions = HashMap::new();
         let mut emission = Emission::new();
@@ -709,6 +716,20 @@ impl Emitter {
             stats.nodes_visited += 1;
 
             let bounds = geometry.emission_bounds;
+
+            if let Some(surface) = node.external_surface {
+                external_surfaces.push(CompositeEntry {
+                    source: CompositeSource::External(ExternalSurfaceId::from_raw(
+                        surface.id.as_raw(),
+                    )),
+                    bounds: geometry.absolute_bounds,
+                    content_mask: geometry.visible_bounds,
+                    opacity: surface.opacity,
+                    corner_radius: surface.corner_radius,
+                    source_is_opaque: false,
+                    content_token: 0,
+                });
+            }
 
             // A boundary root's own paint belongs to the layer around it, not to
             // the layer it declares — see `PlannedNode::boundary`.
@@ -932,6 +953,7 @@ impl Emitter {
         Ok(FrameEmission {
             patch,
             composites,
+            external_surfaces,
             tiled_visits,
             damage,
             stats,
@@ -2084,6 +2106,7 @@ mod tests {
             depth: 0,
             outcome: crate::reconcile::plan::NodeOutcome::Uncached,
             invalidation: Invalidation::all(),
+            external_surface: None,
         };
         plan.push(node);
         node.depth = 4;

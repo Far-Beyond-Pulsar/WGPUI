@@ -30,7 +30,9 @@
 //! The resulting glyph runs still enter the ordinary retained patch protocol;
 //! no text-specific draw path bypasses reconciliation.
 
-use wgpui_core::boundary::compositor::{Composite, CompositeEntry, TiledVisit};
+use wgpui_core::boundary::compositor::{
+    Composite, CompositeEntry, CompositeSource, TiledVisit,
+};
 use wgpui_core::geometry::Rect;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::invalidation::request::FrameSignals;
@@ -57,6 +59,7 @@ use crate::render::draw::DrawMode;
 use crate::render::frame::{
     Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, OffscreenTarget, RenderTarget,
 };
+use crate::render::surface_registry::SurfaceRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -232,6 +235,7 @@ pub struct FrameLoop {
     interaction_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     scale_factor: f32,
+    surface_registry: Arc<SurfaceRegistry>,
 }
 
 #[derive(Clone)]
@@ -301,6 +305,7 @@ impl FrameLoop {
             interaction_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             scale_factor: 1.0,
+            surface_registry: Arc::new(SurfaceRegistry::new()),
         }
     }
 
@@ -345,6 +350,13 @@ impl FrameLoop {
     /// Update the opt-in diagnostics used by subsequent frames.
     pub fn set_performance_debug(&mut self, debug: PerformanceDebug) {
         self.performance_debug = debug;
+    }
+
+    /// Use the registry owned by the native window for external surface
+    /// composites. Keeping this on the frame loop makes surface lookup part of
+    /// the same retained frame transaction as scene rendering.
+    pub fn set_surface_registry(&mut self, registry: Arc<SurfaceRegistry>) {
+        self.surface_registry = registry;
     }
 
     /// Mark a hitbox region whose hover state changed. This is consumed by the
@@ -490,6 +502,21 @@ impl FrameLoop {
             self.viewport_recomputes += 1;
         }
         let interaction_dirty_regions = self.interaction_dirty_regions.clone();
+        let external_damage_regions: Vec<Rect> = emission
+            .external_surfaces
+            .iter()
+            .filter_map(|composite| {
+                let CompositeSource::External(id) = composite.source else {
+                    return None;
+                };
+                self.surface_registry
+                    .has_unconsumed_frame(crate::render::surface_registry::SurfaceId::from_raw(
+                        id.as_raw(),
+                    ))
+                    .then(|| composite.visible())
+            })
+            .filter(|region| !region.is_empty())
+            .collect();
         let transform_only = emission
             .composites
             .iter()
@@ -500,6 +527,7 @@ impl FrameLoop {
             Rect::from_origin_size([0.0, 0.0], viewport),
             viewport_changed,
             &interaction_dirty_regions,
+            &external_damage_regions,
         );
         self.interaction_dirty_regions.clear();
         let debug_damage = debug_tiles.iter().fold(None, |damage, tile| {
@@ -511,9 +539,14 @@ impl FrameLoop {
                 ),
             ))
         });
-        let has_debug_damage = debug_damage.is_some();
         let needs_redraw = !debug_tiles.is_empty();
         self.renderer.set_debug_tiles(debug_tiles);
+        let external_damage = external_damage_regions.iter().copied().fold(
+            None,
+            |damage, region| Some(union_damage(damage, region)),
+        );
+        let mut composite_entries = input.composites.to_vec();
+        composite_entries.extend(emission.external_surfaces.iter().copied());
         let can_preserve_presentation = input
             .target
             .source
@@ -532,6 +565,9 @@ impl FrameLoop {
             if let Some(debug_damage) = debug_damage {
                 damage = Some(union_damage(damage, debug_damage));
             }
+            if let Some(external_damage) = external_damage {
+                damage = Some(union_damage(damage, external_damage));
+            }
             Some(damage.unwrap_or(Rect::EMPTY))
         };
 
@@ -544,7 +580,6 @@ impl FrameLoop {
             poison: &[],
             dirty: if viewport_changed
                 || transform_only
-                || has_debug_damage
                 || !can_preserve_presentation
             {
                 Dirty::All
@@ -552,8 +587,8 @@ impl FrameLoop {
                 Dirty::Some(&dirty_layers)
             },
             uploads: uploads.entries(),
-            composites: input.composites,
-            registry: None,
+            composites: &composite_entries,
+            registry: Some(&self.surface_registry),
             atlas: input.atlas.or(owned_atlas),
             viewport: [width, height],
             mode: input.mode,
@@ -611,6 +646,7 @@ impl FrameLoop {
         viewport: Rect,
         viewport_changed: bool,
         interaction_dirty_regions: &[Rect],
+        external_damage_regions: &[Rect],
     ) -> Vec<DebugTile> {
         if !flash.enabled {
             self.tile_flash_frames.clear();
@@ -656,6 +692,9 @@ impl FrameLoop {
                     self.record_tile_refresh(key, now);
                 }
             }
+        }
+        for region in external_damage_regions.iter().copied() {
+            self.record_damage_refresh(region, flash.duration_frames.max(1), now);
         }
         if self.tile_flash_frames.is_empty() && self.damage_refresh_regions.is_empty() {
             return Vec::new();

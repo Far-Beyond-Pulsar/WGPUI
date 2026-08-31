@@ -83,12 +83,20 @@ pub use wgpui_widgets::styled_text::{
     UnderlineStyle,
 };
 pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
-pub use wgpui_widgets::wgpu_surface::{WgpuSurface, WgpuSurfaceKey};
+pub use wgpui_widgets::wgpu_surface::{
+    SurfaceId, SurfaceStyle, WgpuSurface, WgpuSurfaceKey,
+};
 
 pub use wgpui_wgpu::window::application::{
     Application, ApplicationError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
     WindowOptions,
 };
+pub use wgpui_wgpu::window::surface::WgpuSurfaceHandle;
+
+/// Lower a native WGPU surface handle into a retained surface element.
+pub fn wgpu_surface(handle: WgpuSurfaceHandle) -> WgpuSurface {
+    WgpuSurface::new(SurfaceId::from_raw(handle.id()))
+}
 pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 
 pub mod prelude {

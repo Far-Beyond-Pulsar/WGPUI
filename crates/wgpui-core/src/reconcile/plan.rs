@@ -16,7 +16,7 @@ use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::axes::Invalidation;
 use crate::patch::emit::Emit;
 use crate::reconcile::instance::InstanceKey;
-use crate::reconcile::description::DescriptionInteraction;
+use crate::reconcile::description::{DescriptionInteraction, ExternalSurfaceProperties};
 use crate::reconcile::state::StateScope;
 use crate::scene::layer::BoundaryId;
 use wgpui_layout::taffy_tree::LayoutNodeId;
@@ -110,6 +110,8 @@ pub struct PlannedNode {
     pub outcome: NodeOutcome,
     /// Which respects of the element changed, as derived by the comparison.
     pub invalidation: Invalidation,
+    /// The external texture sampled by this leaf, if any.
+    pub external_surface: Option<ExternalSurfaceProperties>,
 }
 
 impl PlannedNode {
@@ -352,6 +354,7 @@ mod tests {
             depth,
             outcome,
             invalidation: Invalidation::empty(),
+            external_surface: None,
         }
     }
 

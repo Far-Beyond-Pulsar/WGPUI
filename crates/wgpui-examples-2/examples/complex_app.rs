@@ -2,9 +2,16 @@
 //! direct API.
 
 use std::cell::Cell;
+use std::sync::Arc;
 use std::rc::Rc;
+use std::time::Instant;
 
-use wgpui::{ApplicationError, NativeApplication, Styled, WindowOptions, div, rgb};
+use wgpu::util::DeviceExt;
+
+use wgpui::{
+    ApplicationError, NativeApplication, Styled, SurfaceId, WindowOptions, WgpuSurface,
+    WgpuSurfaceHandle, div, rgb,
+};
 
 fn main() -> Result<(), ApplicationError> {
     let selected = Rc::new(Cell::new(0_u32));
@@ -16,8 +23,17 @@ fn main() -> Result<(), ApplicationError> {
     let hovered_control_for_second = Rc::clone(&hovered_control);
     let scroll_offset = Rc::new(Cell::new(0.0_f32));
     let scroll_offset_for_handler = Rc::clone(&scroll_offset);
+    let mut surface_demo = None;
 
     NativeApplication::new(WindowOptions::default(), move |window| {
+        if surface_demo.is_none() {
+            surface_demo = SurfaceDemo::new(window).ok();
+        }
+        if let Some(surface_demo) = surface_demo.as_mut() {
+            surface_demo.render();
+            window.request_redraw();
+        }
+        let surface_description = surface_demo.as_ref().map(SurfaceDemo::description);
         window.performance_debug().set_tile_refresh_flash(
             wgpui::TileRefreshFlash::enabled()
                 .with_tile_size(256.0, 256.0)
@@ -101,6 +117,7 @@ fn main() -> Result<(), ApplicationError> {
                             .flex()
                             .flex_col()
                             .gap_3()
+                            .justify_between()
                             .flex_1()
                             .min_h(0.0)
                             .p_4()
@@ -210,6 +227,15 @@ fn main() -> Result<(), ApplicationError> {
                                     .text_color(rgb(0x7f8ba5))
                                     .child("Actions update retained state without rebuilding unchanged content."),
                             )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8291ad))
+                                    .child("Live 3D surface"),
+                            )
+                            .when_some(surface_description, |this, description| {
+                                this.child(description)
+                            }),
                     ),
             )
             .child(
@@ -225,6 +251,326 @@ fn main() -> Result<(), ApplicationError> {
             )
     })
     .run()
+}
+
+const SURFACE_SHADER: &str = r#"
+struct Uniforms {
+    mvp: mat4x4<f32>,
+}
+
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec3<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec3<f32>,
+}
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.clip_position = uniforms.mvp * vec4<f32>(input.position, 1.0);
+    output.color = input.color;
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.color, 1.0);
+}
+"#;
+
+#[rustfmt::skip]
+const SURFACE_VERTICES: &[[f32; 6]] = &[
+    [-0.5, -0.5,  0.5, 0.90, 0.20, 0.20], [ 0.5, -0.5,  0.5, 0.90, 0.20, 0.20],
+    [ 0.5,  0.5,  0.5, 1.00, 0.50, 0.50], [-0.5,  0.5,  0.5, 1.00, 0.50, 0.50],
+    [ 0.5, -0.5, -0.5, 0.20, 0.80, 0.20], [-0.5, -0.5, -0.5, 0.20, 0.80, 0.20],
+    [-0.5,  0.5, -0.5, 0.50, 1.00, 0.50], [ 0.5,  0.5, -0.5, 0.50, 1.00, 0.50],
+    [-0.5, -0.5, -0.5, 0.20, 0.20, 0.90], [-0.5, -0.5,  0.5, 0.20, 0.20, 0.90],
+    [-0.5,  0.5,  0.5, 0.50, 0.50, 1.00], [-0.5,  0.5, -0.5, 0.50, 0.50, 1.00],
+    [ 0.5, -0.5,  0.5, 0.90, 0.90, 0.20], [ 0.5, -0.5, -0.5, 0.90, 0.90, 0.20],
+    [ 0.5,  0.5, -0.5, 1.00, 1.00, 0.50], [ 0.5,  0.5,  0.5, 1.00, 1.00, 0.50],
+    [-0.5,  0.5,  0.5, 0.20, 0.90, 0.90], [ 0.5,  0.5,  0.5, 0.20, 0.90, 0.90],
+    [ 0.5,  0.5, -0.5, 0.50, 1.00, 1.00], [-0.5,  0.5, -0.5, 0.50, 1.00, 1.00],
+    [-0.5, -0.5, -0.5, 0.90, 0.20, 0.90], [ 0.5, -0.5, -0.5, 0.90, 0.20, 0.90],
+    [ 0.5, -0.5,  0.5, 1.00, 0.50, 1.00], [-0.5, -0.5,  0.5, 1.00, 0.50, 1.00],
+];
+
+#[rustfmt::skip]
+const SURFACE_INDICES: &[u16] = &[
+     0,  1,  2,   0,  2,  3,  4,  5,  6,   4,  6,  7,
+     8,  9, 10,   8, 10, 11, 12, 13, 14,  12, 14, 15,
+    16, 17, 18,  16, 18, 19, 20, 21, 22,  20, 22, 23,
+];
+
+struct CubeRenderer {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    depth_view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    started: Instant,
+}
+
+impl CubeRenderer {
+    fn new(surface: &WgpuSurfaceHandle, width: u32, height: u32) -> Self {
+        let device = Arc::new(surface.device().clone());
+        let queue = Arc::new(surface.queue().clone());
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("complex app 3d surface shader"),
+            source: wgpu::ShaderSource::Wgsl(SURFACE_SHADER.into()),
+        });
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("complex app 3d surface uniforms"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("complex app 3d surface bindings"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("complex app 3d surface bind group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("complex app 3d surface pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("complex app 3d surface pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 24,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x3,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 12,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x3,
+                        },
+                    ],
+                })],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface.format(),
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("complex app 3d surface vertices"),
+            contents: bytemuck::cast_slice(SURFACE_VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("complex app 3d surface indices"),
+            contents: bytemuck::cast_slice(SURFACE_INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let depth_view = Self::depth_view(&device, width, height);
+        Self {
+            device,
+            queue,
+            pipeline,
+            vertex_buffer,
+            index_buffer,
+            uniform_buffer,
+            bind_group,
+            depth_view,
+            width,
+            height,
+            started: Instant::now(),
+        }
+    }
+
+    fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("complex app 3d surface depth"),
+                size: wgpu::Extent3d {
+                    width: width.max(1),
+                    height: height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+        self.depth_view = Self::depth_view(&self.device, width, height);
+    }
+
+    fn render(&mut self, view: &wgpu::TextureView) {
+        let elapsed = self.started.elapsed().as_secs_f32();
+        let projection = glam::camera::rh::proj::directx::perspective(
+            std::f32::consts::FRAC_PI_4,
+            self.width as f32 / self.height.max(1) as f32,
+            0.1,
+            100.0,
+        );
+        let camera = glam::camera::rh::view::look_at_mat4(
+            glam::Vec3::new(0.0, 0.8, 2.4),
+            glam::Vec3::ZERO,
+            glam::Vec3::Y,
+        );
+        let model = glam::Mat4::from_rotation_y(elapsed * 1.1)
+            * glam::Mat4::from_rotation_x(elapsed * 0.65);
+        let mvp = (projection * camera * model).to_cols_array_2d();
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&mvp));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("complex app 3d surface encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("complex app 3d surface pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.03,
+                            g: 0.04,
+                            b: 0.08,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..SURFACE_INDICES.len() as u32, 0, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+}
+
+struct SurfaceDemo {
+    surface: WgpuSurfaceHandle,
+    renderer: Option<CubeRenderer>,
+}
+
+impl SurfaceDemo {
+    fn new(window: &mut wgpui::Window) -> Result<Self, wgpui::gpu::window::WindowError> {
+        let surface = window.create_wgpu_surface(
+            218,
+            140,
+            wgpui::gpu::render::pipelines::TARGET_FORMAT,
+        )?;
+        Ok(Self {
+            surface,
+            renderer: None,
+        })
+    }
+
+    fn render(&mut self) {
+        let Some((view, (width, height))) = self.surface.back_view_with_size() else {
+            return;
+        };
+        let renderer = self
+            .renderer
+            .get_or_insert_with(|| CubeRenderer::new(&self.surface, width, height));
+        if renderer.width != width || renderer.height != height {
+            renderer.resize(width, height);
+        }
+        renderer.render(&view);
+        self.surface.swap_buffers();
+    }
+
+    fn description(&self) -> wgpui::Description {
+        WgpuSurface::new(SurfaceId::from_raw(self.surface.id()))
+            .bounds(wgpui::layout::taffy_tree::LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 218.0,
+                height: 140.0,
+            })
+            .style(wgpui::SurfaceStyle {
+                corner_radius: 8.0,
+                opacity: 1.0,
+            })
+            .describe()
+    }
 }
 
 fn stat_card(label: &'static str, value: &'static str, color: wgpui::Rgba) -> wgpui::Div {

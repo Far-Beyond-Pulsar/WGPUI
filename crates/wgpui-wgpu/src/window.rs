@@ -45,6 +45,7 @@ pub mod application;
 pub use crate::debug::{PerformanceDebug, TileRefreshFlash};
 pub mod frame_loop;
 pub mod resize_detector;
+pub mod surface;
 
 use std::sync::Arc;
 
