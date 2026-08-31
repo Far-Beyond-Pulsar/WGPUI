@@ -313,7 +313,14 @@ primitive shader, and the untiled fallback. The last presented frame is held
 in one presentation buffer when the target supports `COPY_DST`; tile metadata
 then restricts the damage raster region, rather than becoming a second scene
 or render cache. The existing GPU tile-visibility and indirect-argument
-passes remain covered by their differential integration tests.
+passes remain covered by their differential integration tests. Retained
+boundary layers also carry their effective screen-space clip into the native
+primitive shaders, so scrolling can retain content outside the current
+viewport without allowing it to leak; resize updates that clip without
+re-emitting unchanged primitive bytes. The diagnostic overlay is driven by
+actual presentation damage or tiled visits, reports short-lived counts before
+switching to a measured refresh rate, and adds its own regions to the damage
+set only while it fades.
 
 Two pieces remain deliberately isolated because the current public frame
 protocol has no data path for them. `ScrollRootTable` is not yet the source of

@@ -29,6 +29,14 @@ impl DebugTile {
     /// diagnostic storage stride and public layout remain unchanged.
     pub fn with_refresh_rate(mut self, frames_per_second: f32) -> Self {
         self._padding[0] = frames_per_second.max(0.0);
+        self._padding[1] = 1.0;
+        self
+    }
+
+    /// Attach a refresh count shown in this region's diagnostic label.
+    pub fn with_refresh_count(mut self, count: u32) -> Self {
+        self._padding[0] = count as f32;
+        self._padding[1] = 0.0;
         self
     }
 }
@@ -168,6 +176,21 @@ mod tests {
         }
         .with_refresh_rate(60.0);
         assert_eq!(tile._padding[0], 60.0);
+        assert_eq!(tile._padding[1], 1.0);
+        assert_eq!(std::mem::size_of::<DebugTile>(), 64);
+    }
+
+    #[test]
+    fn a_refresh_count_uses_the_same_storage_as_a_rate() {
+        let tile = DebugTile {
+            origin_size: [0.0; 4],
+            color: [1.0; 4],
+            border_width: 1.0,
+            _padding: [0.0; 7],
+        }
+        .with_refresh_count(4);
+        assert_eq!(tile._padding[0], 4.0);
+        assert_eq!(tile._padding[1], 0.0);
         assert_eq!(std::mem::size_of::<DebugTile>(), 64);
     }
 }

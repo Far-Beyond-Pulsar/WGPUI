@@ -9,6 +9,5 @@ fn main() -> Result<(), ApplicationError> {
             .bg(rgb(0x2050a0))
             .child("Native text is GPU rendered")
     })
-    .with_frame_limit(1_000_000)
     .run()
 }

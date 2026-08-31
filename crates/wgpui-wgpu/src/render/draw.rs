@@ -356,6 +356,7 @@ pub struct SlotBasePlan {
     /// because their records carry the base themselves.
     zero_offset: u32,
     translations: Vec<[f32; 2]>,
+    clips: Vec<[f32; 4]>,
 }
 
 impl SlotBasePlan {
@@ -384,6 +385,18 @@ impl SlotBasePlan {
             if let Some(word) = bytes.get_mut(offset..offset + 4) {
                 word.copy_from_slice(&slot.base.to_le_bytes());
             }
+            if let Some(clip_bytes) = bytes.get_mut(offset + 16..offset + 32) {
+                for (index, value) in [0.0_f32, 0.0, -1.0, -1.0].iter().enumerate() {
+                    clip_bytes[index * 4..index * 4 + 4]
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        let trailing_offset = slots.len() * stride as usize;
+        if let Some(clip_bytes) = bytes.get_mut(trailing_offset + 16..trailing_offset + 32) {
+            for (index, value) in [0.0_f32, 0.0, -1.0, -1.0].iter().enumerate() {
+                clip_bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
         }
         queue.write_buffer(&buffer, 0, &bytes);
         let bind_group = slot_base_bind_group(device, layout, &buffer);
@@ -394,11 +407,12 @@ impl SlotBasePlan {
             stride,
             zero_offset: u32::try_from(slots.len()).unwrap_or(0) * stride,
             translations: vec![[0.0, 0.0]; entries],
+            clips: vec![[0.0, 0.0, -1.0, -1.0]; entries],
         }
     }
 
-    /// Update the compositor translations without rebuilding the slot table.
-    pub fn sync_transforms(&mut self, queue: &wgpu::Queue, layers: &LayerTable) -> bool {
+    /// Update compositor translations and clips without rebuilding the slot table.
+    pub fn sync_layer_state(&mut self, queue: &wgpu::Queue, layers: &LayerTable) -> bool {
         let mut changed = false;
         for (index, slot) in self.slots.iter().enumerate() {
             let translation = layers
@@ -413,6 +427,23 @@ impl SlotBasePlan {
                 ]
                 .concat();
                 queue.write_buffer(&self.buffer, offset as u64, &bytes);
+                changed = true;
+            }
+            let clip = layers.get(slot.layer).and_then(|layer| layer.clip()).map_or(
+                [0.0, 0.0, -1.0, -1.0],
+                |clip| [clip.min_x, clip.min_y, clip.width(), clip.height()],
+            );
+            if self.clips[index] != clip {
+                self.clips[index] = clip;
+                let bytes = clip
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>();
+                queue.write_buffer(
+                    &self.buffer,
+                    (index * self.stride as usize + 16) as u64,
+                    &bytes,
+                );
                 changed = true;
             }
         }
@@ -541,11 +572,16 @@ impl SlotBasePlan {
         &self.slots
     }
 
-    pub(crate) fn has_non_identity_transform(&self) -> bool {
+    pub(crate) fn has_non_identity_layer_state(&self) -> bool {
         self.translations
             .iter()
             .take(self.slots.len())
             .any(|translation| *translation != [0.0, 0.0])
+            || self
+                .clips
+                .iter()
+                .take(self.slots.len())
+                .any(|clip| *clip != [0.0, 0.0, -1.0, -1.0])
     }
 
     /// The bind group holding slot bases.
@@ -582,7 +618,7 @@ pub fn issue_instanced(
     mode: DrawMode,
     resolved: &ResolvedArgs,
 ) -> DrawStats {
-    let mode = if plan.has_non_identity_transform()
+    let mode = if plan.has_non_identity_layer_state()
         && matches!(mode, DrawMode::MultiDrawIndirect | DrawMode::MultiDrawIndirectCount)
     {
         DrawMode::PerSlotIndirect
@@ -783,7 +819,7 @@ pub fn issue_sprites(
     resolved: &ResolvedArgs,
 ) -> DrawStats {
     let plan = draw.plan;
-    let mode = if plan.has_non_identity_transform()
+    let mode = if plan.has_non_identity_layer_state()
         && matches!(mode, DrawMode::MultiDrawIndirect | DrawMode::MultiDrawIndirectCount)
     {
         DrawMode::PerSlotIndirect

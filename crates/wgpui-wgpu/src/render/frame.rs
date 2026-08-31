@@ -1463,13 +1463,13 @@ impl FrameRenderer {
                 )
             }
         };
-        shadow_plan.sync_transforms(queue, &input.scene.layers);
-        quad_plan.sync_transforms(queue, &input.scene.layers);
-        underline_plan.sync_transforms(queue, &input.scene.layers);
-        glyph_plan.sync_transforms(queue, &input.scene.layers);
-        sprite_plan.sync_transforms(queue, &input.scene.layers);
-        path_plan.sync_transforms(queue, &input.scene.layers);
-        backdrop_plan.sync_transforms(queue, &input.scene.layers);
+        shadow_plan.sync_layer_state(queue, &input.scene.layers);
+        quad_plan.sync_layer_state(queue, &input.scene.layers);
+        underline_plan.sync_layer_state(queue, &input.scene.layers);
+        glyph_plan.sync_layer_state(queue, &input.scene.layers);
+        sprite_plan.sync_layer_state(queue, &input.scene.layers);
+        path_plan.sync_layer_state(queue, &input.scene.layers);
+        backdrop_plan.sync_layer_state(queue, &input.scene.layers);
         let shadow_frame_group = self.shadows.frame_bind_group(
             device,
             &self.globals,

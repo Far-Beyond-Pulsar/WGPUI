@@ -50,6 +50,8 @@ struct SlotBase {
     base: u32,
     padding_0: u32,
     translation: vec2<f32>,
+    clip_origin: vec2<f32>,
+    clip_size: vec2<f32>,
 };
 
 // 48 bytes, matching `wgpui_core::patch::primitive::Underline::SLOT_STRIDE` and
@@ -121,6 +123,13 @@ fn vertex_main(
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    if slot.clip_size.x >= 0.0 {
+        let clip_max = slot.clip_origin + slot.clip_size;
+        if in.position.x < slot.clip_origin.x || in.position.y < slot.clip_origin.y
+            || in.position.x >= clip_max.x || in.position.y >= clip_max.y {
+            discard;
+        }
+    }
     let underline = underlines[in.arena_index];
     let thickness = underline.thickness;
     let wavy = underline.wavy;

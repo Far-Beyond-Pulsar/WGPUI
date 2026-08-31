@@ -55,6 +55,7 @@ struct WalkContext {
     emission_offset: [f32; 2],
     screen_offset: [f32; 2],
     clip: Option<Rect>,
+    emission_clip: Option<Rect>,
     layer: LayerId,
 }
 
@@ -81,6 +82,7 @@ pub fn shared_walk(
         emission_offset: [0.0; 2],
         screen_offset: [0.0; 2],
         clip: viewport,
+        emission_clip: viewport,
         layer: root_layer,
     };
     let mut stack = Vec::new();
@@ -135,17 +137,25 @@ pub fn shared_walk(
             screen_origin[0] - emission_origin[0],
             screen_origin[1] - emission_origin[1],
         ];
+        let emission_clip = parent.emission_clip.map(|clip| LayoutRect {
+            x: clip.min_x - accumulated_scroll[0],
+            y: clip.min_y - accumulated_scroll[1],
+            width: clip.width(),
+            height: clip.height(),
+        });
+        let child_emission_clip = if node.declared_boundary.is_some() {
+            None
+        } else if node.clip_children {
+            child_clip
+        } else {
+            parent.emission_clip
+        };
         result.push(WalkNode {
             address: node.address,
             emission_bounds,
             absolute_bounds,
             clip: parent.clip,
-            emission_clip: parent.clip.map(|clip| LayoutRect {
-                x: clip.min_x - accumulated_scroll[0],
-                y: clip.min_y - accumulated_scroll[1],
-                width: clip.width(),
-                height: clip.height(),
-            }),
+            emission_clip,
             visible_bounds,
             accumulated_scroll,
             owning_root: node.boundary,
@@ -163,6 +173,7 @@ pub fn shared_walk(
             emission_offset: child_emission_offset,
             screen_offset: child_screen_offset,
             clip: child_clip,
+            emission_clip: child_emission_clip,
             layer: child_layer,
         });
     }
@@ -268,6 +279,9 @@ mod tests {
         let leaf = transformed.last().expect("leaf is present");
         assert_eq!(leaf.emission_bounds.x, 0.0);
         assert_eq!(leaf.absolute_bounds.min_x, -12.0);
-        assert_eq!(leaf.emission_clip.map(|clip| clip.x), Some(12.0));
+        assert_eq!(
+            leaf.emission_clip, None,
+            "a declared boundary owns its clip in the GPU layer even when its scroll is not transform-only"
+        );
     }
 }

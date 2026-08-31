@@ -249,6 +249,76 @@ fn a_layer_transform_moves_native_pixels_without_scene_uploads() {
 }
 
 #[test]
+fn a_layer_clip_is_enforced_after_the_layer_transform() {
+    let Some(context) = context_or_report("layer_clip") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 128.0,
+        height: 128.0,
+        ..UiSceneSpec::small()
+    };
+    let quad = Quad {
+        origin: [0.0, 0.0],
+        size: [128.0, 128.0],
+        background: [0.1, 0.8, 0.2, 1.0],
+        ..Quad::ZERO
+    };
+    let mut scene = MultiLayerSceneDriver::new(1);
+    scene.set_layer(0, &[quad]).expect("the clip scene applies");
+    let layer = scene
+        .scene
+        .layers
+        .ids()
+        .first()
+        .copied()
+        .expect("the test scene has one layer");
+    let clip = Rect::from_origin_size([16.0, 20.0], [48.0, 40.0]);
+    assert!(scene.scene.layers.set_clip(layer, Some(clip)));
+    assert!(scene
+        .scene
+        .layers
+        .set_transform(layer, LayerTransform::translated(8.0, 10.0)));
+    assert_eq!(
+        scene.scene.draw_slots().kind_slots(PrimitiveKind::Quad)[0].layer,
+        layer
+    );
+
+    let mut renderer = FrameRenderer::new(&context.device);
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, pixels) = render(&context, &mut renderer, &target, &input);
+
+    let mut painted_inside = 0;
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        let x = (index % spec.width as usize) as f32;
+        let y = (index / spec.width as usize) as f32;
+        let painted = pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0;
+        let inside = x + 0.5 >= clip.min_x
+            && x + 0.5 < clip.max_x
+            && y + 0.5 >= clip.min_y
+            && y + 0.5 < clip.max_y;
+        if inside {
+            painted_inside += usize::from(painted);
+        } else {
+            assert!(!painted, "layer clip leaked at ({x}, {y})");
+        }
+    }
+    assert_eq!(painted_inside, (clip.width() * clip.height()) as usize);
+}
+
+#[test]
 fn a_layer_transform_keeps_rounded_quad_edges_attached_to_the_quad() {
     let Some(context) = context_or_report("rounded_layer_transform") else {
         return;

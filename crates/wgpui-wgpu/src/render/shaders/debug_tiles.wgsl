@@ -1,5 +1,5 @@
 struct Globals { viewport: vec2<f32>, };
-struct Tile { origin_size: vec4<f32>, color: vec4<f32>, border_width: f32, refresh_rate: f32, _padding: array<f32, 6>, };
+struct Tile { origin_size: vec4<f32>, color: vec4<f32>, border_width: f32, refresh_rate: f32, display_mode: f32, _padding: array<f32, 5>, };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var<storage, read> tiles: array<Tile>;
 struct VertexOutput {
@@ -9,6 +9,7 @@ struct VertexOutput {
     @location(2) tile_size: vec2<f32>,
     @location(3) border_width: f32,
     @location(4) refresh_rate: f32,
+    @location(5) display_mode: f32,
 };
 @vertex
 fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> VertexOutput {
@@ -23,6 +24,7 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index
     output.tile_size = tile.origin_size.zw;
     output.border_width = tile.border_width;
     output.refresh_rate = tile.refresh_rate;
+    output.display_mode = tile.display_mode;
     return output;
 }
 

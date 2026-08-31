@@ -144,6 +144,9 @@ pub struct LoopFrame {
     /// The GPU half.
     pub frame: FrameOutput,
     pub interactions: Vec<InteractionRegistration>,
+    /// Whether the native handler should schedule another frame for a fading
+    /// diagnostic overlay.
+    pub needs_redraw: bool,
 }
 
 #[derive(Debug)]
@@ -225,6 +228,7 @@ pub struct FrameLoop {
     tile_flash_frames: HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), u32>,
     tile_refresh_rates:
         HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), TileRefreshRate>,
+    damage_refresh_regions: Vec<DamageRefreshRegion>,
     interaction_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     scale_factor: f32,
@@ -248,7 +252,20 @@ struct TextCacheKey {
 struct TileRefreshRate {
     window_start: Instant,
     samples: u32,
+    updates: u32,
     frames_per_second: f32,
+    regular: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DamageRefreshRegion {
+    rect: Rect,
+    frames_remaining: u32,
+    window_start: Instant,
+    samples: u32,
+    updates: u32,
+    frames_per_second: f32,
+    regular: bool,
 }
 
 impl FrameLoop {
@@ -271,6 +288,7 @@ impl FrameLoop {
             viewport_recomputes: 0,
             tile_flash_frames: HashMap::new(),
             tile_refresh_rates: HashMap::new(),
+            damage_refresh_regions: Vec::new(),
             interaction_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             scale_factor: 1.0,
@@ -475,7 +493,22 @@ impl FrameLoop {
             &interaction_dirty_regions,
         );
         self.interaction_dirty_regions.clear();
+        let debug_damage = debug_tiles.iter().fold(None, |damage, tile| {
+            Some(union_damage(
+                damage,
+                Rect::from_origin_size(
+                    [tile.origin_size[0], tile.origin_size[1]],
+                    [tile.origin_size[2], tile.origin_size[3]],
+                ),
+            ))
+        });
+        let has_debug_damage = debug_damage.is_some();
+        let needs_redraw = !debug_tiles.is_empty();
         self.renderer.set_debug_tiles(debug_tiles);
+        let can_preserve_presentation = input
+            .target
+            .source
+            .is_some_and(|source| source.usage().contains(wgpu::TextureUsages::COPY_DST));
 
         let damage = if viewport_changed {
             None
@@ -487,6 +520,9 @@ impl FrameLoop {
             for region in interaction_dirty_regions.iter().copied() {
                 damage = Some(union_damage(damage, region));
             }
+            if let Some(debug_damage) = debug_damage {
+                damage = Some(union_damage(damage, debug_damage));
+            }
             Some(damage.unwrap_or(Rect::EMPTY))
         };
 
@@ -497,7 +533,11 @@ impl FrameLoop {
             scene: &self.scene,
             clip: Rect::from_origin_size([0.0, 0.0], [width, height]),
             poison: &[],
-            dirty: if viewport_changed || transform_only {
+            dirty: if viewport_changed
+                || transform_only
+                || has_debug_damage
+                || !can_preserve_presentation
+            {
                 Dirty::All
             } else {
                 Dirty::Some(&dirty_layers)
@@ -509,10 +549,6 @@ impl FrameLoop {
             viewport: [width, height],
             mode: input.mode,
         };
-        let can_preserve_presentation = input
-            .target
-            .source
-            .is_some_and(|source| source.usage().contains(wgpu::TextureUsages::COPY_DST));
         let frame = if can_preserve_presentation {
             let target_is_new = self.presentation_target.as_ref().is_none_or(|target| {
                 target.width != input.target.width || target.height != input.target.height
@@ -555,6 +591,7 @@ impl FrameLoop {
             viewport_changed,
             frame,
             interactions,
+            needs_redraw,
         })
     }
 
@@ -569,6 +606,7 @@ impl FrameLoop {
         if !flash.enabled {
             self.tile_flash_frames.clear();
             self.tile_refresh_rates.clear();
+            self.damage_refresh_regions.clear();
             return Vec::new();
         }
         self.tile_flash_frames.retain(|_, frames| {
@@ -581,7 +619,19 @@ impl FrameLoop {
                 .iter()
                 .any(|visit| visit.boundary == key.0 && visit.visible.contains(&key.1))
         });
+        self.damage_refresh_regions.retain_mut(|region| {
+            region.frames_remaining = region.frames_remaining.saturating_sub(1);
+            region.frames_remaining > 0
+        });
         let now = Instant::now();
+        if viewport_changed {
+            self.record_damage_refresh(viewport, flash.duration_frames.max(1), now);
+        }
+        if emission.tiled_visits.is_empty() {
+            for region in emission.damage.iter().copied() {
+                self.record_damage_refresh(region, flash.duration_frames.max(1), now);
+            }
+        }
         for visit in &emission.tiled_visits {
             for tile in &visit.visible {
                 let key = (visit.boundary, *tile);
@@ -598,10 +648,37 @@ impl FrameLoop {
                 }
             }
         }
-        if self.tile_flash_frames.is_empty() && !viewport_changed {
+        if self.tile_flash_frames.is_empty() && self.damage_refresh_regions.is_empty() {
             return Vec::new();
         }
         let mut tiles = Vec::new();
+        for refresh_region in &self.damage_refresh_regions {
+            let region = refresh_region.rect.intersect(&viewport);
+            if region.is_empty() {
+                continue;
+            }
+            let fade = tile_flash_fade(
+                refresh_region.frames_remaining,
+                flash.duration_frames,
+            );
+            let mut tile = DebugTile {
+                origin_size: [
+                    region.min_x,
+                    region.min_y,
+                    region.width(),
+                    region.height(),
+                ],
+                color: faded_color(flash.color, fade),
+                border_width: 3.0,
+                _padding: [0.0; 7],
+            };
+            if refresh_region.regular {
+                tile = tile.with_refresh_rate(refresh_region.frames_per_second);
+            } else {
+                tile = tile.with_refresh_count(refresh_region.updates);
+            }
+            tiles.push(tile);
+        }
         for visit in &emission.tiled_visits {
             for tile in &visit.visible {
                 let key = (visit.boundary, *tile);
@@ -612,24 +689,31 @@ impl FrameLoop {
                 if tile_rect.is_empty() {
                     continue;
                 }
-                let rate = self
-                    .tile_refresh_rates
-                    .get(&key)
-                    .map_or(0.0, |rate| rate.frames_per_second);
-                tiles.push(
-                    DebugTile {
+                let mut debug_tile = DebugTile {
                         origin_size: [
                             tile_rect.min_x,
                             tile_rect.min_y,
                             tile_rect.width(),
                             tile_rect.height(),
                         ],
-                        color: flash.color,
+                        color: faded_color(
+                            flash.color,
+                            tile_flash_fade(
+                                self.tile_flash_frames.get(&key).copied().unwrap_or(0),
+                                flash.duration_frames,
+                            ),
+                        ),
                         border_width: 3.0,
                         _padding: [0.0; 7],
+                    };
+                if let Some(rate) = self.tile_refresh_rates.get(&key) {
+                    if rate.regular {
+                        debug_tile = debug_tile.with_refresh_rate(rate.frames_per_second);
+                    } else {
+                        debug_tile = debug_tile.with_refresh_count(rate.updates);
                     }
-                    .with_refresh_rate(rate),
-                );
+                }
+                tiles.push(debug_tile);
             }
         }
         tiles
@@ -643,14 +727,50 @@ impl FrameLoop {
         let rate = self.tile_refresh_rates.entry(key).or_insert(TileRefreshRate {
             window_start: now,
             samples: 0,
+            updates: 0,
             frames_per_second: 0.0,
+            regular: false,
         });
         rate.samples = rate.samples.saturating_add(1);
+        rate.updates = rate.updates.saturating_add(1);
         let elapsed = now.duration_since(rate.window_start).as_secs_f32();
         if elapsed >= 0.25 {
             rate.frames_per_second = rate.samples as f32 / elapsed;
+            rate.regular = rate.samples >= 10;
             rate.window_start = now;
             rate.samples = 0;
+        }
+    }
+
+    fn record_damage_refresh(&mut self, rect: Rect, duration_frames: u32, now: Instant) {
+        if rect.is_empty() {
+            return;
+        }
+        if let Some(region) = self
+            .damage_refresh_regions
+            .iter_mut()
+            .find(|region| same_rect(region.rect, rect))
+        {
+            region.frames_remaining = duration_frames;
+            region.samples = region.samples.saturating_add(1);
+            region.updates = region.updates.saturating_add(1);
+            let elapsed = now.duration_since(region.window_start).as_secs_f32();
+            if elapsed >= 0.25 {
+                region.frames_per_second = region.samples as f32 / elapsed;
+                region.regular = region.samples >= 10;
+                region.window_start = now;
+                region.samples = 0;
+            }
+        } else {
+            self.damage_refresh_regions.push(DamageRefreshRegion {
+                rect,
+                frames_remaining: duration_frames,
+                window_start: now,
+                samples: 1,
+                updates: 1,
+                frames_per_second: 0.0,
+                regular: false,
+            });
         }
     }
 
@@ -788,6 +908,26 @@ fn union_damage(current: Option<Rect>, next: Rect) -> Rect {
         Some(current) => current.union(&next),
         None => next,
     }
+}
+
+fn same_rect(first: Rect, second: Rect) -> bool {
+    const EPSILON: f32 = 0.5;
+    (first.min_x - second.min_x).abs() <= EPSILON
+        && (first.min_y - second.min_y).abs() <= EPSILON
+        && (first.max_x - second.max_x).abs() <= EPSILON
+        && (first.max_y - second.max_y).abs() <= EPSILON
+}
+
+fn tile_flash_fade(frames_remaining: u32, duration_frames: u32) -> f32 {
+    if duration_frames == 0 {
+        return 0.0;
+    }
+    (frames_remaining as f32 / duration_frames as f32).clamp(0.0, 1.0)
+}
+
+fn faded_color(mut color: [f32; 4], fade: f32) -> [f32; 4] {
+    color[3] *= fade;
+    color
 }
 
 fn screen_tile_rect(visit: &TiledVisit, tile: TileCoord) -> Rect {

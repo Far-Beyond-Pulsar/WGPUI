@@ -71,6 +71,8 @@ struct SlotBase {
     base: u32,
     padding_0: u32,
     translation: vec2<f32>,
+    clip_origin: vec2<f32>,
+    clip_size: vec2<f32>,
 };
 
 // 144 bytes, matching `wgpui_core::patch::primitive::Quad::SLOT_STRIDE` and the
@@ -222,6 +224,13 @@ fn material_color(quad: QuadSlot, local: vec2<f32>) -> vec4<f32> {
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    if slot.clip_size.x >= 0.0 {
+        let clip_max = slot.clip_origin + slot.clip_size;
+        if in.position.x < slot.clip_origin.x || in.position.y < slot.clip_origin.y
+            || in.position.x >= clip_max.x || in.position.y >= clip_max.y {
+            discard;
+        }
+    }
     let quad = quads[in.arena_index];
 
     let background_color = material_color(quad, in.local);

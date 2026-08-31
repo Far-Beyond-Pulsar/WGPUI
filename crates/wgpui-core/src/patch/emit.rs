@@ -740,7 +740,15 @@ impl Emitter {
                 } else {
                     LayerTransform::IDENTITY
                 };
-                self.begin_boundary(declared, policy, transform, frame, scene, &mut boundaries);
+                let declared_layer = self.begin_boundary(
+                    declared,
+                    policy,
+                    transform,
+                    frame,
+                    scene,
+                    &mut boundaries,
+                );
+                scene.layers.set_clip(declared_layer, geometry.child_clip);
                 if let Some(visit) = self.compositor.visit_tiled(
                     declared,
                     policy,
