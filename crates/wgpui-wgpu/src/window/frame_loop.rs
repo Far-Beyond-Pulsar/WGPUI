@@ -51,7 +51,8 @@ use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::LayerId;
 use wgpui_core::scene::tile::TileCoord;
 use wgpui_layout::taffy_tree::{
-    Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
+    BoxSizing, Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree,
+    LengthPercentage, definite,
 };
 
 use crate::debug::{DebugTile, PerformanceDebug};
@@ -961,12 +962,7 @@ impl FrameLoop {
             };
             let layout_width = available_width.filter(|width| width.is_finite() && *width > 0.0);
             let rendered = self.layout_text(&prepared, &options, layout_width)?;
-            let intrinsic_width = if options.nowrap.unwrap_or(false) {
-                rendered.width
-            } else {
-                layout_width.map_or(rendered.width, |width| width.min(rendered.width.max(width)))
-            };
-            description.set_intrinsic_size(intrinsic_width, rendered.height);
+            description.set_intrinsic_size(rendered.width, rendered.height);
             let runs = Arc::new(rendered.runs);
             let underlines = Arc::new(rendered.underlines);
             description.set_text_emitter(move |context: &EmitContext, emission: &mut Emission| {
@@ -1051,11 +1047,7 @@ impl FrameLoop {
             let widths = wrapped.visual_line_widths(remaining_lines);
             let paragraph_width = widths.iter().copied().fold(0.0, f32::max);
             let alignment_width = available_width.unwrap_or(paragraph_width);
-            block_width = block_width.max(if nowrap {
-                paragraph_width
-            } else {
-                alignment_width
-            });
+            block_width = block_width.max(paragraph_width);
             let baseline = (line_height - paragraph_line.ascent - paragraph_line.descent).max(0.0)
                 * 0.5
                 + paragraph_line.ascent;
@@ -1259,23 +1251,46 @@ fn merge_text_options(parent: &TextOptions, local: &TextOptions) -> TextOptions 
 
 fn resolve_text_width(description: &Description, inherited_width: Option<f32>) -> Option<f32> {
     let dimension = description.layout_style().size.width;
-    if dimension.is_auto() {
-        return inherited_width;
-    }
-    if dimension.tag() == Dimension::length(0.0).tag() {
+    let width = if dimension.is_auto() {
+        inherited_width
+    } else if dimension.tag() == Dimension::length(0.0).tag() {
         let width = dimension.value();
-        return width
-            .is_finite()
-            .then_some(width)
-            .filter(|width| *width > 0.0);
-    }
-    if dimension.tag() == Dimension::percent(0.0).tag() {
+        width.is_finite().then_some(width).filter(|width| *width > 0.0)
+    } else if dimension.tag() == Dimension::percent(0.0).tag() {
         let percent = dimension.value();
-        return inherited_width
+        inherited_width
             .map(|width| width * percent)
-            .filter(|width| width.is_finite() && *width > 0.0);
-    }
-    inherited_width
+            .filter(|width| width.is_finite() && *width > 0.0)
+    } else {
+        inherited_width
+    }?;
+
+    let content_width = if description.layout_style().box_sizing == BoxSizing::BorderBox {
+        width - horizontal_box_insets(description.layout_style())
+    } else {
+        width
+    };
+    content_width.is_finite().then_some(content_width.max(0.0))
+}
+
+fn horizontal_box_insets(style: &LayoutStyle) -> f32 {
+    [
+        style.padding.left,
+        style.padding.right,
+        style.border.left,
+        style.border.right,
+    ]
+    .into_iter()
+    .map(fixed_length)
+    .sum()
+}
+
+fn fixed_length(value: LengthPercentage) -> f32 {
+    let raw = value.into_raw();
+    (raw.tag() == LengthPercentage::length(0.0).into_raw().tag())
+        .then_some(raw.value())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(0.0)
 }
 
 fn gradient_color(stops: &[([f32; 4], f32)], mut position: f32, fallback: [f32; 4]) -> [f32; 4] {
@@ -1496,6 +1511,7 @@ mod debug_refresh_region_tests {
 #[cfg(test)]
 mod text_materialization_tests {
     use super::*;
+    use wgpui_core::reconcile::description::Description;
 
     #[test]
     fn local_text_options_override_inherited_values() {
@@ -1515,6 +1531,44 @@ mod text_materialization_tests {
         assert_eq!(merged.size, Some(20.0));
         assert_eq!(merged.color, Some([0.0, 1.0, 0.0, 1.0]));
         assert_eq!(merged.nowrap, Some(true));
+    }
+
+    #[test]
+    fn auto_sized_text_keeps_its_intrinsic_width() {
+        let description = Description::new::<()>().style(LayoutStyle {
+            size: LayoutSize {
+                width: Dimension::auto(),
+                height: Dimension::auto(),
+            },
+            ..LayoutStyle::default()
+        });
+
+        assert_eq!(resolve_text_width(&description, Some(240.0)), Some(240.0));
+    }
+
+    #[test]
+    fn inherited_text_width_excludes_border_box_insets() {
+        let description = Description::new::<()>().style(LayoutStyle {
+            size: LayoutSize {
+                width: Dimension::length(250.0),
+                height: Dimension::auto(),
+            },
+            padding: wgpui_layout::taffy_tree::LayoutSides {
+                left: LengthPercentage::length(16.0),
+                right: LengthPercentage::length(16.0),
+                top: LengthPercentage::length(0.0),
+                bottom: LengthPercentage::length(0.0),
+            },
+            border: wgpui_layout::taffy_tree::LayoutSides {
+                left: LengthPercentage::length(1.0),
+                right: LengthPercentage::length(1.0),
+                top: LengthPercentage::length(0.0),
+                bottom: LengthPercentage::length(0.0),
+            },
+            ..LayoutStyle::default()
+        });
+
+        assert_eq!(resolve_text_width(&description, Some(800.0)), Some(216.0));
     }
 
     #[test]
