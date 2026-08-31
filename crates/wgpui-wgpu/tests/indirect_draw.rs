@@ -717,7 +717,7 @@ fn tile_refresh_diagnostics_draw_the_measured_rate_label() {
             border_width: 2.0,
             _padding: [0.0; 7],
         }
-        .with_refresh_rate(60.0),
+        .with_refresh_rate(888.0),
     ]);
     let input = FrameInput {
         scene: &scene.scene,
@@ -737,6 +737,18 @@ fn tile_refresh_diagnostics_draw_the_measured_rate_label() {
             .chunks_exact(4)
             .any(|pixel| pixel == [255, 255, 0, 255]),
         "the active tile must contain visible rate glyphs"
+    );
+    let label_gap_index = (7 * spec.width as usize + 8) * 4;
+    assert_eq!(
+        pixels.get(label_gap_index..label_gap_index + 4),
+        baseline.get(label_gap_index..label_gap_index + 4),
+        "diagnostic digits must not fill their interior gaps"
+    );
+    let last_digit_index = (5 * spec.width as usize + 20) * 4;
+    assert_eq!(
+        pixels.get(last_digit_index..last_digit_index + 4),
+        Some(&[255, 255, 0, 255][..]),
+        "the third rate digit must not be clipped at the label edge"
     );
     let interior_index = (40 * spec.width as usize + 40) * 4;
     assert_eq!(

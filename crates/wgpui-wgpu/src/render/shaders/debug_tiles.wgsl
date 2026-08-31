@@ -49,35 +49,35 @@ fn refresh_label(input: VertexOutput) -> bool {
         return false;
     }
     let point = input.local_position - vec2<f32>(5.0, 5.0);
-    if point.x < 0.0 || point.y < 0.0 || point.x >= 20.0 || point.y >= 9.0 {
+    if point.x < 0.0 || point.y < 0.0 || point.x >= 21.0 || point.y >= 9.0 {
         return false;
     }
     let digit_index = i32(floor(point.x / 7.0));
     let digit_power = pow(10.0, f32(2 - digit_index));
     let digit = i32(floor(input.refresh_rate / digit_power)) % 10;
     let local = vec2<f32>(point.x - f32(digit_index) * 7.0, point.y);
-    let segment = select(
-        select(
-            select(6, 0, local.y < 2.0 && local.x >= 1.0 && local.x < 6.0),
-            5,
-            local.x < 2.0 && local.y >= 1.0 && local.y < 5.0,
-        ),
-        1,
-        local.x >= 5.0 && local.y >= 1.0 && local.y < 5.0,
-    );
+    if local.y < 2.0 && local.x >= 1.0 && local.x < 6.0 {
+        return segment_on(digit, 0);
+    }
+    if local.y >= 1.0 && local.y < 4.0 && local.x < 2.0 {
+        return segment_on(digit, 5);
+    }
+    if local.y >= 1.0 && local.y < 4.0 && local.x >= 5.0 {
+        return segment_on(digit, 1);
+    }
+    if local.y >= 7.0 && local.x >= 1.0 && local.x < 6.0 {
+        return segment_on(digit, 3);
+    }
     if local.y >= 4.0 && local.x < 2.0 {
         return segment_on(digit, 4);
     }
     if local.y >= 4.0 && local.x >= 5.0 {
         return segment_on(digit, 2);
     }
-    if local.y >= 7.0 && local.x >= 1.0 && local.x < 6.0 {
-        return segment_on(digit, 3);
-    }
     if local.y >= 3.0 && local.y < 5.0 && local.x >= 1.0 && local.x < 6.0 {
         return segment_on(digit, 6);
     }
-    return segment_on(digit, segment);
+    return false;
 }
 
 @fragment

@@ -344,6 +344,7 @@ impl Description {
 
     /// Replace automatic dimensions with measured text dimensions.
     pub fn set_intrinsic_size(&mut self, width: f32, height: f32) {
+        self.layout_style.flex_shrink = 0.0;
         if self.layout_style.size.width == wgpui_layout::taffy_tree::Dimension::auto() {
             self.layout_style.size.width = wgpui_layout::taffy_tree::Dimension::length(width);
         }
@@ -525,5 +526,25 @@ mod tests {
         assert_ne!(ElementId::from("7"), ElementId::from(7u64));
         assert_ne!(ElementId::from(7u64), ElementId::Slot(7));
         assert_eq!(ElementId::from("row"), ElementId::from(String::from("row")));
+    }
+
+    #[test]
+    fn intrinsic_text_size_cannot_be_flex_shrunk() {
+        let mut description = Description::new::<Panel>().style(LayoutStyle {
+            flex_shrink: 1.0,
+            ..LayoutStyle::default()
+        });
+
+        description.set_intrinsic_size(120.0, 20.0);
+
+        assert_eq!(description.layout_style.flex_shrink, 0.0);
+        assert_eq!(
+            description.layout_style.size.width,
+            wgpui_layout::taffy_tree::Dimension::length(120.0)
+        );
+        assert_eq!(
+            description.layout_style.size.height,
+            wgpui_layout::taffy_tree::Dimension::length(20.0)
+        );
     }
 }

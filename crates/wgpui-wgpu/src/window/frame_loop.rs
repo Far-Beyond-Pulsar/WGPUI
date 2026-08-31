@@ -870,7 +870,7 @@ impl FrameLoop {
     fn prepare_text(&mut self, raw: RawText, font_size: f32) -> Result<PreparedText, LoopError> {
         let value = raw.shared_value();
         let shared = SharedString::from(value.as_ref());
-        let font = wgpui_text::shaping::font("sans-serif");
+        let font = wgpui_text::shaping::font("Segoe UI");
         let font_id = self
             .text_shaper
             .resolve_font(&font)
