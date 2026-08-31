@@ -8,6 +8,8 @@ use std::sync::Arc;
 pub const TRACE_EVENT_VERSION: u16 = 1;
 /// Descriptive alias for [`TRACE_EVENT_VERSION`].
 pub const TRACE_EVENT_SCHEMA_VERSION: u16 = TRACE_EVENT_VERSION;
+/// Compatibility alias for capture consumers that name the schema version directly.
+pub const TRACE_SCHEMA_VERSION: u16 = TRACE_EVENT_VERSION;
 
 /// The versioned identifier types used by [`TraceEvent`].
 pub type TraceFrameId = u64;
@@ -26,6 +28,7 @@ pub struct TraceSpan {
     pub name: &'static str,
     pub frame_id: TraceFrameId,
     pub thread_id: TraceThreadId,
+    pub parent_span_id: Option<TraceSpanId>,
     pub queue_id: Option<TraceQueueId>,
     pub element_address: Option<TraceElementAddress>,
     pub boundary_id: Option<TraceBoundaryId>,
@@ -39,6 +42,7 @@ impl TraceSpan {
             name,
             frame_id: 0,
             thread_id: 0,
+            parent_span_id: None,
             queue_id: None,
             element_address: None,
             boundary_id: None,
@@ -57,6 +61,14 @@ pub struct TraceTileCoord {
 
 /// Alias emphasizing that this coordinate is part of the serialized contract.
 pub type TraceTileCoordinate = TraceTileCoord;
+
+/// The execution queue associated with a captured operation.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum TraceQueue {
+    #[default]
+    Cpu,
+    Gpu,
+}
 
 impl TraceTileCoord {
     /// Creates a tile coordinate.
@@ -274,6 +286,20 @@ impl TraceEvent {
             return Err(TraceEventError::ZeroDroppedCount);
         }
         Ok(())
+    }
+
+    /// Returns a conservative bounded-storage estimate for this event.
+    pub fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match &self.kind {
+                TraceEventKind::SpanBegin { name } | TraceEventKind::Counter { name, .. } => {
+                    name.len()
+                }
+                TraceEventKind::SpanEnd
+                | TraceEventKind::FramePresented
+                | TraceEventKind::GpuTimestamp
+                | TraceEventKind::Dropped { .. } => 0,
+            }
     }
 }
 

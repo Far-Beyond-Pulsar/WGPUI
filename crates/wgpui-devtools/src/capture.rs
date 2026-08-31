@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use wgpui_core::hooks::{
-    InstrumentationHooks, TRACE_SCHEMA_VERSION, TraceEvent, TraceEventKind, TraceQueue, TraceSpan,
+    InstrumentationHooks, TRACE_SCHEMA_VERSION, TraceEvent, TraceSpan,
 };
 
 const DISABLED: u8 = 0;
@@ -49,8 +49,14 @@ struct ActiveSpan {
 
 #[derive(Debug, Default)]
 struct ThreadBuffer {
-    events: Mutex<Vec<TraceEvent>>,
+    events: Mutex<Vec<RecordedEvent>>,
     spans: Mutex<Vec<ActiveSpan>>,
+}
+
+#[derive(Clone, Debug)]
+struct RecordedEvent {
+    sequence: u64,
+    event: TraceEvent,
 }
 
 #[derive(Debug)]
@@ -198,7 +204,7 @@ impl CaptureRecorder {
         CaptureSnapshot {
             schema_version: TRACE_SCHEMA_VERSION,
             config: self.inner.config,
-            events,
+            events: events.into_iter().map(|record| record.event).collect(),
             dropped_events: self.inner.dropped_events.load(Ordering::Acquire),
             dropped_bytes: self.inner.dropped_bytes.load(Ordering::Acquire),
         }
@@ -242,7 +248,7 @@ impl CaptureRecorder {
         if self.inner.state.load(Ordering::Acquire) != COLLECTING {
             return false;
         }
-        if event.schema_version != TRACE_SCHEMA_VERSION {
+        if event.version != TRACE_SCHEMA_VERSION {
             self.inner.dropped_events.fetch_add(1, Ordering::Relaxed);
             self.inner
                 .dropped_bytes
@@ -255,13 +261,13 @@ impl CaptureRecorder {
             return false;
         }
 
-        if event.frame_id == 0 {
-            event.frame_id = self.inner.frame_id.load(Ordering::Acquire);
+        if event.frame_id.is_none() {
+            event.frame_id = Some(self.inner.frame_id.load(Ordering::Acquire));
         }
-        if event.thread_id == 0 {
-            event.thread_id = current_thread_id();
+        if event.thread_id.is_none() {
+            event.thread_id = Some(current_thread_id());
         }
-        event.sequence = self.inner.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.inner.next_sequence.fetch_add(1, Ordering::Relaxed);
         let bytes = event.estimated_bytes();
         if !self.reserve(bytes) {
             self.inner.dropped_events.fetch_add(1, Ordering::Relaxed);
@@ -273,7 +279,7 @@ impl CaptureRecorder {
         }
 
         let buffer = self.buffer();
-        recover_lock(&buffer.events).push(event);
+        recover_lock(&buffer.events).push(RecordedEvent { sequence, event });
         self.inner.active_writers.fetch_sub(1, Ordering::AcqRel);
         true
     }
@@ -343,7 +349,16 @@ impl CaptureRecorder {
             }
         }
         let token = self.inner.next_span_id.fetch_add(1, Ordering::Relaxed);
-        let event = TraceEvent::span_begin(now_ns(self.inner.started_at), token, &span);
+        let event = TraceEvent::span_begin(span.name, now_ns(self.inner.started_at))
+            .with_frame_id(span.frame_id)
+            .with_span_ids(token, span.parent_span_id)
+            .with_execution(Some(span.thread_id), span.queue_id)
+            .with_ownership(
+                span.element_address,
+                span.boundary_id,
+                span.root_id,
+                span.tile,
+            );
         if !self.record_event(event) {
             return None;
         }
@@ -361,27 +376,26 @@ impl CaptureRecorder {
                 .map(|index| spans.remove(index))
         };
         if let Some(active_span) = active_span {
-            let event =
-                TraceEvent::span_end(now_ns(self.inner.started_at), token, &active_span.span);
+            let event = TraceEvent::span_end(token, now_ns(self.inner.started_at))
+                .with_frame_id(active_span.span.frame_id)
+                .with_span_ids(token, active_span.span.parent_span_id)
+                .with_execution(
+                    Some(active_span.span.thread_id),
+                    active_span.span.queue_id,
+                )
+                .with_ownership(
+                    active_span.span.element_address,
+                    active_span.span.boundary_id,
+                    active_span.span.root_id,
+                    active_span.span.tile,
+                );
             self.record_event(event);
         }
     }
 
     fn record_frame_presented(&self, frame_id: u64) {
-        let event = TraceEvent {
-            schema_version: TRACE_SCHEMA_VERSION,
-            sequence: 0,
-            frame_id,
-            thread_id: current_thread_id(),
-            queue: TraceQueue::Cpu,
-            timestamp_ns: now_ns(self.inner.started_at),
-            span_id: None,
-            parent_span_id: None,
-            element: None,
-            boundary_id: None,
-            tile: None,
-            kind: TraceEventKind::FramePresented,
-        };
+        let event = TraceEvent::frame_presented(frame_id, now_ns(self.inner.started_at))
+            .with_execution(Some(current_thread_id()), None);
         self.record_event(event);
     }
 }
@@ -405,7 +419,7 @@ impl CaptureSnapshot {
         let events = self
             .events
             .iter()
-            .filter(|event| event.frame_id == frame_id)
+            .filter(|event| event.frame_id == Some(frame_id))
             .cloned()
             .collect();
         FrameSnapshot {
@@ -420,7 +434,7 @@ impl CaptureSnapshot {
         let mut frame_ids = self
             .events
             .iter()
-            .map(|event| event.frame_id)
+            .filter_map(|event| event.frame_id)
             .collect::<Vec<_>>();
         frame_ids.sort_unstable();
         frame_ids.dedup();
@@ -463,23 +477,13 @@ impl InstrumentationHooks for CaptureRecorder {
     }
 
     fn counter(&self, name: &'static str, amount: u64) {
-        let event = TraceEvent {
-            schema_version: TRACE_SCHEMA_VERSION,
-            sequence: 0,
-            frame_id: self.inner.frame_id.load(Ordering::Acquire),
-            thread_id: current_thread_id(),
-            queue: TraceQueue::Cpu,
-            timestamp_ns: now_ns(self.inner.started_at),
-            span_id: None,
-            parent_span_id: None,
-            element: None,
-            boundary_id: None,
-            tile: None,
-            kind: TraceEventKind::Counter {
-                name: name.to_owned(),
-                amount,
-            },
-        };
+        let event = TraceEvent::counter(
+            name,
+            amount,
+            now_ns(self.inner.started_at),
+        )
+        .with_frame_id(self.inner.frame_id.load(Ordering::Acquire))
+        .with_execution(Some(current_thread_id()), None);
         self.record_event(event);
     }
 
@@ -489,37 +493,27 @@ impl InstrumentationHooks for CaptureRecorder {
     }
 
     fn gpu_timestamp(&self, name: &'static str, start: u64, end: u64) {
-        let event = TraceEvent {
-            schema_version: TRACE_SCHEMA_VERSION,
-            sequence: 0,
-            frame_id: self.inner.frame_id.load(Ordering::Acquire),
-            thread_id: current_thread_id(),
-            queue: TraceQueue::Gpu,
-            timestamp_ns: now_ns(self.inner.started_at),
-            span_id: None,
-            parent_span_id: None,
-            element: None,
-            boundary_id: None,
-            tile: None,
-            kind: TraceEventKind::GpuTimestamp {
-                name: name.to_owned(),
-                start,
-                end,
-            },
-        };
+        let _ = name;
+        let event = TraceEvent::gpu_timestamp(start, end)
+            .with_frame_id(self.inner.frame_id.load(Ordering::Acquire))
+            .with_execution(Some(current_thread_id()), Some(1));
         self.record_event(event);
     }
 
     fn begin_trace_span(&self, span: TraceSpan) -> Option<u64> {
-        self.begin_trace_span(span)
+        CaptureRecorder::begin_trace_span(self, span)
     }
 
     fn end_trace_span(&self, token: u64, timestamp_ns: u64) {
-        self.end_trace_span(token, timestamp_ns);
+        CaptureRecorder::end_trace_span(self, token, timestamp_ns);
     }
 
-    fn trace_event(&self, event: TraceEvent) {
-        self.record_event(event);
+    fn trace_event(&self, event: &TraceEvent) -> wgpui_core::hooks::TraceEventResult {
+        if self.record_event(event.clone()) {
+            wgpui_core::hooks::TraceEventResult::Recorded
+        } else {
+            wgpui_core::hooks::TraceEventResult::Dropped { count: 1 }
+        }
     }
 
     fn frame_started(&self, frame_id: u64) {
@@ -528,6 +522,10 @@ impl InstrumentationHooks for CaptureRecorder {
 
     fn frame_presented_with(&self, frame_id: u64) {
         self.present_frame(frame_id);
+    }
+
+    fn dropped_event_count(&self) -> u64 {
+        self.dropped_events()
     }
 }
 
@@ -541,7 +539,7 @@ impl Default for CaptureRecorder {
 mod tests {
     use super::*;
     use std::sync::Barrier;
-    use wgpui_core::hooks::{TraceElementAddress, TraceTileCoordinate};
+    use wgpui_core::hooks::TraceTileCoordinate;
 
     fn recorder() -> CaptureRecorder {
         CaptureRecorder::enabled(CaptureConfig::new(100, 100_000))
@@ -581,11 +579,8 @@ mod tests {
         let recorder = recorder();
         recorder.begin_frame(42);
         let mut trace_span = TraceSpan::new("paint");
-        trace_span.queue = TraceQueue::Gpu;
-        trace_span.element = Some(TraceElementAddress {
-            id: 8,
-            generation: 3,
-        });
+        trace_span.queue_id = Some(1);
+        trace_span.element_address = Some(8);
         trace_span.boundary_id = Some(13);
         trace_span.tile = Some(TraceTileCoordinate { x: -2, y: 4 });
         let _span = wgpui_core::hooks::Span::with_trace(&recorder, trace_span);
@@ -594,19 +589,16 @@ mod tests {
             snapshot.events.first().map(|event| {
                 (
                     event.frame_id,
-                    event.queue,
-                    event.element,
+                    event.queue_id,
+                    event.element_address,
                     event.boundary_id,
                     event.tile,
                 )
             }),
             Some((
                 42,
-                TraceQueue::Gpu,
-                Some(TraceElementAddress {
-                    id: 8,
-                    generation: 3,
-                }),
+                Some(1),
+                Some(8),
                 Some(13),
                 Some(TraceTileCoordinate { x: -2, y: 4 }),
             ))
@@ -616,18 +608,19 @@ mod tests {
     #[test]
     fn event_and_byte_budgets_report_drops() {
         let sample = TraceEvent {
-            schema_version: TRACE_SCHEMA_VERSION,
-            sequence: 0,
-            frame_id: 1,
-            thread_id: 1,
-            queue: TraceQueue::Cpu,
-            timestamp_ns: 0,
+            version: TRACE_SCHEMA_VERSION,
+            frame_id: Some(1),
+            thread_id: Some(1),
+            queue_id: Some(0),
+            start_timestamp: 0,
             span_id: None,
             parent_span_id: None,
-            element: None,
+            element_address: None,
             boundary_id: None,
+            root_id: None,
             tile: Some(TraceTileCoordinate { x: 1, y: 2 }),
             kind: TraceEventKind::FramePresented,
+            end_timestamp: None,
         };
         let bytes = sample.estimated_bytes();
         let recorder = CaptureRecorder::enabled(CaptureConfig::new(1, bytes));
@@ -674,7 +667,7 @@ mod tests {
         assert!(producer.join().is_ok());
         let after = recorder.snapshot();
         assert_eq!(snapshot, after);
-        assert!(after.events.iter().all(|event| event.frame_id == 9));
+        assert!(after.events.iter().all(|event| event.frame_id == Some(9)));
     }
 
     #[test]
