@@ -34,6 +34,7 @@ pub mod primitive;
 use crate::patch::primitive::{EncodeError, PrimitiveKind};
 use crate::reconcile::instance::InstanceKey;
 use crate::scene::layer::LayerId;
+use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 
 /// The stable, cross-frame address of one patchable record within its layer.
@@ -44,7 +45,7 @@ use std::hash::{Hash, Hasher};
 /// itself derived from the element's path — positionally, with no `.id()`
 /// required (§4.0) — a record keeps its address across frames without any
 /// element in the tree opting into anything.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RecordKey(u64);
 
 impl RecordKey {

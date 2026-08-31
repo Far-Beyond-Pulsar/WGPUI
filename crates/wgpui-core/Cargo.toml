@@ -13,6 +13,7 @@ doctest = false
 lyon = "1.0"
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # The retained instance records this crate keeps (§4.0) hold the layout node
 # each element reuses, so `wgpui-core` names `wgpui-layout`'s node identity
 # directly. The edge runs one way only: `wgpui-layout` knows nothing of
@@ -21,6 +22,3 @@ wgpui-layout = { path = "../wgpui-layout" }
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
-
-[dev-dependencies]
-serde_json = "1.0"

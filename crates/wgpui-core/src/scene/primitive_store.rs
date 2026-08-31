@@ -31,7 +31,7 @@ use crate::patch::primitive::Primitive;
 use crate::patch::{Patch, PatchError, PatchList, PatchOp, RecordKey};
 use crate::scene::layer::LayerId;
 use crate::scene::slab::SlabAllocator;
-use crate::scene::slab_range::{SlabRange, UploadRange};
+use crate::scene::slab_range::{PrimitiveSlotDiff, SlabRange, SlotChange, SlotSpan, UploadRange};
 use std::collections::{HashMap, HashSet};
 
 /// One record's value and its placement inside its layer's slab.
@@ -113,18 +113,53 @@ impl<P: Primitive> PrimitiveStore<P> {
         allocator: &mut SlabAllocator,
         uploads: &mut Vec<UploadRange>,
     ) -> Result<(), PatchError> {
+        let mut no_slot_diffs = None;
+        self.apply_internal(list, allocator, uploads, &mut no_slot_diffs)
+    }
+
+    /// Apply patches and report the exact retained primitive-slot transitions.
+    /// The existing [`Self::apply`] remains the small compatibility API for
+    /// callers interested only in uploads.
+    pub fn apply_with_diffs(
+        &mut self,
+        list: &PatchList<P>,
+        allocator: &mut SlabAllocator,
+        uploads: &mut Vec<UploadRange>,
+        slot_diffs: &mut Vec<PrimitiveSlotDiff>,
+    ) -> Result<(), PatchError> {
+        let mut slot_diffs = Some(slot_diffs);
+        self.apply_internal(list, allocator, uploads, &mut slot_diffs)
+    }
+
+    fn apply_internal(
+        &mut self,
+        list: &PatchList<P>,
+        allocator: &mut SlabAllocator,
+        uploads: &mut Vec<UploadRange>,
+        slot_diffs: &mut Option<&mut Vec<PrimitiveSlotDiff>>,
+    ) -> Result<(), PatchError> {
         if self.can_bulk_append(list) {
-            return self.bulk_append(list, allocator, uploads);
+            return self.bulk_append(list, allocator, uploads, slot_diffs);
         }
         for Patch { layer, op } in list.patches() {
             match op {
                 PatchOp::Insert { key, index, value } => {
-                    self.insert(*layer, *key, *index, value.clone(), allocator, uploads)?;
+                    self.insert(
+                        *layer,
+                        *key,
+                        *index,
+                        value.clone(),
+                        allocator,
+                        uploads,
+                        slot_diffs,
+                    )?;
                 }
                 PatchOp::Update { key, value } => {
-                    self.update(*layer, *key, value.clone(), allocator, uploads)?;
+                    self.update(*layer, *key, value.clone(), allocator, uploads, slot_diffs)?;
                 }
-                PatchOp::Remove { key } => self.remove(*layer, *key, allocator, uploads)?,
+                PatchOp::Remove { key } => {
+                    self.remove(*layer, *key, allocator, uploads, slot_diffs)?
+                }
             }
         }
         Ok(())
@@ -171,6 +206,7 @@ impl<P: Primitive> PrimitiveStore<P> {
         list: &PatchList<P>,
         allocator: &mut SlabAllocator,
         uploads: &mut Vec<UploadRange>,
+        slot_diffs: &mut Option<&mut Vec<PrimitiveSlotDiff>>,
     ) -> Result<(), PatchError> {
         let mut batches: HashMap<LayerId, Vec<(RecordKey, P)>> = HashMap::new();
         for patch in list.patches() {
@@ -183,9 +219,26 @@ impl<P: Primitive> PrimitiveStore<P> {
                 .push((*key, value.clone()));
         }
 
+        let mut batches: Vec<_> = batches.into_iter().collect();
+        batches.sort_by_key(|(layer, _)| *layer);
         for (layer, batch) in batches {
             let primitives = self.layers.entry(layer).or_default();
             let previous_count = primitives.order.len();
+            let previous_spans: HashMap<RecordKey, SlotSpan> = primitives
+                .order
+                .iter()
+                .filter_map(|key| {
+                    primitives.records.get(key).map(|stored| {
+                        (
+                            *key,
+                            SlotSpan {
+                                start: stored.slot_offset,
+                                count: stored.slot_count,
+                            },
+                        )
+                    })
+                })
+                .collect();
             let previous_slots = primitives
                 .records
                 .values()
@@ -274,10 +327,36 @@ impl<P: Primitive> PrimitiveStore<P> {
                     byte_length: span.end - span.start,
                 });
             }
+            for key in primitives.order.iter() {
+                let stored = primitives
+                    .records
+                    .get(key)
+                    .ok_or(PatchError::UnknownKey { layer, key: *key })?;
+                let new = SlotSpan {
+                    start: stored.slot_offset,
+                    count: stored.slot_count,
+                };
+                let old = previous_spans.get(key).copied();
+                if old == Some(new) {
+                    continue;
+                }
+                Self::push_slot_diff(
+                    slot_diffs,
+                    PrimitiveSlotDiff {
+                        kind: P::KIND,
+                        layer,
+                        key: *key,
+                        change: old.map_or(SlotChange::Inserted, |_| SlotChange::Reflowed),
+                        old,
+                        new: Some(new),
+                    },
+                );
+            }
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
         layer: LayerId,
@@ -286,6 +365,7 @@ impl<P: Primitive> PrimitiveStore<P> {
         value: P,
         allocator: &mut SlabAllocator,
         uploads: &mut Vec<UploadRange>,
+        slot_diffs: &mut Option<&mut Vec<PrimitiveSlotDiff>>,
     ) -> Result<(), PatchError> {
         let primitives = self.layers.entry(layer).or_default();
         if primitives.records.contains_key(&key) {
@@ -311,7 +391,7 @@ impl<P: Primitive> PrimitiveStore<P> {
                 slot_count,
             },
         );
-        self.reflow(layer, position, allocator, uploads)
+        self.reflow(layer, position, allocator, uploads, slot_diffs, None)
     }
 
     fn update(
@@ -321,6 +401,7 @@ impl<P: Primitive> PrimitiveStore<P> {
         value: P,
         allocator: &mut SlabAllocator,
         uploads: &mut Vec<UploadRange>,
+        slot_diffs: &mut Option<&mut Vec<PrimitiveSlotDiff>>,
     ) -> Result<(), PatchError> {
         let new_slot_count = value.slot_count();
         {
@@ -333,6 +414,9 @@ impl<P: Primitive> PrimitiveStore<P> {
                 .records
                 .get_mut(&key)
                 .ok_or(PatchError::UnknownKey { layer, key })?;
+            if stored.value == value {
+                return Ok(());
+            }
             let keeps_its_slot = new_slot_count == stored.slot_count;
             stored.value = value;
             if keeps_its_slot {
@@ -347,9 +431,27 @@ impl<P: Primitive> PrimitiveStore<P> {
                         byte_length: span.end - span.start,
                     });
                 }
+                if new_slot_count > 0 {
+                    Self::push_slot_diff(
+                        slot_diffs,
+                        PrimitiveSlotDiff {
+                            kind: P::KIND,
+                            layer,
+                            key,
+                            change: SlotChange::Updated,
+                            old: Some(SlotSpan {
+                                start: stored.slot_offset,
+                                count: new_slot_count,
+                            }),
+                            new: Some(SlotSpan {
+                                start: stored.slot_offset,
+                                count: new_slot_count,
+                            }),
+                        },
+                    );
+                }
                 return Ok(());
             }
-            stored.slot_count = new_slot_count;
         }
 
         let position = self
@@ -362,7 +464,14 @@ impl<P: Primitive> PrimitiveStore<P> {
                     .position(|existing| *existing == key)
             })
             .ok_or(PatchError::UnknownKey { layer, key })?;
-        self.reflow(layer, position, allocator, uploads)
+        self.reflow(
+            layer,
+            position,
+            allocator,
+            uploads,
+            slot_diffs,
+            Some((key, new_slot_count)),
+        )
     }
 
     fn remove(
@@ -371,21 +480,40 @@ impl<P: Primitive> PrimitiveStore<P> {
         key: RecordKey,
         allocator: &mut SlabAllocator,
         uploads: &mut Vec<UploadRange>,
+        slot_diffs: &mut Option<&mut Vec<PrimitiveSlotDiff>>,
     ) -> Result<(), PatchError> {
         let primitives = self
             .layers
             .get_mut(&layer)
             .ok_or(PatchError::UnknownKey { layer, key })?;
-        if primitives.records.remove(&key).is_none() {
-            return Err(PatchError::UnknownKey { layer, key });
-        }
+        let old = primitives
+            .records
+            .get(&key)
+            .map(|stored| SlotSpan {
+                start: stored.slot_offset,
+                count: stored.slot_count,
+            })
+            .ok_or(PatchError::UnknownKey { layer, key })?;
+        primitives.records.remove(&key);
         let position = primitives
             .order
             .iter()
             .position(|existing| *existing == key)
             .ok_or(PatchError::UnknownKey { layer, key })?;
         primitives.order.remove(position);
-        self.reflow(layer, position, allocator, uploads)
+        self.reflow(layer, position, allocator, uploads, slot_diffs, None)?;
+        Self::push_slot_diff(
+            slot_diffs,
+            PrimitiveSlotDiff {
+                kind: P::KIND,
+                layer,
+                key,
+                change: SlotChange::Removed,
+                old: Some(old),
+                new: None,
+            },
+        );
+        Ok(())
     }
 
     /// Drop a layer's primitives and return its slab reservation.
@@ -408,6 +536,8 @@ impl<P: Primitive> PrimitiveStore<P> {
         first_dirty: usize,
         allocator: &mut SlabAllocator,
         uploads: &mut Vec<UploadRange>,
+        slot_diffs: &mut Option<&mut Vec<PrimitiveSlotDiff>>,
+        slot_count_override: Option<(RecordKey, u32)>,
     ) -> Result<(), PatchError> {
         let Self { layers, resident } = self;
         let primitives = layers
@@ -423,6 +553,28 @@ impl<P: Primitive> PrimitiveStore<P> {
             kind: P::KIND,
             requested_slots: slots,
         };
+
+        let previous_spans: HashMap<RecordKey, SlotSpan> = order
+            .iter()
+            .filter_map(|key| {
+                records.get(key).map(|stored| {
+                    (
+                        *key,
+                        SlotSpan {
+                            start: stored.slot_offset,
+                            count: stored.slot_count,
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        if let Some((key, slot_count)) = slot_count_override {
+            let stored = records
+                .get_mut(&key)
+                .ok_or(PatchError::UnknownKey { layer, key })?;
+            stored.slot_count = slot_count;
+        }
 
         // Records before the edit point cannot have moved, so their offsets are
         // already current and only the tail needs recomputing. Phase 1's own
@@ -504,7 +656,40 @@ impl<P: Primitive> PrimitiveStore<P> {
                 byte_length: span.end - span.start,
             });
         }
+        for key in order.iter() {
+            let new = records.get(key).map(|stored| SlotSpan {
+                start: stored.slot_offset,
+                count: stored.slot_count,
+            });
+            let old = previous_spans.get(key).copied();
+            if old != new {
+                Self::push_slot_diff(
+                    slot_diffs,
+                    PrimitiveSlotDiff {
+                        kind: P::KIND,
+                        layer,
+                        key: *key,
+                        change: if old.is_none() {
+                            SlotChange::Inserted
+                        } else {
+                            SlotChange::Reflowed
+                        },
+                        old,
+                        new,
+                    },
+                );
+            }
+        }
         Ok(())
+    }
+
+    fn push_slot_diff(
+        slot_diffs: &mut Option<&mut Vec<PrimitiveSlotDiff>>,
+        slot_diff: PrimitiveSlotDiff,
+    ) {
+        if let Some(slot_diffs) = slot_diffs.as_deref_mut() {
+            slot_diffs.push(slot_diff);
+        }
     }
 
     /// Write one record's encoded bytes into the resident buffer at its
@@ -629,7 +814,7 @@ impl<P: Primitive> PrimitiveStore<P> {
 mod tests {
     use super::*;
     use crate::patch::primitive::{Glyph, GlyphRun, Quad};
-    use crate::scene::slab_range::coalesce_uploads;
+    use crate::scene::slab_range::{SlotChange, SlotSpan, coalesce_uploads};
 
     const LAYER: LayerId = LayerId::from_raw(1);
 
@@ -962,5 +1147,105 @@ mod tests {
             })
         );
         assert_eq!(harness.store.len(LAYER), 0);
+    }
+
+    #[test]
+    fn an_equal_update_has_no_slot_diff_or_upload() {
+        let mut store = PrimitiveStore::new();
+        let mut allocator = SlabAllocator::new();
+        let mut uploads = Vec::new();
+        let mut diffs = Vec::new();
+        let mut insert = PatchList::new();
+        insert.insert(LAYER, key(1), 0, quad(1.0));
+        store
+            .apply_with_diffs(&insert, &mut allocator, &mut uploads, &mut diffs)
+            .expect("insert applies");
+        uploads.clear();
+        diffs.clear();
+
+        let mut update = PatchList::new();
+        update.update(LAYER, key(1), quad(1.0));
+        store
+            .apply_with_diffs(&update, &mut allocator, &mut uploads, &mut diffs)
+            .expect("equal update applies");
+        assert!(uploads.is_empty());
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn a_fixed_update_reports_its_exact_layer_relative_slot() {
+        let mut store = PrimitiveStore::new();
+        let mut allocator = SlabAllocator::new();
+        let mut uploads = Vec::new();
+        let mut diffs = Vec::new();
+        let mut insert = PatchList::new();
+        insert.insert(LAYER, key(1), 0, quad(1.0));
+        store
+            .apply_with_diffs(&insert, &mut allocator, &mut uploads, &mut diffs)
+            .expect("insert applies");
+        uploads.clear();
+        diffs.clear();
+
+        let mut update = PatchList::new();
+        update.update(LAYER, key(1), quad(2.0));
+        store
+            .apply_with_diffs(&update, &mut allocator, &mut uploads, &mut diffs)
+            .expect("update applies");
+        assert_eq!(
+            diffs,
+            vec![PrimitiveSlotDiff {
+                kind: Quad::KIND,
+                layer: LAYER,
+                key: key(1),
+                change: SlotChange::Updated,
+                old: Some(SlotSpan { start: 0, count: 1 }),
+                new: Some(SlotSpan { start: 0, count: 1 }),
+            }]
+        );
+        assert_eq!(uploads.len(), 1);
+    }
+
+    #[test]
+    fn a_text_size_change_reports_the_changed_run_and_shifted_successor() {
+        let mut store = PrimitiveStore::new();
+        let mut allocator = SlabAllocator::new();
+        let mut uploads = Vec::new();
+        let mut diffs = Vec::new();
+        let mut insert = PatchList::new();
+        insert
+            .insert(LAYER, key(1), 0, run(4))
+            .insert(LAYER, key(2), 1, run(6));
+        store
+            .apply_with_diffs(&insert, &mut allocator, &mut uploads, &mut diffs)
+            .expect("text inserts apply");
+        uploads.clear();
+        diffs.clear();
+
+        let mut update = PatchList::new();
+        update.update(LAYER, key(1), run(7));
+        store
+            .apply_with_diffs(&update, &mut allocator, &mut uploads, &mut diffs)
+            .expect("text update applies");
+        assert_eq!(
+            diffs,
+            vec![
+                PrimitiveSlotDiff {
+                    kind: GlyphRun::KIND,
+                    layer: LAYER,
+                    key: key(1),
+                    change: SlotChange::Reflowed,
+                    old: Some(SlotSpan { start: 0, count: 4 }),
+                    new: Some(SlotSpan { start: 0, count: 7 }),
+                },
+                PrimitiveSlotDiff {
+                    kind: GlyphRun::KIND,
+                    layer: LAYER,
+                    key: key(2),
+                    change: SlotChange::Reflowed,
+                    old: Some(SlotSpan { start: 4, count: 6 }),
+                    new: Some(SlotSpan { start: 7, count: 6 }),
+                },
+            ]
+        );
     }
 }
