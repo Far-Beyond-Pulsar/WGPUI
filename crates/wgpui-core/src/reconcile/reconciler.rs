@@ -246,6 +246,7 @@ impl Reconciler {
         let clip_children = description.clips_children();
         let Description {
             type_id,
+            type_name,
             diff_key,
             boundary,
             scroll_offset,
@@ -372,7 +373,7 @@ impl Reconciler {
         if outcome == NodeOutcome::Reused {
             self.instances.touch(instance_key, self.frame);
         } else {
-            self.instances.store(
+            self.instances.store_with_type_name(
                 instance_key,
                 RetainedElement {
                     type_id,
@@ -382,6 +383,7 @@ impl Reconciler {
                     children: child_instances,
                 },
                 self.frame,
+                Some(type_name),
             );
         }
         context.plan.set_layout_node(plan_index, layout_node);

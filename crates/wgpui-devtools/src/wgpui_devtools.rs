@@ -17,7 +17,14 @@ pub mod render_stats;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use hooks::DevtoolsHooks;
 #[cfg(feature = "inspector")]
-pub use inspector::{ElementInfo, Inspector};
+pub use inspector::{
+    BOXED_SNAPSHOT_VERSION, BoundaryPolicySnapshot, BoundarySnapshot, BoxModelSnapshot,
+    BufferingSnapshot, ClipSnapshot, ComputedStyle, ElementInfo, ElementMetadata, ElementSnapshot,
+    FrozenCapture, FrozenInspectorSnapshot, INSPECTOR_SNAPSHOT_SCHEMA_VERSION, Inspector,
+    InspectorSnapshot, InvalidationSnapshot, LastPresentedState, LayoutSnapshot, PaintRecord,
+    RectSnapshot, ScrollRootSnapshot, SnapshotError, SourceLocation, StableAddress,
+    TileOwnershipSnapshot, TileSnapshot, TransformSnapshot,
+};
 #[cfg(feature = "perf-ab")]
 pub use perf_ab_tests::Sample;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]

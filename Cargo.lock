@@ -6798,7 +6798,10 @@ dependencies = [
 name = "wgpui-devtools"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "wgpui-core",
+ "wgpui-layout",
 ]
 
 [[package]]
