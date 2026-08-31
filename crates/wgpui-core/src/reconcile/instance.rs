@@ -80,6 +80,14 @@ pub struct ElementInstance {
     children: Vec<InstanceKey>,
     /// The last frame this record was visited, for the sweep.
     last_visited_frame: u64,
+    /// Bumped whenever this address receives a new retained record. A
+    /// snapshot can therefore distinguish a released record from a later
+    /// record that happens to reuse the same address.
+    generation: u64,
+    /// The type name supplied by the frontend, when the record came through
+    /// the native reconciler. Direct users of `InstanceTable::store` may not
+    /// have one.
+    type_name: Option<&'static str>,
 }
 
 impl std::fmt::Debug for ElementInstance {
@@ -119,6 +127,16 @@ impl ElementInstance {
     pub fn last_visited_frame(&self) -> u64 {
         self.last_visited_frame
     }
+
+    /// The retained generation for this address.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The frontend's type name, when it was available at retention time.
+    pub fn type_name(&self) -> Option<&'static str> {
+        self.type_name
+    }
 }
 
 /// What one frame retains about an element, handed to [`InstanceTable::store`]
@@ -145,6 +163,7 @@ pub struct RetainedElement {
 #[derive(Debug, Default)]
 pub struct InstanceTable {
     instances: HashMap<InstanceKey, ElementInstance>,
+    next_generation: u64,
 }
 
 impl InstanceTable {
@@ -176,6 +195,18 @@ impl InstanceTable {
 
     /// Insert or replace the record for `key`.
     pub fn store(&mut self, key: InstanceKey, element: RetainedElement, frame: u64) {
+        self.store_with_type_name(key, element, frame, None);
+    }
+
+    /// Insert or replace a retained record while preserving the frontend type
+    /// name for diagnostics.
+    pub fn store_with_type_name(
+        &mut self,
+        key: InstanceKey,
+        element: RetainedElement,
+        frame: u64,
+        type_name: Option<&'static str>,
+    ) {
         let RetainedElement {
             type_id,
             diff_key,
@@ -183,6 +214,7 @@ impl InstanceTable {
             child_nodes,
             children,
         } = element;
+        self.next_generation = self.next_generation.wrapping_add(1);
         self.instances.insert(
             key,
             ElementInstance {
@@ -192,6 +224,8 @@ impl InstanceTable {
                 child_nodes,
                 children,
                 last_visited_frame: frame,
+                generation: self.next_generation,
+                type_name,
             },
         );
     }
@@ -357,5 +391,20 @@ mod tests {
         assert_eq!(table.sweep(1), 0);
         assert!(table.contains(key));
         assert!(!table.touch(InstanceKey::from_raw(99), 1));
+    }
+
+    #[test]
+    fn replacing_a_record_bumps_its_generation_without_changing_its_address() {
+        let mut table = InstanceTable::new();
+        let key = InstanceKey::from_raw(1);
+        table.store(key, record(Vec::new()), 0);
+        let first = table.get(key).map(ElementInstance::generation);
+        table.store(key, record(Vec::new()), 1);
+        let second = table.get(key).map(ElementInstance::generation);
+        assert!(second > first);
+        assert_eq!(
+            table.get(key).map(ElementInstance::last_visited_frame),
+            Some(1)
+        );
     }
 }

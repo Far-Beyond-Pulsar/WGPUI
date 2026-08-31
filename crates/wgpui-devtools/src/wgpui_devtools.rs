@@ -24,7 +24,14 @@ pub mod transport;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use hooks::DevtoolsHooks;
 #[cfg(feature = "inspector")]
-pub use inspector::{ElementInfo, Inspector};
+pub use inspector::{
+    BOXED_SNAPSHOT_VERSION, BoundaryPolicySnapshot, BoundarySnapshot, BoxModelSnapshot,
+    BufferingSnapshot, ClipSnapshot, ComputedStyle, ElementInfo, ElementMetadata, ElementSnapshot,
+    FrozenCapture, FrozenInspectorSnapshot, INSPECTOR_SNAPSHOT_SCHEMA_VERSION, Inspector,
+    InspectorSnapshot, InvalidationSnapshot, LastPresentedState, LayoutSnapshot, PaintRecord,
+    RectSnapshot, ScrollRootSnapshot, SnapshotError, SourceLocation, StableAddress,
+    TileOwnershipSnapshot, TileSnapshot, TransformSnapshot,
+};
 pub use memory::{
     AllocationCategory, AllocationCategorySnapshot, AllocationEntry, AllocationId,
     AllocationRegistry, AllocationSnapshot,

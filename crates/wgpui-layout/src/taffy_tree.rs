@@ -290,6 +290,12 @@ impl LayoutTree {
         })
     }
 
+    /// A live node's retained style, for diagnostics and backend adapters.
+    pub fn style_of(&self, node: LayoutNodeId) -> Result<LayoutStyle, LayoutError> {
+        self.require_live(node)?;
+        Ok(self.tree.style(node.to_taffy())?.clone())
+    }
+
     /// Remove every node not touched this frame.
     ///
     /// Safe regardless of removal order among the swept set: `TaffyTree`
