@@ -1623,6 +1623,11 @@ mod tests {
             ROW_COUNT as u64 * Quad::SLOT_STRIDE as u64,
             "exactly the moved rows' bytes, and nothing wider"
         );
+        assert_eq!(
+            without.upload_calls,
+            1,
+            "the moved primitive slots coalesce to one upload"
+        );
 
         // 4. The container's own background did not move in either case: a
         //    scroll container's own paint does not scroll with its contents.

@@ -637,7 +637,12 @@ impl FrameLoop {
             self.record_damage_refresh(viewport, flash.duration_frames.max(1), now);
         }
         if emission.tiled_visits.is_empty() {
-            for region in emission.damage.iter().copied() {
+            for region in emission
+                .damage
+                .iter()
+                .copied()
+                .chain(interaction_dirty_regions.iter().copied())
+            {
                 self.record_damage_refresh(region, flash.duration_frames.max(1), now);
             }
         }
@@ -1003,6 +1008,13 @@ mod debug_refresh_region_tests {
         ]);
 
         assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected.iter().map(|region| region.rect).collect::<Vec<_>>(),
+            vec![
+                Rect::from_origin_size([0.0, 0.0], [200.0, 200.0]),
+                Rect::from_origin_size([20.0, 20.0], [80.0, 80.0]),
+            ]
+        );
     }
 
     #[test]
@@ -1041,6 +1053,31 @@ mod debug_refresh_region_tests {
         ]);
 
         assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn identical_regions_keep_the_strongest_live_metrics() {
+        let mut first = region([0.0, 0.0], [80.0, 80.0], 30.0);
+        first.frames_remaining = 1;
+        first.updates = 2;
+        let mut second = region([0.0, 0.0], [80.0, 80.0], 60.0);
+        second.frames_remaining = 3;
+        second.updates = 9;
+
+        let selected = select_debug_refresh_regions(vec![first, second]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].frames_remaining, 3);
+        assert_eq!(selected[0].updates, 9);
+        assert_eq!(selected[0].frames_per_second, 60.0);
+    }
+
+    #[test]
+    fn diagnostic_fade_reaches_zero_after_the_last_displayed_frame() {
+        assert_eq!(tile_flash_fade(4, 4), 1.0);
+        assert_eq!(tile_flash_fade(2, 4), 0.5);
+        assert_eq!(tile_flash_fade(0, 4), 0.0);
+        assert_eq!(tile_flash_fade(4, 0), 0.0);
     }
 }
 
