@@ -319,6 +319,87 @@ fn a_layer_clip_is_enforced_after_the_layer_transform() {
 }
 
 #[test]
+fn a_clipped_layer_does_not_hide_other_layers_on_the_indirect_fallback() {
+    let Some(context) = context_or_report("multi_layer_clip") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 128.0,
+        height: 128.0,
+        ..UiSceneSpec::small()
+    };
+    let root = Quad {
+        origin: [0.0, 0.0],
+        size: [128.0, 128.0],
+        background: [0.1, 0.2, 0.8, 1.0],
+        ..Quad::ZERO
+    };
+    let clipped = Quad {
+        origin: [0.0, 0.0],
+        size: [128.0, 128.0],
+        background: [0.8, 0.2, 0.1, 1.0],
+        ..Quad::ZERO
+    };
+    let mut scene = MultiLayerSceneDriver::new(2);
+    scene.set_layer(0, &[root]).expect("the root layer applies");
+    scene
+        .set_layer(1, &[clipped])
+        .expect("the clipped layer applies");
+    let clip = Rect::from_origin_size([16.0, 20.0], [48.0, 40.0]);
+    let clipped_layer = scene.layers()[1];
+    assert!(scene.scene.layers.set_clip(clipped_layer, Some(clip)));
+    assert!(scene
+        .scene
+        .layers
+        .set_transform(clipped_layer, LayerTransform::translated(8.0, 10.0)));
+
+    let mut renderer = FrameRenderer::new(&context.device);
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, pixels) = render(&context, &mut renderer, &target, &input);
+
+    let pixel_at = |x: usize, y: usize| -> &[u8] {
+        let index = (y * spec.width as usize + x) * 4;
+        pixels.get(index..index + 4).unwrap_or(&[])
+    };
+    let root_pixel = pixel_at(4, 4);
+    assert!(
+        root_pixel.get(2).copied().unwrap_or(0) > root_pixel.first().copied().unwrap_or(0),
+        "the unclipped root layer disappeared: {root_pixel:?}"
+    );
+    let clipped_pixel = pixel_at(32, 40);
+    assert!(
+        clipped_pixel.first().copied().unwrap_or(0) > clipped_pixel.get(2).copied().unwrap_or(0),
+        "the clipped layer did not paint inside its clip: {clipped_pixel:?}"
+    );
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        let x = index % spec.width as usize;
+        let y = index / spec.width as usize;
+        let inside = x as f32 + 0.5 >= clip.min_x
+            && x as f32 + 0.5 < clip.max_x
+            && y as f32 + 0.5 >= clip.min_y
+            && y as f32 + 0.5 < clip.max_y;
+        if !inside {
+            assert!(
+                pixel[2] >= pixel[0],
+                "the clipped layer leaked outside its clip at ({x}, {y}): {pixel:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_layer_transform_keeps_rounded_quad_edges_attached_to_the_quad() {
     let Some(context) = context_or_report("rounded_layer_transform") else {
         return;
@@ -592,14 +673,48 @@ fn tile_refresh_diagnostics_draw_the_measured_rate_label() {
         height: 64.0,
         ..UiSceneSpec::small()
     };
-    let scene = MultiLayerSceneDriver::new(1);
+    let mut scene = MultiLayerSceneDriver::new(1);
+    let content = Quad {
+        origin: [0.0, 0.0],
+        size: [64.0, 64.0],
+        background: [0.15, 0.35, 0.75, 1.0],
+        ..Quad::ZERO
+    };
+    scene
+        .set_layer(0, &[content])
+        .expect("the diagnostic content applies");
+    let baseline_target = OffscreenTarget::new(
+        &context.device,
+        spec.width as u32,
+        spec.height as u32,
+    );
+    let baseline_input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let mut baseline_renderer = FrameRenderer::new(&context.device);
+    let (_, baseline) = render(
+        &context,
+        &mut baseline_renderer,
+        &baseline_target,
+        &baseline_input,
+    );
+
     let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
     let mut renderer = FrameRenderer::new(&context.device);
     renderer.set_debug_tiles(vec![
         DebugTile {
             origin_size: [0.0, 0.0, 64.0, 64.0],
-            color: [1.0, 0.0, 1.0, 0.25],
-            border_width: 3.0,
+            color: [1.0, 1.0, 0.0, 1.0],
+            border_width: 2.0,
             _padding: [0.0; 7],
         }
         .with_refresh_rate(60.0),
@@ -620,8 +735,14 @@ fn tile_refresh_diagnostics_draw_the_measured_rate_label() {
     assert!(
         pixels
             .chunks_exact(4)
-            .any(|pixel| pixel == [255, 255, 255, 255]),
+            .any(|pixel| pixel == [255, 255, 0, 255]),
         "the active tile must contain visible rate glyphs"
+    );
+    let interior_index = (40 * spec.width as usize + 40) * 4;
+    assert_eq!(
+        pixels.get(interior_index..interior_index + 4),
+        baseline.get(interior_index..interior_index + 4),
+        "the refresh diagnostic must not shade the content interior"
     );
 }
 

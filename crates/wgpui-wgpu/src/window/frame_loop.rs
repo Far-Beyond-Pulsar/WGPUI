@@ -711,7 +711,7 @@ impl FrameLoop {
                         refresh_region.rect.height(),
                     ],
                     color: faded_color(flash.color, fade),
-                    border_width: 3.0,
+                    border_width: 2.0,
                     _padding: [0.0; 7],
                 };
                 if refresh_region.regular {
