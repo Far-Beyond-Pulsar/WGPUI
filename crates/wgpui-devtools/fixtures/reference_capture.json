@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "producer": {
+    "framework": "WGPUI",
+    "framework_version": "2.0-fixture",
+    "backend": "reference"
+  },
+  "capture": {
+    "capture_id": "reference-capture",
+    "frame_id": 42,
+    "monotonic_start_ns": 1000000,
+    "monotonic_end_ns": 4000000,
+    "frozen_after_present": true,
+    "dropped_events": 0
+  },
+  "capabilities": {
+    "gpu_timestamps": true,
+    "gpu_readback": false,
+    "render_pass_records": true,
+    "network_phase_hooks": false,
+    "network_body_previews": false
+  },
+  "element_tree": {
+    "status": "available",
+    "data": {
+      "roots": [
+        {
+          "address": "element:root#1",
+          "generation": 1,
+          "type_name": "Div",
+          "source": { "file": "fixture.rs", "line": 10, "column": 5 },
+          "parent": null,
+          "children": ["element:button#1"],
+          "bounds": { "x": 0.0, "y": 0.0, "width": 320.0, "height": 200.0 },
+          "transform": [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+          "clip": { "x": 0.0, "y": 0.0, "width": 320.0, "height": 200.0 },
+          "scroll_root": "scroll:root#1",
+          "boundary": "boundary:main#1",
+          "tile": { "x": 0, "y": 0 },
+          "invalidation": ["layout"],
+          "last_presented": true,
+          "paint_records": ["quad:0"]
+        },
+        {
+          "address": "element:button#1",
+          "generation": 1,
+          "type_name": "Button",
+          "source": null,
+          "parent": "element:root#1",
+          "children": [],
+          "bounds": { "x": 20.0, "y": 24.0, "width": 100.0, "height": 32.0 },
+          "transform": [1.0, 0.0, 0.0, 1.0, 20.0, 24.0],
+          "clip": null,
+          "scroll_root": "scroll:root#1",
+          "boundary": "boundary:main#1",
+          "tile": { "x": 0, "y": 0 },
+          "invalidation": [],
+          "last_presented": true,
+          "paint_records": ["quad:1", "glyph:0"]
+        }
+      ]
+    }
+  },
+  "flamegraph": {
+    "status": "available",
+    "data": {
+      "roots": [
+        {
+          "name": "frame",
+          "start_ns": 1000000,
+          "duration_ns": 3000000,
+          "exclusive_ns": 500000,
+          "element": null,
+          "parent": null,
+          "children": ["span:layout"],
+          "phase": "frame"
+        },
+        {
+          "name": "layout",
+          "start_ns": 1200000,
+          "duration_ns": 1000000,
+          "exclusive_ns": 1000000,
+          "element": "element:root#1",
+          "parent": "span:frame",
+          "children": [],
+          "phase": "layout"
+        }
+      ]
+    }
+  },
+  "timeline": {
+    "status": "available",
+    "data": {
+      "events": [
+        {
+          "id": "event:present",
+          "frame_id": 42,
+          "start_ns": 3900000,
+          "duration_ns": 100000,
+          "thread_or_queue": "main",
+          "kind": "present",
+          "element": null,
+          "boundary": null,
+          "tile": null,
+          "detail": "surface presented"
+        },
+        {
+          "id": "event:gpu",
+          "frame_id": 42,
+          "start_ns": 2000000,
+          "duration_ns": 900000,
+          "thread_or_queue": "gpu",
+          "kind": "gpu_span",
+          "element": null,
+          "boundary": "boundary:main#1",
+          "tile": { "x": 0, "y": 0 },
+          "detail": "quad pass"
+        }
+      ]
+    }
+  },
+  "memory": {
+    "status": "available",
+    "data": {
+      "allocations": [
+        {
+          "id": "memory:primitive-slabs",
+          "owner": "scene",
+          "category": "primitive_slabs",
+          "live_bytes": 256,
+          "capacity_bytes": 512,
+          "high_water_bytes": 512,
+          "allocation_count": 2,
+          "ranges": [{ "offset": 0, "length": 256, "label": "quad slots" }]
+        }
+      ],
+      "total_live_bytes": 256,
+      "total_capacity_bytes": 512,
+      "high_water_bytes": 512
+    }
+  },
+  "listeners": {
+    "status": "available",
+    "data": {
+      "listeners": [
+        {
+          "id": "listener:click#1",
+          "owner": "element:button#1",
+          "event": "mouse_click",
+          "registration_order": 0,
+          "phase": "bubble",
+          "handler_present": true,
+          "hitbox": { "x": 20.0, "y": 24.0, "width": 100.0, "height": 32.0 },
+          "dispatch_ancestry": ["element:root#1", "element:button#1"],
+          "clipped": false,
+          "rejection_reason": null
+        }
+      ]
+    }
+  },
+  "damage": {
+    "status": "available",
+    "data": {
+      "records": [
+        {
+          "root": "scroll:root#1",
+          "content_rect": { "x": 20.0, "y": 24.0, "width": 100.0, "height": 32.0 },
+          "reason": "hover",
+          "element": "element:button#1",
+          "tile": { "x": 0, "y": 0 },
+          "primitive_slots": [1]
+        }
+      ]
+    }
+  },
+  "tiles": {
+    "status": "available",
+    "data": {
+      "grids": [
+        {
+          "root": "scroll:root#1",
+          "tile_size": 256,
+          "visible": [
+            {
+              "coordinate": { "x": 0, "y": 0 },
+              "generation": 1,
+              "state": "visible",
+              "owner": "boundary:main#1",
+              "content_slots": [0, 1],
+              "transform_only": false
+            }
+          ],
+          "resident_budget": 4,
+          "parent_damage_subtracted": 0
+        }
+      ]
+    }
+  },
+  "resources": {
+    "status": "available",
+    "data": {
+      "resources": [
+        {
+          "id": "resource:tile#1",
+          "kind": "tile_texture",
+          "owner": "scroll:root#1",
+          "generation": 1,
+          "last_use_frame": 42,
+          "live_bytes": 262144,
+          "capacity_bytes": 262144,
+          "format": "rgba8unorm",
+          "width": 256,
+          "height": 256,
+          "readback": { "unavailable": { "reason": "device does not expose safe readback" } },
+          "ranges": []
+        }
+      ]
+    }
+  },
+  "network": {
+    "status": "unavailable",
+    "reason": "network capture was not armed for this frame"
+  }
+}

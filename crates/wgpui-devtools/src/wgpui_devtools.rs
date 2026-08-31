@@ -3,6 +3,7 @@
 //! move-and-decouple, zero behavior change (Phase 7's gate: `wgpui-core`
 //! builds and runs with this crate absent entirely).
 //! See docs/gpu-native-architecture.md §3.6, §8 Phase 7.
+pub mod capture;
 #[cfg(feature = "flamegraph")]
 pub mod flamegraph;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
@@ -11,14 +12,17 @@ pub mod hooks;
 pub mod inspector;
 #[cfg(feature = "perf-ab")]
 pub mod perf_ab_tests;
+pub mod reference_viewer;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod render_stats;
 
+pub use capture::{Availability, CaptureBundle, CaptureError};
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use hooks::DevtoolsHooks;
 #[cfg(feature = "inspector")]
 pub use inspector::{ElementInfo, Inspector};
 #[cfg(feature = "perf-ab")]
 pub use perf_ab_tests::Sample;
+pub use reference_viewer::{CaptureViewerError, ReferenceViewer};
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use render_stats::{Scope, Snapshot, TimerSnapshot};
