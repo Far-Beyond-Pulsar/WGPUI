@@ -470,7 +470,7 @@ pub struct TextShaper {
     scratch: ShapeBuffer,
     loaded_fonts: Vec<LoadedFont>,
     font_ids_by_request: HashMap<Font, FontId>,
-    font_ids_by_database_id: HashMap<fontdb::ID, FontId>,
+    font_ids_by_database_id: HashMap<(fontdb::ID, fontdb::Weight), FontId>,
     cache: HashMap<ShapeCacheKey, CachedLine>,
     frame: u64,
     stats: ShaperStats,
@@ -610,7 +610,10 @@ impl TextShaper {
         weight: fontdb::Weight,
         features: cosmic_text::FontFeatures,
     ) -> Result<FontId, ShapeError> {
-        if let Some(font_id) = self.font_ids_by_database_id.get(&database_id) {
+        if let Some(font_id) = self
+            .font_ids_by_database_id
+            .get(&(database_id, weight))
+        {
             return Ok(*font_id);
         }
 
@@ -632,7 +635,8 @@ impl TextShaper {
             is_known_emoji_font,
             weight,
         });
-        self.font_ids_by_database_id.insert(database_id, font_id);
+        self.font_ids_by_database_id
+            .insert((database_id, weight), font_id);
         self.stats.fonts_resolved += 1;
         Ok(font_id)
     }
@@ -814,11 +818,9 @@ impl TextShaper {
         let mut runs_out: Vec<ShapedRun> = Vec::new();
         for glyph in &layout.glyphs {
             let mut font_id = FontId(glyph.metadata);
-            if self
-                .loaded_fonts
-                .get(font_id.0)
-                .is_none_or(|loaded| loaded.face.id() != glyph.font_id)
-            {
+            if self.loaded_fonts.get(font_id.0).is_none_or(|loaded| {
+                loaded.face.id() != glyph.font_id || loaded.weight != glyph.font_weight
+            }) {
                 // Fallback picked a face the caller never asked for. Load it
                 // now so the run carries a `FontId` that resolves, rather than
                 // one that points at the requested face and lies about which
@@ -1071,6 +1073,20 @@ mod tests {
         let second = shaper.resolve_font(&font("Segoe UI")).expect("resolve");
         assert_eq!(first, second);
         assert_eq!(shaper.stats().fonts_resolved, resolved_once);
+    }
+
+    #[test]
+    fn different_requested_weights_do_not_alias_the_loaded_face() {
+        let mut shaper = shaper();
+        let normal = shaper
+            .resolve_font(&font("Segoe UI"))
+            .expect("normal face");
+        let bold = shaper
+            .resolve_font(&font("Segoe UI").bold())
+            .expect("bold face");
+
+        assert_ne!(normal, bold);
+        assert_eq!(shaper.stats().fonts_resolved, 2);
     }
 
     #[test]

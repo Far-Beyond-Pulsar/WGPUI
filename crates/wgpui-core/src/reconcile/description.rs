@@ -85,6 +85,38 @@ pub struct RawTextKey {
     value: Arc<str>,
 }
 
+/// Renderer-neutral text properties inherited by raw string children.
+///
+/// The core description must not depend on a font or glyph atlas, but it does
+/// need to carry the resolved style far enough for the renderer to measure raw
+/// text before laying out the tree. `None` means that the renderer should use
+/// the inherited value or its platform default.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextOptions {
+    pub size: Option<f32>,
+    pub line_height: Option<f32>,
+    pub color: Option<[f32; 4]>,
+    pub weight: Option<u16>,
+    pub italic: Option<bool>,
+    pub alignment: Option<u8>,
+    pub nowrap: Option<bool>,
+    pub ellipsis: Option<bool>,
+    pub line_clamp: Option<usize>,
+    pub letter_spacing: Option<f32>,
+    pub underline: Option<TextDecoration>,
+    pub strikethrough: Option<TextDecoration>,
+    pub gradient: Option<Vec<([f32; 4], f32)>>,
+    pub gradient_angle: Option<f32>,
+}
+
+/// A renderer-neutral text decoration.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TextDecoration {
+    pub thickness: f32,
+    pub color: Option<[f32; 4]>,
+    pub wavy: bool,
+}
+
 /// Metadata for a texture produced outside the retained scene.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ExternalSurfaceProperties {
@@ -431,6 +463,7 @@ pub struct Description {
     pub(crate) raw_text: Option<RawText>,
     pub(crate) text_size: Option<f32>,
     pub(crate) text_color: Option<[f32; 4]>,
+    pub(crate) text_options: TextOptions,
     pub(crate) interaction: Option<DescriptionInteraction>,
     pub(crate) layout_callback: Option<DescriptionLayout>,
     pub(crate) external_surface: Option<ExternalSurfaceProperties>,
@@ -479,6 +512,7 @@ impl Description {
             raw_text: None,
             text_size: None,
             text_color: None,
+            text_options: TextOptions::default(),
             interaction: None,
             layout_callback: None,
             external_surface: None,
@@ -609,6 +643,17 @@ impl Description {
 
     pub fn text_metrics_value(&self) -> (Option<f32>, Option<[f32; 4]>) {
         (self.text_size, self.text_color)
+    }
+
+    /// Carry the complete resolved text style to a renderer-owned materializer.
+    pub fn text_options(mut self, options: TextOptions) -> Self {
+        self.text_options = options;
+        self
+    }
+
+    /// Read the local text style during renderer materialization.
+    pub fn text_options_value(&self) -> &TextOptions {
+        &self.text_options
     }
 
     pub fn interaction(mut self, interaction: DescriptionInteraction) -> Self {

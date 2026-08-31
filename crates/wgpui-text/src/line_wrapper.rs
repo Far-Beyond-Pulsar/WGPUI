@@ -30,17 +30,19 @@ pub struct WrapBoundary {
     pub index: usize,
 }
 
-/// Whether a byte can end a word, and so is a candidate break point.
-///
-/// Deliberately narrow: ASCII whitespace only. The legacy wrapper's
-/// `is_word_char` is wider (it handles CJK, where every character is a break
-/// opportunity, and a set of punctuation that may be broken after), and
-/// widening this to match is a self-contained change to this one function.
-/// Narrow-and-correct beats wide-and-approximate here: a missed break
-/// opportunity wraps a line later than ideal, while a wrong one wraps inside a
-/// word that should have stayed whole.
-fn is_break_opportunity(byte: u8) -> bool {
-    byte == b' ' || byte == b'\t'
+/// The byte after a word, whitespace, or CJK character that may end a line.
+fn break_opportunity(text: &str, index: usize) -> Option<usize> {
+    let character = text.get(index..)?.chars().next()?;
+    let is_cjk = matches!(
+        character as u32,
+        0x2e80..=0x2fff
+            | 0x3040..=0x30ff
+            | 0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xac00..=0xd7af
+            | 0xf900..=0xfaff
+    );
+    (character.is_whitespace() || is_cjk).then_some(index + character.len_utf8())
 }
 
 /// Break `line` into visual lines no wider than `wrap_width`.
@@ -55,7 +57,6 @@ pub fn wrap_boundaries(line: &ShapedLine, text: &str, wrap_width: f32) -> Vec<Wr
         return boundaries;
     }
 
-    let bytes = text.as_bytes();
     let mut line_start = 0usize;
     let mut last_opportunity: Option<usize> = None;
     let mut index = 0usize;
@@ -85,8 +86,8 @@ pub fn wrap_boundaries(line: &ShapedLine, text: &str, wrap_width: f32) -> Vec<Wr
             continue;
         }
 
-        if bytes.get(index).copied().is_some_and(is_break_opportunity) {
-            last_opportunity = Some(index + 1);
+        if let Some(opportunity) = break_opportunity(text, index) {
+            last_opportunity = Some(opportunity);
         }
         index += 1;
     }
@@ -198,5 +199,25 @@ mod tests {
                 boundary.index
             );
         }
+    }
+
+    #[test]
+    fn cjk_text_can_break_between_characters_when_it_has_no_spaces() {
+        let text = "日本語";
+        let mut shaped = line("aaa");
+        shaped.len = text.len();
+        for (position, glyph) in shaped
+            .runs
+            .iter_mut()
+            .flat_map(|run| run.glyphs.iter_mut())
+            .enumerate()
+        {
+            glyph.index = position * 3;
+        }
+
+        assert_eq!(
+            wrap_boundaries(&shaped, text, 15.0),
+            vec![WrapBoundary { index: 6 }]
+        );
     }
 }

@@ -37,8 +37,10 @@ use wgpui_core::invalidation::request::FrameSignals;
 use wgpui_core::patch::PatchError;
 use wgpui_core::patch::apply::apply;
 use wgpui_core::patch::emit::{Emission, Emit, EmitContext, EmitError, Emitter, FrameEmission};
-use wgpui_core::patch::primitive::{Glyph, GlyphRun, Material, Quad};
-use wgpui_core::reconcile::description::{Description, DescriptionInteraction, RawText};
+use wgpui_core::patch::primitive::{Glyph, GlyphRun, Material, Quad, Underline};
+use wgpui_core::reconcile::description::{
+    Description, DescriptionInteraction, RawText, TextDecoration, TextOptions,
+};
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
@@ -62,9 +64,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
-use wgpui_text::patch::{RunPlacement, glyph_runs};
+use wgpui_text::patch::RunPlacement;
+use wgpui_text::line::WrappedLine;
+use wgpui_text::line_layout::x_for_index;
 use wgpui_text::raster::GlyphRasterizer;
-use wgpui_text::shaping::{FontRun, SharedString, TextShaper};
+use wgpui_text::shaping::{Font, FontRun, FontStyle, FontWeight, SharedString, ShapedLine, TextShaper};
 
 /// Why a frame could not be produced.
 #[derive(Debug)]
@@ -239,16 +243,29 @@ pub struct FrameLoop {
 
 #[derive(Clone)]
 struct PreparedText {
+    paragraphs: Arc<Vec<PreparedParagraph>>,
+}
+
+#[derive(Clone)]
+struct PreparedParagraph {
+    text: Arc<str>,
+    line: Arc<ShapedLine>,
+}
+
+struct RenderedText {
     width: f32,
     height: f32,
-    baseline: f32,
-    runs: Arc<Vec<CoreGlyphRun>>,
+    runs: Vec<CoreGlyphRun>,
+    underlines: Vec<Underline>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct TextCacheKey {
     value: Arc<str>,
     font_size_bits: u32,
+    weight: u16,
+    italic: bool,
+    letter_spacing_bits: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -473,7 +490,10 @@ impl FrameLoop {
         input: &LoopInput<'_>,
     ) -> Result<LoopFrame, LoopError> {
         let mut description = description;
-        self.materialize_raw_text(&mut description)?;
+        self.materialize_raw_text(
+            &mut description,
+            Some((input.target.width.max(1)) as f32),
+        )?;
         let mut plan = self.reconciler.reconcile(description, &mut self.layout)?;
         let root = plan
             .root()
@@ -884,105 +904,435 @@ impl FrameLoop {
         Ok(result)
     }
 
-    fn materialize_raw_text(&mut self, description: &mut Description) -> Result<(), LoopError> {
-        self.materialize_raw_text_with_metrics(description, None, None)
-    }
-
-    fn materialize_raw_text_with_metrics(
+    fn materialize_raw_text(
         &mut self,
         description: &mut Description,
-        inherited_size: Option<f32>,
-        inherited_color: Option<[f32; 4]>,
+        inherited_width: Option<f32>,
     ) -> Result<(), LoopError> {
+        let inherited_options = TextOptions::default();
+        self.materialize_raw_text_with_options(description, &inherited_options, inherited_width)
+    }
+
+    fn materialize_raw_text_with_options(
+        &mut self,
+        description: &mut Description,
+        inherited: &TextOptions,
+        inherited_width: Option<f32>,
+    ) -> Result<(), LoopError> {
+        let mut options = merge_text_options(inherited, description.text_options_value());
+        let (legacy_size, legacy_color) = description.text_metrics_value();
+        options.size = options.size.or(legacy_size);
+        options.color = options.color.or(legacy_color);
+        let available_width = resolve_text_width(description, inherited_width);
+
         if let Some(raw) = description.take_raw_text() {
             let value = raw.shared_value();
-            let (local_size, local_color) = description.text_metrics_value();
-            let font_size = local_size.or(inherited_size);
-            let color = local_color.or(inherited_color);
-            let font_size = font_size
-                .filter(|size| size.is_finite() && *size > 0.0)
-                .unwrap_or(14.0)
-                * self.scale_factor;
+            let font_size = valid_text_size(options.size) * self.scale_factor;
+            let weight = options.weight.unwrap_or(400);
+            let italic = options.italic.unwrap_or(false);
+            let letter_spacing = options.letter_spacing.unwrap_or(0.0) * font_size;
             let key = TextCacheKey {
                 value: Arc::clone(&value),
                 font_size_bits: font_size.to_bits(),
+                weight,
+                italic,
+                letter_spacing_bits: letter_spacing.to_bits(),
             };
             let prepared = match self.prepared_text.get(&key).cloned() {
                 Some(prepared) => prepared,
-                None => self.prepare_text(raw, font_size)?,
+                None => self.prepare_text(
+                    raw,
+                    font_size,
+                    FontWeight(weight as f32),
+                    italic,
+                    letter_spacing,
+                )?,
             };
-            let text_color = color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            let runs = Arc::new(
-                prepared
-                    .runs
-                    .iter()
-                    .map(|run| {
-                        let mut run = run.clone();
-                        run.color = text_color;
-                        run
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let baseline = prepared.baseline;
-            description.set_intrinsic_size(prepared.width, prepared.height);
+            let layout_width = available_width.filter(|width| width.is_finite() && *width > 0.0);
+            let rendered = self.layout_text(&prepared, &options, layout_width)?;
+            let intrinsic_width = if options.nowrap.unwrap_or(false) {
+                rendered.width
+            } else {
+                layout_width.map_or(rendered.width, |width| width.min(rendered.width.max(width)))
+            };
+            description.set_intrinsic_size(intrinsic_width, rendered.height);
+            let runs = Arc::new(rendered.runs);
+            let underlines = Arc::new(rendered.underlines);
             description.set_text_emitter(move |context: &EmitContext, emission: &mut Emission| {
+                for underline in underlines.iter() {
+                    let mut positioned = *underline;
+                    positioned.origin[0] += context.bounds.x;
+                    positioned.origin[1] += context.bounds.y;
+                    emission.underline(positioned);
+                }
                 for run in runs.iter() {
                     let mut positioned = run.clone();
                     for glyph in &mut positioned.glyphs {
                         glyph.position[0] += context.bounds.x;
-                        glyph.position[1] += context.bounds.y + baseline;
+                        glyph.position[1] += context.bounds.y;
                     }
                     emission.glyph_run(positioned);
                 }
             });
         }
-        let (local_size, local_color) = description.text_metrics_value();
-        let effective_size = local_size.or(inherited_size);
-        let effective_color = local_color.or(inherited_color);
+
         for child in description.child_descriptions_mut() {
-            self.materialize_raw_text_with_metrics(child, effective_size, effective_color)?;
+            self.materialize_raw_text_with_options(child, &options, available_width)?;
         }
         Ok(())
     }
 
-    fn prepare_text(&mut self, raw: RawText, font_size: f32) -> Result<PreparedText, LoopError> {
+    fn layout_text(
+        &mut self,
+        prepared: &PreparedText,
+        options: &TextOptions,
+        available_width: Option<f32>,
+    ) -> Result<RenderedText, LoopError> {
+        let font_size = valid_text_size(options.size) * self.scale_factor;
+        let default_line_height = (font_size * 1.618_034).max(
+            prepared
+                .paragraphs
+                .first()
+                .map_or(0.0, |paragraph| paragraph.line.ascent + paragraph.line.descent),
+        );
+        let line_height = options
+            .line_height
+            .filter(|height| height.is_finite() && *height > 0.0)
+            .unwrap_or(default_line_height);
+        let nowrap = options.nowrap.unwrap_or(false);
+        let max_lines = options.line_clamp.filter(|lines| *lines > 0);
+        let text_color = options.color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        let mut output_runs = Vec::new();
+        let mut output_underlines = Vec::new();
+        let mut block_width: f32 = 0.0;
+        let mut block_height: f32 = 0.0;
+        let mut visual_lines = 0usize;
+
+        for paragraph in prepared.paragraphs.iter() {
+            if max_lines.is_some_and(|limit| visual_lines >= limit) {
+                break;
+            }
+            let mut paragraph_text = Arc::clone(&paragraph.text);
+            let mut paragraph_line = Arc::clone(&paragraph.line);
+            if options.ellipsis.unwrap_or(false)
+                && max_lines.is_none()
+                && let Some(width) = available_width
+                && paragraph_line.width > width
+            {
+                let truncated = self.truncate_line(
+                    paragraph_text.as_ref(),
+                    &paragraph_line,
+                    width,
+                    font_size,
+                    options,
+                )?;
+                paragraph_text = truncated.0;
+                paragraph_line = truncated.1;
+            }
+            let wrapped = if nowrap || available_width.is_none() {
+                WrappedLine::unwrapped(paragraph_line.clone())
+            } else {
+                WrappedLine::new(
+                    paragraph_line.clone(),
+                    paragraph_text.as_ref(),
+                    available_width.unwrap_or(0.0),
+                )
+            };
+            let remaining_lines = max_lines.map(|limit| limit.saturating_sub(visual_lines));
+            let widths = wrapped.visual_line_widths(remaining_lines);
+            let paragraph_width = widths.iter().copied().fold(0.0, f32::max);
+            let alignment_width = available_width.unwrap_or(paragraph_width);
+            block_width = block_width.max(if nowrap {
+                paragraph_width
+            } else {
+                alignment_width
+            });
+            let baseline = (line_height - paragraph_line.ascent - paragraph_line.descent)
+                .max(0.0)
+                * 0.5
+                + paragraph_line.ascent;
+            let line_offset = if options.alignment == Some(1) {
+                (alignment_width - paragraph_width).max(0.0) * 0.5
+            } else if options.alignment == Some(2) {
+                (alignment_width - paragraph_width).max(0.0)
+            } else {
+                0.0
+            };
+            let mut source = AtlasTileSource::new(&mut self.text_atlas, |key| {
+                self.text_rasterizer
+                    .rasterize(&mut self.text_shaper, key)
+                    .ok()
+            });
+            let runs = wrapped.glyph_runs_limited(
+                RunPlacement {
+                    origin: [line_offset, baseline],
+                    color: text_color,
+                    ..RunPlacement::default()
+                },
+                line_height,
+                &mut source,
+                remaining_lines,
+            );
+            let rendered_lines = widths.len();
+            output_runs.extend(colorize_glyph_runs(
+                runs,
+                options.gradient.as_deref(),
+                options.gradient_angle,
+                paragraph_width,
+                line_height * rendered_lines as f32,
+                baseline,
+                text_color,
+            ));
+
+            if rendered_lines > 0 {
+                if let Some(decoration) = options.underline {
+                    for line_number in 0..rendered_lines {
+                        output_underlines.push(underline_for_line(
+                            decoration,
+                            line_offset,
+                            widths.get(line_number).copied().unwrap_or(0.0),
+                            baseline + line_number as f32 * line_height
+                                + paragraph_line.descent * 0.618,
+                            text_color,
+                        ));
+                    }
+                }
+                if let Some(decoration) = options.strikethrough {
+                    for line_number in 0..rendered_lines {
+                        output_underlines.push(underline_for_line(
+                            decoration,
+                            line_offset,
+                            widths.get(line_number).copied().unwrap_or(0.0),
+                            baseline + line_number as f32 * line_height
+                                - (paragraph_line.ascent + paragraph_line.descent) * 0.5,
+                            text_color,
+                        ));
+                    }
+                }
+            }
+            visual_lines += rendered_lines;
+            block_height += rendered_lines as f32 * line_height;
+        }
+
+        Ok(RenderedText {
+            width: block_width,
+            height: block_height,
+            runs: output_runs,
+            underlines: output_underlines,
+        })
+    }
+
+    fn truncate_line(
+        &mut self,
+        text: &str,
+        line: &Arc<ShapedLine>,
+        width: f32,
+        font_size: f32,
+        options: &TextOptions,
+    ) -> Result<(Arc<str>, Arc<ShapedLine>), LoopError> {
+        let Some(font_id) = line.runs.first().map(|run| run.font_id) else {
+            return Ok((Arc::from(""), Arc::clone(line)));
+        };
+        let mut suffix_run = FontRun::new("…".len(), font_id);
+        suffix_run.weight = FontWeight(options.weight.unwrap_or(400) as f32);
+        suffix_run.style = if options.italic.unwrap_or(false) {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        };
+        suffix_run.letter_spacing = options.letter_spacing.unwrap_or(0.0) * font_size;
+        let suffix = self
+            .text_shaper
+            .shape_line(&SharedString::from("…"), font_size, &[suffix_run])
+            .map_err(|error| LoopError::Text(error.to_string()))?;
+        let suffix_width = suffix.width;
+        let mut keep = 0usize;
+        for (index, _) in text.char_indices() {
+            if x_for_index(line, index) + suffix_width <= width {
+                keep = index;
+            }
+        }
+        if x_for_index(line, text.len()) + suffix_width <= width {
+            keep = text.len();
+        }
+        let mut candidate = text[..keep].to_owned();
+        candidate.push('…');
+        let candidate_shared = SharedString::from(candidate);
+        let mut run = FontRun::new(candidate_shared.len(), font_id);
+        run.weight = suffix_run.weight;
+        run.style = suffix_run.style;
+        run.letter_spacing = options.letter_spacing.unwrap_or(0.0) * font_size;
+        let shaped = self
+            .text_shaper
+            .shape_line(&candidate_shared, font_size, &[run])
+            .map_err(|error| LoopError::Text(error.to_string()))?;
+        Ok((Arc::from(candidate_shared.as_str()), shaped))
+    }
+
+    fn prepare_text(
+        &mut self,
+        raw: RawText,
+        font_size: f32,
+        weight: FontWeight,
+        italic: bool,
+        letter_spacing: f32,
+    ) -> Result<PreparedText, LoopError> {
         let value = raw.shared_value();
-        let shared = SharedString::from(value.as_ref());
-        let font = wgpui_text::shaping::font("Segoe UI");
+        let font = Font {
+            family: SharedString::from("Segoe UI"),
+            weight,
+            style: if italic { FontStyle::Italic } else { FontStyle::Normal },
+            ..Font::default()
+        };
         let font_id = self
             .text_shaper
             .resolve_font(&font)
             .map_err(|error| LoopError::Text(error.to_string()))?;
-        let font_runs = vec![FontRun::new(shared.len(), font_id)];
-        let line = self
-            .text_shaper
-            .shape_line(&shared, font_size, &font_runs)
-            .map_err(|error| LoopError::Text(error.to_string()))?;
-        let placement = RunPlacement {
-            color: [1.0, 1.0, 1.0, 1.0],
-            ..RunPlacement::default()
-        };
-        let mut source = AtlasTileSource::new(&mut self.text_atlas, |key| {
-            self.text_rasterizer
-                .rasterize(&mut self.text_shaper, key)
-                .ok()
-        });
-        let (converted, _) = glyph_runs(&line, placement, &mut source);
-        let height = 20.0_f32.max(line.ascent + line.descent);
+        let mut lines = Vec::new();
+        for paragraph in value.split('\n') {
+            let shared = SharedString::from(paragraph);
+            let mut run = FontRun::new(shared.len(), font_id);
+            run.weight = weight;
+            run.style = font.style;
+            run.letter_spacing = letter_spacing;
+            let line = self
+                .text_shaper
+                .shape_line(&shared, font_size, &[run])
+                .map_err(|error| LoopError::Text(error.to_string()))?;
+            lines.push(PreparedParagraph {
+                text: Arc::from(paragraph),
+                line,
+            });
+        }
+        let paragraphs = Arc::new(lines);
         let prepared = PreparedText {
-            width: line.width,
-            height,
-            baseline: (height - line.ascent - line.descent) * 0.5 + line.ascent,
-            runs: Arc::new(converted),
+            paragraphs,
         };
         self.prepared_text.insert(
             TextCacheKey {
                 value,
                 font_size_bits: font_size.to_bits(),
+                weight: weight.0 as u16,
+                italic,
+                letter_spacing_bits: letter_spacing.to_bits(),
             },
             prepared.clone(),
         );
         Ok(prepared)
+    }
+}
+
+fn valid_text_size(size: Option<f32>) -> f32 {
+    size.filter(|size| size.is_finite() && *size > 0.0)
+        .unwrap_or(14.0)
+}
+
+fn merge_text_options(parent: &TextOptions, local: &TextOptions) -> TextOptions {
+    TextOptions {
+        size: local.size.or(parent.size),
+        line_height: local.line_height.or(parent.line_height),
+        color: local.color.or(parent.color),
+        weight: local.weight.or(parent.weight),
+        italic: local.italic.or(parent.italic),
+        alignment: local.alignment.or(parent.alignment),
+        nowrap: local.nowrap.or(parent.nowrap),
+        ellipsis: local.ellipsis.or(parent.ellipsis),
+        line_clamp: local.line_clamp.or(parent.line_clamp),
+        letter_spacing: local.letter_spacing.or(parent.letter_spacing),
+        underline: local.underline.or(parent.underline),
+        strikethrough: local.strikethrough.or(parent.strikethrough),
+        gradient: local.gradient.clone().or_else(|| parent.gradient.clone()),
+        gradient_angle: local.gradient_angle.or(parent.gradient_angle),
+    }
+}
+
+fn resolve_text_width(description: &Description, inherited_width: Option<f32>) -> Option<f32> {
+    let dimension = description.layout_style().size.width;
+    if dimension.is_auto() {
+        return inherited_width;
+    }
+    if dimension.tag() == Dimension::length(0.0).tag() {
+        let width = dimension.value();
+        return width.is_finite().then_some(width).filter(|width| *width > 0.0);
+    }
+    if dimension.tag() == Dimension::percent(0.0).tag() {
+        let percent = dimension.value();
+        return inherited_width
+            .map(|width| width * percent)
+            .filter(|width| width.is_finite() && *width > 0.0);
+    }
+    inherited_width
+}
+
+fn gradient_color(stops: &[( [f32; 4], f32)], mut position: f32, fallback: [f32; 4]) -> [f32; 4] {
+    if stops.is_empty() {
+        return fallback;
+    }
+    position = position.clamp(0.0, 1.0);
+    let mut ordered = stops.to_vec();
+    ordered.sort_by(|left, right| left.1.total_cmp(&right.1));
+    if position <= ordered[0].1 {
+        return ordered[0].0;
+    }
+    for pair in ordered.windows(2) {
+        let (left, right) = (pair[0], pair[1]);
+        if position <= right.1 {
+            let range = (right.1 - left.1).max(f32::EPSILON);
+            let amount = ((position - left.1) / range).clamp(0.0, 1.0);
+            return std::array::from_fn(|channel| {
+                left.0[channel] + (right.0[channel] - left.0[channel]) * amount
+            });
+        }
+    }
+    ordered.last().map_or(fallback, |stop| stop.0)
+}
+
+fn colorize_glyph_runs(
+    runs: Vec<CoreGlyphRun>,
+    stops: Option<&[([f32; 4], f32)]>,
+    angle: Option<f32>,
+    width: f32,
+    height: f32,
+    origin_y: f32,
+    fallback: [f32; 4],
+) -> Vec<CoreGlyphRun> {
+    let Some(stops) = stops else {
+        return runs;
+    };
+    let denominator = width.max(1.0);
+    let vertical_denominator = height.max(1.0);
+    let vertical = angle.is_some_and(|angle| (angle.abs() - 180.0).abs() < 45.0);
+    let mut output = Vec::new();
+    for run in runs {
+        for glyph in run.glyphs {
+            let position = if vertical {
+                (glyph.position[1] - origin_y) / vertical_denominator
+            } else {
+                glyph.position[0] / denominator
+            };
+            output.push(CoreGlyphRun {
+                color: gradient_color(stops, position, fallback),
+                glyphs: vec![glyph],
+            });
+        }
+    }
+    output
+}
+
+fn underline_for_line(
+    decoration: TextDecoration,
+    x: f32,
+    width: f32,
+    y: f32,
+    fallback: [f32; 4],
+) -> Underline {
+    let thickness = decoration.thickness.max(1.0);
+    Underline {
+        origin: [x, y],
+        size: [width, if decoration.wavy { thickness * 3.0 } else { thickness }],
+        color: decoration.color.unwrap_or(fallback),
+        thickness,
+        wavy: decoration.wavy,
     }
 }
 
@@ -1119,6 +1469,87 @@ mod debug_refresh_region_tests {
         ]);
 
         assert_eq!(selected.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod text_materialization_tests {
+    use super::*;
+
+    #[test]
+    fn local_text_options_override_inherited_values() {
+        let inherited = TextOptions {
+            size: Some(16.0),
+            color: Some([1.0, 0.0, 0.0, 1.0]),
+            nowrap: Some(true),
+            ..TextOptions::default()
+        };
+        let local = TextOptions {
+            size: Some(20.0),
+            color: Some([0.0, 1.0, 0.0, 1.0]),
+            ..TextOptions::default()
+        };
+
+        let merged = merge_text_options(&inherited, &local);
+        assert_eq!(merged.size, Some(20.0));
+        assert_eq!(merged.color, Some([0.0, 1.0, 0.0, 1.0]));
+        assert_eq!(merged.nowrap, Some(true));
+    }
+
+    #[test]
+    fn a_text_gradient_interpolates_between_stops() {
+        let color = gradient_color(
+            &[
+                ([1.0, 0.0, 0.0, 1.0], 0.0),
+                ([0.0, 0.0, 1.0, 1.0], 1.0),
+            ],
+            0.5,
+            [0.0; 4],
+        );
+        assert_eq!(color, [0.5, 0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn a_gradient_keeps_every_glyph_while_assigning_per_glyph_color() {
+        let run = CoreGlyphRun {
+            color: [1.0; 4],
+            glyphs: vec![Glyph::ZERO, Glyph { position: [10.0, 0.0], ..Glyph::ZERO }],
+        };
+        let runs = colorize_glyph_runs(
+            vec![run],
+            Some(&[
+                ([1.0, 0.0, 0.0, 1.0], 0.0),
+                ([0.0, 0.0, 1.0, 1.0], 1.0),
+            ]),
+            Some(90.0),
+            10.0,
+            10.0,
+            0.0,
+            [1.0; 4],
+        );
+
+        assert_eq!(runs.len(), 2);
+        assert_ne!(runs[0].color, runs[1].color);
+        assert_eq!(runs.iter().map(|run| run.glyphs.len()).sum::<usize>(), 2);
+    }
+
+    #[test]
+    fn wavy_decorations_reserve_three_times_the_stroke_height() {
+        let underline = underline_for_line(
+            TextDecoration {
+                thickness: 2.0,
+                color: None,
+                wavy: true,
+            },
+            4.0,
+            30.0,
+            12.0,
+            [0.2, 0.3, 0.4, 1.0],
+        );
+
+        assert_eq!(underline.origin, [4.0, 12.0]);
+        assert_eq!(underline.size, [30.0, 6.0]);
+        assert_eq!(underline.color, [0.2, 0.3, 0.4, 1.0]);
     }
 }
 
