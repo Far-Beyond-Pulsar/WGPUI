@@ -29,6 +29,8 @@
 //!   §3.4's `div/interactivity/hitbox.rs` is a placeholder for.
 //! - Mouse and keyboard event binding (`InteractiveElement`, today's ~456-line
 //!   trait block) remains in `div/events.rs`.
+//! - Scroll containers use overflow metadata and are connected by the native
+//!   backend after layout establishes their actual content extent.
 //!
 //! # Why `describe` consumes `self`
 //!
@@ -578,6 +580,13 @@ impl Div {
             let handle = handle.clone();
             interaction.on_scroll(move |event, _, _| handle.scroll_wheel(event));
         }
+        let scroll_axes = [
+            layout_style.overflow.x == wgpui_layout::taffy_tree::Overflow::Scroll,
+            layout_style.overflow.y == wgpui_layout::taffy_tree::Overflow::Scroll,
+        ];
+        let automatic_scroll = scroll_axes != [false, false]
+            && scroll_handle.is_none()
+            && !interaction.has_scroll_handler();
 
         let scroll_offset = scroll_handle
             .as_ref()
@@ -589,6 +598,8 @@ impl Div {
             .text_metrics(paint.text_size, paint.text_color)
             .text_options(text_options)
             .scroll_offset(scroll_offset)
+            .with_scroll_axes(scroll_axes)
+            .automatic_scroll(automatic_scroll)
             .children(children);
 
         if clips_children {
@@ -945,6 +956,52 @@ mod tests {
             4,
             "two shadow layers, one background, one border"
         );
+    }
+
+    #[test]
+    fn overflow_scroll_declares_an_automatic_root_without_an_id() {
+        let description = div()
+            .size_full()
+            .overflow_y_scroll()
+            .child(div().h(800.0))
+            .describe();
+        assert_eq!(description.element_id(), None);
+        assert_eq!(description.scroll_axes(), [false, true]);
+        assert!(description.has_automatic_scroll());
+    }
+
+    #[test]
+    fn shadow_example_shape_keeps_overflow_scroll_automatic() {
+        let description = div()
+            .id("shadow-example")
+            .overflow_y_scroll()
+            .size_full()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(div().h(800.0)),
+            )
+            .describe();
+        assert_eq!(
+            description.element_id(),
+            Some(&ElementId::from("shadow-example"))
+        );
+        assert_eq!(description.scroll_axes(), [false, true]);
+        assert!(description.has_automatic_scroll());
+    }
+
+    #[test]
+    fn explicit_scroll_callbacks_and_handles_remain_manual() {
+        let callback = div().overflow_y_scroll().on_scroll(|_, _, _| ());
+        assert!(!callback.describe().has_automatic_scroll());
+        let handle = scroll_state::ScrollHandle::new();
+        assert!(!div()
+            .overflow_y_scroll()
+            .track_scroll(&handle)
+            .describe()
+            .has_automatic_scroll());
     }
 
     #[test]

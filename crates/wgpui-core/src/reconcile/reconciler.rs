@@ -249,6 +249,8 @@ impl Reconciler {
             diff_key,
             boundary,
             scroll_offset,
+            scroll_axes,
+            automatic_scroll,
             emitter,
             interaction,
             layout_callback,
@@ -324,6 +326,9 @@ impl Reconciler {
             invalidation,
             external_surface,
         });
+        context
+            .plan
+            .set_scroll_metadata(plan_index, scroll_axes, automatic_scroll);
         context.plan.set_emitter(plan_index, emitter);
         context.plan.set_interaction(plan_index, interaction);
         context
@@ -445,6 +450,11 @@ impl Reconciler {
             invalidation: Invalidation::all(),
             external_surface: description.external_surface,
         });
+        context.plan.set_scroll_metadata(
+            plan_index,
+            description.scroll_axes,
+            description.automatic_scroll,
+        );
         context
             .plan
             .set_emitter(plan_index, description.emitter.take());

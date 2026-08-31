@@ -878,7 +878,6 @@ impl FrameRenderer {
             || paths_grew
             || backdrops_grew
             || scene_changed
-            || self.uploaded_generation.is_none()
             || matches!(input.dirty, Dirty::All);
         if upload_all {
             self.shadow_arena.upload_all(device, queue, shadow_resident);

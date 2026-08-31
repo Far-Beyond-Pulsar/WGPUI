@@ -533,9 +533,37 @@ impl Window {
                 }
                 handled
             }
-            InputEvent::Scroll(scroll) => self
-                .hit_interaction(scroll.position)
-                .is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app)),
+            InputEvent::Scroll(scroll) => {
+                let mut remaining = scroll.delta;
+                let mut handled = false;
+                for index in self.hit_interactions(scroll.position) {
+                    let mut bubbled = *scroll;
+                    bubbled.delta = remaining;
+                    let event = InputEvent::Scroll(bubbled);
+                    handled |= self.dispatch_interaction_bubbled(index, &event, app);
+                    if handled {
+                        break;
+                    }
+                    let Some(scroll_root) = self
+                        .interactions
+                        .get(index)
+                        .and_then(|registration| registration.scroll_root.as_ref())
+                    else {
+                        continue;
+                    };
+                    let consumed = scroll_root.handle.scroll_by(wgpui_core::geometry::Point::new(
+                        Pixels(remaining[0]),
+                        Pixels(remaining[1]),
+                    ));
+                    remaining[0] -= consumed.x.value();
+                    remaining[1] -= consumed.y.value();
+                    handled |= consumed.x != Pixels::ZERO || consumed.y != Pixels::ZERO;
+                    if remaining == [0.0, 0.0] {
+                        break;
+                    }
+                }
+                handled
+            }
             _ => self.interaction.handle_input(event),
         }
     }

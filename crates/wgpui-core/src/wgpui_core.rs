@@ -26,7 +26,7 @@ pub use window::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TextInputEvent,
     TimerHandle, TimerId, TimerState, TitlebarOptions, WindowAppearance,
     WindowBackgroundAppearance, WindowDecorations, WindowKind,
-    WindowOptions,
+    ScrollRootHandle, WindowOptions,
 };
 pub mod boundary;
 pub mod color;

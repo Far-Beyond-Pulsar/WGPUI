@@ -8,6 +8,7 @@ pub mod hitbox;
 pub mod input;
 pub mod keymap;
 pub mod menu;
+pub mod scroll;
 pub mod timer;
 
 use crate::action::Action;
@@ -27,6 +28,7 @@ pub use input::{
 };
 pub use keymap::{KeyBinding, KeyParseError, Keymap, Keystroke};
 pub use menu::{Menu, MenuItem};
+pub use scroll::ScrollRootHandle;
 pub use timer::{TimerHandle, TimerId, TimerState};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
