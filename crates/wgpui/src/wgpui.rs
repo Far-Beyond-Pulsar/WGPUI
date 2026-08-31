@@ -77,7 +77,7 @@ pub use wgpui_widgets::div::interactivity::style::{
 };
 pub use wgpui_widgets::div::{Div, div};
 pub use wgpui_widgets::image_cache::{
-    DecodedFrame, DecodedImage, ImageCache, ImageDecodeError, decode, decode_async,
+    DecodedFrame, DecodedImage, ImageCache, ImageDecodeError, decode, decode_async, decode_svg_at,
 };
 pub use wgpui_widgets::img::{
     ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img, ObjectFit, SharedImageEngine, img,
