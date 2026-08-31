@@ -20,16 +20,16 @@
 //! a scope flag, and children. Every element type in `wgpui-widgets` will
 //! produce one of these; nothing here knows or cares which.
 
-use crate::boundary::policy::BoundaryPolicy;
+use crate::app::App;
 use crate::boundary::compositor::ExternalSurfaceId;
+use crate::boundary::policy::BoundaryPolicy;
 use crate::patch::emit::Emit;
 use crate::reconcile::diff_key::ReconcileKey;
-use crate::app::App;
 use crate::action::Action;
 use crate::window::{DragData, EventResult, FocusHandle, InputEvent, Window};
 use std::any::TypeId;
 use std::sync::Arc;
-use wgpui_layout::taffy_tree::LayoutStyle;
+use wgpui_layout::taffy_tree::{LayoutRect, LayoutStyle};
 
 /// One segment of an element's path identity.
 ///
@@ -105,6 +105,12 @@ type ActionCallback = Box<dyn FnMut(&dyn Action, &mut Window, &mut App) -> Event
 type DragStartCallback = Box<dyn FnMut(&DragData, &mut Window, &mut App)>;
 type DragHoverCallback = Box<dyn FnMut(bool, &DragData, &mut Window, &mut App) -> EventResult>;
 type DropCallback = Box<dyn FnMut(&DragData, &mut Window, &mut App) -> EventResult>;
+enum LayoutCallback {
+    Bounds(Box<dyn FnMut(LayoutRect)>),
+    BoundsChanged(Box<dyn FnMut(LayoutRect) -> bool>),
+    Content(Box<dyn FnMut(LayoutRect, LayoutRect)>),
+    ContentChanged(Box<dyn FnMut(LayoutRect, LayoutRect) -> bool>),
+}
 
 pub struct DescriptionInteraction {
     callback: InteractionCallback,
@@ -114,6 +120,74 @@ pub struct DescriptionInteraction {
     drag_start_callback: Option<DragStartCallback>,
     drag_hover_callback: Option<DragHoverCallback>,
     drop_callback: Option<DropCallback>,
+}
+
+pub struct DescriptionLayout {
+    callback: LayoutCallback,
+}
+
+impl std::fmt::Debug for DescriptionLayout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DescriptionLayout(..)")
+    }
+}
+
+impl DescriptionLayout {
+    pub fn new(callback: impl FnMut(LayoutRect) + 'static) -> Self {
+        Self {
+            callback: LayoutCallback::Bounds(Box::new(callback)),
+        }
+    }
+
+    pub fn apply(&mut self, bounds: LayoutRect) -> bool {
+        match &mut self.callback {
+            LayoutCallback::Bounds(callback) => {
+                callback(bounds);
+                false
+            }
+            LayoutCallback::BoundsChanged(callback) => callback(bounds),
+            LayoutCallback::Content(callback) => {
+                callback(bounds, bounds);
+                false
+            }
+            LayoutCallback::ContentChanged(callback) => callback(bounds, bounds),
+        }
+    }
+
+    pub fn new_changed(callback: impl FnMut(LayoutRect) -> bool + 'static) -> Self {
+        Self {
+            callback: LayoutCallback::BoundsChanged(Box::new(callback)),
+        }
+    }
+
+    pub fn with_content(callback: impl FnMut(LayoutRect, LayoutRect) + 'static) -> Self {
+        Self {
+            callback: LayoutCallback::Content(Box::new(callback)),
+        }
+    }
+
+    pub fn apply_with_content(&mut self, bounds: LayoutRect, content: LayoutRect) -> bool {
+        match &mut self.callback {
+            LayoutCallback::Bounds(callback) => {
+                callback(bounds);
+                false
+            }
+            LayoutCallback::BoundsChanged(callback) => callback(bounds),
+            LayoutCallback::Content(callback) => {
+                callback(bounds, content);
+                false
+            }
+            LayoutCallback::ContentChanged(callback) => callback(bounds, content),
+        }
+    }
+
+    pub fn with_content_changed(
+        callback: impl FnMut(LayoutRect, LayoutRect) -> bool + 'static,
+    ) -> Self {
+        Self {
+            callback: LayoutCallback::ContentChanged(Box::new(callback)),
+        }
+    }
 }
 
 impl std::fmt::Debug for DescriptionInteraction {
@@ -358,6 +432,7 @@ pub struct Description {
     pub(crate) text_size: Option<f32>,
     pub(crate) text_color: Option<[f32; 4]>,
     pub(crate) interaction: Option<DescriptionInteraction>,
+    pub(crate) layout_callback: Option<DescriptionLayout>,
     pub(crate) external_surface: Option<ExternalSurfaceProperties>,
 }
 
@@ -374,6 +449,7 @@ impl std::fmt::Debug for Description {
             .field("has_emitter", &self.emitter.is_some())
             .field("children", &self.children.len())
             .field("clip_children", &self.clip_children)
+            .field("has_layout_callback", &self.layout_callback.is_some())
             .finish()
     }
 }
@@ -404,6 +480,7 @@ impl Description {
             text_size: None,
             text_color: None,
             interaction: None,
+            layout_callback: None,
             external_surface: None,
         }
     }
@@ -536,6 +613,32 @@ impl Description {
 
     pub fn interaction(mut self, interaction: DescriptionInteraction) -> Self {
         self.interaction = Some(interaction);
+        self
+    }
+
+    pub fn on_layout(mut self, callback: impl FnMut(LayoutRect) + 'static) -> Self {
+        self.layout_callback = Some(DescriptionLayout::new(callback));
+        self
+    }
+
+    pub fn on_layout_with_content(
+        mut self,
+        callback: impl FnMut(LayoutRect, LayoutRect) + 'static,
+    ) -> Self {
+        self.layout_callback = Some(DescriptionLayout::with_content(callback));
+        self
+    }
+
+    pub fn on_layout_changed(mut self, callback: impl FnMut(LayoutRect) -> bool + 'static) -> Self {
+        self.layout_callback = Some(DescriptionLayout::new_changed(callback));
+        self
+    }
+
+    pub fn on_layout_with_content_changed(
+        mut self,
+        callback: impl FnMut(LayoutRect, LayoutRect) -> bool + 'static,
+    ) -> Self {
+        self.layout_callback = Some(DescriptionLayout::with_content_changed(callback));
         self
     }
 

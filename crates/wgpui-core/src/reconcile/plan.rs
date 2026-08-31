@@ -15,8 +15,10 @@
 use crate::boundary::policy::BoundaryPolicy;
 use crate::invalidation::axes::Invalidation;
 use crate::patch::emit::Emit;
+use crate::reconcile::description::{
+    DescriptionInteraction, DescriptionLayout, ExternalSurfaceProperties,
+};
 use crate::reconcile::instance::InstanceKey;
-use crate::reconcile::description::{DescriptionInteraction, ExternalSurfaceProperties};
 use crate::reconcile::state::StateScope;
 use crate::scene::layer::BoundaryId;
 use wgpui_layout::taffy_tree::LayoutNodeId;
@@ -172,6 +174,7 @@ pub struct FramePlan {
     nodes: Vec<PlannedNode>,
     emitters: Vec<Option<Box<dyn Emit>>>,
     interactions: Vec<Option<DescriptionInteraction>>,
+    layout_callbacks: Vec<Option<DescriptionLayout>>,
     stats: FrameStats,
 }
 
@@ -202,6 +205,7 @@ impl FramePlan {
         self.nodes.push(node);
         self.emitters.push(None);
         self.interactions.push(None);
+        self.layout_callbacks.push(None);
         self.nodes.len() - 1
     }
 
@@ -219,7 +223,11 @@ impl FramePlan {
         }
     }
 
-    pub(crate) fn set_interaction(&mut self, index: usize, interaction: Option<DescriptionInteraction>) {
+    pub(crate) fn set_interaction(
+        &mut self,
+        index: usize,
+        interaction: Option<DescriptionInteraction>,
+    ) {
         if let Some(slot) = self.interactions.get_mut(index) {
             *slot = interaction;
         }
@@ -227,6 +235,20 @@ impl FramePlan {
 
     pub fn take_interaction(&mut self, index: usize) -> Option<DescriptionInteraction> {
         self.interactions.get_mut(index)?.take()
+    }
+
+    pub(crate) fn set_layout_callback(
+        &mut self,
+        index: usize,
+        callback: Option<DescriptionLayout>,
+    ) {
+        if let Some(slot) = self.layout_callbacks.get_mut(index) {
+            *slot = callback;
+        }
+    }
+
+    pub fn take_layout_callback(&mut self, index: usize) -> Option<DescriptionLayout> {
+        self.layout_callbacks.get_mut(index)?.take()
     }
 
     /// The emitter for the element at `index`, if it has one.

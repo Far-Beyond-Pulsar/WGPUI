@@ -1,7 +1,7 @@
 //! `Div` — the element nearly every example in this repository is built out of.
 //! See docs/gpu-native-architecture.md §3.4 and §8's Phase 6.6 row.
 //!
-//! # What Phase 6.6 built here, and what it deliberately left for later
+//! # What Phase 6.6 built here
 //!
 //! Before this phase `div.rs` and its four submodules were 33 lines in total: a
 //! `pub struct Div;` with no fields, no builder, no emission and no layout. Five
@@ -21,6 +21,14 @@
 //!   displacement and `.boundary()` already resolves one to a layer transform
 //!   (Phase 2), so the *mechanism* exists; what does not is a `ScrollHandle`
 //!   deciding what the offset should be, which is `div/scroll_state.rs`.
+//!
+//! Input state and richer platform interaction remain separate concerns:
+//!
+//! - `:hover` / `:active` / `:focus`. These need a cascade *above* `DivStyle`
+//!   and a hit-test to drive it, and the hit-test needs the input plumbing
+//!   §3.4's `div/interactivity/hitbox.rs` is a placeholder for.
+//! - Mouse and keyboard event binding (`InteractiveElement`, today's ~456-line
+//!   trait block) remains in `div/events.rs`.
 //!
 //! # Why `describe` consumes `self`
 //!
@@ -343,6 +351,7 @@ impl Div {
 
     pub fn track_scroll(mut self, handle: &scroll_state::ScrollHandle) -> Self {
         self.scroll_handle = Some(handle.clone());
+        self.boundary = true;
         self
     }
 
@@ -381,15 +390,9 @@ impl Div {
         self
     }
 
-    /// Displace this element's children by `offset`.
-    ///
-    /// The raw mechanism, not a scroll container: nothing here decides what the
-    /// offset should be, subscribes to a wheel event, or clamps to a content
-    /// extent. That is `div/scroll_state.rs`'s job and it is out of scope for
-    /// this phase — see this module's doc. Exposed anyway because
-    /// `Description::scroll_offset` has carried it since Phase 1 and a `Div`
-    /// that could not reach it would make Phase 2's boundary gates unreachable
-    /// from a real element.
+    /// Displace this element's children by `offset` without attaching a
+    /// scroll handle. Use [`Self::track_scroll`] when input and clamping are
+    /// needed as well.
     pub fn scroll_offset(mut self, offset: [f32; 2]) -> Self {
         self.scroll_offset = offset;
         self
@@ -429,7 +432,7 @@ impl Div {
             element_id,
             style,
             children,
-            boundary,
+            mut boundary,
             uncached,
             scroll_offset,
             estimated_size,
@@ -441,7 +444,7 @@ impl Div {
             focus_visible_style,
             group_name: _,
             group_hover_style,
-            interaction,
+            mut interaction,
             ..
         } = self;
 
@@ -475,7 +478,13 @@ impl Div {
         ) || matches!(
             layout_style.overflow.y,
             wgpui_layout::taffy_tree::Overflow::Hidden | wgpui_layout::taffy_tree::Overflow::Scroll
-        );
+        ) || scroll_handle.is_some();
+
+        if let Some(handle) = scroll_handle.as_ref() {
+            boundary = true;
+            let handle = handle.clone();
+            interaction.on_scroll(move |event, _, _| handle.scroll_wheel(event));
+        }
 
         let scroll_offset = scroll_handle
             .as_ref()
@@ -490,6 +499,32 @@ impl Div {
 
         if clips_children {
             description = description.clip_children();
+        }
+
+        if let Some(handle) = scroll_handle.as_ref() {
+            let content = estimated_size;
+            let handle = handle.clone();
+            description =
+                description.on_layout_with_content_changed(move |bounds, content_bounds| {
+                    let viewport = wgpui_core::geometry::Bounds::new(
+                        wgpui_core::geometry::Point::new(
+                            wgpui_core::geometry::Pixels(bounds.x),
+                            wgpui_core::geometry::Pixels(bounds.y),
+                        ),
+                        wgpui_core::geometry::Size::pixels(bounds.width, bounds.height),
+                    );
+                    let measured_content = wgpui_core::geometry::Size::pixels(
+                        content_bounds.width.max(viewport.size.width.value()),
+                        content_bounds.height.max(viewport.size.height.value()),
+                    );
+                    let content = content.map_or(measured_content, |size| {
+                        wgpui_core::geometry::Size::pixels(
+                            measured_content.width.value().max(size[0]),
+                            measured_content.height.value().max(size[1]),
+                        )
+                    });
+                    handle.set_viewport(viewport, content)
+                });
         }
 
         if let Some(element_id) = element_id {

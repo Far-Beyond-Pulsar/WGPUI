@@ -251,6 +251,7 @@ impl Reconciler {
             scroll_offset,
             emitter,
             interaction,
+            layout_callback,
             external_surface,
             layout_style,
             children,
@@ -325,6 +326,9 @@ impl Reconciler {
         });
         context.plan.set_emitter(plan_index, emitter);
         context.plan.set_interaction(plan_index, interaction);
+        context
+            .plan
+            .set_layout_callback(plan_index, layout_callback);
 
         let child_position = WalkPosition {
             depth: position.depth + 1,
@@ -447,6 +451,9 @@ impl Reconciler {
         context
             .plan
             .set_interaction(plan_index, description.interaction.take());
+        context
+            .plan
+            .set_layout_callback(plan_index, description.layout_callback.take());
 
         let child_position = WalkPosition {
             depth: position.depth + 1,

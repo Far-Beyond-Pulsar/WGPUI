@@ -412,6 +412,15 @@ mod tests {
         let mut emitter = Emitter::new();
         let mut scene = Scene::new();
         let signals = FrameSignals::new();
+        type SurfaceFrame = Result<
+            (
+                usize,
+                u64,
+                usize,
+                Option<wgpui_core::boundary::compositor::CompositeEntry>,
+            ),
+            Box<dyn std::error::Error>,
+        >;
 
         let draw = |description: Description,
                     reconciler: &mut Reconciler,

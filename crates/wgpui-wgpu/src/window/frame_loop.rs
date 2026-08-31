@@ -30,9 +30,7 @@
 //! The resulting glyph runs still enter the ordinary retained patch protocol;
 //! no text-specific draw path bypasses reconciliation.
 
-use wgpui_core::boundary::compositor::{
-    Composite, CompositeEntry, CompositeSource, TiledVisit,
-};
+use wgpui_core::boundary::compositor::{Composite, CompositeEntry, CompositeSource, TiledVisit};
 use wgpui_core::geometry::Rect;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::invalidation::request::FrameSignals;
@@ -231,8 +229,7 @@ pub struct FrameLoop {
     last_viewport: Option<[f32; 2]>,
     viewport_recomputes: u64,
     tile_flash_frames: HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), u32>,
-    tile_refresh_rates:
-        HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), TileRefreshRate>,
+    tile_refresh_rates: HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), TileRefreshRate>,
     damage_refresh_regions: Vec<DamageRefreshRegion>,
     interaction_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
@@ -487,6 +484,33 @@ impl FrameLoop {
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
+        let mut layout_changed = false;
+        for index in 0..plan.nodes().len() {
+            let Some(mut callback) = plan.take_layout_callback(index) else {
+                continue;
+            };
+            let node = plan.nodes().get(index).ok_or(LoopError::NoRoot)?;
+            let bounds = self
+                .layout
+                .layout_of(node.layout_node)
+                .map_err(EmitError::from)?;
+            let mut content = wgpui_layout::taffy_tree::LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.width,
+                height: bounds.height,
+            };
+            for child in self
+                .layout
+                .children(node.layout_node)
+                .map_err(EmitError::from)?
+            {
+                let child_bounds = self.layout.layout_of(child).map_err(EmitError::from)?;
+                content.width = content.width.max(child_bounds.x + child_bounds.width);
+                content.height = content.height.max(child_bounds.y + child_bounds.height);
+            }
+            layout_changed |= callback.apply_with_content(bounds, content);
+        }
         let interactions = self.collect_interactions(
             &mut plan,
             input.signals,
@@ -541,12 +565,12 @@ impl FrameLoop {
                 ),
             ))
         });
-        let needs_redraw = !debug_tiles.is_empty();
+        let needs_redraw = layout_changed || !debug_tiles.is_empty();
         self.renderer.set_debug_tiles(debug_tiles);
-        let external_damage = external_damage_regions.iter().copied().fold(
-            None,
-            |damage, region| Some(union_damage(damage, region)),
-        );
+        let external_damage = external_damage_regions
+            .iter()
+            .copied()
+            .fold(None, |damage, region| Some(union_damage(damage, region)));
         let mut composite_entries = input.composites.to_vec();
         composite_entries.extend(emission.external_surfaces.iter().copied());
         let can_preserve_presentation = input
@@ -580,10 +604,7 @@ impl FrameLoop {
             scene: &self.scene,
             clip: Rect::from_origin_size([0.0, 0.0], [width, height]),
             poison: &[],
-            dirty: if viewport_changed
-                || transform_only
-                || !can_preserve_presentation
-            {
+            dirty: if viewport_changed || transform_only || !can_preserve_presentation {
                 Dirty::All
             } else {
                 Dirty::Some(&dirty_layers)
@@ -684,7 +705,10 @@ impl FrameLoop {
                 let key = (visit.boundary, *tile);
                 let tile_rect = screen_tile_rect(visit, *tile);
                 let presentation_changed = viewport_changed
-                    || emission.damage.iter().any(|region| region.intersects(&tile_rect));
+                    || emission
+                        .damage
+                        .iter()
+                        .any(|region| region.intersects(&tile_rect));
                 let interaction_changed = interaction_dirty_regions
                     .iter()
                     .any(|region| region.intersects(&tile_rect));
@@ -770,13 +794,16 @@ impl FrameLoop {
         key: (wgpui_core::scene::layer::BoundaryId, TileCoord),
         now: Instant,
     ) {
-        let rate = self.tile_refresh_rates.entry(key).or_insert(TileRefreshRate {
-            window_start: now,
-            samples: 0,
-            updates: 0,
-            frames_per_second: 0.0,
-            regular: false,
-        });
+        let rate = self
+            .tile_refresh_rates
+            .entry(key)
+            .or_insert(TileRefreshRate {
+                window_start: now,
+                samples: 0,
+                updates: 0,
+                frames_per_second: 0.0,
+                regular: false,
+            });
         rate.samples = rate.samples.saturating_add(1);
         rate.updates = rate.updates.saturating_add(1);
         let elapsed = now.duration_since(rate.window_start).as_secs_f32();

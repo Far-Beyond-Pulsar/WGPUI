@@ -386,11 +386,26 @@ impl DivStyle {
         }
 
         if let Some(gradient) = &self.background_gradient {
-            emission.quad(material_quad(origin, size, corner_radii, gradient_material(gradient, self.opacity)));
+            emission.quad(material_quad(
+                origin,
+                size,
+                corner_radii,
+                gradient_material(gradient, self.opacity),
+            ));
         } else if let Some(gradient) = &self.background_radial_gradient {
-            emission.quad(material_quad(origin, size, corner_radii, radial_material(gradient, self.opacity)));
+            emission.quad(material_quad(
+                origin,
+                size,
+                corner_radii,
+                radial_material(gradient, self.opacity),
+            ));
         } else if let Some(pattern) = &self.background_pattern {
-            emission.quad(material_quad(origin, size, corner_radii, pattern_material(pattern, self.opacity)));
+            emission.quad(material_quad(
+                origin,
+                size,
+                corner_radii,
+                pattern_material(pattern, self.opacity),
+            ));
         } else if self.is_background_visible() {
             let mut background = self.background.unwrap_or([0.0; 4]);
             background[3] *= self.opacity;
@@ -514,7 +529,10 @@ fn material_quad(
 
 fn gradient_material(gradient: &LinearGradient, opacity: f32) -> Material {
     let angle = gradient.angle.to_radians();
-    let mut colors: [[f32; 4]; 2] = [gradient.stops[0].color.into(), gradient.stops[1].color.into()];
+    let mut colors: [[f32; 4]; 2] = [
+        gradient.stops[0].color.into(),
+        gradient.stops[1].color.into(),
+    ];
     colors[0][3] *= opacity;
     colors[1][3] *= opacity;
     Material::Linear {
@@ -524,7 +542,10 @@ fn gradient_material(gradient: &LinearGradient, opacity: f32) -> Material {
 }
 
 fn radial_material(gradient: &RadialGradient, opacity: f32) -> Material {
-    let mut colors: [[f32; 4]; 2] = [gradient.stops[0].color.into(), gradient.stops[1].color.into()];
+    let mut colors: [[f32; 4]; 2] = [
+        gradient.stops[0].color.into(),
+        gradient.stops[1].color.into(),
+    ];
     colors[0][3] *= opacity;
     colors[1][3] *= opacity;
     Material::Radial {
@@ -536,22 +557,44 @@ fn radial_material(gradient: &RadialGradient, opacity: f32) -> Material {
 
 fn pattern_material(pattern: &Pattern, opacity: f32) -> Material {
     match pattern {
-        Pattern::Slash { color, width, interval } => {
+        Pattern::Slash {
+            color,
+            width,
+            interval,
+        } => {
             let mut color = *color;
             color[3] *= opacity;
-            Material::Slash { color, width: *width, interval: *interval }
+            Material::Slash {
+                color,
+                width: *width,
+                interval: *interval,
+            }
         }
-        Pattern::Checker { first, second, cell } => {
+        Pattern::Checker {
+            first,
+            second,
+            cell,
+        } => {
             let mut colors = [*first, *second];
             colors[0][3] *= opacity;
             colors[1][3] *= opacity;
-            Material::Checker { colors, cell: *cell }
+            Material::Checker {
+                colors,
+                cell: *cell,
+            }
         }
-        Pattern::Stripes { first, second, width } => {
+        Pattern::Stripes {
+            first,
+            second,
+            width,
+        } => {
             let mut colors = [*first, *second];
             colors[0][3] *= opacity;
             colors[1][3] *= opacity;
-            Material::Stripes { colors, width: *width }
+            Material::Stripes {
+                colors,
+                width: *width,
+            }
         }
     }
 }

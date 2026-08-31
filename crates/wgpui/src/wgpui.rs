@@ -77,6 +77,12 @@ pub use wgpui_widgets::img::{
     ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img, ObjectFit, SharedImageEngine, img,
 };
 pub use wgpui_widgets::list;
+pub use wgpui_widgets::list::uniform_list::{
+    UniformItemTransform, UniformList, UniformListState, uniform_list,
+};
+pub use wgpui_widgets::list::virtual_list::{
+    VirtualItemTransform, VirtualList, VirtualListState, virtual_list,
+};
 pub use wgpui_widgets::scroll::{ScrollHandle, ScrollPhysics, ScrollPhysicsMode};
 pub use wgpui_widgets::styled::{
     IntoStyleBackground, IntoStyleColor, IntoStyleDimension, IntoStylePixels, Styled,
@@ -103,6 +109,7 @@ pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 pub mod prelude {
     pub use crate::{
         Application, Description, Div, Element, EntityFactory, IntoElement, Render, RenderOnce,
-        Stateful, StatefulDiv, Styled, Window, WindowOptions, div,
+        Stateful, StatefulDiv, Styled, UniformList, VirtualList, Window, WindowOptions, div,
+        uniform_list, virtual_list,
     };
 }
