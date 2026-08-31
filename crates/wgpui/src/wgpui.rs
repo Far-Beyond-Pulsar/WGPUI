@@ -45,6 +45,10 @@ pub use wgpui_core::reconcile::description::{
 };
 pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey, Reconciler};
 pub use wgpui_core::reconcile::{StateKey, StateScope};
+pub use wgpui_core::reconcile::{
+    RetainedElementSnapshot, RetainedFrameSnapshot, RetainedWalk, RetainedWalkNode, TileOwnership,
+};
+pub use wgpui_core::damage::{DamagePlan, DamageReason, DamageRecord};
 pub use wgpui_core::scene;
 pub use wgpui_core::window::{
     AnimationClock, AnimationScheduler, DispatchTree, FocusManager, Keymap, WindowTimers,
@@ -125,7 +129,6 @@ pub use wgpui_wgpu::window::surface::WgpuSurfaceHandle;
 pub fn wgpu_surface(handle: WgpuSurfaceHandle) -> WgpuSurface {
     WgpuSurface::new(SurfaceId::from_raw(handle.id()))
 }
-pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 
 pub mod prelude {
     pub use crate::{
