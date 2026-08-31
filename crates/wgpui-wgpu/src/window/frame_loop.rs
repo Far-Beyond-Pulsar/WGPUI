@@ -31,7 +31,7 @@
 //! no text-specific draw path bypasses reconciliation.
 
 use wgpui_core::boundary::compositor::CompositeEntry;
-use wgpui_core::geometry::Rect;
+use wgpui_core::geometry::{Pixels, Rect};
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::invalidation::request::FrameSignals;
 use wgpui_core::patch::PatchError;
@@ -40,10 +40,12 @@ use wgpui_core::patch::emit::{Emission, Emit, EmitContext, EmitError, Emitter, F
 use wgpui_core::patch::primitive::{Glyph, GlyphRun, Material, Quad};
 use wgpui_core::reconcile::description::{Description, DescriptionInteraction, RawText};
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
+use wgpui_core::reconcile::instance::InstanceKey;
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::LayerId;
+use wgpui_core::window::ScrollRootHandle;
 use wgpui_layout::taffy_tree::{
     Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
 };
@@ -149,6 +151,27 @@ pub struct InteractionRegistration {
     pub bounds: Rect,
     pub order: u64,
     pub interaction: DescriptionInteraction,
+    pub scroll_root: Option<ScrollRootRegistration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScrollRootRegistration {
+    pub handle: ScrollRootHandle,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct WalkFrame {
+    origin: [f32; 2],
+    layout_origin: [f32; 2],
+    scroll_offset: [f32; 2],
+    clip: Option<Rect>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct WalkNode {
+    bounds: Rect,
+    layout_bounds: Rect,
+    visible_bounds: Rect,
 }
 
 impl LoopFrame {
@@ -223,6 +246,10 @@ pub struct FrameLoop {
     interaction_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     scale_factor: f32,
+    automatic_scroll_roots: HashMap<
+        wgpui_core::reconcile::instance::InstanceKey,
+        ScrollRootHandle,
+    >,
 }
 
 #[derive(Clone)]
@@ -261,6 +288,7 @@ impl FrameLoop {
             interaction_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             scale_factor: 1.0,
+            automatic_scroll_roots: HashMap::new(),
         }
     }
 
@@ -433,7 +461,15 @@ impl FrameLoop {
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
-        let interactions = self.collect_interactions(&mut plan)?;
+        self.prime_scroll_offsets(&mut plan);
+        let walk = self.collect_walk(&plan)?;
+        let (scroll_roots, offsets_changed) = self.update_scroll_roots(&mut plan, &walk);
+        let walk = if offsets_changed {
+            self.collect_walk(&plan)?
+        } else {
+            walk
+        };
+        let interactions = self.collect_interactions(&mut plan, &walk, scroll_roots)?;
         let emission = self
             .emitter
             .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
@@ -588,45 +624,192 @@ impl FrameLoop {
             .collect()
     }
 
-    fn collect_interactions(
+    fn collect_walk(
         &self,
-        plan: &mut wgpui_core::reconcile::plan::FramePlan,
-    ) -> Result<Vec<InteractionRegistration>, LoopError> {
-        let mut frames = Vec::<([f32; 2], [f32; 2], Option<Rect>)>::new();
-        let mut result = Vec::new();
-        for index in 0..plan.nodes().len() {
-            let node = plan.nodes()[index];
+        plan: &wgpui_core::reconcile::plan::FramePlan,
+    ) -> Result<Vec<WalkNode>, LoopError> {
+        let mut frames = Vec::<WalkFrame>::new();
+        let mut result = Vec::with_capacity(plan.nodes().len());
+        for node in plan.nodes() {
             let rectangle = self
                 .layout
                 .layout_of(node.layout_node)
                 .map_err(EmitError::from)?;
             frames.truncate(node.depth as usize);
-            let (parent_origin, parent_offset, parent_clip) = frames
-                .last()
-                .copied()
-                .unwrap_or(([0.0, 0.0], [0.0, 0.0], None));
+            let parent = frames.last().copied().unwrap_or_default();
+            let layout_origin = [
+                parent.layout_origin[0] + rectangle.x,
+                parent.layout_origin[1] + rectangle.y,
+            ];
             let origin = [
-                parent_origin[0] + parent_offset[0] + rectangle.x,
-                parent_origin[1] + parent_offset[1] + rectangle.y,
+                parent.origin[0] + parent.scroll_offset[0] + rectangle.x,
+                parent.origin[1] + parent.scroll_offset[1] + rectangle.y,
             ];
             let bounds = Rect::from_origin_size(origin, [rectangle.width, rectangle.height]);
-            if let Some(interaction) = plan.take_interaction(index) {
-                let visible_bounds = parent_clip.map_or(bounds, |clip| bounds.intersect(&clip));
-                if !visible_bounds.is_empty() {
-                result.push(InteractionRegistration {
-                        address: node.address,
-                        bounds: visible_bounds,
-                        order: index as u64,
-                        interaction,
-                    });
-                }
-            }
+            let layout_bounds = Rect::from_origin_size(
+                layout_origin,
+                [rectangle.width, rectangle.height],
+            );
+            let visible_bounds = parent
+                .clip
+                .map_or(bounds, |clip| bounds.intersect(&clip));
             let clip = if node.clip_children {
-                Some(parent_clip.map_or(bounds, |parent| bounds.intersect(&parent)))
+                Some(parent.clip.map_or(bounds, |parent| bounds.intersect(&parent)))
             } else {
-                parent_clip
+                parent.clip
             };
-            frames.push((origin, node.scroll_offset, clip));
+            result.push(WalkNode {
+                bounds,
+                layout_bounds,
+                visible_bounds,
+            });
+            frames.push(WalkFrame {
+                origin,
+                layout_origin,
+                scroll_offset: node.scroll_offset,
+                clip,
+            });
+        }
+        Ok(result)
+    }
+
+    fn prime_scroll_offsets(
+        &self,
+        plan: &mut wgpui_core::reconcile::plan::FramePlan,
+    ) {
+        for index in 0..plan.nodes().len() {
+            if !plan.has_automatic_scroll(index) {
+                continue;
+            }
+            let address = plan.nodes()[index].address;
+            let Some(handle) = self.automatic_scroll_roots.get(&address) else {
+                continue;
+            };
+            plan.set_scroll_offset(
+                index,
+                [handle.offset().x.value(), handle.offset().y.value()],
+            );
+        }
+    }
+
+    fn update_scroll_roots(
+        &mut self,
+        plan: &mut wgpui_core::reconcile::plan::FramePlan,
+        walk: &[WalkNode],
+    ) -> (HashMap<InstanceKey, ScrollRootRegistration>, bool) {
+        let mut active = HashMap::new();
+        let mut offsets_changed = false;
+        for index in 0..plan.nodes().len() {
+            let node = plan.nodes()[index];
+            let scroll_axes = plan.scroll_axes(index).unwrap_or([false, false]);
+            if !plan.has_automatic_scroll(index) || scroll_axes == [false, false] {
+                continue;
+            }
+            let Some(geometry) = walk.get(index) else {
+                continue;
+            };
+            let content_size = self.content_size(index, plan, walk);
+            let handle = self
+                .automatic_scroll_roots
+                .entry(node.address)
+                .or_insert_with(|| ScrollRootHandle::new(scroll_axes))
+                .clone();
+            handle.set_viewport(
+                wgpui_core::geometry::size(
+                    Pixels(geometry.bounds.width()),
+                    Pixels(geometry.bounds.height()),
+                ),
+                wgpui_core::geometry::size(Pixels(content_size[0]), Pixels(content_size[1])),
+                scroll_axes,
+            );
+            offsets_changed |= plan.set_scroll_offset(
+                index,
+                [handle.offset().x.value(), handle.offset().y.value()],
+            );
+            if !geometry.visible_bounds.is_empty()
+                && scroll_axes.iter().enumerate().any(|(axis, enabled)| {
+                    *enabled
+                        && content_size[axis]
+                            > [geometry.bounds.width(), geometry.bounds.height()][axis]
+                })
+            {
+                active.insert(node.address, ScrollRootRegistration { handle });
+            }
+        }
+        self.automatic_scroll_roots
+            .retain(|address, _| plan.nodes().iter().any(|node| node.address == *address));
+        (active, offsets_changed)
+    }
+
+    fn content_size(
+        &self,
+        root_index: usize,
+        plan: &wgpui_core::reconcile::plan::FramePlan,
+        walk: &[WalkNode],
+    ) -> [f32; 2] {
+        let Some(root) = walk.get(root_index) else {
+            return [0.0, 0.0];
+        };
+        let root_depth = plan.nodes()[root_index].depth;
+        let mut content_size = [root.bounds.width(), root.bounds.height()];
+        let mut index = root_index + 1;
+        while let Some(node) = plan.nodes().get(index) {
+            if node.depth <= root_depth {
+                break;
+            }
+            let nested_root = index > root_index
+                && plan.scroll_axes(index).unwrap_or([false, false]) != [false, false];
+            if nested_root {
+                let nested = &walk[index].layout_bounds;
+                let x = nested.max_x - root.layout_bounds.min_x;
+                let y = nested.max_y - root.layout_bounds.min_y;
+                content_size[0] = content_size[0].max(x);
+                content_size[1] = content_size[1].max(y);
+                let nested_depth = node.depth;
+                index += 1;
+                while let Some(descendant) = plan.nodes().get(index) {
+                    if descendant.depth <= nested_depth {
+                        break;
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+            let bounds = &walk[index].layout_bounds;
+            content_size[0] = content_size[0].max(bounds.max_x - root.layout_bounds.min_x);
+            content_size[1] = content_size[1].max(bounds.max_y - root.layout_bounds.min_y);
+            index += 1;
+        }
+        content_size
+    }
+
+    fn collect_interactions(
+        &self,
+        plan: &mut wgpui_core::reconcile::plan::FramePlan,
+        walk: &[WalkNode],
+        scroll_roots: HashMap<InstanceKey, ScrollRootRegistration>,
+    ) -> Result<Vec<InteractionRegistration>, LoopError> {
+        let mut result = Vec::new();
+        for index in 0..plan.nodes().len() {
+            let node = plan.nodes()[index];
+            let scroll_root = scroll_roots.get(&node.address).cloned();
+            let interaction = plan.take_interaction(index);
+            if let Some(geometry) = walk.get(index)
+                && !geometry.visible_bounds.is_empty()
+                && (interaction.is_some() || scroll_root.is_some())
+            {
+                result.push(InteractionRegistration {
+                    address: node.address,
+                    bounds: geometry.visible_bounds,
+                    order: index as u64,
+                    interaction: interaction.unwrap_or_else(|| {
+                        DescriptionInteraction::new(|_, _, _| {
+                            wgpui_core::window::EventResult::IGNORED
+                        })
+                    }),
+                    scroll_root,
+                });
+            }
         }
         Ok(result)
     }

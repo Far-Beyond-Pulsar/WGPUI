@@ -63,6 +63,9 @@ impl InteractionState {
     pub fn is_focused(&self) -> bool {
         self.focused
     }
+    pub fn has_scroll_handler(&self) -> bool {
+        !self.scroll.is_empty()
+    }
     pub fn set_focused(&mut self, focused: bool) -> bool {
         let changed = self.focused != focused;
         self.focused = focused;

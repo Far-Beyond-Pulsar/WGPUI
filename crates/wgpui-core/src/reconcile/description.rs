@@ -189,6 +189,8 @@ pub struct Description {
     pub(crate) uncached: bool,
     pub(crate) boundary: Option<BoundaryPolicy>,
     pub(crate) scroll_offset: [f32; 2],
+    pub(crate) scroll_axes: [bool; 2],
+    pub(crate) automatic_scroll: bool,
     pub(crate) emitter: Option<Box<dyn Emit>>,
     pub(crate) layout_style: LayoutStyle,
     pub(crate) children: Vec<Description>,
@@ -209,6 +211,8 @@ impl std::fmt::Debug for Description {
             .field("uncached", &self.uncached)
             .field("boundary", &self.boundary)
             .field("scroll_offset", &self.scroll_offset)
+            .field("scroll_axes", &self.scroll_axes)
+            .field("automatic_scroll", &self.automatic_scroll)
             .field("has_emitter", &self.emitter.is_some())
             .field("children", &self.children.len())
             .field("clip_children", &self.clip_children)
@@ -234,6 +238,8 @@ impl Description {
             uncached: false,
             boundary: None,
             scroll_offset: [0.0, 0.0],
+            scroll_axes: [false, false],
+            automatic_scroll: false,
             emitter: None,
             layout_style: LayoutStyle::default(),
             children: Vec::new(),
@@ -311,6 +317,19 @@ impl Description {
     /// something an element's fingerprint can see.
     pub fn scroll_offset(mut self, offset: [f32; 2]) -> Self {
         self.scroll_offset = offset;
+        self
+    }
+
+    /// Declare which overflow axes may establish an automatic scroll root.
+    pub fn with_scroll_axes(mut self, axes: [bool; 2]) -> Self {
+        self.scroll_axes = axes;
+        self
+    }
+
+    /// Allow the native backend to retain and route scroll input for this
+    /// element when its configured overflow has a scrollable extent.
+    pub fn automatic_scroll(mut self, automatic: bool) -> Self {
+        self.automatic_scroll = automatic;
         self
     }
 
@@ -448,6 +467,14 @@ impl Description {
     /// The displacement this element applies to its children.
     pub fn scroll_offset_of(&self) -> [f32; 2] {
         self.scroll_offset
+    }
+
+    pub fn scroll_axes(&self) -> [bool; 2] {
+        self.scroll_axes
+    }
+
+    pub fn has_automatic_scroll(&self) -> bool {
+        self.automatic_scroll
     }
 
     /// Whether this element emits anything of its own.

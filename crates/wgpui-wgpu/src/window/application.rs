@@ -254,10 +254,35 @@ impl Window {
             }
             InputEvent::Scroll(scroll) => {
                 let mut handled = false;
+                let mut remaining = scroll.delta;
                 for index in self.hit_interactions(scroll.position) {
-                    let result = self.dispatch_interaction(index, &event, app);
+                    let mut bubbled_event = *scroll;
+                    bubbled_event.delta = remaining;
+                    let result = self.dispatch_interaction(
+                        index,
+                        &InputEvent::Scroll(bubbled_event),
+                        app,
+                    );
                     handled |= result;
                     if result {
+                        break;
+                    }
+                    let Some(registration) = self.interactions.get(index) else {
+                        continue;
+                    };
+                    let Some(scroll_root) = registration.scroll_root.as_ref() else {
+                        continue;
+                    };
+                    let consumed = scroll_root.handle.scroll_by(wgpui_core::geometry::Point::new(
+                        Pixels(remaining[0]),
+                        Pixels(remaining[1]),
+                    ));
+                    remaining[0] -= consumed.x.value();
+                    remaining[1] -= consumed.y.value();
+                    if consumed.x != Pixels::ZERO || consumed.y != Pixels::ZERO {
+                        handled = true;
+                    }
+                    if remaining[0] == 0.0 && remaining[1] == 0.0 {
                         break;
                     }
                 }
@@ -267,25 +292,7 @@ impl Window {
         }
     }
     fn hit_interactions(&self, position: [Pixels; 2]) -> Vec<usize> {
-        let point = [
-            position[0].value() * self.scale_factor as f32,
-            position[1].value() * self.scale_factor as f32,
-        ];
-        let mut hits: Vec<_> = self
-            .interactions
-            .iter()
-            .enumerate()
-            .filter(|(_, registration)| {
-                let bounds = registration.bounds;
-                point[0] >= bounds.min_x
-                    && point[0] < bounds.max_x
-                    && point[1] >= bounds.min_y
-                    && point[1] < bounds.max_y
-            })
-            .map(|(index, _)| index)
-            .collect();
-        hits.sort_unstable_by_key(|index| std::cmp::Reverse(self.interactions[*index].order));
-        hits
+        hit_interaction_indices(&self.interactions, position, self.scale_factor)
     }
     fn hit_interaction(&self, position: [Pixels; 2]) -> Option<usize> {
         self.hit_interactions(position).into_iter().next()
@@ -398,6 +405,31 @@ impl Window {
     pub fn end_frame(&mut self) -> usize {
         self.state.sweep(self.state_frame)
     }
+}
+
+fn hit_interaction_indices(
+    interactions: &[InteractionRegistration],
+    position: [Pixels; 2],
+    scale_factor: f64,
+) -> Vec<usize> {
+    let point = [
+        position[0].value() * scale_factor as f32,
+        position[1].value() * scale_factor as f32,
+    ];
+    let mut hits: Vec<_> = interactions
+        .iter()
+        .enumerate()
+        .filter(|(_, registration)| {
+            let bounds = registration.bounds;
+            point[0] >= bounds.min_x
+                && point[0] < bounds.max_x
+                && point[1] >= bounds.min_y
+                && point[1] < bounds.max_y
+        })
+        .map(|(index, _)| index)
+        .collect();
+    hits.sort_unstable_by_key(|index| std::cmp::Reverse(interactions[*index].order));
+    hits
 }
 
 impl WindowHandle {
@@ -1125,6 +1157,8 @@ fn key_name(event: &winit::event::KeyEvent) -> String {
 mod tests {
     use super::*;
     use wgpui_core::geometry::{point, px, size};
+    use wgpui_core::reconcile::description::DescriptionInteraction;
+    use wgpui_core::window::{EventResult, ScrollRootHandle};
 
     #[test]
     fn window_bounds_override_fallback_size_and_preserve_position() {
@@ -1148,5 +1182,42 @@ mod tests {
             ..WindowOptions::default()
         };
         assert_eq!(initial_bounds(&options).size, size(px(320.0), px(240.0)));
+    }
+
+    fn registration(bounds: Rect, order: u64) -> InteractionRegistration {
+        InteractionRegistration {
+            address: wgpui_core::reconcile::instance::InstanceKey::from_raw(order + 1),
+            bounds,
+            order,
+            interaction: DescriptionInteraction::new(|_, _, _| EventResult::IGNORED),
+            scroll_root: None,
+        }
+    }
+
+    #[test]
+    fn scroll_hit_candidates_are_inner_first_and_fully_clipped_regions_do_not_hit() {
+        let interactions = vec![
+            registration(Rect::from_origin_size([0.0, 0.0], [100.0, 100.0]), 1),
+            registration(Rect::from_origin_size([20.0, 20.0], [40.0, 40.0]), 2),
+            registration(Rect::EMPTY, 3),
+        ];
+        assert_eq!(hit_interaction_indices(&interactions, [px(30.0), px(30.0)], 1.0), vec![1, 0]);
+        assert_eq!(hit_interaction_indices(&interactions, [px(0.0), px(0.0)], 1.0), vec![0]);
+    }
+
+    #[test]
+    fn nested_scroll_roots_can_consume_a_delta_in_order() {
+        let inner = ScrollRootHandle::new([false, true]);
+        let outer = ScrollRootHandle::new([false, true]);
+        inner.set_viewport(size(px(100.0), px(50.0)), size(px(100.0), px(90.0)), [false, true]);
+        outer.set_viewport(size(px(100.0), px(100.0)), size(px(100.0), px(300.0)), [false, true]);
+        let mut remaining = -80.0;
+        let consumed = inner.scroll_by(Point::new(px(0.0), px(remaining)));
+        remaining -= consumed.y.value();
+        let consumed = outer.scroll_by(Point::new(px(0.0), px(remaining)));
+        remaining -= consumed.y.value();
+        assert_eq!(remaining, 0.0);
+        assert_eq!(inner.offset().y, px(-40.0));
+        assert_eq!(outer.offset().y, px(-40.0));
     }
 }

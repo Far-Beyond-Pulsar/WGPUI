@@ -119,6 +119,7 @@ impl PlannedNode {
     pub fn skipped_prepaint_and_paint(&self) -> bool {
         matches!(self.outcome, NodeOutcome::Reused)
     }
+
 }
 
 /// How much work a frame's reconciliation actually did.
@@ -170,6 +171,8 @@ pub struct FramePlan {
     nodes: Vec<PlannedNode>,
     emitters: Vec<Option<Box<dyn Emit>>>,
     interactions: Vec<Option<DescriptionInteraction>>,
+    scroll_axes: Vec<[bool; 2]>,
+    automatic_scroll: Vec<bool>,
     stats: FrameStats,
 }
 
@@ -200,7 +203,42 @@ impl FramePlan {
         self.nodes.push(node);
         self.emitters.push(None);
         self.interactions.push(None);
+        self.scroll_axes.push([false, false]);
+        self.automatic_scroll.push(false);
         self.nodes.len() - 1
+    }
+
+    pub(crate) fn set_scroll_metadata(
+        &mut self,
+        index: usize,
+        axes: [bool; 2],
+        automatic: bool,
+    ) {
+        if let Some(value) = self.scroll_axes.get_mut(index) {
+            *value = axes;
+        }
+        if let Some(value) = self.automatic_scroll.get_mut(index) {
+            *value = automatic;
+        }
+    }
+
+    pub fn scroll_axes(&self, index: usize) -> Option<[bool; 2]> {
+        self.scroll_axes.get(index).copied()
+    }
+
+    pub fn has_automatic_scroll(&self, index: usize) -> bool {
+        self.automatic_scroll.get(index).copied().unwrap_or(false)
+    }
+
+    pub fn set_scroll_offset(&mut self, index: usize, offset: [f32; 2]) -> bool {
+        let Some(node) = self.nodes.get_mut(index) else {
+            return false;
+        };
+        if node.scroll_offset == offset {
+            return false;
+        }
+        node.scroll_offset = offset;
+        true
     }
 
     /// Attach an element's emitter, if it had one.
