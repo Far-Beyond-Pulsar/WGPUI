@@ -1,12 +1,13 @@
 use super::{App, Entity, EntityId, Subscription, Task};
 use crate::window::{FocusHandle, Window};
+use std::ops::Deref;
 
 pub struct Context<T> {
     entity: Entity<T>,
     notified: bool,
 }
 impl<T> Context<T> {
-    pub(crate) fn new(entity: Entity<T>) -> Self {
+    pub(crate) fn from_entity(entity: Entity<T>) -> Self {
         Self {
             entity,
             notified: false,
@@ -22,13 +23,13 @@ impl<T> Context<T> {
     }
     pub fn spawn<F, Fut, R>(&self, make: F) -> Task<R>
     where
-        F: FnOnce(super::WeakEntity<T>, Context<T>) -> Fut,
+        F: FnOnce(super::WeakEntity<T>, Context<T>) -> Fut + 'static,
         Fut: std::future::Future<Output = R> + 'static,
         R: 'static,
     {
         self.entity.app().spawn(make(
             self.entity.downgrade(),
-            Context::new(self.entity.clone()),
+            Context::from_entity(self.entity.clone()),
         ))
     }
     pub fn observe(&self, callback: impl Fn(EntityId) + 'static) -> Subscription {
@@ -53,6 +54,23 @@ impl<T> Context<T> {
     /// Create a focus handle for a control owned by this entity.
     pub fn focus_handle(&self) -> FocusHandle {
         FocusHandle::new()
+    }
+
+    /// Run sendable work away from the foreground executor.
+    pub fn background_spawn<Fut, R>(&self, future: Fut) -> Task<R>
+    where
+        Fut: std::future::Future<Output = R> + Send + 'static,
+        R: Send + 'static,
+    {
+        self.app().background_spawn(future)
+    }
+}
+
+impl<T> Deref for Context<T> {
+    type Target = App;
+
+    fn deref(&self) -> &Self::Target {
+        self.entity.app_ref()
     }
 }
 
@@ -80,9 +98,9 @@ mod tests {
 
     #[test]
     fn listener_updates_the_live_entity_and_can_use_window_state() {
-        let app = App::new();
+        let app = App::create();
         let entity = app.new_entity(0_u32);
-        let context = Context::new(entity.clone());
+        let context = Context::from_entity(entity.clone());
         let listener = context.listener(|value, event: &u32, window, context| {
             *value += *event;
             window.activate();
@@ -99,9 +117,9 @@ mod tests {
 
     #[test]
     fn listener_does_not_keep_an_entity_alive() {
-        let app = App::new();
+        let app = App::create();
         let entity = app.new_entity(0_u32);
-        let context = Context::new(entity.clone());
+        let context = Context::from_entity(entity.clone());
         let listener = context.listener(|_: &mut u32, _: &(), _: &mut Window, _| {});
         drop(entity);
         let mut window = Window::new();
@@ -111,9 +129,9 @@ mod tests {
 
     #[test]
     fn context_activation_and_quit_delegate_to_shared_app_state() {
-        let app = App::new();
+        let app = App::create();
         let entity = app.new_entity(());
-        let context = Context::new(entity);
+        let context = Context::from_entity(entity);
 
         context.activate(true);
         context.quit();

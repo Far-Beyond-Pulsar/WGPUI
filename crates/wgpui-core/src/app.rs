@@ -2,8 +2,12 @@
 //! docs/gpu-native-architecture.md §1, §3.1.
 use std::any::TypeId;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use crate::action::Action;
 use crate::element::{IntoElement, Render};
@@ -16,10 +20,19 @@ use futures::task::LocalSpawnExt;
 pub use context::Context;
 pub use entity::{Entity, EntityError, EntityId, WeakEntity};
 
+/// Constructs an entity while giving its constructor a context owned by the
+/// same eventual entity. The entity is initialized immediately after the
+/// constructor returns, so handles captured by the constructor remain valid.
+#[allow(clippy::new_ret_no_self, clippy::wrong_self_convention)]
+pub trait EntityFactory {
+    fn new<T: 'static>(&mut self, build: impl FnOnce(&mut Context<T>) -> T) -> Entity<T>;
+}
+
 type Observer = Rc<dyn Fn(EntityId)>;
 type ActionHandler = Rc<RefCell<dyn FnMut(&dyn Action, &mut App)>>;
 type WindowBuild = Box<dyn FnOnce(&mut crate::window::Window, &mut App) -> WindowRenderer>;
 type WindowRender = Box<dyn FnMut(&mut crate::window::Window, &mut App) -> Description>;
+type WindowClosedHandler = Rc<RefCell<dyn FnMut(&mut App, WindowId)>>;
 
 struct AppState {
     observers: HashMap<EntityId, Vec<(u64, Observer)>>,
@@ -32,9 +45,38 @@ struct AppState {
     quit_requested: bool,
     menus: Vec<Menu>,
     pending_windows: Vec<WindowRequest>,
+    next_window: u64,
+    windows: HashSet<WindowId>,
+    close_requested: bool,
+    next_window_closed_handler: u64,
+    window_closed_handlers: Vec<(u64, WindowClosedHandler)>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowId(u64);
+
+impl WindowId {
+    pub const fn as_raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WindowList {
+    count: usize,
+}
+
+impl WindowList {
+    pub const fn len(self) -> usize {
+        self.count
+    }
+    pub const fn is_empty(self) -> bool {
+        self.count == 0
+    }
 }
 
 pub struct WindowRequest {
+    pub id: WindowId,
     pub options: WindowOptions,
     pub build: WindowBuild,
 }
@@ -49,16 +91,17 @@ pub struct WindowRenderer {
 pub struct App {
     state: Rc<RefCell<AppState>>,
     foreground: Rc<RefCell<futures::executor::LocalPool>>,
+    pending_tasks: Arc<AtomicUsize>,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self::new()
+        Self::create()
     }
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn create() -> Self {
         Self {
             state: Rc::new(RefCell::new(AppState {
                 observers: HashMap::new(),
@@ -71,8 +114,14 @@ impl App {
                 quit_requested: false,
                 menus: Vec::new(),
                 pending_windows: Vec::new(),
+                next_window: 0,
+                windows: HashSet::new(),
+                close_requested: false,
+                next_window_closed_handler: 0,
+                window_closed_handlers: Vec::new(),
             })),
             foreground: Rc::new(RefCell::new(futures::executor::LocalPool::new())),
+            pending_tasks: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -80,6 +129,20 @@ impl App {
         let mut state = self.state.borrow_mut();
         state.next_entity += 1;
         Entity::new(EntityId(state.next_entity), value, self.clone())
+    }
+
+    pub fn new_entity_with<T: 'static>(
+        &self,
+        build: impl FnOnce(&mut Context<T>) -> T,
+    ) -> Entity<T> {
+        let mut state = self.state.borrow_mut();
+        state.next_entity += 1;
+        let entity = Entity::new_uninitialized(EntityId(state.next_entity), self.clone());
+        drop(state);
+        let mut context = Context::from_entity(entity.clone());
+        let value = build(&mut context);
+        entity.initialize(value);
+        entity
     }
 
     pub(crate) fn add_observer(&self, entity: EntityId, callback: Observer) -> Subscription {
@@ -113,6 +176,10 @@ impl App {
 
     pub fn run_pending_tasks(&self) {
         self.foreground.borrow_mut().run_until_stalled();
+    }
+
+    pub fn has_pending_tasks(&self) -> bool {
+        self.pending_tasks.load(Ordering::Acquire) != 0
     }
 
     pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
@@ -189,11 +256,65 @@ impl App {
     }
 
     pub fn quit(&mut self) {
-        self.state.borrow_mut().quit_requested = true;
+        let mut state = self.state.borrow_mut();
+        state.quit_requested = true;
+        state.close_requested = true;
     }
 
     pub fn quit_requested(&self) -> bool {
         self.state.borrow().quit_requested
+    }
+
+    pub fn request_close(&mut self) {
+        self.state.borrow_mut().close_requested = true;
+    }
+
+    pub fn close_requested(&self) -> bool {
+        self.state.borrow().close_requested
+    }
+
+    pub fn windows(&self) -> WindowList {
+        WindowList {
+            count: self.state.borrow().windows.len(),
+        }
+    }
+
+    pub fn on_window_closed(
+        &mut self,
+        handler: impl FnMut(&mut App, WindowId) + 'static,
+    ) -> WindowClosedSubscription {
+        let mut state = self.state.borrow_mut();
+        state.next_window_closed_handler += 1;
+        let id = state.next_window_closed_handler;
+        state
+            .window_closed_handlers
+            .push((id, Rc::new(RefCell::new(handler))));
+        WindowClosedSubscription {
+            app: self.clone(),
+            id,
+            detached: false,
+        }
+    }
+
+    pub fn window_closed(&mut self, id: WindowId) {
+        let handlers = {
+            let mut state = self.state.borrow_mut();
+            if !state.windows.remove(&id) {
+                return;
+            }
+            state
+                .window_closed_handlers
+                .iter()
+                .map(|(_, handler)| handler.clone())
+                .collect::<Vec<_>>()
+        };
+        for handler in handlers {
+            handler.borrow_mut()(self, id);
+        }
+    }
+
+    pub fn window_creation_failed(&mut self, id: WindowId) {
+        self.state.borrow_mut().windows.remove(&id);
     }
 
     pub fn open_window<V: Render>(
@@ -204,7 +325,12 @@ impl App {
         if self.quit_requested() {
             return Err("application is quitting");
         }
+        if self.close_requested() {
+            return Err("application is closing");
+        }
+        let id = self.reserve_window();
         self.state.borrow_mut().pending_windows.push(WindowRequest {
+            id,
             options,
             build: Box::new(move |window, app| {
                 let entity = build_root_view(window, app);
@@ -218,6 +344,14 @@ impl App {
             }),
         });
         Ok(())
+    }
+
+    pub fn reserve_window(&mut self) -> WindowId {
+        let mut state = self.state.borrow_mut();
+        state.next_window += 1;
+        let id = WindowId(state.next_window);
+        state.windows.insert(id);
+        id
     }
 
     pub fn take_window_requests(&mut self) -> Vec<WindowRequest> {
@@ -239,19 +373,24 @@ impl App {
     {
         let (abort, registration) = AbortHandle::new_pair();
         let (sender, receiver) = oneshot::channel();
+        let pending_tasks = self.pending_tasks.clone();
+        pending_tasks.fetch_add(1, Ordering::AcqRel);
         let future = Abortable::new(future, registration);
         let spawn_result = self.foreground.borrow().spawner().spawn_local(async move {
+            let _guard = PendingTaskGuard(pending_tasks);
             if let Ok(value) = future.await {
                 let _ = sender.send(value);
             }
         });
         if spawn_result.is_err() {
             abort.abort();
+            self.pending_tasks.fetch_sub(1, Ordering::AcqRel);
         }
         Task {
             receiver,
             abort: Some(abort),
             completed: false,
+            cancelled: false,
         }
     }
 
@@ -262,7 +401,10 @@ impl App {
     {
         let (abort, registration) = AbortHandle::new_pair();
         let (sender, receiver) = oneshot::channel();
+        let pending_tasks = self.pending_tasks.clone();
+        pending_tasks.fetch_add(1, Ordering::AcqRel);
         std::thread::spawn(move || {
+            let _guard = PendingTaskGuard(pending_tasks);
             let result = futures::executor::block_on(Abortable::new(future, registration));
             if let Ok(value) = result {
                 let _ = sender.send(value);
@@ -272,7 +414,16 @@ impl App {
             receiver,
             abort: Some(abort),
             completed: false,
+            cancelled: false,
         }
+    }
+}
+
+struct PendingTaskGuard(Arc<AtomicUsize>);
+
+impl Drop for PendingTaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -281,6 +432,7 @@ pub struct Task<T> {
     receiver: oneshot::Receiver<T>,
     abort: Option<AbortHandle>,
     completed: bool,
+    cancelled: bool,
 }
 
 impl<T> Task<T> {
@@ -291,18 +443,22 @@ impl<T> Task<T> {
             receiver,
             abort: None,
             completed: false,
+            cancelled: false,
         }
     }
     pub fn detach(mut self) {
         self.abort = None;
     }
     pub fn cancel(&mut self) {
-        if let Some(abort) = self.abort.take() {
+        if !self.completed
+            && let Some(abort) = self.abort.take()
+        {
             abort.abort();
+            self.cancelled = true;
         }
     }
     pub fn is_cancelled(&self) -> bool {
-        self.abort.is_none() && !self.completed
+        self.cancelled
     }
 }
 
@@ -319,6 +475,7 @@ impl<T> std::future::Future for Task<T> {
             }
             std::task::Poll::Ready(Err(_)) => {
                 self.completed = true;
+                self.cancelled = true;
                 std::task::Poll::Ready(Err(TaskError::Cancelled))
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
@@ -350,6 +507,42 @@ pub struct Subscription {
     entity: EntityId,
     id: u64,
 }
+
+pub struct WindowClosedSubscription {
+    app: App,
+    id: u64,
+    detached: bool,
+}
+
+impl WindowClosedSubscription {
+    pub fn detach(mut self) {
+        self.detached = true;
+    }
+}
+
+impl Drop for WindowClosedSubscription {
+    fn drop(&mut self) {
+        if !self.detached {
+            self.app
+                .state
+                .borrow_mut()
+                .window_closed_handlers
+                .retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+impl EntityFactory for App {
+    fn new<T: 'static>(&mut self, build: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
+        self.new_entity_with(build)
+    }
+}
+
+impl<T> EntityFactory for Context<T> {
+    fn new<U: 'static>(&mut self, build: impl FnOnce(&mut Context<U>) -> U) -> Entity<U> {
+        self.app().new_entity_with(build)
+    }
+}
 impl Drop for Subscription {
     fn drop(&mut self) {
         if let Some(observers) = self.app.state.borrow_mut().observers.get_mut(&self.entity) {
@@ -370,7 +563,7 @@ mod tests {
 
     #[test]
     fn entity_identity_and_state_survive_high_frequency_updates() {
-        let app = App::new();
+        let app = App::create();
         let entity = app.new_entity(0_u64);
         let identity = entity.entity_id();
         let notifications = Rc::new(Cell::new(0_u64));
@@ -392,15 +585,17 @@ mod tests {
 
     #[test]
     fn foreground_tasks_run_when_the_app_pumps_and_return_errors_as_values() {
-        let app = App::new();
+        let app = App::create();
         let mut task = app.spawn(async { Ok::<_, &'static str>(42_u32) });
+        assert!(app.has_pending_tasks());
         app.run_pending_tasks();
         assert_eq!(futures::executor::block_on(&mut task), Ok(Ok(42)));
+        assert!(!app.has_pending_tasks());
     }
 
     #[test]
     fn dropping_a_task_cancels_the_underlying_work() {
-        let app = App::new();
+        let app = App::create();
         let mut task = app.spawn(pending::<()>());
         task.cancel();
         assert!(task.is_cancelled());
@@ -409,11 +604,58 @@ mod tests {
             futures::executor::block_on(&mut task),
             Err(TaskError::Cancelled)
         );
+        assert!(!app.has_pending_tasks());
+    }
+
+    #[test]
+    fn background_tasks_complete_and_release_the_pending_task_count() {
+        let app = App::create();
+        let (start_sender, start_receiver) = std::sync::mpsc::channel();
+        let mut task = app.background_spawn(async move {
+            if start_receiver.recv().is_err() {
+                return 0_u32;
+            }
+            42_u32
+        });
+        assert!(app.has_pending_tasks());
+        assert!(start_sender.send(()).is_ok());
+        assert_eq!(futures::executor::block_on(&mut task), Ok(42));
+        for _ in 0..1000 {
+            if !app.has_pending_tasks() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(!app.has_pending_tasks());
+    }
+
+    #[test]
+    fn entity_constructors_can_capture_weak_self_and_create_owned_children() {
+        struct Parent {
+            child: Entity<u32>,
+            self_handle: WeakEntity<Parent>,
+        }
+
+        let app = App::create();
+        let parent = app.new_entity_with(|cx| Parent {
+            child: cx.new(|_| 7_u32),
+            self_handle: cx.entity().downgrade(),
+        });
+        let self_handle = parent.read(&app).self_handle.clone();
+        let child = parent.read(&app).child.clone();
+
+        assert_eq!(
+            self_handle.upgrade().map(|entity| entity.entity_id()),
+            Some(parent.entity_id())
+        );
+        assert_eq!(*child.read(&app), 7);
+        parent.update(|value, _| value.child.update(|child, _| *child += 1));
+        assert_eq!(*child.read(&app), 8);
     }
 
     #[test]
     fn weak_entities_fail_after_the_strong_identity_is_dropped() {
-        let app = App::new();
+        let app = App::create();
         let entity = app.new_entity(1_u8);
         let weak = entity.downgrade();
         assert_eq!(weak.entity_id(), entity.entity_id());
@@ -443,7 +685,7 @@ mod tests {
 
     #[test]
     fn actions_route_in_registration_order_and_can_propagate() {
-        let mut app = App::new();
+        let mut app = App::create();
         let calls = Rc::new(RefCell::new(Vec::new()));
         let first_calls = calls.clone();
         app.on_action(move |_: &Activate, app| {
@@ -458,7 +700,7 @@ mod tests {
 
     #[test]
     fn activation_quit_and_menus_update_shared_application_state() {
-        let mut app = App::new();
+        let mut app = App::create();
         assert!(!app.is_active());
         assert!(!app.quit_requested());
         assert!(app.menus().is_empty());
@@ -469,7 +711,64 @@ mod tests {
 
         assert!(app.is_active());
         assert!(app.quit_requested());
+        assert!(app.close_requested());
         assert_eq!(app.menus()[0].name, "File");
+    }
+
+    #[test]
+    fn window_requests_have_owned_ids_and_close_requests_stop_new_windows() {
+        let mut app = App::create();
+        assert!(app.windows().is_empty());
+        assert!(
+            app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot))
+                .is_ok()
+        );
+        assert!(
+            app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot))
+                .is_ok()
+        );
+        let requests = app.take_window_requests();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0].id, requests[1].id);
+        assert_eq!(app.windows().len(), 2);
+
+        app.request_close();
+        assert!(app.close_requested());
+        assert_eq!(
+            app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot)),
+            Err("application is closing")
+        );
+        app.window_creation_failed(requests[0].id);
+        assert_eq!(app.windows().len(), 1);
+    }
+
+    #[test]
+    fn window_closed_callbacks_run_in_order_once_and_can_observe_remaining_windows() {
+        let mut app = App::create();
+        let first = app.reserve_window();
+        let second = app.reserve_window();
+        let callbacks = Rc::new(RefCell::new(Vec::new()));
+        let first_callbacks = callbacks.clone();
+        let first_subscription = app.on_window_closed(move |app, id| {
+            first_callbacks
+                .borrow_mut()
+                .push((1_u8, id, app.windows().len()));
+        });
+        let second_callbacks = callbacks.clone();
+        let second_subscription = app.on_window_closed(move |_, id| {
+            second_callbacks.borrow_mut().push((2_u8, id, 99));
+        });
+
+        app.window_closed(first);
+        app.window_closed(first);
+        assert_eq!(app.windows().len(), 1);
+        assert_eq!(&*callbacks.borrow(), &[(1, first, 1), (2, first, 99)]);
+
+        drop(first_subscription);
+        drop(second_subscription);
+        app.window_closed(second);
+        assert!(app.windows().is_empty());
+        assert_eq!(&*callbacks.borrow(), &[(1, first, 1), (2, first, 99)]);
     }
 
     struct TestRoot;
@@ -482,14 +781,17 @@ mod tests {
 
     #[test]
     fn open_window_queues_each_root_and_rejects_new_windows_after_quit() {
-        let mut app = App::new();
+        let mut app = App::create();
         app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot))
             .expect("first window request should be accepted");
         app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot))
             .expect("second window request should be accepted");
         assert_eq!(app.take_window_requests().len(), 2);
         app.quit();
-        assert_eq!(app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot)), Err("application is quitting"));
+        assert_eq!(
+            app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot)),
+            Err("application is quitting")
+        );
     }
 }
 

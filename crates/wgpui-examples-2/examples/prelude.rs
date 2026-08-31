@@ -27,7 +27,7 @@ pub fn init_example(cx: &mut App, name: impl Into<SharedString>) {
 
     // Set up an app menu with the example name and a Quit action (cmd-q)
     cx.set_menus(vec![Menu {
-        name: name.into(),
+        name: name.into().to_string(),
         items: vec![MenuItem::action("Quit", Quit)],
     }]);
 

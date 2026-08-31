@@ -202,6 +202,15 @@ mod tests {
 
     const SURFACE_SLOT: [ElementId; 2] = [ElementId::Slot(0), ElementId::Slot(0)];
     const PANEL_SLOT: [ElementId; 2] = [ElementId::Slot(0), ElementId::Slot(1)];
+    type SurfaceDrawResult = Result<
+        (
+            usize,
+            u64,
+            usize,
+            Option<wgpui_core::boundary::compositor::CompositeEntry>,
+        ),
+        Box<dyn std::error::Error>,
+    >;
 
     fn viewport(width: f32, height: f32) -> LayoutRect {
         LayoutRect {
@@ -399,7 +408,7 @@ mod tests {
                     layout: &mut LayoutTree,
                     emitter: &mut Emitter,
                     scene: &mut Scene|
-         -> Result<(usize, u64, usize, Option<wgpui_core::boundary::compositor::CompositeEntry>), Box<dyn std::error::Error>> {
+         -> SurfaceDrawResult {
             let plan = reconciler.reconcile(description, layout)?;
             let root = plan.nodes().first().map(|node| node.layout_node);
             if let Some(root) = root {
@@ -422,7 +431,10 @@ mod tests {
             &mut emitter,
             &mut scene,
         )?;
-        assert_eq!(built, 0, "the external surface does not emit scene primitives");
+        assert_eq!(
+            built, 0,
+            "the external surface does not emit scene primitives"
+        );
         assert_eq!(first_bytes, 0);
         assert_eq!(first_surfaces, 1);
         assert_eq!(

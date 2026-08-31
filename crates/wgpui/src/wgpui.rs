@@ -40,12 +40,13 @@ pub use wgpui_core::window::{
     AnimationScheduler, DispatchTree, FocusManager, Keymap, WindowTimers,
 };
 pub use wgpui_core::{
-    Action, App, ClickEvent, CloseState, Context, DispatchNodeId, Entity, EntityError, EntityId,
-    EventResult, FocusHandle, FocusId, FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId,
-    InputEvent, KeyBinding, KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton,
-    KeyboardClickEvent, Keystroke, Menu, MenuItem, Modifiers, MouseButton, MouseButtonState,
-    MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Subscription,
-    Task, TaskError, TimerHandle, TimerId, TimerState, WeakEntity,
+    Action, App, ClickEvent, CloseState, Context, DispatchNodeId, Entity, EntityError,
+    EntityFactory, EntityId, EventResult, FocusHandle, FocusId, FocusTransition, Focusable,
+    HitTestIndex, Hitbox, HitboxId, InputEvent, KeyBinding, KeyDownEvent, KeyParseError,
+    KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu, MenuItem, Modifiers,
+    MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ScrollWheelEvent, Subscription, Task, TaskError, TimerHandle, TimerId, TimerState, WeakEntity,
+    WindowClosedSubscription, WindowId, WindowList,
 };
 pub use wgpui_core::{
     Component, Element, IntoElement, Render, RenderOnce, Stateful, render_description,
@@ -63,6 +64,7 @@ pub use wgpui_widgets::animation::{
     Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline, ease_in_out,
     ease_out_quint, linear, quadratic,
 };
+pub use wgpui_widgets::div::StatefulDiv;
 pub use wgpui_widgets::div::interactivity::style::{
     BoxShadow, Corners, DivStyle, Edges, LinearGradient, Pattern, RadialGradient,
 };
@@ -83,9 +85,7 @@ pub use wgpui_widgets::styled_text::{
     UnderlineStyle,
 };
 pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
-pub use wgpui_widgets::wgpu_surface::{
-    SurfaceId, SurfaceStyle, WgpuSurface, WgpuSurfaceKey,
-};
+pub use wgpui_widgets::wgpu_surface::{SurfaceId, SurfaceStyle, WgpuSurface, WgpuSurfaceKey};
 
 pub use wgpui_wgpu::window::application::{
     Application, ApplicationError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
@@ -101,7 +101,7 @@ pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 
 pub mod prelude {
     pub use crate::{
-        Application, Description, Div, Element, IntoElement, Render, RenderOnce, Stateful, Styled,
-        Window, WindowOptions, div,
+        Application, Description, Div, Element, EntityFactory, IntoElement, Render, RenderOnce,
+        Stateful, StatefulDiv, Styled, Window, WindowOptions, div,
     };
 }

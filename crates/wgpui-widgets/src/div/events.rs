@@ -6,8 +6,10 @@
 //! style resolver and do not require repainting unchanged siblings.
 
 use wgpui_core::app::App;
-use wgpui_core::window::{ClickEvent, EventResult, InputEvent, MouseButton, ScrollWheelEvent, Window};
 use wgpui_core::reconcile::description::DescriptionInteraction;
+use wgpui_core::window::{
+    ClickEvent, EventResult, InputEvent, MouseButton, ScrollWheelEvent, Window,
+};
 
 type ClickHandler = Box<dyn FnMut(&ClickEvent, &mut Window, &mut App) -> EventResult>;
 type MouseDownHandler = Box<dyn FnMut(&InputEvent, &mut Window, &mut App) -> EventResult>;
@@ -204,12 +206,12 @@ mod tests {
         });
         assert!(
             state
-                .update_hover(true, &mut Window::new(), &mut App::new())
+                .update_hover(true, &mut Window::new(), &mut App::create())
                 .handled
         );
         assert!(
             !state
-                .update_hover(true, &mut Window::new(), &mut App::new())
+                .update_hover(true, &mut Window::new(), &mut App::create())
                 .handled
         );
         assert_eq!(enters.get(), 1);
@@ -227,7 +229,7 @@ mod tests {
         });
         assert!(
             !state
-                .handle_input(&event, &mut Window::new(), &mut App::new())
+                .handle_input(&event, &mut Window::new(), &mut App::create())
                 .handled
         );
         assert_eq!(downs.get(), 0);

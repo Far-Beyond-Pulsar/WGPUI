@@ -20,11 +20,11 @@ use wgpui_core::window::{
 use crate::debug::PerformanceDebug;
 use crate::render::draw::DrawMode;
 use crate::render::frame::RenderTarget;
+use crate::render::surface_registry::SurfaceRegistry;
 use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
-use crate::window::{Acquired, WindowError, WindowSurface};
 use crate::window::surface::WgpuSurfaceHandle;
-use crate::render::surface_registry::SurfaceRegistry;
+use crate::window::{Acquired, WindowError, WindowSurface};
 
 fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
     let fallback = size(Pixels(options.width as f32), Pixels(options.height as f32));
@@ -562,7 +562,7 @@ where
             initialize: Some(Box::new(initialize)),
             live: Vec::new(),
             failure: None,
-            app: App::new(),
+            app: App::create(),
         };
         event_loop
             .run_app(&mut handler)
@@ -591,7 +591,7 @@ where
             initialize: None,
             live: Vec::new(),
             failure: None,
-            app: App::new(),
+            app: App::create(),
         };
         event_loop
             .run_app(&mut handler)
@@ -616,7 +616,7 @@ impl Application {
             )),
             max_frames: None,
             initialize: Some(Box::new(initialize)),
-            app: App::new(),
+            app: App::create(),
             live: Vec::new(),
             failure: None,
         };
@@ -649,6 +649,7 @@ fn event_loop() -> Result<winit::event_loop::EventLoop<()>, ApplicationError> {
 }
 
 struct Live {
+    id: wgpui_core::app::WindowId,
     surface: WindowSurface,
     context: crate::render::device::ComputeContext,
     window: Window,
@@ -679,6 +680,7 @@ impl Handler {
     fn create_window(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
+        id: wgpui_core::app::WindowId,
         options: WindowOptions,
         build: WindowBuildCallback,
     ) -> Result<(), ApplicationError> {
@@ -747,6 +749,7 @@ impl Handler {
         let mut frame_loop = FrameLoop::new(&context.device);
         frame_loop.set_surface_registry(surface_registry);
         self.live.push(Live {
+            id,
             frame_loop,
             surface,
             context,
@@ -778,10 +781,13 @@ impl Handler {
                 let build = Box::new(move |window: &mut Window| {
                     (renderer.render)(&mut window.interaction, &mut app)
                 });
-                if let Err(error) = self.create_window(event_loop, request.options, build)
-                    && first_error.is_none()
+                if let Err(error) =
+                    self.create_window(event_loop, request.id, request.options, build)
                 {
-                    first_error = Some(error);
+                    self.app.window_creation_failed(request.id);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 }
             }
             if let Some(error) = first_error {
@@ -803,6 +809,7 @@ impl Handler {
         else {
             return;
         };
+        self.app.run_pending_tasks();
         let all_other_windows_reached_limit = self.max_frames.is_some_and(|limit| {
             self.live
                 .iter()
@@ -872,8 +879,15 @@ impl Handler {
                 live.window.last_frame = Some(report.clone());
                 live.last_report = Some(report);
                 live.surface.present(&live.context.queue, texture);
-                if live.window.close_requested || live.app.quit_requested() {
-                    self.live.remove(index);
+                if live.window.close_requested || live.app.close_requested() {
+                    let closed = if live.app.close_requested() {
+                        self.live.drain(..).map(|live| live.id).collect::<Vec<_>>()
+                    } else {
+                        vec![self.live.remove(index).id]
+                    };
+                    for id in closed {
+                        self.app.window_closed(id);
+                    }
                     if self.live.is_empty() {
                         event_loop.exit();
                     }
@@ -899,10 +913,19 @@ impl winit::application::ApplicationHandler for Handler {
             initialize(&mut self.app);
         }
         self.create_pending_windows(event_loop);
-        if let Some((options, build)) = self.initial.take()
-            && let Err(error) = self.create_window(event_loop, options, build)
+        if self.live.is_empty() && self.app.close_requested() {
+            event_loop.exit();
+            return;
+        }
+        if self.live.is_empty()
+            && !self.app.close_requested()
+            && let Some((options, build)) = self.initial.take()
         {
-            self.fail(event_loop, error);
+            let id = self.app.reserve_window();
+            if let Err(error) = self.create_window(event_loop, id, options, build) {
+                self.app.window_creation_failed(id);
+                self.fail(event_loop, error);
+            }
         }
     }
 
@@ -1022,7 +1045,8 @@ impl winit::application::ApplicationHandler for Handler {
         match event {
             winit::event::WindowEvent::CloseRequested => {
                 if live.window.try_close() {
-                    self.live.remove(index);
+                    let id = self.live.remove(index).id;
+                    self.app.window_closed(id);
                     if self.live.is_empty() {
                         event_loop.exit();
                     }
@@ -1131,11 +1155,15 @@ impl winit::application::ApplicationHandler for Handler {
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        self.app.run_pending_tasks();
         self.create_pending_windows(event_loop);
-        if self.max_frames.is_some() {
+        if self.max_frames.is_some() || self.app.has_pending_tasks() || self.app.close_requested() {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             for live in &self.live {
                 live.window.request_redraw();
             }
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
         }
     }
 }

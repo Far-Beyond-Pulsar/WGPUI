@@ -424,6 +424,32 @@ impl Div {
     }
 }
 
+pub trait StatefulDiv {
+    fn on_click<R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(
+            &wgpui_core::window::ClickEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+        + 'static,
+    ) -> Self;
+}
+
+impl StatefulDiv for wgpui_core::element::Stateful<Div> {
+    fn on_click<R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(
+            &wgpui_core::window::ClickEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+        + 'static,
+    ) -> Self {
+        self.map_inner(|element| element.on_click(handler))
+    }
+}
+
 impl Element for Div {
     fn into_description(self) -> Description {
         self.describe()

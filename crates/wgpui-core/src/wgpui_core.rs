@@ -14,7 +14,10 @@
 
 pub mod app;
 pub use app::entity::EntityError;
-pub use app::{App, Context, Entity, EntityId, Subscription, Task, TaskError, WeakEntity};
+pub use app::{
+    App, Context, Entity, EntityFactory, EntityId, Subscription, Task, TaskError, WeakEntity,
+    WindowClosedSubscription, WindowId, WindowList,
+};
 pub use window::{
     ClickEvent, CloseState, DispatchNodeId, EventResult, FocusHandle, FocusId, FocusManager,
     FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId, InputEvent, KeyBinding,
