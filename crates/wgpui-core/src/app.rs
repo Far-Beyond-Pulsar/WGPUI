@@ -1,6 +1,6 @@
 //! `App`/`Context<T>` root context assembly. See
 //! docs/gpu-native-architecture.md §1, §3.1.
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -25,6 +25,7 @@ struct AppState {
     observers: HashMap<EntityId, Vec<(u64, Observer)>>,
     next_observer: u64,
     next_entity: u64,
+    globals: HashMap<TypeId, Rc<dyn Any>>,
     keymap: Keymap,
     action_handlers: HashMap<TypeId, Vec<ActionHandler>>,
     propagate_actions: bool,
@@ -64,6 +65,7 @@ impl App {
                 observers: HashMap::new(),
                 next_observer: 0,
                 next_entity: 0,
+                globals: HashMap::new(),
                 keymap: Keymap::default(),
                 action_handlers: HashMap::new(),
                 propagate_actions: false,
@@ -113,6 +115,34 @@ impl App {
 
     pub fn run_pending_tasks(&self) {
         self.foreground.borrow_mut().run_until_stalled();
+    }
+
+    /// Install application-scoped state without making the core crate depend
+    /// on the state owner's implementation crate.
+    pub fn set_global<T: 'static>(&mut self, value: T) {
+        self.state
+            .borrow_mut()
+            .globals
+            .insert(TypeId::of::<T>(), Rc::new(value));
+    }
+
+    /// Read application-scoped state installed with [`Self::set_global`].
+    pub fn global<T: 'static>(&self) -> Option<Rc<T>> {
+        self.state
+            .borrow()
+            .globals
+            .get(&TypeId::of::<T>())
+            .and_then(|value| Rc::clone(value).downcast::<T>().ok())
+    }
+
+    /// Remove application-scoped state and return it to the caller.
+    pub fn remove_global<T: 'static>(&mut self) -> Option<T> {
+        self.state
+            .borrow_mut()
+            .globals
+            .remove(&TypeId::of::<T>())
+            .and_then(|value| Rc::downcast::<T>(value).ok())
+            .and_then(|value| Rc::try_unwrap(value).ok())
     }
 
     pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
@@ -399,6 +429,22 @@ mod tests {
     }
 
     #[test]
+    fn type_erased_globals_are_shared_by_app_clones_and_can_be_removed() {
+        let mut app = App::new();
+        let clone = app.clone();
+        app.set_global(String::from("native service"));
+        assert_eq!(
+            clone.global::<String>().as_deref().map(String::as_str),
+            Some("native service")
+        );
+        assert_eq!(
+            app.remove_global::<String>().as_deref(),
+            Some("native service")
+        );
+        assert!(clone.global::<String>().is_none());
+    }
+
+    #[test]
     fn dropping_a_task_cancels_the_underlying_work() {
         let app = App::new();
         let mut task = app.spawn(pending::<()>());
@@ -489,7 +535,10 @@ mod tests {
             .expect("second window request should be accepted");
         assert_eq!(app.take_window_requests().len(), 2);
         app.quit();
-        assert_eq!(app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot)), Err("application is quitting"));
+        assert_eq!(
+            app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot)),
+            Err("application is quitting")
+        );
     }
 }
 

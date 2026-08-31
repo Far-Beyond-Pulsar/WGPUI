@@ -6742,6 +6742,7 @@ name = "wgpui"
 version = "0.1.0"
 dependencies = [
  "wgpui-core",
+ "wgpui-http-client",
  "wgpui-layout",
  "wgpui-macros",
  "wgpui-text",
@@ -6819,6 +6820,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpui-http-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "gpui_http_client",
+ "wgpui-core",
+]
+
+[[package]]
 name = "wgpui-layout"
 version = "0.1.0"
 dependencies = [
@@ -6856,6 +6868,7 @@ dependencies = [
  "wgpu",
  "wgpui-core",
  "wgpui-devtools",
+ "wgpui-http-client",
  "wgpui-layout",
  "wgpui-text",
  "wgpui-widgets",
@@ -6866,10 +6879,13 @@ dependencies = [
 name = "wgpui-widgets"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "futures",
  "image",
  "resvg",
  "usvg",
  "wgpui-core",
+ "wgpui-http-client",
  "wgpui-layout",
  "wgpui-text",
 ]

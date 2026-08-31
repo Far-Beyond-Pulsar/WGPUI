@@ -2,6 +2,7 @@
 members = [
     "old",
     "crates/wgpui-core",
+    "crates/wgpui-http-client",
     "crates/wgpui-layout",
     "crates/wgpui-text",
     "crates/wgpui-widgets",

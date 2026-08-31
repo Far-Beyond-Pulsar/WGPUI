@@ -5,6 +5,7 @@
 //! frozen compatibility crate or the reference implementation under `old/`.
 
 pub use wgpui_core as core;
+pub use wgpui_http_client as http_client;
 pub use wgpui_layout as layout;
 pub use wgpui_text as text;
 pub use wgpui_wgpu as gpu;
@@ -50,6 +51,11 @@ pub use wgpui_core::{
 pub use wgpui_core::{
     Component, Element, IntoElement, Render, RenderOnce, Stateful, render_description,
 };
+pub use wgpui_http_client::{
+    AppHttpClientExt, AsyncBody, BoxedHttpClient, Builder, FollowRedirects, HttpBody, HttpClient,
+    HttpClientService, HttpClientWithProxy, HttpClientWithUrl, HttpRequestExt, Inner, Method,
+    NullHttpClient, RedirectPolicy, Request, Response, Result, StatusCode, Uri, Url,
+};
 pub use wgpui_layout::{
     AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
     LayoutTree, Measure,
@@ -63,6 +69,7 @@ pub use wgpui_widgets::animation::{
     Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline, ease_in_out,
     ease_out_quint, linear, quadratic,
 };
+pub use wgpui_widgets::assets::{AssetLoadError, AssetSource, ImageAssetLoader, Resource};
 pub use wgpui_widgets::div::interactivity::style::{
     BoxShadow, Corners, DivStyle, Edges, LinearGradient, Pattern, RadialGradient,
 };
@@ -85,11 +92,11 @@ pub use wgpui_widgets::styled_text::{
 pub use wgpui_widgets::svg::{Svg, SvgKey, load as load_svg, svg};
 pub use wgpui_widgets::wgpu_surface::{WgpuSurface, WgpuSurfaceKey};
 
-pub use wgpui_wgpu::window::application::{
-    Application, ApplicationError, DisplayId, FrameReport, NativeApplication, Window, WindowHandle,
-    WindowOptions,
-};
 pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
+pub use wgpui_wgpu::window::application::{
+    Application, ApplicationError, ConfiguredApplication, DisplayId, FrameReport,
+    NativeApplication, Window, WindowHandle, WindowOptions,
+};
 
 pub mod prelude {
     pub use crate::{

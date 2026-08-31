@@ -16,9 +16,10 @@ use wgpui_core::window::{
     InputEvent, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton as CoreMouseButton,
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
 };
+use wgpui_http_client::{AppHttpClientExt, BoxedHttpClient};
 
-use crate::render::draw::DrawMode;
 use crate::debug::PerformanceDebug;
+use crate::render::draw::DrawMode;
 use crate::render::frame::RenderTarget;
 use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
@@ -203,7 +204,8 @@ impl Window {
                 let hit = self.hit_interaction(mouse.position);
                 let mut handled = false;
                 if self.hovered_interaction != hit {
-                    if let Some(previous) = self.hovered_interaction
+                    if let Some(previous) = self
+                        .hovered_interaction
                         .and_then(|index| self.interactions.get(index))
                     {
                         self.hover_dirty_regions.push(previous.bounds);
@@ -212,10 +214,18 @@ impl Window {
                         self.hover_dirty_regions.push(current.bounds);
                     }
                     if let Some(previous) = self.hovered_interaction {
-                        handled |= self.dispatch_interaction(previous, &InputEvent::MouseLeave(*mouse), app);
+                        handled |= self.dispatch_interaction(
+                            previous,
+                            &InputEvent::MouseLeave(*mouse),
+                            app,
+                        );
                     }
                     if let Some(current) = hit {
-                        handled |= self.dispatch_interaction(current, &InputEvent::MouseEnter(*mouse), app);
+                        handled |= self.dispatch_interaction(
+                            current,
+                            &InputEvent::MouseEnter(*mouse),
+                            app,
+                        );
                     }
                     self.hovered_interaction = hit;
                 }
@@ -241,14 +251,13 @@ impl Window {
                 let Some(index) = pressed else { return false };
                 let mut handled = self.dispatch_interaction(index, &event, app);
                 if self.hit_interaction(mouse.position) == Some(index) {
-                    handled |= self.dispatch_interaction(index, &InputEvent::Click(
-                        wgpui_core::window::ClickEvent::Mouse(
-                            wgpui_core::window::MouseClickEvent {
-                                down,
-                                up: *mouse,
-                            },
-                        ),
-                    ), app);
+                    handled |= self.dispatch_interaction(
+                        index,
+                        &InputEvent::Click(wgpui_core::window::ClickEvent::Mouse(
+                            wgpui_core::window::MouseClickEvent { down, up: *mouse },
+                        )),
+                        app,
+                    );
                 }
                 handled
             }
@@ -292,9 +301,12 @@ impl Window {
     }
     fn dispatch_interaction(&mut self, index: usize, event: &InputEvent, app: &mut App) -> bool {
         let mut interactions = std::mem::take(&mut self.interactions);
-        let handled = interactions
-            .get_mut(index)
-            .is_some_and(|registration| registration.interaction.dispatch(event, &mut self.interaction, app).handled);
+        let handled = interactions.get_mut(index).is_some_and(|registration| {
+            registration
+                .interaction
+                .dispatch(event, &mut self.interaction, app)
+                .handled
+        });
         self.interactions = interactions;
         handled
     }
@@ -308,7 +320,10 @@ impl Window {
             .and_then(|index| self.interactions.get(index))
             .map(|registration| registration.bounds);
         let previous_interactions = std::mem::replace(&mut self.interactions, interactions);
-        let hit = self.cursor_inside.then(|| self.hit_interaction(self.cursor)).flatten();
+        let hit = self
+            .cursor_inside
+            .then(|| self.hit_interaction(self.cursor))
+            .flatten();
         let hit_address = hit
             .and_then(|index| self.interactions.get(index))
             .map(|registration| registration.address);
@@ -468,6 +483,7 @@ pub struct NativeApplication<F, R> {
     options: WindowOptions,
     build: F,
     max_frames: Option<u64>,
+    http_client: Option<BoxedHttpClient>,
     marker: std::marker::PhantomData<fn() -> R>,
 }
 
@@ -481,6 +497,7 @@ where
             options,
             build,
             max_frames: None,
+            http_client: None,
             marker: std::marker::PhantomData,
         }
     }
@@ -506,6 +523,12 @@ where
         initialize: impl FnOnce(&mut App) + 'static,
     ) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
+        let mut app = App::new();
+        if let Some(client) = self.http_client {
+            app.set_http_client(client);
+        } else {
+            app.install_default_http_client();
+        }
         let mut handler = Handler {
             initial: Some((
                 self.options,
@@ -515,7 +538,7 @@ where
             initialize: Some(Box::new(initialize)),
             live: Vec::new(),
             failure: None,
-            app: App::new(),
+            app,
         };
         event_loop
             .run_app(&mut handler)
@@ -533,8 +556,20 @@ where
         self
     }
 
+    /// Configure the client used by URI resource loading in this application.
+    pub fn with_http_client(mut self, client: BoxedHttpClient) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
     pub fn run(mut self) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
+        let mut app = App::new();
+        if let Some(client) = self.http_client {
+            app.set_http_client(client);
+        } else {
+            app.install_default_http_client();
+        }
         let mut handler = Handler {
             initial: Some((
                 self.options,
@@ -544,7 +579,7 @@ where
             initialize: None,
             live: Vec::new(),
             failure: None,
-            app: App::new(),
+            app,
         };
         event_loop
             .run_app(&mut handler)
@@ -560,24 +595,55 @@ impl Application {
         Self
     }
 
-    pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
-        let event_loop = event_loop()?;
-        let mut handler = Handler {
-            initial: Some((
-                WindowOptions::default(),
-                Box::new(|_| Description::new::<()>()),
-            )),
-            max_frames: None,
-            initialize: Some(Box::new(initialize)),
-            app: App::new(),
-            live: Vec::new(),
-            failure: None,
-        };
-        event_loop
-            .run_app(&mut handler)
-            .map_err(ApplicationError::from)?;
-        handler.failure.map_or(Ok(()), Err)
+    /// Configure the client used by URI resource loading in this application.
+    pub fn with_http_client(self, client: BoxedHttpClient) -> ConfiguredApplication {
+        ConfiguredApplication {
+            http_client: client,
+        }
     }
+
+    pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
+        run_application(None, initialize)
+    }
+}
+
+/// An [`Application`] with an explicitly configured native HTTP client.
+pub struct ConfiguredApplication {
+    http_client: BoxedHttpClient,
+}
+
+impl ConfiguredApplication {
+    pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
+        run_application(Some(self.http_client), initialize)
+    }
+}
+
+fn run_application(
+    http_client: Option<BoxedHttpClient>,
+    initialize: impl FnOnce(&mut App) + 'static,
+) -> Result<(), ApplicationError> {
+    let mut app = App::new();
+    if let Some(client) = http_client {
+        app.set_http_client(client);
+    } else {
+        app.install_default_http_client();
+    }
+    let event_loop = event_loop()?;
+    let mut handler = Handler {
+        initial: Some((
+            WindowOptions::default(),
+            Box::new(|_| Description::new::<()>()),
+        )),
+        max_frames: None,
+        initialize: Some(Box::new(initialize)),
+        app,
+        live: Vec::new(),
+        failure: None,
+    };
+    event_loop
+        .run_app(&mut handler)
+        .map_err(ApplicationError::from)?;
+    handler.failure.map_or(Ok(()), Err)
 }
 
 impl Default for Application {
@@ -806,7 +872,8 @@ impl Handler {
         );
         match result {
             Ok(frame) => {
-                live.window.set_interactions(frame.interactions, &mut live.app);
+                live.window
+                    .set_interactions(frame.interactions, &mut live.app);
                 live.frames += 1;
                 let report = FrameReport {
                     frame_number: live.frames,

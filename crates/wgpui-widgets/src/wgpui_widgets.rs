@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod animation;
+pub mod assets;
 pub mod canvas;
 pub mod div;
 pub mod image_cache;
