@@ -18,6 +18,8 @@ doctest = false
 
 [dependencies]
 wgpui-core = { path = "../wgpui-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }

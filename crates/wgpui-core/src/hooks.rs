@@ -20,6 +20,34 @@ pub type TraceRootId = u64;
 /// Monotonic nanoseconds from the clock selected by the trace producer.
 pub type TraceTimestamp = u64;
 
+/// Metadata used when a producer opens an attributed trace span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceSpan {
+    pub name: &'static str,
+    pub frame_id: TraceFrameId,
+    pub thread_id: TraceThreadId,
+    pub queue_id: Option<TraceQueueId>,
+    pub element_address: Option<TraceElementAddress>,
+    pub boundary_id: Option<TraceBoundaryId>,
+    pub root_id: Option<TraceRootId>,
+    pub tile: Option<TraceTileCoord>,
+}
+
+impl TraceSpan {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            frame_id: 0,
+            thread_id: 0,
+            queue_id: None,
+            element_address: None,
+            boundary_id: None,
+            root_id: None,
+            tile: None,
+        }
+    }
+}
+
 /// A tile coordinate in a trace event's owning tile grid.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct TraceTileCoord {
@@ -309,6 +337,24 @@ pub trait InstrumentationHooks: Send + Sync {
     /// Records a backend timestamp pair when supported.
     fn gpu_timestamp(&self, _name: &'static str, _start: u64, _end: u64) {}
 
+    /// Starts a span with stable trace metadata.
+    fn begin_trace_span(&self, span: TraceSpan) -> Option<u64> {
+        self.begin_span(span.name)
+    }
+
+    /// Completes an attributed span.
+    fn end_trace_span(&self, token: u64, _timestamp: TraceTimestamp) {
+        self.end_span(token);
+    }
+
+    /// Announces the frame whose events are about to be collected.
+    fn frame_started(&self, _frame_id: TraceFrameId) {}
+
+    /// Presentation notification carrying the stable frame ID.
+    fn frame_presented_with(&self, _frame_id: TraceFrameId) {
+        self.frame_presented();
+    }
+
     /// Delivers a versioned, attributed event to an optional trace consumer.
     ///
     /// This method has a default so existing hook implementations remain
@@ -357,6 +403,14 @@ impl<'a> Span<'a> {
         Self {
             hooks,
             token: hooks.begin_span(name),
+        }
+    }
+
+    /// Begins an attributed span, or creates an inert guard when instrumentation is off.
+    pub fn with_trace(hooks: &'a dyn InstrumentationHooks, span: TraceSpan) -> Self {
+        Self {
+            hooks,
+            token: hooks.begin_trace_span(span),
         }
     }
 }
