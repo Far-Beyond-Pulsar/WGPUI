@@ -212,16 +212,6 @@ mod tests {
 
     const SURFACE_SLOT: [ElementId; 2] = [ElementId::Slot(0), ElementId::Slot(0)];
     const PANEL_SLOT: [ElementId; 2] = [ElementId::Slot(0), ElementId::Slot(1)];
-    type SurfaceDrawResult = Result<
-        (
-            usize,
-            u64,
-            usize,
-            Option<wgpui_core::boundary::compositor::CompositeEntry>,
-        ),
-        Box<dyn std::error::Error>,
-    >;
-
     fn viewport(width: f32, height: f32) -> LayoutRect {
         LayoutRect {
             x: 0.0,

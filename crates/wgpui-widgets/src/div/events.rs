@@ -440,12 +440,12 @@ mod tests {
         });
         assert!(
             state
-                .update_hover(true, &mut Window::new(), &mut App::new())
+                .update_hover(true, &mut Window::new(), &mut App::create())
                 .handled
         );
         assert!(
             !state
-                .update_hover(true, &mut Window::new(), &mut App::new())
+                .update_hover(true, &mut Window::new(), &mut App::create())
                 .handled
         );
         assert_eq!(enters.get(), 1);
@@ -463,7 +463,7 @@ mod tests {
         });
         assert!(
             !state
-                .handle_input(&event, &mut Window::new(), &mut App::new())
+                .handle_input(&event, &mut Window::new(), &mut App::create())
                 .handled
         );
         assert_eq!(downs.get(), 0);
@@ -497,12 +497,12 @@ mod tests {
         state.handle_input(
             &InputEvent::MouseEnter(move_event),
             &mut Window::new(),
-            &mut App::new(),
+            &mut App::create(),
         );
         state.handle_input(
             &InputEvent::MouseMove(move_event),
             &mut Window::new(),
-            &mut App::new(),
+            &mut App::create(),
         );
         state.handle_input(
             &InputEvent::MouseDown(MouseDownEvent {
@@ -512,7 +512,7 @@ mod tests {
                 click_count: 2,
             }),
             &mut Window::new(),
-            &mut App::new(),
+            &mut App::create(),
         );
         state.handle_input(
             &InputEvent::MouseUp(MouseUpEvent {
@@ -522,7 +522,7 @@ mod tests {
                 click_count: 2,
             }),
             &mut Window::new(),
-            &mut App::new(),
+            &mut App::create(),
         );
         assert_eq!(calls.get(), 3);
         assert!(!state.is_active());
@@ -538,7 +538,7 @@ mod tests {
                 visible: true,
             }),
             &mut Window::new(),
-            &mut App::new(),
+            &mut App::create(),
         );
         assert!(state.is_focus_visible());
 
@@ -570,7 +570,7 @@ mod tests {
         let mut interaction = state.into_description_interaction(Some(focus)).expect("handlers");
         let action = Activate;
         let mut window = Window::new();
-        let mut app = App::new();
+        let mut app = App::create();
         assert!(interaction.dispatch_action(&action, &mut window, &mut app).handled);
         let data = interaction
             .drag_source()
