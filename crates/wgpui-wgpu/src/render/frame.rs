@@ -752,6 +752,8 @@ impl FrameRenderer {
         target: &RenderTarget<'_>,
     ) -> Result<FrameOutput, FrameError> {
         #[cfg(feature = "devtools")]
+        wgpui_devtools::capture::begin_global_backend_frame();
+        #[cfg(feature = "devtools")]
         let _instrumentation_span = {
             static HOOKS: std::sync::OnceLock<wgpui_devtools::hooks::DevtoolsHooks> =
                 std::sync::OnceLock::new();

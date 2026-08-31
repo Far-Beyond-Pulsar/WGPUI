@@ -3,8 +3,16 @@
 //! move-and-decouple, zero behavior change (Phase 7's gate: `wgpui-core`
 //! builds and runs with this crate absent entirely).
 //! See docs/gpu-native-architecture.md §3.6, §8 Phase 7.
-#[cfg(feature = "flamegraph")]
+#[cfg(any(feature = "flamegraph", feature = "render-stats"))]
 pub mod flamegraph;
+#[cfg(any(feature = "flamegraph", feature = "render-stats"))]
+pub use flamegraph::capture;
+#[cfg(any(feature = "flamegraph", feature = "render-stats"))]
+pub use flamegraph::{
+    CaptureBundle, CaptureController, CaptureError, CaptureEvent, CaptureEventKind, CaptureLimits,
+    CaptureMetadata, CaptureRequest, CaptureState, CaptureTarget, ClockCalibration,
+    DroppedEventStatus, RecordResult,
+};
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod hooks;
 #[cfg(feature = "inspector")]

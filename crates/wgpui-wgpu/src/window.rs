@@ -461,6 +461,8 @@ impl WindowSurface {
         self.window.pre_present_notify();
         queue.present(texture);
         self.stats.presents += 1;
+        #[cfg(feature = "devtools")]
+        wgpui_devtools::capture::present_global_backend_frame();
     }
 }
 
