@@ -3,6 +3,17 @@
 //! move-and-decouple, zero behavior change (Phase 7's gate: `wgpui-core`
 //! builds and runs with this crate absent entirely).
 //! See docs/gpu-native-architecture.md §3.6, §8 Phase 7.
+pub mod network;
+
+pub use network::{
+    replay_request, BodyPreviewMetadata, CacheStatus, CapabilityStatus, FrozenCaptureBundle,
+    FrozenCaptureBundleError, Header, Initiator, NetworkCaptureStatus, NetworkError,
+    NetworkErrorKind, NetworkPhase, NetworkRecorder, NetworkRequest, NetworkRequestHandle,
+    NetworkRequestResult, NetworkRequestStart, NetworkResourceType, NetworkTiming,
+    NetworkWaterfall, ObservationStatus, PhaseTiming, RecordedReplayTransport, ReplayError,
+    ReplayRequest, ReplayResponse, ReplayTransport, TransferInfo, FROZEN_CAPTURE_SCHEMA_VERSION,
+};
+
 #[cfg(feature = "flamegraph")]
 pub mod flamegraph;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
