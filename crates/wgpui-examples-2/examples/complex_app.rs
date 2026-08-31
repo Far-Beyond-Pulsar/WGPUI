@@ -21,7 +21,7 @@ fn main() -> Result<(), ApplicationError> {
         window.performance_debug().set_tile_refresh_flash(
             wgpui::TileRefreshFlash::enabled()
                 .with_tile_size(256.0, 256.0)
-                .with_color([1.0, 0.0, 1.0, 0.35]),
+                .with_color([1.0, 1.0, 0.0, 1.0]),
         );
         let _ = window.interaction();
         let selected = selected.get();

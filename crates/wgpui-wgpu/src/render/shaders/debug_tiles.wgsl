@@ -83,16 +83,15 @@ fn refresh_label(input: VertexOutput) -> bool {
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let border = input.border_width;
-    let inside = input.local_position.x >= border
+    let inside_border = input.local_position.x >= border
         && input.local_position.y >= border
         && input.local_position.x < input.tile_size.x - border
         && input.local_position.y < input.tile_size.y - border;
-    var color = input.color;
-    if (inside) {
-        color.a *= 0.12;
-    }
     if refresh_label(input) {
-        color = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        return vec4<f32>(1.0, 1.0, 0.0, input.color.a);
     }
-    return color;
+    if inside_border {
+        discard;
+    }
+    return input.color;
 }

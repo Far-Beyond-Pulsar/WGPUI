@@ -1249,6 +1249,30 @@ impl FrameRenderer {
         }
         timing.compute = started.elapsed();
 
+        // A non-identity layer state requires one dynamic slot-base bind per
+        // draw. Multi-draw records cannot carry the matching clip/translation
+        // for each record, so the argument pass must use the same per-slot
+        // first-instance convention as the draw pass below.
+        let draw_mode = if matches!(
+            input.mode,
+            DrawMode::MultiDrawIndirect | DrawMode::MultiDrawIndirectCount
+        ) && shadow_slots
+            .iter()
+            .chain(quad_slots.iter())
+            .chain(underline_slots.iter())
+            .chain(glyph_slots.iter())
+            .chain(sprite_slots.iter())
+            .any(|slot| {
+                input.scene.layers.get(slot.layer).is_some_and(|layer| {
+                    !layer.transform().is_identity() || layer.clip().is_some()
+                })
+            })
+        {
+            DrawMode::PerSlotIndirect
+        } else {
+            input.mode
+        };
+
         // --- 3. Arguments.
         let started = Instant::now();
         let mut shadow_slot_bytes = Vec::new();
@@ -1259,7 +1283,7 @@ impl FrameRenderer {
             &self.shadow_args,
             &shadow_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         let mut slot_bytes = Vec::new();
         encode_slots(&quad_slots, &mut slot_bytes);
@@ -1269,7 +1293,7 @@ impl FrameRenderer {
             &self.quad_args,
             &slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         let mut underline_slot_bytes = Vec::new();
         encode_slots(&underline_slots, &mut underline_slot_bytes);
@@ -1279,7 +1303,7 @@ impl FrameRenderer {
             &self.underline_args,
             &underline_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         let mut glyph_slot_bytes = Vec::new();
         encode_slots(&glyph_slots, &mut glyph_slot_bytes);
@@ -1291,7 +1315,7 @@ impl FrameRenderer {
             &self.glyph_args,
             &glyph_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         let mut sprite_slot_bytes = Vec::new();
         encode_slots(&sprite_slots, &mut sprite_slot_bytes);
@@ -1301,7 +1325,7 @@ impl FrameRenderer {
             &self.sprite_args,
             &sprite_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
 
         let composite_plan = plan_composites(
@@ -1345,7 +1369,7 @@ impl FrameRenderer {
             &self.composite_args,
             &composite_slot_bytes,
             QUAD_VERTEX_COUNT,
-            input.mode.first_instance(),
+            draw_mode.first_instance(),
         )?;
         timing.arguments = started.elapsed();
 
@@ -1353,7 +1377,7 @@ impl FrameRenderer {
         // because it submits its own encoder and blocks.
         let started = Instant::now();
         let shadow_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.shadow_args,
@@ -1361,7 +1385,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let quad_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.quad_args,
@@ -1369,7 +1393,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let underline_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.underline_args,
@@ -1377,7 +1401,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let glyph_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.glyph_args,
@@ -1385,7 +1409,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let sprite_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.sprite_args,
@@ -1393,7 +1417,7 @@ impl FrameRenderer {
             &mut self.reader,
         )?;
         let composite_resolved = ResolvedArgs::resolve(
-            input.mode,
+            draw_mode,
             device,
             queue,
             &self.composite_args,
@@ -1592,7 +1616,7 @@ impl FrameRenderer {
                 &shadow_plan,
                 &shadow_frame_group,
                 &self.shadow_args,
-                input.mode,
+                draw_mode,
                 &shadow_resolved,
             );
             stats.merge(issue_instanced(
@@ -1601,7 +1625,7 @@ impl FrameRenderer {
                 &quad_plan,
                 &quad_frame_group,
                 &self.quad_args,
-                input.mode,
+                draw_mode,
                 &quad_resolved,
             ));
             stats.merge(issue_paths(
@@ -1619,7 +1643,7 @@ impl FrameRenderer {
                 &underline_plan,
                 &underline_frame_group,
                 &self.underline_args,
-                input.mode,
+                draw_mode,
                 &underline_resolved,
             ));
             // After the quads and before the composites: text paints over the
@@ -1634,7 +1658,7 @@ impl FrameRenderer {
                 },
                 &glyph_frame_group,
                 &self.glyph_args,
-                input.mode,
+                draw_mode,
                 &glyph_resolved,
             ));
             // After the text and before the composites, which is the order
@@ -1650,7 +1674,7 @@ impl FrameRenderer {
                 },
                 &sprite_frame_group,
                 &self.sprite_args,
-                input.mode,
+                draw_mode,
                 &sprite_resolved,
             ));
             if has_backdrop_filters {
@@ -1705,7 +1729,7 @@ impl FrameRenderer {
                 &composite_frame_group,
                 &self.composite_args,
                 &composite_plan,
-                input.mode,
+                draw_mode,
                 &composite_resolved,
             ));
             if has_debug_tiles {

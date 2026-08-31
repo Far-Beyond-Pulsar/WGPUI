@@ -44,13 +44,14 @@ impl DebugTile {
 /// A tile-refresh visualizer configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TileRefreshFlash {
-    /// Whether refreshed tiles are shaded.
+    /// Whether refreshed tiles are outlined.
     pub enabled: bool,
     /// Tile edge in logical pixels. This must match the tiled boundary policy.
     pub tile_size: [f32; 2],
-    /// Number of displayed frames a refreshed tile remains shaded.
+    /// Number of displayed frames a refreshed tile remains outlined.
     pub duration_frames: u32,
-    /// RGBA overlay colour. Alpha controls how strongly content is tinted.
+    /// RGBA outline colour. The default is opaque yellow; alpha controls the
+    /// outline itself and never tints the content inside it.
     pub color: [f32; 4],
     /// Also draw the visible tile outlines for tiled boundaries while their
     /// diagnostics are active.
@@ -63,14 +64,14 @@ impl Default for TileRefreshFlash {
             enabled: false,
             tile_size: [256.0, 256.0],
             duration_frames: 2,
-            color: [1.0, 0.0, 1.0, 0.35],
+            color: [1.0, 1.0, 0.0, 1.0],
             viewport_grid: false,
         }
     }
 }
 
 impl TileRefreshFlash {
-    /// Enable the visualizer using the default magenta two-frame flash.
+    /// Enable the visualizer using the default yellow two-frame outline.
     pub fn enabled() -> Self {
         Self {
             enabled: true,
@@ -152,12 +153,12 @@ mod tests {
     }
 
     #[test]
-    fn default_flash_is_magenta_and_two_frames() {
+    fn default_flash_is_yellow_and_two_frames() {
         let mut debug = PerformanceDebug::default();
         debug.flash_tile_refreshes();
         let flash = debug.tile_refresh_flash();
         assert_eq!(flash.duration_frames, 2);
-        assert_eq!(flash.color, [1.0, 0.0, 1.0, 0.35]);
+        assert_eq!(flash.color, [1.0, 1.0, 0.0, 1.0]);
     }
 
     #[test]
