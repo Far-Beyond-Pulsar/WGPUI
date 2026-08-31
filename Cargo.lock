@@ -6798,6 +6798,7 @@ dependencies = [
 name = "wgpui-devtools"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "wgpui-core",
 ]
 
