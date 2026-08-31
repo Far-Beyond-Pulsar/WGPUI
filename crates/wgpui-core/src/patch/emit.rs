@@ -70,6 +70,7 @@ use crate::patch::primitive::{
 use crate::patch::{PatchList, RecordKey};
 use crate::reconcile::instance::InstanceKey;
 use crate::reconcile::plan::FramePlan;
+use crate::reconcile::walk::RetainedWalk;
 use crate::scene::layer::{BoundaryId, LayerId, LayerKey, LayerTransform};
 use crate::scene::{PrimitiveStore, Scene};
 use std::collections::HashMap;
@@ -688,6 +689,23 @@ impl Emitter {
         signals: &FrameSignals,
         scene: &mut Scene,
     ) -> Result<FrameEmission, EmitError> {
+        let walk = RetainedWalk::build(plan, layout, signals)?;
+        self.emit_with_walk(plan, &walk, signals, scene)
+    }
+
+    /// Emit a frame using a caller-owned shared walk.
+    ///
+    /// A native frame driver can use this to register interactions and emit
+    /// paint from exactly the same transform and clip result. [`Self::emit`]
+    /// remains the compatibility convenience path for callers that do not need
+    /// to share the result.
+    pub fn emit_with_walk(
+        &mut self,
+        plan: &FramePlan,
+        walk: &RetainedWalk,
+        signals: &FrameSignals,
+        scene: &mut Scene,
+    ) -> Result<FrameEmission, EmitError> {
         self.frame += 1;
         let frame = self.frame;
         for layer in std::mem::take(&mut self.pending_layer_removals) {
@@ -699,7 +717,7 @@ impl Emitter {
         let mut boundaries: HashMap<BoundaryId, BoundaryFrame> = HashMap::new();
         let mut emission = Emission::new();
 
-        let root_layer = self.begin_boundary(
+        self.begin_boundary(
             BoundaryId::ROOT,
             BoundaryPolicy::default(),
             LayerTransform::IDENTITY,
@@ -707,98 +725,41 @@ impl Emitter {
             scene,
             &mut boundaries,
         );
-        let mut stack: Vec<WalkFrame> = Vec::new();
-        let root_frame = WalkFrame {
-            depth: 0,
-            layer: root_layer,
-            boundary: BoundaryId::ROOT,
-            origin: [0.0, 0.0],
-            content_offset: [0.0, 0.0],
-            clip: None,
-        };
-
         for (index, node) in plan.nodes().iter().enumerate() {
-            while stack.last().is_some_and(|frame| frame.depth >= node.depth) {
-                stack.pop();
-            }
-            let parent = *stack.last().unwrap_or(&root_frame);
-            if node.depth != u32::try_from(stack.len()).unwrap_or(u32::MAX) {
+            let Some(walked) = walk.node(index) else {
                 return Err(EmitError::MalformedPlan {
                     index,
                     depth: node.depth,
                 });
-            }
+            };
             stats.nodes_visited += 1;
-
-            let rectangle = layout.layout_of(node.layout_node)?;
-            let origin = [
-                parent.origin[0] + rectangle.x + parent.content_offset[0],
-                parent.origin[1] + rectangle.y + parent.content_offset[1],
-            ];
-            let bounds = LayoutRect {
-                x: origin[0],
-                y: origin[1],
-                width: rectangle.width,
-                height: rectangle.height,
-            };
-
-            // A boundary root's own paint belongs to the layer around it, not to
-            // the layer it declares — see `PlannedNode::boundary`.
-            let layer = parent.layer;
-            let (child_layer, child_boundary, content_offset) = match node.declared_boundary {
-                Some(declared) => {
-                    let policy = node.boundary_policy.unwrap_or_default();
-                    let declared_layer = LayerId::from_key(LayerKey::untiled(declared));
-                    // Decided from the signal alone, before the walk knows
-                    // whether the content is clean, because it changes where
-                    // the content is emitted: a boundary permitted the fast
-                    // path hands its displacement to its layer, and one that is
-                    // not folds it into its children exactly as an ordinary
-                    // element would.
-                    let slides = signals
-                        .reason_for_layer(declared_layer)
-                        .permits_transform_only();
-                    let transform = if slides {
-                        LayerTransform {
-                            translation: node.scroll_offset,
-                        }
-                    } else {
-                        LayerTransform::IDENTITY
-                    };
-                    let boundary_layer = self.begin_boundary(
-                        declared,
-                        policy,
-                        transform,
-                        frame,
-                        scene,
-                        &mut boundaries,
-                    );
-                    let folded = if slides {
-                        [0.0, 0.0]
-                    } else {
-                        node.scroll_offset
-                    };
-                    (boundary_layer, declared, folded)
-                }
-                None => (parent.layer, node.boundary, node.scroll_offset),
-            };
+            if let Some(declared) = node.declared_boundary {
+                let policy = node.boundary_policy.unwrap_or_default();
+                let transform = if walked.compositor_scroll {
+                    LayerTransform {
+                        translation: node.scroll_offset,
+                    }
+                } else {
+                    LayerTransform::IDENTITY
+                };
+                self.begin_boundary(declared, policy, transform, frame, scene, &mut boundaries);
+            }
 
             let previous = self.emitted.get(&node.address).copied();
             match plan.emitter(index) {
                 Some(emitter) => {
-                    let stale = previous
-                        .is_none_or(|record| {
-                            record.bounds != bounds
-                                || record.layer != layer
-                                || record.clip != parent.clip
-                        });
+                    let stale = previous.is_none_or(|record| {
+                        record.bounds != walked.bounds
+                            || record.layer != walked.layer
+                            || record.clip != walked.effective_clip
+                    });
                     if node.skipped_prepaint_and_paint() && !stale {
                         stats.nodes_skipped += 1;
                         if let Some(record) = previous {
                             self.record_visited(node.address, record, frame);
                             Self::account(
                                 &mut boundaries,
-                                node.boundary,
+                                walked.owning_root,
                                 false,
                                 record.record_count(),
                             );
@@ -808,69 +769,69 @@ impl Emitter {
                         emission.clear();
                         emitter.emit(
                             &EmitContext {
-                                bounds,
-                                layer,
-                                boundary: node.boundary,
-                                clip: parent.clip,
+                                bounds: walked.bounds,
+                                layer: walked.layer,
+                                boundary: walked.owning_root,
+                                clip: walked.effective_clip,
                             },
                             &mut emission,
                         );
-                        if let Some(clip) = parent.clip {
+                        if let Some(clip) = walked.effective_clip {
                             emission.clip_to(clip);
                         }
                         Self::reconcile_records(
                             node.address,
-                            layer,
+                            walked.layer,
                             previous.map(|record| (record.layer, record.shadows)),
                             emission.shadows(),
                             &mut pending.shadows,
                         );
                         Self::reconcile_records(
                             node.address,
-                            layer,
+                            walked.layer,
                             previous.map(|record| (record.layer, record.quads)),
                             emission.quads(),
                             &mut pending.quads,
                         );
                         Self::reconcile_records(
                             node.address,
-                            layer,
+                            walked.layer,
                             previous.map(|record| (record.layer, record.underlines)),
                             emission.underlines(),
                             &mut pending.underlines,
                         );
                         Self::reconcile_records(
                             node.address,
-                            layer,
+                            walked.layer,
                             previous.map(|record| (record.layer, record.glyph_runs)),
                             emission.glyph_runs(),
                             &mut pending.glyph_runs,
                         );
                         Self::reconcile_records(
                             node.address,
-                            layer,
+                            walked.layer,
                             previous.map(|record| (record.layer, record.poly_sprites)),
                             emission.poly_sprites(),
                             &mut pending.poly_sprites,
                         );
                         Self::reconcile_records(
                             node.address,
-                            layer,
+                            walked.layer,
                             previous.map(|record| (record.layer, record.paths)),
                             emission.paths(),
                             &mut pending.paths,
                         );
                         Self::reconcile_records(
                             node.address,
-                            layer,
+                            walked.layer,
                             previous.map(|record| (record.layer, record.backdrop_filters)),
                             emission.backdrop_filters(),
                             &mut pending.backdrop_filters,
                         );
                         let emitted = EmittedNode {
-                            layer,
-                            bounds,
-                            clip: parent.clip,
+                            layer: walked.layer,
+                            bounds: walked.bounds,
+                            clip: walked.effective_clip,
                             shadows: u32::try_from(emission.shadows().len()).unwrap_or(u32::MAX),
                             quads: u32::try_from(emission.quads().len()).unwrap_or(u32::MAX),
                             underlines: u32::try_from(emission.underlines().len())
@@ -885,7 +846,7 @@ impl Emitter {
                             last_visited_frame: frame,
                         };
                         self.emitted.insert(node.address, emitted);
-                        Self::account(&mut boundaries, node.boundary, true, emission.len());
+                        Self::account(&mut boundaries, walked.owning_root, true, emission.len());
                     }
                 }
                 None => {
@@ -895,23 +856,10 @@ impl Emitter {
                     if let Some(record) = previous {
                         Self::retire_records(node.address, record, &mut pending);
                         self.emitted.remove(&node.address);
-                        Self::account(&mut boundaries, node.boundary, true, 0);
+                        Self::account(&mut boundaries, walked.owning_root, true, 0);
                     }
                 }
             }
-
-            stack.push(WalkFrame {
-                depth: node.depth,
-                layer: child_layer,
-                boundary: child_boundary,
-                origin,
-                content_offset,
-                clip: if node.clip_children {
-                    Some(intersect_layout_rect(parent.clip, bounds))
-                } else {
-                    parent.clip
-                },
-            });
         }
 
         self.sweep_departed(frame, &mut pending, &mut boundaries);

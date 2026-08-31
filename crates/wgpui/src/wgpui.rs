@@ -35,6 +35,10 @@ pub use wgpui_core::reconcile;
 pub use wgpui_core::reconcile::description::{RawText, RawTextKey};
 pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey, Reconciler};
 pub use wgpui_core::reconcile::{StateKey, StateScope};
+pub use wgpui_core::reconcile::{
+    RetainedElementSnapshot, RetainedFrameSnapshot, RetainedWalk, RetainedWalkNode, TileOwnership,
+};
+pub use wgpui_core::damage::{DamagePlan, DamageReason, DamageRecord};
 pub use wgpui_core::scene;
 pub use wgpui_core::window::{
     AnimationScheduler, DispatchTree, FocusManager, Keymap, WindowTimers,

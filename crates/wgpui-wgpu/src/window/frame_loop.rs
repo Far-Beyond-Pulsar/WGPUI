@@ -42,6 +42,7 @@ use wgpui_core::reconcile::description::{Description, DescriptionInteraction, Ra
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
+use wgpui_core::reconcile::{RetainedWalk, TileOwnership};
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::LayerId;
 use wgpui_layout::taffy_tree::{
@@ -148,6 +149,13 @@ pub struct InteractionRegistration {
     pub address: wgpui_core::reconcile::instance::InstanceKey,
     pub bounds: Rect,
     pub order: u64,
+    pub effective_clip: Option<Rect>,
+    pub owning_root: wgpui_core::scene::BoundaryId,
+    pub tile_ownership: TileOwnership,
+    pub outcome: wgpui_core::reconcile::NodeOutcome,
+    pub invalidation: wgpui_core::invalidation::Invalidation,
+    pub layout_skipped: bool,
+    pub paint_skipped: bool,
     pub interaction: DescriptionInteraction,
 }
 
@@ -433,10 +441,12 @@ impl FrameLoop {
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
-        let interactions = self.collect_interactions(&mut plan)?;
+        let walk =
+            RetainedWalk::build(&plan, &self.layout, input.signals).map_err(EmitError::from)?;
+        let interactions = self.collect_interactions(&mut plan, &walk)?;
         let emission = self
             .emitter
-            .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
+            .emit_with_walk(&plan, &walk, input.signals, &mut self.scene)?;
         let uploads = apply(&mut self.scene, &emission.patch)?;
         let dirty_layers = emission.patch.layers();
         let viewport = [width, height];
@@ -591,42 +601,42 @@ impl FrameLoop {
     fn collect_interactions(
         &self,
         plan: &mut wgpui_core::reconcile::plan::FramePlan,
+        walk: &RetainedWalk,
     ) -> Result<Vec<InteractionRegistration>, LoopError> {
-        let mut frames = Vec::<([f32; 2], [f32; 2], Option<Rect>)>::new();
         let mut result = Vec::new();
         for index in 0..plan.nodes().len() {
             let node = plan.nodes()[index];
-            let rectangle = self
-                .layout
-                .layout_of(node.layout_node)
-                .map_err(EmitError::from)?;
-            frames.truncate(node.depth as usize);
-            let (parent_origin, parent_offset, parent_clip) = frames
-                .last()
-                .copied()
-                .unwrap_or(([0.0, 0.0], [0.0, 0.0], None));
-            let origin = [
-                parent_origin[0] + parent_offset[0] + rectangle.x,
-                parent_origin[1] + parent_offset[1] + rectangle.y,
-            ];
-            let bounds = Rect::from_origin_size(origin, [rectangle.width, rectangle.height]);
+            let walked = walk.node(index).ok_or(LoopError::Emit(
+                EmitError::MalformedPlan {
+                    index,
+                    depth: node.depth,
+                },
+            ))?;
             if let Some(interaction) = plan.take_interaction(index) {
-                let visible_bounds = parent_clip.map_or(bounds, |clip| bounds.intersect(&clip));
+                let bounds = Rect::from_origin_size(
+                    [walked.bounds.x, walked.bounds.y],
+                    [walked.bounds.width, walked.bounds.height],
+                );
+                let effective_clip = walked.effective_clip.map(|clip| {
+                    Rect::from_origin_size([clip.x, clip.y], [clip.width, clip.height])
+                });
+                let visible_bounds = effective_clip.map_or(bounds, |clip| bounds.intersect(&clip));
                 if !visible_bounds.is_empty() {
-                result.push(InteractionRegistration {
+                    result.push(InteractionRegistration {
                         address: node.address,
                         bounds: visible_bounds,
                         order: index as u64,
+                        effective_clip,
+                        owning_root: walked.owning_root,
+                        tile_ownership: walked.tile_ownership,
+                        outcome: walked.outcome,
+                        invalidation: walked.invalidation,
+                        layout_skipped: walked.layout_skipped,
+                        paint_skipped: walked.paint_skipped,
                         interaction,
                     });
                 }
             }
-            let clip = if node.clip_children {
-                Some(parent_clip.map_or(bounds, |parent| bounds.intersect(&parent)))
-            } else {
-                parent_clip
-            };
-            frames.push((origin, node.scroll_offset, clip));
         }
         Ok(result)
     }
