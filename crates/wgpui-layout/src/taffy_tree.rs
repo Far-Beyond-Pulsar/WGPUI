@@ -427,6 +427,35 @@ mod tests {
     }
 
     #[test]
+    fn aspect_ratio_is_applied_by_the_retained_layout_tree() -> Result<(), LayoutError> {
+        let mut tree = LayoutTree::new();
+        let node = tree.request_layout(
+            LayoutStyle {
+                size: TaffySize {
+                    width: Dimension::length(120.0),
+                    height: Dimension::auto(),
+                },
+                aspect_ratio: Some(2.0),
+                ..LayoutStyle::default()
+            },
+            &[],
+        )?;
+
+        tree.compute_layout(node, definite(120.0, 80.0))?;
+
+        assert_eq!(
+            tree.layout_of(node)?,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 120.0,
+                height: 60.0,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn children_can_be_relinked_without_recreating_the_parent() -> Result<(), LayoutError> {
         let mut tree = LayoutTree::new();
         tree.begin_frame();

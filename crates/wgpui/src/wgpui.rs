@@ -56,6 +56,10 @@ pub use wgpui_layout::{
     AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
     LayoutTree, Measure,
 };
+pub use wgpui_layout::taffy_tree::{
+    AlignContent, AlignItems, BoxSizing, FlexWrap, GridPlacement, GridTemplateComponent,
+    LengthPercentage, LengthPercentageAuto, Overflow, Position, TrackSizingFunction,
+};
 pub use wgpui_macros::IntoElement;
 pub use wgpui_text::patch::{RunPlacement, glyph_runs};
 pub use wgpui_text::shaping::{
@@ -85,7 +89,8 @@ pub use wgpui_widgets::list::virtual_list::{
 };
 pub use wgpui_widgets::scroll::{ScrollHandle, ScrollPhysics, ScrollPhysicsMode};
 pub use wgpui_widgets::styled::{
-    IntoStyleBackground, IntoStyleColor, IntoStyleDimension, IntoStylePixels, Styled,
+    IntoStyleBackground, IntoStyleColor, IntoStyleDimension, IntoStylePixels, Styled, TextAlign,
+    TextOverflow,
 };
 pub use wgpui_widgets::styled_text::{
     Highlight, HighlightStyle, StrikethroughStyle, StyledText, TextEngine, TextStyle,

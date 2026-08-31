@@ -20,3 +20,4 @@ pub mod wgpu_surface;
 pub use div::interactivity::style::{
     BoxShadow, Corners, DivStyle, Edges, LinearGradient, Pattern, RadialGradient,
 };
+pub use styled::{TextAlign, TextOverflow};

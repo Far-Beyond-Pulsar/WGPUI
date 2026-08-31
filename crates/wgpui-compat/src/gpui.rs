@@ -25,7 +25,7 @@ pub use wgpui_text::shaping::{Font, FontId, FontStyle, FontWeight, SharedString}
 pub use wgpui_widgets::div::interactivity::style::BoxShadow as ResolvedBoxShadow;
 pub use wgpui_widgets::div::{Div, IntoDescription, div};
 pub use wgpui_widgets::styled::LinearColorStop;
-pub use wgpui_widgets::styled::Styled;
+pub use wgpui_widgets::styled::{Styled, TextAlign, TextOverflow};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers;
@@ -305,6 +305,18 @@ impl From<Hsla> for [f32; 4] {
         }
     }
 }
+
+impl wgpui_widgets::styled::IntoStyleColor for Rgba {
+    fn into_style_color(self) -> [f32; 4] {
+        self.into()
+    }
+}
+
+impl wgpui_widgets::styled::IntoStyleColor for Hsla {
+    fn into_style_color(self) -> [f32; 4] {
+        self.into()
+    }
+}
 pub const fn red() -> Hsla {
     Hsla {
         h: 0.0,
@@ -542,6 +554,10 @@ impl KeyBinding {
             action: A::name(),
             context: context.map(Into::into),
         }
+    }
+
+    pub fn keystrokes(&self) -> Vec<&str> {
+        self.keystrokes.as_str().split_whitespace().collect()
     }
 }
 pub struct Menu {
