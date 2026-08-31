@@ -1510,7 +1510,7 @@ mod tests {
             .events
             .iter()
             .filter_map(|event| match &event.kind {
-                TraceEventKind::SpanBegin { name } => {
+                wgpui_core::hooks::TraceEventKind::SpanBegin { name } => {
                     Some((name.as_str(), event.span_id, event.parent_span_id))
                 }
                 _ => None,
