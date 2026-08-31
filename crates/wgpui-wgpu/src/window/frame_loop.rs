@@ -57,6 +57,7 @@ use crate::render::frame::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
 use wgpui_text::patch::{RunPlacement, glyph_runs};
 use wgpui_text::raster::GlyphRasterizer;
@@ -141,6 +142,102 @@ pub struct LoopFrame {
     /// The GPU half.
     pub frame: FrameOutput,
     pub interactions: Vec<InteractionRegistration>,
+}
+
+/// CPU timings for the stages owned by [`FrameLoop`].
+///
+/// The renderer's upload and compute timings are copied into this value by the
+/// frame loop. `visibility` is the existing dirty-layer ordering/occlusion
+/// stage; tiled visibility dispatches have their own benchmark because the
+/// current frame loop does not yet route tiled boundaries through that pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoopTiming {
+    /// Raw-text materialization, including shaping and atlas placement.
+    pub description_build: Duration,
+    /// Reconciliation of the per-frame description tree.
+    pub reconciliation: Duration,
+    /// Taffy layout computation.
+    pub layout: Duration,
+    /// The interaction geometry walk over the retained plan.
+    pub shared_walk: Duration,
+    /// Conversion of the plan into a scene patch.
+    pub emission: Duration,
+    /// Patch application, dirty-layer selection, and transient damage hints.
+    pub damage: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum TimingStage {
+    DescriptionBuild,
+    Reconciliation,
+    Layout,
+    SharedWalk,
+    Emission,
+    Damage,
+}
+
+trait TimingCapture {
+    type Mark: Copy;
+
+    fn begin(&self) -> Self::Mark;
+    fn finish(&mut self, mark: Self::Mark, stage: TimingStage);
+    fn finish_frame(&mut self) -> LoopTiming;
+}
+
+#[derive(Default)]
+struct NoTiming;
+
+impl TimingCapture for NoTiming {
+    type Mark = ();
+
+    #[inline(always)]
+    fn begin(&self) {}
+
+    #[inline(always)]
+    fn finish(&mut self, _mark: Self::Mark, _stage: TimingStage) {}
+
+    #[inline(always)]
+    fn finish_frame(&mut self) -> LoopTiming {
+        LoopTiming::default()
+    }
+}
+
+struct ActiveTiming {
+    timing: LoopTiming,
+}
+
+impl ActiveTiming {
+    fn new() -> Self {
+        Self {
+            timing: LoopTiming::default(),
+        }
+    }
+}
+
+impl TimingCapture for ActiveTiming {
+    type Mark = Instant;
+
+    #[inline(always)]
+    fn begin(&self) -> Self::Mark {
+        Instant::now()
+    }
+
+    #[inline(always)]
+    fn finish(&mut self, mark: Self::Mark, stage: TimingStage) {
+        let duration = mark.elapsed();
+        match stage {
+            TimingStage::DescriptionBuild => self.timing.description_build = duration,
+            TimingStage::Reconciliation => self.timing.reconciliation = duration,
+            TimingStage::Layout => self.timing.layout = duration,
+            TimingStage::SharedWalk => self.timing.shared_walk = duration,
+            TimingStage::Emission => self.timing.emission = duration,
+            TimingStage::Damage => self.timing.damage = duration,
+        }
+    }
+
+    fn finish_frame(&mut self) -> LoopTiming {
+        std::mem::take(&mut self.timing)
+    }
 }
 
 #[derive(Debug)]
@@ -421,22 +518,62 @@ impl FrameLoop {
         description: Description,
         input: &LoopInput<'_>,
     ) -> Result<LoopFrame, LoopError> {
+        let mut timing = NoTiming;
+        let (frame, _) = self.draw_inner(device, queue, description, input, &mut timing)?;
+        Ok(frame)
+    }
+
+    /// Draw one frame and time the retained frontend stages.
+    ///
+    /// Profiling is explicit so ordinary callers pay no `Instant` reads in the
+    /// frame path. The returned renderer timing still supplies upload and
+    /// visibility/compute measurements for the same frame.
+    pub fn draw_profiled(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        description: Description,
+        input: &LoopInput<'_>,
+    ) -> Result<(LoopFrame, LoopTiming), LoopError> {
+        let mut timing = ActiveTiming::new();
+        self.draw_inner(device, queue, description, input, &mut timing)
+    }
+
+    fn draw_inner<T: TimingCapture>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        description: Description,
+        input: &LoopInput<'_>,
+        timing: &mut T,
+    ) -> Result<(LoopFrame, LoopTiming), LoopError> {
         let mut description = description;
+        let started = timing.begin();
         self.materialize_raw_text(&mut description)?;
+        timing.finish(started, TimingStage::DescriptionBuild);
+        let started = timing.begin();
         let mut plan = self.reconciler.reconcile(description, &mut self.layout)?;
+        timing.finish(started, TimingStage::Reconciliation);
         let root = plan
             .root()
             .map(|node| node.layout_node)
             .ok_or(LoopError::NoRoot)?;
         let width = input.target.width.max(1) as f32;
         let height = input.target.height.max(1) as f32;
+        let started = timing.begin();
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
+        timing.finish(started, TimingStage::Layout);
+        let started = timing.begin();
         let interactions = self.collect_interactions(&mut plan)?;
+        timing.finish(started, TimingStage::SharedWalk);
+        let started = timing.begin();
         let emission = self
             .emitter
             .emit(&plan, &self.layout, input.signals, &mut self.scene)?;
+        timing.finish(started, TimingStage::Emission);
+        let started = timing.begin();
         let uploads = apply(&mut self.scene, &emission.patch)?;
         let dirty_layers = emission.patch.layers();
         let viewport = [width, height];
@@ -455,6 +592,7 @@ impl FrameLoop {
         );
         self.interaction_dirty_regions.clear();
         self.renderer.set_debug_tiles(debug_tiles);
+        timing.finish(started, TimingStage::Damage);
 
         self.atlas_textures
             .sync(device, queue, &mut self.text_atlas);
@@ -480,15 +618,19 @@ impl FrameLoop {
             .render_to(device, queue, &frame_input, input.target)?;
         self.frames += 1;
 
-        Ok(LoopFrame {
-            reconciled: plan.stats(),
-            emission,
-            dirty_layers,
-            uploaded_bytes: uploads.byte_count(),
-            viewport_changed,
-            frame,
-            interactions,
-        })
+        let timing = timing.finish_frame();
+        Ok((
+            LoopFrame {
+                reconciled: plan.stats(),
+                emission,
+                dirty_layers,
+                uploaded_bytes: uploads.byte_count(),
+                viewport_changed,
+                frame,
+                interactions,
+            },
+            timing,
+        ))
     }
 
     fn refresh_debug_tiles(
