@@ -386,6 +386,8 @@ pub struct TiledVisit {
     pub boundary: BoundaryId,
     /// Its grid.
     pub grid: TileGrid,
+    /// The boundary viewport in screen coordinates.
+    pub screen_viewport: Rect,
     /// The content-plane rectangle under the viewport at this pan offset.
     pub content_viewport: Rect,
     /// Every tile in range this frame, row-major and ascending.
@@ -549,6 +551,7 @@ impl Compositor {
         Some(TiledVisit {
             boundary,
             grid,
+            screen_viewport: viewport,
             content_viewport,
             visible: span.tiles(),
             revealed,
