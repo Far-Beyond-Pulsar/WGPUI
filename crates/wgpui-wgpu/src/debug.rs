@@ -22,6 +22,17 @@ pub struct DebugTile {
 unsafe impl bytemuck::Zeroable for DebugTile {}
 unsafe impl bytemuck::Pod for DebugTile {}
 
+impl DebugTile {
+    /// Attach the measured refresh rate shown in this tile's diagnostic label.
+    ///
+    /// The value occupies the first word of the existing padding so the
+    /// diagnostic storage stride and public layout remain unchanged.
+    pub fn with_refresh_rate(mut self, frames_per_second: f32) -> Self {
+        self._padding[0] = frames_per_second.max(0.0);
+        self
+    }
+}
+
 /// A tile-refresh visualizer configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TileRefreshFlash {
@@ -33,8 +44,8 @@ pub struct TileRefreshFlash {
     pub duration_frames: u32,
     /// RGBA overlay colour. Alpha controls how strongly content is tinted.
     pub color: [f32; 4],
-    /// Also flash the visible diagnostic grid when the scene has not yet
-    /// opted a boundary into tiled residency.
+    /// Also draw the visible tile outlines for tiled boundaries while their
+    /// diagnostics are active.
     pub viewport_grid: bool,
 }
 
@@ -83,8 +94,7 @@ impl TileRefreshFlash {
         self
     }
 
-    /// Also flash the visible tile grid when an application has not yet
-    /// opted a boundary into tiled residency.
+    /// Also draw visible tile outlines for tiled boundaries.
     pub fn with_viewport_grid(mut self, enabled: bool) -> Self {
         self.viewport_grid = enabled;
         self
@@ -146,5 +156,18 @@ mod tests {
     fn invalid_tile_dimensions_do_not_replace_a_valid_configuration() {
         let flash = TileRefreshFlash::enabled().with_tile_size(64.0, 32.0);
         assert_eq!(flash.with_tile_size(f32::NAN, 0.0).tile_size, [64.0, 32.0]);
+    }
+
+    #[test]
+    fn a_refresh_rate_is_stored_without_changing_the_debug_tile_stride() {
+        let tile = DebugTile {
+            origin_size: [0.0; 4],
+            color: [1.0; 4],
+            border_width: 1.0,
+            _padding: [0.0; 7],
+        }
+        .with_refresh_rate(60.0);
+        assert_eq!(tile._padding[0], 60.0);
+        assert_eq!(std::mem::size_of::<DebugTile>(), 64);
     }
 }

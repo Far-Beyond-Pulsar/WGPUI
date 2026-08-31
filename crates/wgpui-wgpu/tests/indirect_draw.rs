@@ -34,6 +34,7 @@ use wgpui_wgpu::render::draw::DrawMode;
 use wgpui_wgpu::render::frame::{Dirty, FrameInput, FrameOutput, FrameRenderer, OffscreenTarget};
 use wgpui_wgpu::render::pipelines::TARGET_FORMAT;
 use wgpui_wgpu::render::surface_registry::SurfaceRegistry;
+use wgpui_wgpu::debug::DebugTile;
 
 const LAYERS: usize = 6;
 
@@ -509,6 +510,49 @@ fn damaged_presentation_clears_removed_content() {
         .read_pixels(&context.device, &context.queue)
         .expect("the damaged removal frame reads back");
     assert!(pixels.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 255]));
+}
+
+#[test]
+fn tile_refresh_diagnostics_draw_the_measured_rate_label() {
+    let Some(context) = context_or_report("tile_refresh_rate_label") else {
+        return;
+    };
+    let spec = UiSceneSpec {
+        width: 64.0,
+        height: 64.0,
+        ..UiSceneSpec::small()
+    };
+    let scene = MultiLayerSceneDriver::new(1);
+    let target = OffscreenTarget::new(&context.device, spec.width as u32, spec.height as u32);
+    let mut renderer = FrameRenderer::new(&context.device);
+    renderer.set_debug_tiles(vec![
+        DebugTile {
+            origin_size: [0.0, 0.0, 64.0, 64.0],
+            color: [1.0, 0.0, 1.0, 0.25],
+            border_width: 3.0,
+            _padding: [0.0; 7],
+        }
+        .with_refresh_rate(60.0),
+    ]);
+    let input = FrameInput {
+        scene: &scene.scene,
+        clip: window(&spec),
+        poison: &scene.poison,
+        dirty: Dirty::All,
+        uploads: &[],
+        composites: &[],
+        registry: None,
+        atlas: None,
+        viewport: [spec.width, spec.height],
+        mode: DrawMode::best_available(context.indirect),
+    };
+    let (_, pixels) = render(&context, &mut renderer, &target, &input);
+    assert!(
+        pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel == [255, 255, 255, 255]),
+        "the active tile must contain visible rate glyphs"
+    );
 }
 
 /// **Gate 1**: a clean window's CPU-side draw-issuing work is O(layer slots),

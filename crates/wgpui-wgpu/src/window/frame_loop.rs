@@ -30,7 +30,7 @@
 //! The resulting glyph runs still enter the ordinary retained patch protocol;
 //! no text-specific draw path bypasses reconciliation.
 
-use wgpui_core::boundary::compositor::{Composite, CompositeEntry};
+use wgpui_core::boundary::compositor::{Composite, CompositeEntry, TiledVisit};
 use wgpui_core::geometry::Rect;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::invalidation::request::FrameSignals;
@@ -45,6 +45,7 @@ use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
 use wgpui_core::reconcile::walk::shared_walk;
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::LayerId;
+use wgpui_core::scene::tile::TileCoord;
 use wgpui_layout::taffy_tree::{
     Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
 };
@@ -58,6 +59,7 @@ use crate::render::frame::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
 use wgpui_text::patch::{RunPlacement, glyph_runs};
 use wgpui_text::raster::GlyphRasterizer;
@@ -220,8 +222,9 @@ pub struct FrameLoop {
     frames: u64,
     last_viewport: Option<[f32; 2]>,
     viewport_recomputes: u64,
-    tile_flash_frames: HashMap<LayerId, u32>,
-    viewport_flash_frames: u32,
+    tile_flash_frames: HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), u32>,
+    tile_refresh_rates:
+        HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), TileRefreshRate>,
     interaction_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     scale_factor: f32,
@@ -239,6 +242,13 @@ struct PreparedText {
 struct TextCacheKey {
     value: Arc<str>,
     font_size_bits: u32,
+}
+
+#[derive(Clone, Copy)]
+struct TileRefreshRate {
+    window_start: Instant,
+    samples: u32,
+    frames_per_second: f32,
 }
 
 impl FrameLoop {
@@ -260,7 +270,7 @@ impl FrameLoop {
             last_viewport: None,
             viewport_recomputes: 0,
             tile_flash_frames: HashMap::new(),
-            viewport_flash_frames: 0,
+            tile_refresh_rates: HashMap::new(),
             interaction_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             scale_factor: 1.0,
@@ -458,9 +468,9 @@ impl FrameLoop {
             .iter()
             .any(|composite| composite.composite == Composite::TransformOnly);
         let debug_tiles = self.refresh_debug_tiles(
-            &emission.patch,
+            &emission,
             self.performance_debug.tile_refresh_flash(),
-            viewport,
+            Rect::from_origin_size([0.0, 0.0], viewport),
             viewport_changed,
             &interaction_dirty_regions,
         );
@@ -550,102 +560,98 @@ impl FrameLoop {
 
     fn refresh_debug_tiles(
         &mut self,
-        patch: &wgpui_core::patch::apply::ScenePatch,
+        emission: &FrameEmission,
         flash: crate::debug::TileRefreshFlash,
-        viewport: [f32; 2],
+        viewport: Rect,
         viewport_changed: bool,
         interaction_dirty_regions: &[Rect],
     ) -> Vec<DebugTile> {
         if !flash.enabled {
             self.tile_flash_frames.clear();
-            self.viewport_flash_frames = 0;
+            self.tile_refresh_rates.clear();
             return Vec::new();
         }
         self.tile_flash_frames.retain(|_, frames| {
             *frames = frames.saturating_sub(1);
             *frames > 0
         });
-        self.viewport_flash_frames = self.viewport_flash_frames.saturating_sub(1);
-        let content_layers = patch.content_layers();
-        for layer_id in content_layers.iter().copied() {
-            let Some(layer) = self.scene.layers.get(layer_id) else {
-                continue;
-            };
-            let Some(tile) = layer.key().tile else {
-                continue;
-            };
-            let tile_rect = Rect::from_origin_size(
-                [
-                    tile.x as f32 * flash.tile_size[0] + layer.transform().translation[0],
-                    tile.y as f32 * flash.tile_size[1] + layer.transform().translation[1],
-                ],
-                flash.tile_size,
-            );
-            if !interaction_dirty_regions.is_empty()
-                && !interaction_dirty_regions
+        self.tile_refresh_rates.retain(|key, _| {
+            emission
+                .tiled_visits
+                .iter()
+                .any(|visit| visit.boundary == key.0 && visit.visible.contains(&key.1))
+        });
+        let now = Instant::now();
+        for visit in &emission.tiled_visits {
+            for tile in &visit.visible {
+                let key = (visit.boundary, *tile);
+                let tile_rect = screen_tile_rect(visit, *tile);
+                let presentation_changed = viewport_changed
+                    || emission.damage.iter().any(|region| region.intersects(&tile_rect));
+                let interaction_changed = interaction_dirty_regions
                     .iter()
-                    .any(|region| tile_rect.intersects(region))
-            {
-                continue;
-            }
-            self.tile_flash_frames
-                .insert(layer_id, flash.duration_frames.max(1));
-        }
-        if flash.viewport_grid && (viewport_changed || !interaction_dirty_regions.is_empty()) {
-            self.viewport_flash_frames = flash.duration_frames.max(1);
-        }
-        if flash.viewport_grid && self.viewport_flash_frames > 0 {
-            let columns = (viewport[0] / flash.tile_size[0]).ceil().max(0.0) as i32;
-            let rows = (viewport[1] / flash.tile_size[1]).ceil().max(0.0) as i32;
-            let mut tiles = Vec::new();
-            for y in 0..rows {
-                for x in 0..columns {
-                    let width = flash.tile_size[0].min(viewport[0] - x as f32 * flash.tile_size[0]);
-                    let height =
-                        flash.tile_size[1].min(viewport[1] - y as f32 * flash.tile_size[1]);
-                    let tile_rect = Rect::from_origin_size(
-                        [x as f32 * flash.tile_size[0], y as f32 * flash.tile_size[1]],
-                        [width, height],
-                    );
-                    let region_matches = viewport_changed
-                        || interaction_dirty_regions.is_empty()
-                        || interaction_dirty_regions
-                            .iter()
-                            .any(|region| tile_rect.intersects(region));
-                    if width > 0.0 && height > 0.0 && region_matches {
-                        tiles.push(DebugTile {
-                            origin_size: [
-                                x as f32 * flash.tile_size[0],
-                                y as f32 * flash.tile_size[1],
-                                width,
-                                height,
-                            ],
-                            color: flash.color,
-                            border_width: 3.0,
-                            _padding: [0.0; 7],
-                        });
-                    }
+                    .any(|region| region.intersects(&tile_rect));
+                if presentation_changed || interaction_changed {
+                    self.tile_flash_frames
+                        .insert(key, flash.duration_frames.max(1));
+                    self.record_tile_refresh(key, now);
                 }
             }
-            return tiles;
         }
-        self.tile_flash_frames
-            .keys()
-            .filter_map(|layer_id| {
-                let layer = self.scene.layers.get(*layer_id)?;
-                let tile = layer.key().tile?;
-                let origin = [
-                    tile.x as f32 * flash.tile_size[0] + layer.transform().translation[0],
-                    tile.y as f32 * flash.tile_size[1] + layer.transform().translation[1],
-                ];
-                Some(DebugTile {
-                    origin_size: [origin[0], origin[1], flash.tile_size[0], flash.tile_size[1]],
-                    color: flash.color,
-                    border_width: 3.0,
-                    _padding: [0.0; 7],
-                })
-            })
-            .collect()
+        if self.tile_flash_frames.is_empty() && !viewport_changed {
+            return Vec::new();
+        }
+        let mut tiles = Vec::new();
+        for visit in &emission.tiled_visits {
+            for tile in &visit.visible {
+                let key = (visit.boundary, *tile);
+                if !self.tile_flash_frames.contains_key(&key) && !flash.viewport_grid {
+                    continue;
+                }
+                let tile_rect = screen_tile_rect(visit, *tile).intersect(&viewport);
+                if tile_rect.is_empty() {
+                    continue;
+                }
+                let rate = self
+                    .tile_refresh_rates
+                    .get(&key)
+                    .map_or(0.0, |rate| rate.frames_per_second);
+                tiles.push(
+                    DebugTile {
+                        origin_size: [
+                            tile_rect.min_x,
+                            tile_rect.min_y,
+                            tile_rect.width(),
+                            tile_rect.height(),
+                        ],
+                        color: flash.color,
+                        border_width: 3.0,
+                        _padding: [0.0; 7],
+                    }
+                    .with_refresh_rate(rate),
+                );
+            }
+        }
+        tiles
+    }
+
+    fn record_tile_refresh(
+        &mut self,
+        key: (wgpui_core::scene::layer::BoundaryId, TileCoord),
+        now: Instant,
+    ) {
+        let rate = self.tile_refresh_rates.entry(key).or_insert(TileRefreshRate {
+            window_start: now,
+            samples: 0,
+            frames_per_second: 0.0,
+        });
+        rate.samples = rate.samples.saturating_add(1);
+        let elapsed = now.duration_since(rate.window_start).as_secs_f32();
+        if elapsed >= 0.25 {
+            rate.frames_per_second = rate.samples as f32 / elapsed;
+            rate.window_start = now;
+            rate.samples = 0;
+        }
     }
 
     fn collect_interactions(
@@ -782,6 +788,21 @@ fn union_damage(current: Option<Rect>, next: Rect) -> Rect {
         Some(current) => current.union(&next),
         None => next,
     }
+}
+
+fn screen_tile_rect(visit: &TiledVisit, tile: TileCoord) -> Rect {
+    let content_rect = visit.grid.tile_bounds(tile);
+    let translation = [
+        visit.screen_viewport.min_x - visit.content_viewport.min_x,
+        visit.screen_viewport.min_y - visit.content_viewport.min_y,
+    ];
+    Rect::from_origin_size(
+        [
+            content_rect.min_x + translation[0],
+            content_rect.min_y + translation[1],
+        ],
+        [content_rect.width(), content_rect.height()],
+    )
 }
 
 /// Phase 6's reference scene: one solid quad and one line of shaped text.
