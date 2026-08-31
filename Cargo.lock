@@ -4978,6 +4978,7 @@ dependencies = [
 name = "wgpui-devtools"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "getrandom 0.3.4",
  "serde",
  "serde_json",

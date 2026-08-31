@@ -14,6 +14,7 @@ pub mod hooks;
 #[cfg(feature = "inspector")]
 pub mod inspector;
 pub mod memory;
+pub mod network;
 #[cfg(feature = "perf-ab")]
 pub mod perf_ab_tests;
 pub mod reference_viewer;
@@ -44,6 +45,14 @@ pub use gpu_resources::{
     ResourceKind as GpuResourceKind,
     ResourceRecord, ResourceRole, TextureRegion, TransferKind, UploadRecord,
 };
+pub use network::{
+    BodyChunkRecord, BodyDirection, BodyPreview, CaptureNetworkClient, NetworkBody, NetworkCapture,
+    NetworkCaptureConfig, NetworkCaptureSnapshot, NetworkClient, NetworkError, NetworkEvent,
+    NetworkFuture, NetworkHeaders, NetworkPhase, NetworkPhaseRecord, NetworkRecordingClient,
+    NetworkRedirectRecord, NetworkRequest, NetworkRequestMetadata, NetworkRequestRecord,
+    NetworkResponse, NetworkResponseRecord, NetworkTransportObserver, ObservationStatus,
+    PhaseAvailability, RecordingNetworkClient, RedirectPolicy,
+};
 #[cfg(feature = "perf-ab")]
 pub use perf_ab_tests::Sample;
 pub use reference_viewer::{CaptureViewerError, ReferenceViewer};
@@ -53,7 +62,8 @@ pub use capture::{
     Availability, CaptureBundle, CaptureConfig, CaptureController, CaptureError, CaptureExport,
     CaptureRecorder, CaptureService, CaptureSnapshot, CaptureState, DEFAULT_MAX_CAPTURE_BYTES,
     DEFAULT_MAX_RESOURCE_READBACK_BYTES, FrameSnapshot, FrozenCapture, RecorderConfig, ResourceId,
-    ResourceKind, ResourceReadback, ResourceSnapshot,
+    ResourceKind, ResourceReadback, ResourceSnapshot, CaptureRequest,
+    active as capture_active, start as start_capture, stop as stop_capture,
 };
 pub use protocol::{
     BoundedMessageQueue, Capabilities, Capability, ClientMessage, DEFAULT_MAX_MESSAGE_BYTES,

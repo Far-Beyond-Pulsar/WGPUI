@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
@@ -14,6 +14,35 @@ use wgpui_core::hooks::{
 const DISABLED: u8 = 0;
 const COLLECTING: u8 = 1;
 const FROZEN: u8 = 2;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureRequest {
+    pub include_gpu: bool,
+}
+
+static GPU_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn start(request: CaptureRequest) -> bool {
+    if GPU_CAPTURE_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    crate::gpu_resources::begin(request.include_gpu);
+    true
+}
+
+pub fn stop() -> Option<crate::gpu_resources::CaptureSnapshot> {
+    if !GPU_CAPTURE_ACTIVE.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+    Some(crate::gpu_resources::end())
+}
+
+pub fn active() -> bool {
+    GPU_CAPTURE_ACTIVE.load(Ordering::Acquire)
+}
 
 /// Limits for one recorder lifetime. Budgets are shared by all producer
 /// threads and all frames until [`CaptureRecorder::reset`] is called.
@@ -1515,7 +1544,7 @@ mod tests {
                 )
             }),
             Some((
-                42,
+                Some(42),
                 Some(1),
                 Some(8),
                 Some(13),
@@ -1566,7 +1595,7 @@ mod tests {
             boundary_id: None,
             root_id: None,
             tile: Some(TraceTileCoordinate { x: 1, y: 2 }),
-            kind: TraceEventKind::FramePresented,
+            kind: wgpui_core::hooks::TraceEventKind::FramePresented,
             end_timestamp: None,
         };
         let bytes = sample.estimated_bytes();

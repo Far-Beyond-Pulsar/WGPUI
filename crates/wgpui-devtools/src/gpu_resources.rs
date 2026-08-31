@@ -302,6 +302,9 @@ pub fn evict(id: ResourceId, frame: u64) {
 mod tests {
     use super::*;
     use crate::capture::{self, CaptureRequest};
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn descriptor(role: ResourceRole) -> ResourceDescriptor {
         ResourceDescriptor {
@@ -318,6 +321,7 @@ mod tests {
 
     #[test]
     fn gpu_resources_are_not_recorded_outside_a_gpu_capture() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let id = register(descriptor(ResourceRole::PrimitiveBuffer));
         assert_eq!(id, ResourceId::INVALID);
         assert!(!enabled());
@@ -325,6 +329,7 @@ mod tests {
 
     #[test]
     fn capture_exposes_lifetime_upload_and_use_metadata() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(capture::start(CaptureRequest { include_gpu: true }));
         set_frame(7);
         let id = register(descriptor(ResourceRole::IndirectArguments));
@@ -356,6 +361,7 @@ mod tests {
 
     #[test]
     fn cpu_only_capture_does_not_enable_gpu_records() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(capture::start(CaptureRequest { include_gpu: false }));
         assert!(!enabled());
         assert_eq!(

@@ -23,6 +23,7 @@ wgpui-core = { path = "../wgpui-core" }
 wgpui-layout = { path = "../wgpui-layout" }
 getrandom = "0.3"
 thiserror = "2.0"
+futures = "0.3"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
