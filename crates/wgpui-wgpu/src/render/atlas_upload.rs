@@ -31,6 +31,9 @@
 //! appears.
 
 use crate::render::atlas::GlyphAtlas;
+use crate::render::resources::{
+    NativeResourceDimensions, NativeResourceId, NativeResourceRegistry, NativeResourceRole,
+};
 use std::collections::HashMap;
 use wgpui_core::scene::atlas::AtlasKind;
 
@@ -75,12 +78,23 @@ struct PageTexture {
     kind: AtlasKind,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    resource_registry: NativeResourceRegistry,
+    resource_id: NativeResourceId,
+}
+
+impl Drop for PageTexture {
+    fn drop(&mut self) {
+        self.resource_registry
+            .evict(self.resource_id, self.resource_registry.current_frame());
+    }
 }
 
 /// One `wgpu::Texture` per live atlas page, kept in step with a [`GlyphAtlas`].
 pub struct AtlasTextures {
     page_size: u32,
     pages: HashMap<u32, PageTexture>,
+    generations: HashMap<u32, u64>,
+    resource_registry: NativeResourceRegistry,
 }
 
 impl AtlasTextures {
@@ -89,6 +103,8 @@ impl AtlasTextures {
         Self {
             page_size,
             pages: HashMap::new(),
+            generations: HashMap::new(),
+            resource_registry: NativeResourceRegistry,
         }
     }
 
@@ -171,8 +187,8 @@ impl AtlasTextures {
         let uploads = atlas.drain_uploads();
         for upload in uploads {
             if !self.pages.contains_key(&upload.page) {
-                self.pages
-                    .insert(upload.page, self.create_page(device, upload.kind));
+                let page = self.create_page(device, upload.page, upload.kind);
+                self.pages.insert(upload.page, page);
                 report.pages_created += 1;
             }
             let Some(texels) = atlas.page_texels(upload.page) else {
@@ -241,12 +257,21 @@ impl AtlasTextures {
             );
             report.rectangles += 1;
             report.texel_bytes += copied;
+            page.resource_registry.record_texture_upload(
+                page.resource_id,
+                [upload.origin[0], upload.origin[1], 0],
+                [upload.size[0], upload.size[1], 1],
+                copied as u64,
+                page.resource_registry.current_frame(),
+            );
+            page.resource_registry
+                .mark_used(page.resource_id, page.resource_registry.current_frame());
         }
 
         report
     }
 
-    fn create_page(&self, device: &wgpu::Device, kind: AtlasKind) -> PageTexture {
+    fn create_page(&mut self, device: &wgpu::Device, page: u32, kind: AtlasKind) -> PageTexture {
         let format = texture_format(kind);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("wgpui glyph atlas page"),
@@ -278,10 +303,32 @@ impl AtlasTextures {
             base_array_layer: 0,
             array_layer_count: None,
         });
+        let generation = self.generations.entry(page).or_insert(0);
+        let generation_value = *generation;
+        *generation = generation.saturating_add(1);
+        let resource_registry = self.resource_registry;
+        let format_name = format!("{format:?}");
+        let resource_id = resource_registry.register_texture(
+            "wgpui glyph atlas page",
+            NativeResourceRole::AtlasPage,
+            NativeResourceDimensions {
+                width: self.page_size,
+                height: self.page_size,
+                depth_or_array_layers: 1,
+            },
+            &format_name,
+            u64::from(self.page_size)
+                .saturating_mul(u64::from(self.page_size))
+                .saturating_mul(u64::from(kind.bytes_per_pixel())),
+            texture.usage().bits() as u64,
+            generation_value,
+        );
         PageTexture {
             kind,
             texture,
             view,
+            resource_registry,
+            resource_id,
         }
     }
 }

@@ -9,6 +9,7 @@ pub mod draw;
 pub mod frame;
 pub mod pipelines;
 pub mod readback;
+pub mod resources;
 pub mod shaders;
 pub mod surface_registry;
 pub mod textures;

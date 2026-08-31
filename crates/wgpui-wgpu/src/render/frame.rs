@@ -70,6 +70,9 @@ use crate::render::pipelines::{
     PolySpritePipeline, QuadPipeline, ShadowPipeline, TARGET_FORMAT, UnderlinePipeline,
 };
 use crate::render::readback::{ReadbackError, StagingReader, read_texture_rgba8};
+use crate::render::resources::{
+    NativeResourceDimensions, NativeResourceId, NativeResourceRegistry, NativeResourceRole,
+};
 use crate::render::surface_registry::SurfaceRegistry;
 use crate::render::textures::external_surface::{
     CompositeConsumer, CompositePlan, plan_composites,
@@ -105,8 +108,9 @@ impl std::fmt::Display for FrameError {
                 formatter,
                 "backdrop filtering requires a copyable render-target texture"
             ),
-            FrameError::DebugOverlayUnavailable =>
-                write!(formatter, "tile refresh diagnostics could not be prepared"),
+            FrameError::DebugOverlayUnavailable => {
+                write!(formatter, "tile refresh diagnostics could not be prepared")
+            }
         }
     }
 }
@@ -241,6 +245,15 @@ pub struct OffscreenTarget {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
+    resource_registry: NativeResourceRegistry,
+    resource_id: NativeResourceId,
+}
+
+impl Drop for OffscreenTarget {
+    fn drop(&mut self) {
+        self.resource_registry
+            .evict(self.resource_id, self.resource_registry.current_frame());
+    }
 }
 
 impl OffscreenTarget {
@@ -263,11 +276,32 @@ impl OffscreenTarget {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let resource_registry = NativeResourceRegistry;
+        let resource_id = resource_registry.register_texture(
+            "frame target",
+            NativeResourceRole::Surface,
+            NativeResourceDimensions {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            &format!("{TARGET_FORMAT:?}"),
+            u64::from(width.max(1))
+                .saturating_mul(u64::from(height.max(1)))
+                .saturating_mul(u64::from(TARGET_FORMAT.block_copy_size(None).unwrap_or(4))),
+            (wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC)
+                .bits() as u64,
+            0,
+        );
         OffscreenTarget {
             texture,
             view,
             width: width.max(1),
             height: height.max(1),
+            resource_registry,
+            resource_id,
         }
     }
 
@@ -331,6 +365,7 @@ pub struct RenderTarget<'a> {
 
 /// Everything a frame needs that outlives one: pipelines, arenas, pools.
 pub struct FrameRenderer {
+    frame: u64,
     ordering: OrderingPass,
     occlusion: OcclusionPass,
     indirect: IndirectArgsPass,
@@ -426,6 +461,7 @@ impl FrameRenderer {
         let (debug_bind_group_layout, debug_pipeline) = create_debug_pipeline(device);
         let debug_buffer_capacity = std::mem::size_of::<DebugTile>() as u64;
         FrameRenderer {
+            frame: 0,
             ordering: OrderingPass::new(device),
             occlusion: OcclusionPass::new(device),
             indirect: IndirectArgsPass::new(device),
@@ -758,6 +794,8 @@ impl FrameRenderer {
             let hooks = HOOKS.get_or_init(Default::default);
             wgpui_core::hooks::Span::new(hooks, "frame: render")
         };
+        self.frame = self.frame.saturating_add(1);
+        NativeResourceRegistry.begin_frame(self.frame);
         self.textures.begin_frame();
         let mut timing = FrameTiming::default();
         let upload_calls_before = self.scene_upload_calls();
@@ -1634,7 +1672,10 @@ impl FrameRenderer {
                 };
                 pass.set_pipeline(&self.debug_pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
-                pass.draw(0..4, 0..u32::try_from(debug_tiles.len()).unwrap_or(u32::MAX));
+                pass.draw(
+                    0..4,
+                    0..u32::try_from(debug_tiles.len()).unwrap_or(u32::MAX),
+                );
             }
             timing.draw_issue = started.elapsed();
         }
@@ -1691,7 +1732,7 @@ fn create_debug_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu:
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
                     min_binding_size: std::num::NonZeroU64::new(
-                        std::mem::size_of::<DebugTile>() as u64,
+                        std::mem::size_of::<DebugTile>() as u64
                     ),
                 },
                 count: None,

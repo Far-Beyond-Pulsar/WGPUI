@@ -43,9 +43,13 @@
 //! surfaces batch makes, in the same order — and nothing else.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+use crate::render::resources::{
+    NativeResourceDimensions, NativeResourceId, NativeResourceRegistry, NativeResourceRole,
+};
 
 /// An opaque identifier for a registered WGPU surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,6 +103,18 @@ struct TripleBuffer {
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
+    resource_registry: NativeResourceRegistry,
+    resource_ids: [NativeResourceId; 3],
+    resource_generation: u64,
+}
+
+impl Drop for TripleBuffer {
+    fn drop(&mut self) {
+        let frame = self.resource_registry.current_frame();
+        for resource_id in self.resource_ids {
+            self.resource_registry.evict(resource_id, frame);
+        }
+    }
 }
 
 impl TripleBuffer {
@@ -148,7 +164,7 @@ impl SurfaceRegistry {
         format: wgpu::TextureFormat,
     ) -> SurfaceId {
         let id = SurfaceId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let tb = Self::create_triple_buffer(device, width, height, format);
+        let tb = Self::create_triple_buffer(device, width, height, format, 0);
         self.lock_surfaces().insert(id, tb);
         id
     }
@@ -277,6 +293,10 @@ impl SurfaceRegistry {
         let surfaces = self.lock_surfaces();
         surfaces.get(&id).map(|tb| {
             let (rendering, _, _) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
+            tb.resource_registry.mark_used(
+                tb.resource_ids[rendering as usize],
+                tb.resource_registry.current_frame(),
+            );
             tb.views[rendering as usize].clone()
         })
     }
@@ -286,6 +306,10 @@ impl SurfaceRegistry {
         let surfaces = self.lock_surfaces();
         surfaces.get(&id).map(|tb| {
             let (_, _, display) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
+            tb.resource_registry.mark_used(
+                tb.resource_ids[display as usize],
+                tb.resource_registry.current_frame(),
+            );
             tb.views[display as usize].clone()
         })
     }
@@ -333,7 +357,13 @@ impl SurfaceRegistry {
             // 4. The skip-if-redraw-pending check above prevents resize during active composition
 
             // Now safe to recreate textures
-            let new_tb = Self::create_triple_buffer(device, width, height, tb.format);
+            let new_tb = Self::create_triple_buffer(
+                device,
+                width,
+                height,
+                tb.format,
+                tb.resource_generation.saturating_add(1),
+            );
             *tb = new_tb;
             return true;
         }
@@ -349,7 +379,13 @@ impl SurfaceRegistry {
             let width = surface.width;
             let height = surface.height;
             let format = surface.format;
-            *surface = Self::create_triple_buffer(device, width, height, format);
+            *surface = Self::create_triple_buffer(
+                device,
+                width,
+                height,
+                format,
+                surface.resource_generation.saturating_add(1),
+            );
         }
     }
 
@@ -493,6 +529,7 @@ impl SurfaceRegistry {
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
+        resource_generation: u64,
     ) -> TripleBuffer {
         let w = width.max(1);
         let h = height.max(1);
@@ -536,6 +573,31 @@ impl SurfaceRegistry {
         let tex1 = create_texture("surface_buffer_1");
         let tex2 = create_texture("surface_buffer_2");
 
+        let resource_registry = NativeResourceRegistry;
+        let format_name = format!("{format:?}");
+        let byte_size = u64::from(w)
+            .saturating_mul(u64::from(h))
+            .saturating_mul(u64::from(format.block_copy_size(None).unwrap_or(4)));
+        let usage = (wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | deep_capture_readback)
+            .bits() as u64;
+        let resource_ids = [0, 1, 2].map(|index| {
+            resource_registry.register_texture(
+                &format!("surface_buffer_{index}"),
+                NativeResourceRole::Surface,
+                NativeResourceDimensions {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                &format_name,
+                byte_size,
+                usage,
+                resource_generation,
+            )
+        });
+
         let view0 = tex0.create_view(&wgpu::TextureViewDescriptor::default());
         let view1 = tex1.create_view(&wgpu::TextureViewDescriptor::default());
         let view2 = tex2.create_view(&wgpu::TextureViewDescriptor::default());
@@ -551,6 +613,9 @@ impl SurfaceRegistry {
             width: w,
             height: h,
             format,
+            resource_registry,
+            resource_ids,
+            resource_generation,
         }
     }
 }

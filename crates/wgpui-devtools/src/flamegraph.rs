@@ -3,7 +3,4 @@ pub mod cpu;
 pub mod gpu;
 pub mod replay;
 pub mod ui_capture;
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct CaptureRequest {
-    pub include_gpu: bool,
-}
+pub use crate::capture::CaptureRequest;
