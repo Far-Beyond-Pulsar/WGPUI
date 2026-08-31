@@ -277,7 +277,18 @@ pub fn context_for(
     // this adapter has, and nothing required. `request_device` rejects a
     // feature the adapter does not advertise, so the intersection is the
     // request rather than a retry loop.
-    let requested = IndirectSupport::wanted() & adapter.features();
+    let requested = IndirectSupport::wanted();
+    let adapter_features = adapter.features();
+    #[cfg(feature = "devtools")]
+    let requested = if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        requested
+            | wgpu::Features::TIMESTAMP_QUERY
+            | (wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS & adapter_features)
+            | (wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES & adapter_features)
+    } else {
+        requested
+    };
+    let requested = requested & adapter_features;
 
     // The adapter's own limits rather than `Limits::default()`: the ordering
     // pass binds eight storage buffers in one group, which is exactly the

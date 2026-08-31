@@ -1,6 +1,6 @@
 use wgpui::{
-    Component, Element, ElementId, IntoElement, Render, RenderOnce, Stateful, Styled, div,
-    render_description,
+    Component, Element, ElementId, IntoElement, Render, RenderOnce, Stateful, Styled, TextAlign,
+    TextOverflow, div, hsla, linear_color_stop, px, render_description,
 };
 
 #[derive(IntoElement)]
@@ -141,6 +141,66 @@ fn native_style_changes_report_display_invalidation_through_reconciliation() {
             .invalidation
             .contains(wgpui::invalidation::axes::Invalidation::LAYOUT)
     );
+}
+
+#[test]
+fn native_style_aliases_lower_to_layout_and_text_properties() {
+    let style = div()
+        .flex_initial()
+        .flex_wrap_reverse()
+        .flex_shrink()
+        .flex_basis(24.0)
+        .self_baseline()
+        .content_normal()
+        .aspect_ratio(2.0)
+        .scrollbar_width(px(7.0))
+        .mt(px(3.0))
+        .border_x(2.0)
+        .border_y(3.0)
+        .text_align(TextAlign::Right)
+        .whitespace_normal()
+        .text_overflow(TextOverflow::Truncate("...".into()))
+        .text_gradient(
+            45.0,
+            linear_color_stop(hsla(0.0, 1.0, 0.5, 1.0), 0.0),
+            linear_color_stop(hsla(0.5, 1.0, 0.5, 1.0), 1.0),
+        )
+        .div_style()
+        .clone();
+
+    assert_eq!(style.layout.flex_grow, 0.0);
+    assert_eq!(style.layout.flex_shrink, 1.0);
+    assert_eq!(style.layout.flex_basis, wgpui::Dimension::length(24.0));
+    assert_eq!(style.layout.flex_wrap, wgpui::FlexWrap::WrapReverse);
+    assert_eq!(style.layout.align_self, Some(wgpui::AlignItems::Baseline));
+    assert_eq!(style.layout.align_content, None);
+    assert_eq!(style.layout.aspect_ratio, Some(2.0));
+    assert_eq!(style.layout.scrollbar_width, 7.0);
+    assert_eq!(
+        style.layout.margin.top,
+        wgpui::LengthPercentageAuto::length(3.0)
+    );
+    assert_eq!(
+        style.layout.border.left,
+        wgpui::LengthPercentage::length(2.0)
+    );
+    assert_eq!(
+        style.layout.border.right,
+        wgpui::LengthPercentage::length(2.0)
+    );
+    assert_eq!(
+        style.layout.border.top,
+        wgpui::LengthPercentage::length(3.0)
+    );
+    assert_eq!(
+        style.layout.border.bottom,
+        wgpui::LengthPercentage::length(3.0)
+    );
+    assert_eq!(style.text_alignment, 2);
+    assert!(!style.text_white_space_nowrap);
+    assert!(style.text_ellipsis);
+    assert_eq!(style.text_gradient_angle, Some(45.0));
+    assert_eq!(style.text_gradient.as_ref().map(Vec::len), Some(2));
 }
 
 #[test]

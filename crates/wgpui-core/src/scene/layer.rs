@@ -18,6 +18,7 @@ use crate::scene::slab_range::SlabRange;
 use crate::scene::tile::TileCoord;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use serde::{Deserialize, Serialize};
 
 /// Identity of the compositing boundary a layer belongs to.
 ///
@@ -82,7 +83,7 @@ impl LayerKey {
 /// (§2): a producer can name a layer in a `PatchList` without first asking a
 /// scene to allocate an id for it, so building a frame's patches never
 /// requires a round trip into the backend.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LayerId(u64);
 
 impl LayerId {

@@ -3,6 +3,8 @@
 This crate is a native-backend migration probe. Its examples are copied from
 `old/examples` and use `wgpui` directly. The source tree is intentionally
 kept separate so the legacy examples remain an immutable comparison corpus.
+Examples migrated to the native lifecycle may be edited here; the files under
+`old/examples` remain unchanged.
 
 Use `pwsh ./script/compile-examples-2.ps1` to compile every example
 independently and classify compiler failures. Compilation does not imply that

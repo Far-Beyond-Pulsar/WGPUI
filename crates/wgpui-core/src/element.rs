@@ -95,6 +95,17 @@ impl<E> Stateful<E> {
     pub fn into_inner(self) -> E {
         self.element
     }
+
+    pub fn map_inner<F, R>(self, map: F) -> Stateful<R>
+    where
+        F: FnOnce(E) -> R,
+    {
+        Stateful {
+            element: map(self.element),
+            element_id: self.element_id,
+            state_scope: self.state_scope,
+        }
+    }
 }
 
 impl<E: IntoElement + 'static> Element for Stateful<E> {
@@ -134,6 +145,26 @@ pub trait Render: 'static + Sized {
     /// Native `Render` deliberately receives no window or app context for the
     /// same reason as [`RenderOnce`].
     fn render(&mut self) -> impl IntoElement + 'static;
+}
+
+/// The retained element view of an entity-backed renderer.
+pub struct EntityElement<T: Render> {
+    entity: crate::app::Entity<T>,
+}
+
+impl<T: Render> Element for EntityElement<T> {
+    fn into_description(self) -> Description {
+        self.entity
+            .update(|value, _context| value.render().into_description())
+    }
+}
+
+impl<T: Render> IntoElement for crate::app::Entity<T> {
+    type Element = EntityElement<T>;
+
+    fn into_element(self) -> Self::Element {
+        EntityElement { entity: self }
+    }
 }
 
 /// Render a view into the description consumed by reconciliation.
@@ -186,6 +217,7 @@ impl Element for &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::App;
     use crate::reconcile::description::RawText;
     use crate::reconcile::reconciler::Reconciler;
     use wgpui_layout::taffy_tree::LayoutTree;
@@ -231,6 +263,19 @@ mod tests {
         assert_eq!(description.type_id(), std::any::TypeId::of::<Panel>());
         assert_eq!(description.child_descriptions().len(), 1);
         assert_eq!(badge(9).element_id(), Some(&ElementId::Integer(9)));
+    }
+
+    #[test]
+    fn entity_children_lower_their_current_rendered_description() {
+        let app = App::create();
+        let entity = app.new_entity(View { value: 11 });
+        let description = entity.into_description();
+
+        assert_eq!(description.type_id(), std::any::TypeId::of::<Panel>());
+        assert_eq!(
+            description.child_descriptions()[0].element_id(),
+            Some(&ElementId::Integer(11))
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 //! Backend-neutral capture primitives; GPU readback and UI traversal are adapters.
+pub mod capture;
 pub mod cpu;
 pub mod gpu;
 pub mod replay;
@@ -7,3 +8,9 @@ pub mod ui_capture;
 pub struct CaptureRequest {
     pub include_gpu: bool,
 }
+
+pub use capture::{
+    CaptureBundle, CaptureController, CaptureError, CaptureEvent, CaptureEventKind, CaptureLimits,
+    CaptureMetadata, CaptureState, CaptureTarget, ClockCalibration, DroppedEventStatus,
+    RecordResult,
+};

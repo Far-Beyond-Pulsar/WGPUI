@@ -1,6 +1,10 @@
 //! Native application lifecycle for the retained WGPUI renderer.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use wgpui_core::app::App;
 use wgpui_core::boundary::Pixels;
@@ -13,15 +17,23 @@ use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
 pub use wgpui_core::window::WindowOptions;
 use wgpui_core::window::{
-    InputEvent, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton as CoreMouseButton,
+    AnimationClock, ClipboardItem, DragData, FocusEvent, ImeEvent, InputEvent, KeyDownEvent,
+    KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton as CoreMouseButton,
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
+    TextInputEvent,
 };
+use wgpui_core::window::{
+    WindowAppearance, WindowBackgroundAppearance, WindowDecorations, WindowKind,
+};
+use wgpui_http_client::{AppHttpClientExt, BoxedHttpClient};
 
 use crate::debug::PerformanceDebug;
 use crate::render::draw::DrawMode;
 use crate::render::frame::RenderTarget;
+use crate::render::surface_registry::SurfaceRegistry;
 use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
+use crate::window::surface::WgpuSurfaceHandle;
 use crate::window::{Acquired, WindowError, WindowSurface};
 
 fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
@@ -45,8 +57,13 @@ type WindowBuildCallback = Box<dyn FnMut(&mut Window) -> Description>;
 
 pub struct Window {
     native: Arc<winit::window::Window>,
+    gpu_device: wgpu::Device,
+    gpu_queue: wgpu::Queue,
+    surface_registry: Arc<SurfaceRegistry>,
     scale_factor: f64,
-    close_requested: bool,
+    close_requested: Arc<AtomicBool>,
+    background_appearance: WindowBackgroundAppearance,
+    decorations: bool,
     last_frame: Option<FrameReport>,
     state: ElementStateStore,
     state_frame: u64,
@@ -60,13 +77,49 @@ pub struct Window {
     hovered_interaction: Option<usize>,
     pressed_interaction: Option<usize>,
     pressed_event: Option<MouseDownEvent>,
+    active_drag: Option<DragData>,
+    drag_hovered: Option<usize>,
     hover_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
+    animation_clock: AnimationClock,
+    last_click: Option<ClickState>,
+}
+
+#[derive(Copy, Clone)]
+struct ClickState {
+    button: CoreMouseButton,
+    position: [Pixels; 2],
+    time: Instant,
+    count: u32,
 }
 
 /// A clonable handle for scheduling work on a native window.
 #[derive(Clone)]
-pub struct WindowHandle(Arc<winit::window::Window>);
+pub struct WindowHandle {
+    native: Arc<winit::window::Window>,
+    close_requested: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardError {
+    message: String,
+}
+
+impl std::fmt::Display for ClipboardError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClipboardError {}
+
+impl From<arboard::Error> for ClipboardError {
+    fn from(error: arboard::Error) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
 
 /// The monitor containing a window, when the platform reports one.
 pub type DisplayId = winit::monitor::MonitorHandle;
@@ -114,10 +167,10 @@ impl Window {
 
     pub fn clear_hover_with_app(&mut self, app: &mut App) -> bool {
         self.cursor_inside = false;
-        let Some(index) = self.hovered_interaction.take() else {
-            return false;
-        };
-        if let Some(interaction) = self.interactions.get(index) {
+        let index = self.hovered_interaction.take();
+        if let Some(index) = index
+            && let Some(interaction) = self.interactions.get(index)
+        {
             self.hover_dirty_regions.push(interaction.bounds);
         }
         let event = InputEvent::MouseLeave(MouseMoveEvent {
@@ -125,23 +178,149 @@ impl Window {
             modifiers: self.modifiers(),
             buttons: self.mouse_buttons,
         });
-        self.dispatch_interaction(index, &event, app)
+        let mut handled =
+            index.is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app));
+        if let (Some(index), Some(data)) = (self.drag_hovered.take(), self.active_drag.clone()) {
+            self.mark_interaction_dirty_for(index);
+            handled |= self.dispatch_drag_hover(index, false, &data, app);
+        }
+        handled
     }
     /// Access opt-in visual performance diagnostics for this window.
     pub fn performance_debug(&mut self) -> &mut PerformanceDebug {
         &mut self.performance_debug
     }
+
+    /// Create a producer-owned texture set that can be placed in this window's
+    /// retained scene with `WgpuSurface`.
+    pub fn create_wgpu_surface(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<WgpuSurfaceHandle, WindowError> {
+        Ok(WgpuSurfaceHandle::new(
+            Arc::clone(&self.surface_registry),
+            &self.gpu_device,
+            &self.gpu_queue,
+            width,
+            height,
+            format,
+            {
+                let native = Arc::clone(&self.native);
+                Arc::new(move || {
+                    native.request_redraw();
+                })
+            },
+        ))
+    }
+
+    pub fn write_to_clipboard(&self, item: ClipboardItem) -> Result<(), ClipboardError> {
+        let text = item.text().ok_or_else(|| ClipboardError {
+            message: "native clipboard currently supports text items only".to_string(),
+        })?;
+        let mut clipboard = arboard::Clipboard::new().map_err(ClipboardError::from)?;
+        clipboard.set_text(text).map_err(ClipboardError::from)
+    }
+
+    pub fn read_from_clipboard(&self) -> Result<Option<ClipboardItem>, ClipboardError> {
+        let mut clipboard = arboard::Clipboard::new().map_err(ClipboardError::from)?;
+        match clipboard.get_text() {
+            Ok(text) => Ok(Some(ClipboardItem::new_string(text))),
+            Err(arboard::Error::ContentNotAvailable) => Ok(None),
+            Err(error) => Err(ClipboardError::from(error)),
+        }
+    }
+
+    pub fn set_ime_allowed(&self, allowed: bool) {
+        self.native.set_ime_allowed(allowed);
+    }
     pub fn set_title(&self, title: &str) {
         self.native.set_title(title);
     }
+    pub fn appearance(&self) -> WindowAppearance {
+        match self.native.theme() {
+            Some(winit::window::Theme::Dark) => WindowAppearance::Dark,
+            Some(winit::window::Theme::Light) | None => WindowAppearance::Light,
+        }
+    }
+    pub fn window_bounds(&self) -> WindowBounds {
+        let bounds = self.bounds();
+        if self.native.fullscreen().is_some() {
+            WindowBounds::Fullscreen(bounds)
+        } else if self.native.is_maximized() {
+            WindowBounds::Maximized(bounds)
+        } else {
+            WindowBounds::Windowed(bounds)
+        }
+    }
+    pub fn content_size(&self) -> Size<Pixels> {
+        self.bounds().size
+    }
+    pub fn is_active(&self) -> bool {
+        self.native.has_focus()
+    }
+    pub fn set_background_appearance(&mut self, appearance: WindowBackgroundAppearance) {
+        self.native
+            .set_transparent(appearance != WindowBackgroundAppearance::Opaque);
+        self.native
+            .set_blur(appearance == WindowBackgroundAppearance::Blurred);
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::{BackdropType, WindowExtWindows};
+            let backdrop = match appearance {
+                WindowBackgroundAppearance::Opaque | WindowBackgroundAppearance::Transparent => {
+                    BackdropType::None
+                }
+                WindowBackgroundAppearance::Blurred => BackdropType::TransientWindow,
+                WindowBackgroundAppearance::MicaBackdrop => BackdropType::MainWindow,
+                WindowBackgroundAppearance::MicaAltBackdrop => BackdropType::TabbedWindow,
+            };
+            self.native.set_system_backdrop(backdrop);
+        }
+        self.background_appearance = appearance;
+    }
+    pub fn background_appearance(&self) -> WindowBackgroundAppearance {
+        self.background_appearance
+    }
+    pub fn set_decorations(&mut self, decorations: bool) {
+        self.native.set_decorations(decorations);
+        self.decorations = decorations;
+    }
+    pub fn has_decorations(&self) -> bool {
+        self.decorations
+    }
     pub fn set_resizable(&self, resizable: bool) {
         self.native.set_resizable(resizable);
+    }
+    pub fn set_minimizable(&self, minimizable: bool) {
+        let mut buttons = self.native.enabled_buttons();
+        buttons.set(winit::window::WindowButtons::MINIMIZE, minimizable);
+        self.native.set_enabled_buttons(buttons);
+    }
+    pub fn set_min_inner_size(&self, size: Option<Size<Pixels>>) {
+        self.native.set_min_inner_size(
+            size.map(|size| winit::dpi::LogicalSize::new(size.width.value(), size.height.value())),
+        );
+    }
+    pub fn set_outer_position(&self, position: Point<Pixels>) {
+        self.native
+            .set_outer_position(winit::dpi::LogicalPosition::new(
+                position.x.value(),
+                position.y.value(),
+            ));
     }
     pub fn set_visible(&self, visible: bool) {
         self.native.set_visible(visible);
     }
     pub fn focus_window(&self) {
         self.native.focus_window();
+    }
+    pub fn minimize(&self) {
+        self.native.set_minimized(true);
+    }
+    pub fn zoom(&self) {
+        self.native.set_maximized(!self.native.is_maximized());
     }
     pub fn set_minimized(&self, minimized: bool) {
         self.native.set_minimized(minimized);
@@ -162,19 +341,26 @@ impl Window {
         self.native.outer_position().ok()
     }
     pub fn handle(&self) -> WindowHandle {
-        WindowHandle(Arc::clone(&self.native))
+        WindowHandle {
+            native: Arc::clone(&self.native),
+            close_requested: Arc::clone(&self.close_requested),
+        }
     }
     pub fn current_monitor(&self) -> Option<DisplayId> {
         self.native.current_monitor()
     }
     pub fn close(&mut self) {
-        self.close_requested = true;
+        self.close_requested.store(true, Ordering::Release);
+        self.native.request_redraw();
+    }
+    pub fn close_requested(&self) -> bool {
+        self.close_requested.load(Ordering::Acquire)
     }
     pub fn on_close_requested(&mut self, handler: impl FnMut(&mut Self) -> bool + 'static) {
         self.close_handler = Some(Box::new(handler));
     }
     pub fn try_close(&mut self) -> bool {
-        if self.close_requested {
+        if self.close_requested() {
             return true;
         }
         let allowed = self.close_handler.take().is_none_or(|mut handler| {
@@ -183,7 +369,7 @@ impl Window {
             allowed
         });
         if allowed {
-            self.close_requested = true;
+            self.close();
         }
         allowed
     }
@@ -198,10 +384,62 @@ impl Window {
             return self.interaction.handle_input(event);
         }
         match &event {
+            InputEvent::KeyDown(key) if key.key.eq_ignore_ascii_case("tab") => {
+                let handled = self.interaction.handle_input(event);
+                handled | self.apply_focus_transition(app)
+            }
+            InputEvent::KeyDown(key) => {
+                let mut handled = false;
+                if let Some(index) = self.focused_interaction() {
+                    let result = self.dispatch_interaction_bubbled_result(index, &event, app);
+                    handled |= result.handled;
+                    if !result.propagate {
+                        return handled | self.apply_focus_transition(app);
+                    }
+                }
+                let action = self.interaction.resolve_action(key);
+                if let Some(action) = action {
+                    if let Some(index) = self.interactions.iter().position(|registration| {
+                        registration
+                            .focus
+                            .is_some_and(|focus| Some(focus.id()) == self.interaction.focused())
+                    }) {
+                        handled = self.dispatch_action_bubbled(index, &*action, app);
+                    }
+                    if !handled {
+                        handled = app.dispatch_action(&*action);
+                    }
+                }
+                handled | self.apply_focus_transition(app)
+            }
+            InputEvent::KeyUp(_) | InputEvent::TextInput(_) | InputEvent::Ime(_) => {
+                let handled = self
+                    .focused_interaction()
+                    .is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app));
+                handled | self.apply_focus_transition(app)
+            }
+            InputEvent::ModifiersChanged(_) => {
+                let handled = self
+                    .focused_interaction()
+                    .is_some_and(|index| self.dispatch_interaction_bubbled(index, &event, app));
+                handled | self.apply_focus_transition(app)
+            }
             InputEvent::MouseMove(mouse) => {
                 self.cursor_inside = true;
                 let hit = self.hit_interaction(mouse.position);
                 let mut handled = false;
+                if self.active_drag.is_none()
+                    && self.mouse_buttons.left
+                    && let Some(index) = self.pressed_interaction
+                    && let Some(registration) = self.interactions.get_mut(index)
+                    && let Some(data) = registration.interaction.drag_source()
+                {
+                    let data = data.with_position(mouse.position);
+                    registration
+                        .interaction
+                        .start_drag(&data, &mut self.interaction, app);
+                    self.active_drag = Some(data);
+                }
                 if self.hovered_interaction != hit {
                     if let Some(previous) = self
                         .hovered_interaction
@@ -213,14 +451,14 @@ impl Window {
                         self.hover_dirty_regions.push(current.bounds);
                     }
                     if let Some(previous) = self.hovered_interaction {
-                        handled |= self.dispatch_interaction(
+                        handled |= self.dispatch_interaction_bubbled(
                             previous,
                             &InputEvent::MouseLeave(*mouse),
                             app,
                         );
                     }
                     if let Some(current) = hit {
-                        handled |= self.dispatch_interaction(
+                        handled |= self.dispatch_interaction_bubbled(
                             current,
                             &InputEvent::MouseEnter(*mouse),
                             app,
@@ -229,15 +467,38 @@ impl Window {
                     self.hovered_interaction = hit;
                 }
                 if let Some(current) = hit {
-                    handled |= self.dispatch_interaction(current, &event, app);
+                    handled |= self.dispatch_interaction_bubbled(current, &event, app);
+                }
+                if let Some(data) = self.active_drag.clone() {
+                    let previous_drag = self.drag_hovered;
+                    if previous_drag != hit {
+                        if let Some(previous) = previous_drag {
+                            handled |= self.dispatch_drag_hover(previous, false, &data, app);
+                        }
+                        if let Some(current) = hit {
+                            handled |= self.dispatch_drag_hover(current, true, &data, app);
+                        }
+                        self.drag_hovered = hit;
+                    }
+                    self.active_drag = Some(data.with_position(mouse.position));
                 }
                 handled
             }
             InputEvent::MouseDown(mouse) => {
                 self.pressed_interaction = self.hit_interaction(mouse.position);
                 self.pressed_event = Some(*mouse);
-                self.pressed_interaction
-                    .is_some_and(|index| self.dispatch_interaction(index, &event, app))
+                let mut handled = false;
+                if let Some(index) = self.pressed_interaction {
+                    if mouse.is_focusing()
+                        && let Some(focus) = self.interactions[index].focus
+                        && self.interaction.focus_id(focus.id(), false)
+                    {
+                        self.mark_interaction_dirty_for(index);
+                        handled |= self.apply_focus_transition(app);
+                    }
+                    handled |= self.dispatch_interaction_bubbled(index, &event, app);
+                }
+                handled
             }
             InputEvent::MouseUp(mouse) => {
                 let pressed = self.pressed_interaction.take();
@@ -248,9 +509,21 @@ impl Window {
                     click_count: mouse.click_count,
                 });
                 let Some(index) = pressed else { return false };
-                let mut handled = self.dispatch_interaction(index, &event, app);
+                if let Some(data) = self.active_drag.take() {
+                    if let Some(previous) = self.drag_hovered.take() {
+                        self.mark_interaction_dirty_for(previous);
+                        let mut handled = self.dispatch_drag_hover(previous, false, &data, app);
+                        if self.hit_interaction(mouse.position) == Some(previous) {
+                            handled |= self.dispatch_drop(previous, &data, app);
+                        }
+                        return handled;
+                    }
+                    return false;
+                }
+                self.mark_interaction_dirty_for(index);
+                let mut handled = self.dispatch_interaction_bubbled(index, &event, app);
                 if self.hit_interaction(mouse.position) == Some(index) {
-                    handled |= self.dispatch_interaction(
+                    handled |= self.dispatch_interaction_bubbled(
                         index,
                         &InputEvent::Click(wgpui_core::window::ClickEvent::Mouse(
                             wgpui_core::window::MouseClickEvent { down, up: *mouse },
@@ -261,11 +534,31 @@ impl Window {
                 handled
             }
             InputEvent::Scroll(scroll) => {
+                let mut remaining = scroll.delta;
                 let mut handled = false;
                 for index in self.hit_interactions(scroll.position) {
-                    let result = self.dispatch_interaction_result(index, &event, app);
-                    handled |= result.handled;
-                    if !result.propagate {
+                    let mut bubbled = *scroll;
+                    bubbled.delta = remaining;
+                    let event = InputEvent::Scroll(bubbled);
+                    handled |= self.dispatch_interaction_bubbled(index, &event, app);
+                    if handled {
+                        break;
+                    }
+                    let Some(scroll_root) = self
+                        .interactions
+                        .get(index)
+                        .and_then(|registration| registration.scroll_root.as_ref())
+                    else {
+                        continue;
+                    };
+                    let consumed = scroll_root.handle.scroll_by(wgpui_core::geometry::Point::new(
+                        Pixels(remaining[0]),
+                        Pixels(remaining[1]),
+                    ));
+                    remaining[0] -= consumed.x.value();
+                    remaining[1] -= consumed.y.value();
+                    handled |= consumed.x != Pixels::ZERO || consumed.y != Pixels::ZERO;
+                    if remaining == [0.0, 0.0] {
                         break;
                     }
                 }
@@ -301,6 +594,191 @@ impl Window {
     fn dispatch_interaction(&mut self, index: usize, event: &InputEvent, app: &mut App) -> bool {
         self.dispatch_interaction_result(index, event, app).handled
     }
+    fn dispatch_interaction_bubbled(
+        &mut self,
+        index: usize,
+        event: &InputEvent,
+        app: &mut App,
+    ) -> bool {
+        let mut current = Some(index);
+        let mut handled = false;
+        while let Some(index) = current {
+            let parent = self
+                .interactions
+                .get(index)
+                .and_then(|registration| registration.parent);
+            let result = self.dispatch_interaction_result(index, event, app);
+            handled |= result.handled;
+            if !result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        handled
+    }
+    fn dispatch_interaction_bubbled_result(
+        &mut self,
+        index: usize,
+        event: &InputEvent,
+        app: &mut App,
+    ) -> wgpui_core::window::EventResult {
+        let mut current = Some(index);
+        let mut result = wgpui_core::window::EventResult::IGNORED;
+        while let Some(index) = current {
+            let parent = self.interactions.get(index).and_then(|registration| registration.parent);
+            let current_result = self.dispatch_interaction_result(index, event, app);
+            if current_result.handled {
+                result.handled = true;
+            }
+            result.propagate = current_result.propagate;
+            if !current_result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        result
+    }
+    fn dispatch_action_bubbled(
+        &mut self,
+        index: usize,
+        action: &dyn wgpui_core::Action,
+        app: &mut App,
+    ) -> bool {
+        let mut current = Some(index);
+        let mut handled = false;
+        while let Some(index) = current {
+            let parent = self
+                .interactions
+                .get(index)
+                .and_then(|registration| registration.parent);
+            let result = self.interactions.get_mut(index).map_or(
+                wgpui_core::window::EventResult::IGNORED,
+                |registration| {
+                    registration
+                        .interaction
+                        .dispatch_action(action, &mut self.interaction, app)
+                },
+            );
+            handled |= result.handled;
+            if !result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        handled
+    }
+    fn dispatch_drag_hover(
+        &mut self,
+        index: usize,
+        hovered: bool,
+        data: &DragData,
+        app: &mut App,
+    ) -> bool {
+        let mut current = Some(index);
+        let mut handled = false;
+        while let Some(index) = current {
+            let parent = self
+                .interactions
+                .get(index)
+                .and_then(|registration| registration.parent);
+            let result = self.interactions.get_mut(index).map_or(
+                wgpui_core::window::EventResult::IGNORED,
+                |registration| {
+                    registration.interaction.dispatch_drag_hover(
+                        hovered,
+                        data,
+                        &mut self.interaction,
+                        app,
+                    )
+                },
+            );
+            handled |= result.handled;
+            if !result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        handled
+    }
+    fn dispatch_drop(&mut self, index: usize, data: &DragData, app: &mut App) -> bool {
+        let mut current = Some(index);
+        let mut handled = false;
+        while let Some(index) = current {
+            let parent = self
+                .interactions
+                .get(index)
+                .and_then(|registration| registration.parent);
+            let result = self.interactions.get_mut(index).map_or(
+                wgpui_core::window::EventResult::IGNORED,
+                |registration| {
+                    registration
+                        .interaction
+                        .dispatch_drop(data, &mut self.interaction, app)
+                },
+            );
+            handled |= result.handled;
+            if !result.propagate {
+                break;
+            }
+            current = parent;
+        }
+        handled
+    }
+    fn apply_focus_transition(&mut self, app: &mut App) -> bool {
+        let Some(transition) = self.interaction.take_focus_transition() else {
+            return false;
+        };
+        if transition.from == transition.to {
+            let Some(id) = transition.to else {
+                return false;
+            };
+            let Some(index) = self
+                .interactions
+                .iter()
+                .position(|registration| registration.focus.is_some_and(|focus| focus.id() == id))
+            else {
+                return false;
+            };
+            self.mark_interaction_dirty_for(index);
+            return self.dispatch_interaction_bubbled(
+                index,
+                &InputEvent::Focus(FocusEvent {
+                    focused: true,
+                    visible: transition.visible,
+                }),
+                app,
+            );
+        }
+        let mut handled = false;
+        for (id, focused, visible) in [
+            (transition.from, false, false),
+            (transition.to, true, transition.visible),
+        ] {
+            let Some(id) = id else {
+                continue;
+            };
+            let Some(index) = self
+                .interactions
+                .iter()
+                .position(|registration| registration.focus.is_some_and(|focus| focus.id() == id))
+            else {
+                continue;
+            };
+            self.mark_interaction_dirty_for(index);
+            handled |= self.dispatch_interaction_bubbled(
+                index,
+                &InputEvent::Focus(FocusEvent { focused, visible }),
+                app,
+            );
+        }
+        self.native.set_ime_allowed(self.interaction.focused().is_some());
+        handled
+    }
+    fn mark_interaction_dirty_for(&mut self, index: usize) {
+        if let Some(registration) = self.interactions.get(index) {
+            self.hover_dirty_regions.push(registration.bounds);
+        }
+    }
     fn dispatch_interaction_result(
         &mut self,
         index: usize,
@@ -328,7 +806,44 @@ impl Window {
             .hovered_interaction
             .and_then(|index| self.interactions.get(index))
             .map(|registration| registration.bounds);
-        let previous_interactions = std::mem::replace(&mut self.interactions, interactions);
+        let previous_pressed_address = self
+            .pressed_interaction
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        let previous_drag_address = self
+            .drag_hovered
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        let pressed_event = self.pressed_event;
+        let mut previous_interactions = std::mem::replace(&mut self.interactions, interactions);
+        self.interaction.retain_focus_handles(
+            self.interactions
+                .iter()
+                .filter_map(|registration| registration.focus),
+        );
+        for (order, registration) in self.interactions.iter().enumerate() {
+            if let Some(focus) = registration.focus {
+                self.interaction
+                    .register_focus_handle_ordered(focus, order as u64);
+            }
+        }
+        let focused = self.interaction.focused();
+        let focus_visible = self.interaction.focus_manager().focus_visible();
+        for index in 0..self.interactions.len() {
+            if self.interactions[index]
+                .focus
+                .is_some_and(|focus| Some(focus.id()) == focused)
+            {
+                self.dispatch_interaction(
+                    index,
+                    &InputEvent::Focus(FocusEvent {
+                        focused: true,
+                        visible: focus_visible,
+                    }),
+                    app,
+                );
+            }
+        }
         let hit = self
             .cursor_inside
             .then(|| self.hit_interaction(self.cursor))
@@ -336,6 +851,24 @@ impl Window {
         let hit_address = hit
             .and_then(|index| self.interactions.get(index))
             .map(|registration| registration.address);
+        let hit_bounds = hit
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.bounds);
+        self.pressed_interaction = previous_pressed_address.and_then(|address| {
+            self.interactions
+                .iter()
+                .position(|registration| registration.address == address)
+        });
+        self.pressed_event = self.pressed_interaction.and(pressed_event);
+        let drag_hit = self.active_drag.as_ref().and(hit);
+        let drag_hit_address = drag_hit
+            .and_then(|index| self.interactions.get(index))
+            .map(|registration| registration.address);
+        let old_drag_index = previous_drag_address.and_then(|address| {
+            previous_interactions
+                .iter()
+                .position(|registration| registration.address == address)
+        });
         if previous_address != hit_address {
             if let Some(bounds) = previous_bounds {
                 self.hover_dirty_regions.push(bounds);
@@ -354,23 +887,83 @@ impl Window {
                 && let Some(old_index) = previous_interactions
                     .iter()
                     .position(|registration| registration.address == old_address)
+                && let Some(registration) = previous_interactions.get_mut(old_index)
             {
-                let mut previous_interactions = previous_interactions;
-                if let Some(registration) = previous_interactions.get_mut(old_index) {
-                    registration.interaction.dispatch(
-                        &InputEvent::MouseLeave(mouse),
-                        &mut self.interaction,
-                        app,
-                    );
-                }
+                registration.interaction.dispatch(
+                    &InputEvent::MouseLeave(mouse),
+                    &mut self.interaction,
+                    app,
+                );
             }
             if let Some(index) = hit {
                 self.dispatch_interaction(index, &InputEvent::MouseEnter(mouse), app);
             }
+        } else if let Some(index) = hit {
+            self.dispatch_interaction(
+                index,
+                &InputEvent::MouseEnter(MouseMoveEvent {
+                    position: self.cursor,
+                    modifiers: self.modifiers(),
+                    buttons: self.mouse_buttons,
+                }),
+                app,
+            );
+        }
+        if previous_address == hit_address && previous_bounds != hit_bounds {
+            if let Some(bounds) = previous_bounds {
+                self.hover_dirty_regions.push(bounds);
+            }
+            if let Some(bounds) = hit_bounds {
+                self.hover_dirty_regions.push(bounds);
+            }
         }
         self.hovered_interaction = hit;
+        if self.active_drag.is_some() && previous_drag_address != drag_hit_address {
+            if let (Some(index), Some(data)) = (old_drag_index, self.active_drag.clone())
+                && let Some(registration) = previous_interactions.get_mut(index)
+            {
+                registration.interaction.dispatch_drag_hover(
+                    false,
+                    &data,
+                    &mut self.interaction,
+                    app,
+                );
+            }
+            if let Some(index) = drag_hit
+                && let Some(data) = self.active_drag.clone()
+            {
+                self.dispatch_drag_hover(index, true, &data, app);
+            }
+            self.drag_hovered = drag_hit;
+        } else {
+            self.drag_hovered = previous_drag_address.and_then(|address| {
+                self.interactions
+                    .iter()
+                    .position(|registration| registration.address == address)
+            });
+        }
+    }
+    fn focused_interaction(&self) -> Option<usize> {
+        let focused = self.interaction.focused()?;
+        self.interactions
+            .iter()
+            .position(|registration| registration.focus.is_some_and(|focus| focus.id() == focused))
+    }
+    pub fn handle_window_focus(&mut self, focused: bool, app: &mut App) -> bool {
+        if focused {
+            self.native.set_ime_allowed(self.interaction.focused().is_some());
+            return false;
+        }
+        let mut handled = self.clear_hover_with_app(app);
         self.pressed_interaction = None;
         self.pressed_event = None;
+        self.active_drag = None;
+        self.drag_hovered = None;
+        if self.interaction.blur() {
+            handled |= self.apply_focus_transition(app);
+        }
+        self.native.set_ime_allowed(false);
+        handled
     }
     pub fn cursor_position(&self) -> [Pixels; 2] {
         self.cursor
@@ -385,6 +978,29 @@ impl Window {
             CoreMouseButton::Middle => self.mouse_buttons.middle = pressed,
             CoreMouseButton::Other(_) => {}
         }
+    }
+    fn next_click_count(&mut self, button: CoreMouseButton, position: [Pixels; 2]) -> u32 {
+        let now = Instant::now();
+        let count = self.last_click.map_or(1, |last| {
+            let distance_x = position[0].value() - last.position[0].value();
+            let distance_y = position[1].value() - last.position[1].value();
+            let close = distance_x.mul_add(distance_x, distance_y * distance_y) <= 16.0;
+            if last.button == button
+                && now.duration_since(last.time) <= Duration::from_millis(500)
+                && close
+            {
+                last.count.saturating_add(1)
+            } else {
+                1
+            }
+        });
+        self.last_click = Some(ClickState {
+            button,
+            position,
+            time: now,
+            count,
+        });
+        count
     }
     fn logical_point_for_physical(&mut self, x: f64, y: f64) -> [Pixels; 2] {
         let point = [
@@ -426,22 +1042,88 @@ impl Window {
 
 impl WindowHandle {
     pub fn id(&self) -> winit::window::WindowId {
-        self.0.id()
+        self.native.id()
+    }
+    pub fn inner_size(&self) -> winit::dpi::PhysicalSize<u32> {
+        self.native.inner_size()
+    }
+    pub fn outer_position(&self) -> Option<winit::dpi::PhysicalPosition<i32>> {
+        self.native.outer_position().ok()
+    }
+    pub fn scale_factor(&self) -> f64 {
+        self.native.scale_factor()
+    }
+    pub fn appearance(&self) -> WindowAppearance {
+        match self.native.theme() {
+            Some(winit::window::Theme::Dark) => WindowAppearance::Dark,
+            Some(winit::window::Theme::Light) | None => WindowAppearance::Light,
+        }
+    }
+    pub fn has_focus(&self) -> bool {
+        self.native.has_focus()
+    }
+    pub fn is_visible(&self) -> Option<bool> {
+        self.native.is_visible()
+    }
+    pub fn is_maximized(&self) -> bool {
+        self.native.is_maximized()
+    }
+    pub fn is_fullscreen(&self) -> bool {
+        self.native.fullscreen().is_some()
     }
     pub fn request_redraw(&self) {
-        self.0.request_redraw();
+        self.native.request_redraw();
     }
     pub fn set_title(&self, title: &str) {
-        self.0.set_title(title);
+        self.native.set_title(title);
     }
     pub fn focus_window(&self) {
-        self.0.focus_window();
+        self.native.focus_window();
+    }
+    pub fn set_visible(&self, visible: bool) {
+        self.native.set_visible(visible);
+    }
+    pub fn set_resizable(&self, resizable: bool) {
+        self.native.set_resizable(resizable);
+    }
+    pub fn set_decorations(&self, decorations: bool) {
+        self.native.set_decorations(decorations);
+    }
+    pub fn set_minimizable(&self, minimizable: bool) {
+        let mut buttons = self.native.enabled_buttons();
+        buttons.set(winit::window::WindowButtons::MINIMIZE, minimizable);
+        self.native.set_enabled_buttons(buttons);
+    }
+    pub fn set_min_inner_size(&self, size: Option<Size<Pixels>>) {
+        self.native.set_min_inner_size(
+            size.map(|size| winit::dpi::LogicalSize::new(size.width.value(), size.height.value())),
+        );
+    }
+    pub fn set_outer_position(&self, position: Point<Pixels>) {
+        self.native
+            .set_outer_position(winit::dpi::LogicalPosition::new(
+                position.x.value(),
+                position.y.value(),
+            ));
     }
     pub fn set_minimized(&self, minimized: bool) {
-        self.0.set_minimized(minimized);
+        self.native.set_minimized(minimized);
     }
     pub fn set_maximized(&self, maximized: bool) {
-        self.0.set_maximized(maximized);
+        self.native.set_maximized(maximized);
+    }
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        self.native.set_fullscreen(
+            fullscreen
+                .then(|| winit::window::Fullscreen::Borderless(self.native.current_monitor())),
+        );
+    }
+    pub fn close(&self) {
+        self.close_requested.store(true, Ordering::Release);
+        self.native.request_redraw();
+    }
+    pub fn close_requested(&self) -> bool {
+        self.close_requested.load(Ordering::Acquire)
     }
 }
 
@@ -492,6 +1174,7 @@ pub struct NativeApplication<F, R> {
     options: WindowOptions,
     build: F,
     max_frames: Option<u64>,
+    http_client: Option<BoxedHttpClient>,
     marker: std::marker::PhantomData<fn() -> R>,
 }
 
@@ -505,6 +1188,7 @@ where
             options,
             build,
             max_frames: None,
+            http_client: None,
             marker: std::marker::PhantomData,
         }
     }
@@ -530,6 +1214,12 @@ where
         initialize: impl FnOnce(&mut App) + 'static,
     ) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
+        let mut app = App::create();
+        if let Some(client) = self.http_client {
+            app.set_http_client(client);
+        } else {
+            app.install_default_http_client();
+        }
         let mut handler = Handler {
             initial: Some((
                 self.options,
@@ -539,7 +1229,7 @@ where
             initialize: Some(Box::new(initialize)),
             live: Vec::new(),
             failure: None,
-            app: App::new(),
+            app,
         };
         event_loop
             .run_app(&mut handler)
@@ -557,8 +1247,20 @@ where
         self
     }
 
+    /// Configures the client used by URI resource loading in this application.
+    pub fn with_http_client(mut self, client: BoxedHttpClient) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
     pub fn run(mut self) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
+        let mut app = App::create();
+        if let Some(client) = self.http_client {
+            app.set_http_client(client);
+        } else {
+            app.install_default_http_client();
+        }
         let mut handler = Handler {
             initial: Some((
                 self.options,
@@ -568,7 +1270,7 @@ where
             initialize: None,
             live: Vec::new(),
             failure: None,
-            app: App::new(),
+            app,
         };
         event_loop
             .run_app(&mut handler)
@@ -584,6 +1286,11 @@ impl Application {
         Self
     }
 
+    /// Configures the client used by URI resource loading in this application.
+    pub fn with_http_client(self, client: BoxedHttpClient) -> ConfiguredApplication {
+        ConfiguredApplication { http_client: client }
+    }
+
     pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
@@ -593,7 +1300,35 @@ impl Application {
             )),
             max_frames: None,
             initialize: Some(Box::new(initialize)),
-            app: App::new(),
+            app: App::create(),
+            live: Vec::new(),
+            failure: None,
+        };
+        event_loop
+            .run_app(&mut handler)
+            .map_err(ApplicationError::from)?;
+        handler.failure.map_or(Ok(()), Err)
+    }
+}
+
+/// An [`Application`] with an explicitly configured native HTTP client.
+pub struct ConfiguredApplication {
+    http_client: BoxedHttpClient,
+}
+
+impl ConfiguredApplication {
+    pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
+        let event_loop = event_loop()?;
+        let mut app = App::create();
+        app.set_http_client(self.http_client);
+        let mut handler = Handler {
+            initial: Some((
+                WindowOptions::default(),
+                Box::new(|_| Description::new::<()>()),
+            )),
+            max_frames: None,
+            initialize: Some(Box::new(initialize)),
+            app,
             live: Vec::new(),
             failure: None,
         };
@@ -626,6 +1361,7 @@ fn event_loop() -> Result<winit::event_loop::EventLoop<()>, ApplicationError> {
 }
 
 struct Live {
+    id: wgpui_core::app::WindowId,
     surface: WindowSurface,
     context: crate::render::device::ComputeContext,
     window: Window,
@@ -656,18 +1392,40 @@ impl Handler {
     fn create_window(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
+        id: wgpui_core::app::WindowId,
         options: WindowOptions,
         build: WindowBuildCallback,
     ) -> Result<(), ApplicationError> {
+        let title = options
+            .titlebar
+            .as_ref()
+            .and_then(|titlebar| titlebar.title.as_deref())
+            .unwrap_or(&options.title);
+        let resizable = options.resizable && options.is_resizable;
+        let decorations = options
+            .window_decorations
+            .map(|decorations| decorations == WindowDecorations::Server)
+            .unwrap_or(options.titlebar.is_some());
         let attributes = winit::window::Window::default_attributes()
-            .with_title(options.title.clone())
-            .with_resizable(options.resizable)
-            .with_visible(options.show);
+            .with_title(title)
+            .with_resizable(resizable)
+            .with_visible(options.show)
+            .with_decorations(decorations)
+            .with_enabled_buttons(enabled_window_buttons(resizable, options.is_minimizable))
+            .with_window_level(window_level(&options.kind));
+        let attributes = apply_titlebar_attributes(attributes, options.titlebar.as_ref());
+        let attributes = apply_background_attributes(attributes, options.window_background);
         let bounds = initial_bounds(&options);
         let mut attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(
             bounds.size.width.value(),
             bounds.size.height.value(),
         ));
+        if let Some(min_size) = options.window_min_size {
+            attributes = attributes.with_min_inner_size(winit::dpi::LogicalSize::new(
+                min_size.width.value(),
+                min_size.height.value(),
+            ));
+        }
         if options.window_bounds.is_some() {
             attributes = attributes.with_position(winit::dpi::LogicalPosition::new(
                 bounds.origin.x.value(),
@@ -693,14 +1451,20 @@ impl Handler {
             native.focus_window();
         }
         let (surface, context) = WindowSurface::new(Arc::clone(&native))?;
+        let surface_registry = Arc::new(SurfaceRegistry::new());
         let (width, height) = surface.size();
         let mut resizes = ResizeDetector::new();
         resizes.seed(width, height);
         let mode = DrawMode::best_available(context.indirect);
         let window = Window {
             native,
+            gpu_device: context.device.clone(),
+            gpu_queue: context.queue.clone(),
+            surface_registry: Arc::clone(&surface_registry),
             scale_factor,
-            close_requested: false,
+            close_requested: Arc::new(AtomicBool::new(false)),
+            background_appearance: options.window_background,
+            decorations,
             last_frame: None,
             state: ElementStateStore::new(),
             state_frame: 0,
@@ -714,11 +1478,18 @@ impl Handler {
             hovered_interaction: None,
             pressed_interaction: None,
             pressed_event: None,
+            active_drag: None,
+            drag_hovered: None,
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
+            animation_clock: AnimationClock::new(),
+            last_click: None,
         };
+        let mut frame_loop = FrameLoop::new(&context.device);
+        frame_loop.set_surface_registry(surface_registry);
         self.live.push(Live {
-            frame_loop: FrameLoop::new(&context.device),
+            id,
+            frame_loop,
             surface,
             context,
             window,
@@ -749,10 +1520,13 @@ impl Handler {
                 let build = Box::new(move |window: &mut Window| {
                     (renderer.render)(&mut window.interaction, &mut app)
                 });
-                if let Err(error) = self.create_window(event_loop, request.options, build)
-                    && first_error.is_none()
+                if let Err(error) =
+                    self.create_window(event_loop, request.id, request.options, build)
                 {
-                    first_error = Some(error);
+                    self.app.window_creation_failed(request.id);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 }
             }
             if let Some(error) = first_error {
@@ -774,6 +1548,7 @@ impl Handler {
         else {
             return;
         };
+        self.app.run_pending_tasks();
         let all_other_windows_reached_limit = self.max_frames.is_some_and(|limit| {
             self.live
                 .iter()
@@ -803,7 +1578,12 @@ impl Handler {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let (width, height) = live.surface.size();
         live.window.begin_frame();
-        let description = (live.build)(&mut live.window);
+        let animation_clock = std::mem::take(&mut live.window.animation_clock);
+        let (animation_clock, description) =
+            wgpui_core::window::animation::with_animation_clock(animation_clock, || {
+                (live.build)(&mut live.window)
+            });
+        live.window.animation_clock = animation_clock;
         live.window.end_frame();
         live.frame_loop
             .set_performance_debug(*live.window.performance_debug());
@@ -843,8 +1623,15 @@ impl Handler {
                 live.window.last_frame = Some(report.clone());
                 live.last_report = Some(report);
                 live.surface.present(&live.context.queue, texture);
-                if live.window.close_requested || live.app.quit_requested() {
-                    self.live.remove(index);
+                if live.window.close_requested() || live.app.close_requested() {
+                    let closed = if live.app.close_requested() {
+                        self.live.drain(..).map(|live| live.id).collect::<Vec<_>>()
+                    } else {
+                        vec![self.live.remove(index).id]
+                    };
+                    for id in closed {
+                        self.app.window_closed(id);
+                    }
                     if self.live.is_empty() {
                         event_loop.exit();
                     }
@@ -861,6 +1648,68 @@ impl Handler {
     }
 }
 
+fn enabled_window_buttons(resizable: bool, minimizable: bool) -> winit::window::WindowButtons {
+    let mut buttons = winit::window::WindowButtons::CLOSE;
+    if minimizable {
+        buttons.insert(winit::window::WindowButtons::MINIMIZE);
+    }
+    if resizable {
+        buttons.insert(winit::window::WindowButtons::MAXIMIZE);
+    }
+    buttons
+}
+
+fn apply_titlebar_attributes(
+    attributes: winit::window::WindowAttributes,
+    titlebar: Option<&wgpui_core::window::TitlebarOptions>,
+) -> winit::window::WindowAttributes {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowAttributesExtMacOS;
+        attributes.with_titlebar_transparent(
+            titlebar.is_some_and(|titlebar| titlebar.appears_transparent),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = titlebar;
+        attributes
+    }
+}
+
+fn window_level(kind: &WindowKind) -> winit::window::WindowLevel {
+    match kind {
+        WindowKind::Normal => winit::window::WindowLevel::Normal,
+        WindowKind::PopUp | WindowKind::Floating => winit::window::WindowLevel::AlwaysOnTop,
+    }
+}
+
+fn apply_background_attributes(
+    attributes: winit::window::WindowAttributes,
+    appearance: WindowBackgroundAppearance,
+) -> winit::window::WindowAttributes {
+    let attributes = attributes
+        .with_transparent(appearance != WindowBackgroundAppearance::Opaque)
+        .with_blur(appearance == WindowBackgroundAppearance::Blurred);
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::{BackdropType, WindowAttributesExtWindows};
+        let backdrop = match appearance {
+            WindowBackgroundAppearance::Opaque | WindowBackgroundAppearance::Transparent => {
+                BackdropType::None
+            }
+            WindowBackgroundAppearance::Blurred => BackdropType::TransientWindow,
+            WindowBackgroundAppearance::MicaBackdrop => BackdropType::MainWindow,
+            WindowBackgroundAppearance::MicaAltBackdrop => BackdropType::TabbedWindow,
+        };
+        attributes.with_system_backdrop(backdrop)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        attributes
+    }
+}
+
 impl winit::application::ApplicationHandler for Handler {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if !self.live.is_empty() {
@@ -870,10 +1719,19 @@ impl winit::application::ApplicationHandler for Handler {
             initialize(&mut self.app);
         }
         self.create_pending_windows(event_loop);
-        if let Some((options, build)) = self.initial.take()
-            && let Err(error) = self.create_window(event_loop, options, build)
+        if self.live.is_empty() && self.app.close_requested() {
+            event_loop.exit();
+            return;
+        }
+        if self.live.is_empty()
+            && !self.app.close_requested()
+            && let Some((options, build)) = self.initial.take()
         {
-            self.fail(event_loop, error);
+            let id = self.app.reserve_window();
+            if let Err(error) = self.create_window(event_loop, id, options, build) {
+                self.app.window_creation_failed(id);
+                self.fail(event_loop, error);
+            }
         }
     }
 
@@ -923,12 +1781,16 @@ impl winit::application::ApplicationHandler for Handler {
                 return;
             }
         };
+        let surface_registry = Arc::new(SurfaceRegistry::new());
         let (width, height) = surface.size();
         let mut resizes = ResizeDetector::new();
         resizes.seed(width, height);
         let mode = DrawMode::best_available(context.indirect);
         let window = Window {
             native,
+            gpu_device: context.device.clone(),
+            gpu_queue: context.queue.clone(),
+            surface_registry: Arc::clone(&surface_registry),
             scale_factor,
             close_requested: false,
             last_frame: None,
@@ -946,9 +1808,13 @@ impl winit::application::ApplicationHandler for Handler {
             pressed_event: None,
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
+            animation_clock: AnimationClock::new(),
+            last_click: None,
         };
+        let mut frame_loop = FrameLoop::new(&context.device);
+        frame_loop.set_surface_registry(surface_registry);
         self.live = Some(Live {
-            frame_loop: FrameLoop::new(&context.device),
+            frame_loop,
             surface,
             context,
             window,
@@ -987,7 +1853,8 @@ impl winit::application::ApplicationHandler for Handler {
         match event {
             winit::event::WindowEvent::CloseRequested => {
                 if live.window.try_close() {
-                    self.live.remove(index);
+                    let id = self.live.remove(index).id;
+                    self.app.window_closed(id);
                     if self.live.is_empty() {
                         event_loop.exit();
                     }
@@ -1002,10 +1869,18 @@ impl winit::application::ApplicationHandler for Handler {
                 live.window.request_redraw();
             }
             winit::event::WindowEvent::ModifiersChanged(modifiers) => {
-                live.window.interaction_modifiers = modifiers_from_winit(modifiers.state());
+                let modifiers = modifiers_from_winit(modifiers.state());
+                live.window.interaction_modifiers = modifiers;
+                if live.window.handle_input_with_app(
+                    InputEvent::ModifiersChanged(ModifiersChangedEvent { modifiers }),
+                    &mut live.app,
+                ) {
+                    live.window.request_redraw();
+                }
             }
             winit::event::WindowEvent::KeyboardInput { event, .. } => {
                 let key = key_name(&event);
+                let text = event.text.as_ref().map(ToString::to_string);
                 let input = if event.state == winit::event::ElementState::Pressed {
                     InputEvent::KeyDown(KeyDownEvent {
                         key,
@@ -1019,6 +1894,15 @@ impl winit::application::ApplicationHandler for Handler {
                     })
                 };
                 if live.window.handle_input_with_app(input, &mut live.app) {
+                    live.window.request_redraw();
+                }
+                if let Some(text) = text
+                    && !text.is_empty()
+                    && live.window.handle_input_with_app(
+                        InputEvent::TextInput(TextInputEvent { text }),
+                        &mut live.app,
+                    )
+                {
                     live.window.request_redraw();
                 }
             }
@@ -1045,19 +1929,26 @@ impl winit::application::ApplicationHandler for Handler {
                 let button = core_mouse_button(button);
                 live.window
                     .set_mouse_button(button, state == winit::event::ElementState::Pressed);
+                let click_count = if state == winit::event::ElementState::Pressed {
+                    live.window.next_click_count(button, point)
+                } else {
+                    live.window
+                        .pressed_event
+                        .map_or(1, |event| event.click_count)
+                };
                 let event = if state == winit::event::ElementState::Pressed {
                     InputEvent::MouseDown(MouseDownEvent {
                         button,
                         position: point,
                         modifiers: live.window.modifiers(),
-                        click_count: 1,
+                        click_count,
                     })
                 } else {
                     InputEvent::MouseUp(MouseUpEvent {
                         button,
                         position: point,
                         modifiers: live.window.modifiers(),
-                        click_count: 1,
+                        click_count,
                     })
                 };
                 if live.window.handle_input_with_app(event, &mut live.app) {
@@ -1068,7 +1959,10 @@ impl winit::application::ApplicationHandler for Handler {
                 let delta = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => [x * 16.0, y * 16.0],
                     winit::event::MouseScrollDelta::PixelDelta(point) => {
-                        [point.x as f32, point.y as f32]
+                        [
+                            point.x as f32 / live.window.scale_factor as f32,
+                            point.y as f32 / live.window.scale_factor as f32,
+                        ]
                     }
                 };
                 let event = InputEvent::Scroll(ScrollWheelEvent {
@@ -1079,6 +1973,25 @@ impl winit::application::ApplicationHandler for Handler {
                 if live.window.handle_input_with_app(event, &mut live.app) {
                     live.window.request_redraw();
                 }
+            }
+            winit::event::WindowEvent::Ime(ime) => {
+                let event = ime_event(ime);
+                if live.window.handle_input_with_app(InputEvent::Ime(event), &mut live.app) {
+                    live.window.request_redraw();
+                }
+            }
+            winit::event::WindowEvent::Focused(focused) => {
+                if focused {
+                    live.window.interaction.activate();
+                } else {
+                    live.window.interaction.deactivate();
+                }
+                live.window.handle_window_focus(focused, &mut live.app);
+                let dirty_regions = live.window.take_hover_dirty_regions();
+                for region in dirty_regions {
+                    live.frame_loop.mark_interaction_dirty(region);
+                }
+                live.window.request_redraw();
             }
             winit::event::WindowEvent::RedrawRequested => self.draw(event_loop, window_id),
             winit::event::WindowEvent::CursorEntered { .. } => live.window.request_redraw(),
@@ -1096,11 +2009,15 @@ impl winit::application::ApplicationHandler for Handler {
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        self.app.run_pending_tasks();
         self.create_pending_windows(event_loop);
-        if self.max_frames.is_some() {
+        if self.max_frames.is_some() || self.app.has_pending_tasks() || self.app.close_requested() {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             for live in &self.live {
                 live.window.request_redraw();
             }
+        } else {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
         }
     }
 }
@@ -1120,10 +2037,34 @@ fn core_mouse_button(button: winit::event::MouseButton) -> CoreMouseButton {
         winit::event::MouseButton::Right => CoreMouseButton::Right,
         winit::event::MouseButton::Middle => CoreMouseButton::Middle,
         winit::event::MouseButton::Back | winit::event::MouseButton::Forward => {
-            CoreMouseButton::Other(0)
+            CoreMouseButton::Other(match button {
+                winit::event::MouseButton::Back => 4,
+                _ => 5,
+            })
         }
         winit::event::MouseButton::Other(value) => CoreMouseButton::Other(value),
     }
+}
+
+fn ime_event(event: winit::event::Ime) -> ImeEvent {
+    match event {
+        winit::event::Ime::Enabled => ImeEvent::Enabled,
+        winit::event::Ime::Preedit(text, cursor) => ImeEvent::Preedit {
+            selection: cursor.map(|(start, end)| {
+                byte_to_utf16_offset(&text, start)..byte_to_utf16_offset(&text, end)
+            }),
+            text,
+        },
+        winit::event::Ime::Commit(text) => ImeEvent::Commit(text),
+        winit::event::Ime::Disabled => ImeEvent::Disabled,
+    }
+}
+
+fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
+    text.get(..byte_offset.min(text.len()))
+        .unwrap_or(text)
+        .encode_utf16()
+        .count()
 }
 
 fn key_name(event: &winit::event::KeyEvent) -> String {
@@ -1175,5 +2116,77 @@ mod tests {
             ..WindowOptions::default()
         };
         assert_eq!(initial_bounds(&options).size, size(px(320.0), px(240.0)));
+    }
+
+    #[test]
+    fn ime_preedit_offsets_are_converted_from_utf8_bytes_to_utf16_units() {
+        let event = ime_event(winit::event::Ime::Preedit(
+            "a😀中".to_string(),
+            Some((1, 6)),
+        ));
+        assert_eq!(
+            event,
+            ImeEvent::Preedit {
+                text: "a😀中".to_string(),
+                selection: Some(1..4),
+            }
+        );
+    }
+
+    #[test]
+    fn window_options_translate_to_supported_winit_controls() {
+        let buttons = enabled_window_buttons(false, false);
+        assert!(buttons.contains(winit::window::WindowButtons::CLOSE));
+        assert!(!buttons.contains(winit::window::WindowButtons::MINIMIZE));
+        assert!(!buttons.contains(winit::window::WindowButtons::MAXIMIZE));
+
+        assert_eq!(
+            window_level(&WindowKind::Normal),
+            winit::window::WindowLevel::Normal
+        );
+        assert_eq!(
+            window_level(&WindowKind::PopUp),
+            winit::window::WindowLevel::AlwaysOnTop
+        );
+        assert_eq!(
+            window_level(&WindowKind::Floating),
+            winit::window::WindowLevel::AlwaysOnTop
+        );
+    }
+
+    #[test]
+    fn native_modifiers_preserve_command_and_alt_without_losing_shift() {
+        let state = winit::keyboard::ModifiersState::SUPER
+            | winit::keyboard::ModifiersState::ALT
+            | winit::keyboard::ModifiersState::SHIFT;
+        assert_eq!(
+            modifiers_from_winit(state),
+            Modifiers {
+                shift: true,
+                control: false,
+                alt: true,
+                command: true,
+            }
+        );
+    }
+
+    #[test]
+    fn background_options_preserve_transparency_and_blur_contract() {
+        for appearance in [
+            WindowBackgroundAppearance::Opaque,
+            WindowBackgroundAppearance::Transparent,
+            WindowBackgroundAppearance::Blurred,
+            WindowBackgroundAppearance::MicaBackdrop,
+            WindowBackgroundAppearance::MicaAltBackdrop,
+        ] {
+            let attributes = apply_background_attributes(
+                winit::window::Window::default_attributes(),
+                appearance,
+            );
+            assert_eq!(
+                attributes.transparent(),
+                appearance != WindowBackgroundAppearance::Opaque
+            );
+        }
     }
 }

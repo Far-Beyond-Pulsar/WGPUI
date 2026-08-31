@@ -33,3 +33,19 @@ Initial runtime candidates should be small, deterministic examples such as
 they compile natively. Interactive, image, surface, and custom-drawing
 examples require their corresponding native APIs and should not be reported as
 runtime-tested until those paths are real.
+
+## Phase 4C supported subset
+
+The following examples now use the native `Render::render(&mut self)` contract
+and compile against the retained application path: `learn/text`, `learn/layout`,
+`text_gradients`, `bench/shadow`, and `bench/pattern`. Their `Bounds::centered`
+calls use `None::<()>` because the native geometry helper deliberately accepts
+an unused, generic display marker; this is an inference requirement rather than
+a runtime behavior change.
+
+The native `StyledText` element remains a lower-level renderer-owned element
+because it requires a shared shaping/atlas engine. The text example therefore
+uses equivalent native raw-text children for its inline bold/italic/semibold
+demonstration. Karaoke examples still depend on the context-bearing legacy
+render signature, timer integration, and context-aware entity updates; they are
+not counted as compiled by this phase.

@@ -60,13 +60,17 @@
 //! correct *set* of primitives into a correct *layer* is what this phase needs
 //! and all it claims.
 
-use crate::boundary::compositor::{BoundaryComposite, Composite, Compositor, TiledVisit};
+use crate::boundary::compositor::{
+    BoundaryComposite, Composite, CompositeEntry, CompositeSource, Compositor,
+    ExternalSurfaceId, TiledVisit,
+};
 use crate::boundary::policy::BoundaryPolicy;
 use crate::geometry::Rect;
 use crate::invalidation::request::FrameSignals;
 use crate::patch::apply::ScenePatch;
 use crate::patch::primitive::{
-    AtlasTileId, BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, Underline,
+    AtlasTileId, BackdropFilter, GlyphRun, Path, PolySprite, Primitive, Quad, Shadow, ShadowClip,
+    Underline,
 };
 use crate::patch::{PatchList, RecordKey};
 use crate::reconcile::instance::InstanceKey;
@@ -103,6 +107,7 @@ pub struct EmitContext {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Emission {
     shadows: Vec<Shadow>,
+    shadow_clips: Vec<ShadowClip>,
     quads: Vec<Quad>,
     underlines: Vec<Underline>,
     glyph_runs: Vec<GlyphRun>,
@@ -120,12 +125,18 @@ impl Emission {
     /// Contribute a drop shadow.
     pub fn shadow(&mut self, shadow: Shadow) -> &mut Self {
         self.shadows.push(shadow);
+        self.shadow_clips.push(ShadowClip::UNCLIPPED);
         self
     }
 
     /// The shadows contributed, in emission order.
     pub fn shadows(&self) -> &[Shadow] {
         &self.shadows
+    }
+
+    /// The clips corresponding one-for-one with [`Self::shadows`].
+    pub fn shadow_clips(&self) -> &[ShadowClip] {
+        &self.shadow_clips
     }
 
     /// Contribute a quad.
@@ -219,6 +230,7 @@ impl Emission {
     /// Drop everything, keeping the allocations for the next element.
     pub fn clear(&mut self) {
         self.shadows.clear();
+        self.shadow_clips.clear();
         self.quads.clear();
         self.underlines.clear();
         self.glyph_runs.clear();
@@ -252,6 +264,10 @@ impl Emission {
     /// container. Variable-size kinds keep their slots so retained addresses
     /// do not churn while scrolling; fully outside instances become inert.
     pub fn clip_to(&mut self, clip: LayoutRect) {
+        if self.shadow_clips.len() < self.shadows.len() {
+            self.shadow_clips
+                .resize(self.shadows.len(), ShadowClip::UNCLIPPED);
+        }
         self.clip_quads_to(clip);
         for run in &mut self.glyph_runs {
             for glyph in &mut run.glyphs {
@@ -318,19 +334,23 @@ impl Emission {
                 underline.color[3] = 0.0;
             }
         }
-        for shadow in &mut self.shadows {
+        for (shadow, shadow_clip) in self.shadows.iter_mut().zip(&mut self.shadow_clips) {
             let (origin, size) = shadow.drawn_bounds();
-            if !rects_intersect(
-                LayoutRect {
-                    x: origin[0],
-                    y: origin[1],
-                    width: size[0],
-                    height: size[1],
-                },
-                clip,
-            ) {
+            let bounds = LayoutRect {
+                x: origin[0],
+                y: origin[1],
+                width: size[0],
+                height: size[1],
+            };
+            if rects_intersect(bounds, clip) {
+                *shadow_clip = ShadowClip {
+                    origin: [clip.x, clip.y],
+                    size: [clip.width, clip.height],
+                };
+            } else {
                 shadow.size = [0.0; 2];
                 shadow.color[3] = 0.0;
+                *shadow_clip = ShadowClip::EMPTY;
             }
         }
         for path in &mut self.paths {
@@ -475,6 +495,9 @@ pub struct FrameEmission {
     pub patch: ScenePatch,
     /// What each live boundary did, in ascending layer order.
     pub composites: Vec<BoundaryComposite>,
+    /// External textures in tree paint order. Their pixels remain outside the
+    /// retained scene and are consumed by the GPU compositor directly.
+    pub external_surfaces: Vec<CompositeEntry>,
     /// Tile visibility metadata for damage planning. Tiles are not scene
     /// layers and do not own primitive records; they identify portions of the
     /// retained presentation buffer that may need repainting.
@@ -578,6 +601,7 @@ impl<P> Default for KindOperations<P> {
 #[derive(Default)]
 struct PendingOperations {
     shadows: KindOperations<Shadow>,
+    shadow_clips: KindOperations<ShadowClip>,
     quads: KindOperations<Quad>,
     underlines: KindOperations<Underline>,
     glyph_runs: KindOperations<GlyphRun>,
@@ -612,6 +636,29 @@ impl<P: Primitive> KindOperations<P> {
             list.insert(layer, key, *length, value);
             *length = length.saturating_add(1);
             stats.records_inserted += 1;
+        }
+        list
+    }
+}
+
+impl<P: Clone> KindOperations<P> {
+    /// Fold metadata operations into a keyed CPU-side record list.
+    fn into_record_patch_list(self, store: &crate::scene::RecordStore<P>) -> PatchList<P> {
+        let mut list = PatchList::new();
+        let mut lengths: HashMap<LayerId, u32> = HashMap::new();
+
+        for (layer, key) in self.removes {
+            let length = lengths.entry(layer).or_insert_with(|| store.len(layer));
+            *length = length.saturating_sub(1);
+            list.remove(layer, key);
+        }
+        for (layer, key, value) in self.updates {
+            list.update(layer, key, value);
+        }
+        for (layer, key, value) in self.inserts {
+            let length = lengths.entry(layer).or_insert_with(|| store.len(layer));
+            list.insert(layer, key, *length, value);
+            *length = length.saturating_add(1);
         }
         list
     }
@@ -686,6 +733,7 @@ impl Emitter {
         let mut pending = PendingOperations::default();
         let mut boundaries: HashMap<BoundaryId, BoundaryFrame> = HashMap::new();
         let mut tiled_visits = Vec::new();
+        let mut external_surfaces = Vec::new();
         let mut damage = Vec::new();
         let mut scroll_regions = HashMap::new();
         let mut emission = Emission::new();
@@ -709,6 +757,20 @@ impl Emitter {
             stats.nodes_visited += 1;
 
             let bounds = geometry.emission_bounds;
+
+            if let Some(surface) = node.external_surface {
+                external_surfaces.push(CompositeEntry {
+                    source: CompositeSource::External(ExternalSurfaceId::from_raw(
+                        surface.id.as_raw(),
+                    )),
+                    bounds: geometry.absolute_bounds,
+                    content_mask: geometry.visible_bounds,
+                    opacity: surface.opacity,
+                    corner_radius: surface.corner_radius,
+                    source_is_opaque: false,
+                    content_token: 0,
+                });
+            }
 
             // A boundary root's own paint belongs to the layer around it, not to
             // the layer it declares — see `PlannedNode::boundary`.
@@ -807,6 +869,13 @@ impl Emitter {
                         Self::reconcile_records(
                             node.address,
                             layer,
+                            previous.map(|record| (record.layer, record.shadows)),
+                            emission.shadow_clips(),
+                            &mut pending.shadow_clips,
+                        );
+                        Self::reconcile_records(
+                            node.address,
+                            layer,
                             previous.map(|record| (record.layer, record.quads)),
                             emission.quads(),
                             &mut pending.quads,
@@ -886,6 +955,9 @@ impl Emitter {
 
         let patch = ScenePatch {
             shadows: pending.shadows.into_patch_list(&scene.shadows, &mut stats),
+            shadow_clips: pending
+                .shadow_clips
+                .into_record_patch_list(&scene.shadow_clips),
             quads: pending.quads.into_patch_list(&scene.quads, &mut stats),
             underlines: pending
                 .underlines
@@ -932,6 +1004,7 @@ impl Emitter {
         Ok(FrameEmission {
             patch,
             composites,
+            external_surfaces,
             tiled_visits,
             damage,
             stats,
@@ -972,9 +1045,6 @@ impl Emitter {
     }
 
     fn infer_clean_scrolls(&self, plan: &FramePlan, signals: &FrameSignals) -> FrameSignals {
-        if !signals.is_empty() {
-            return signals.clone();
-        }
         let mut inferred = signals.clone();
         for (index, node) in plan.nodes().iter().enumerate() {
             let Some(boundary) = node.declared_boundary else {
@@ -986,7 +1056,7 @@ impl Emitter {
                 continue;
             }
             let previous = self.compositor.transform(boundary).translation;
-            if previous != node.scroll_offset {
+            if previous != [0.0; 2] || node.scroll_offset != [0.0; 2] {
                 inferred.scrolled(LayerId::from_key(LayerKey::untiled(boundary)));
             }
         }
@@ -1030,7 +1100,7 @@ impl Emitter {
     /// takes §5.0's O(1) in-place update. The two kinds' ordinals are
     /// independent, which is safe because a [`RecordKey`] is only ever unique
     /// within one kind's store.
-    fn reconcile_records<P: Primitive>(
+    fn reconcile_records<P: Clone>(
         address: InstanceKey,
         layer: LayerId,
         previous: Option<(LayerId, u32)>,
@@ -1072,6 +1142,10 @@ impl Emitter {
         for ordinal in 0..record.shadows {
             pending
                 .shadows
+                .removes
+                .push((record.layer, RecordKey::new(address, ordinal)));
+            pending
+                .shadow_clips
                 .removes
                 .push((record.layer, RecordKey::new(address, ordinal)));
         }
@@ -1534,6 +1608,57 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_settled_nonzero_scroll_does_not_reemit_its_contents() -> Result<(), FrameError> {
+        let mut window = Window::new();
+        let boundary = boundary_of(&window);
+        let offset = -ROW_HEIGHT * 3.0;
+
+        window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+        let scrolled = window.draw(scroller(true, offset, 0), &FrameSignals::new())?;
+        assert_eq!(
+            scrolled.emission.composite_for(boundary).map(|composite| composite.composite),
+            Some(Composite::TransformOnly)
+        );
+
+        let settled = window.draw(scroller(true, offset, 0), &FrameSignals::new())?;
+        assert!(settled.emission.patch.is_empty());
+        assert!(settled.emission.damage.is_empty());
+        assert_eq!(settled.emission.stats.nodes_emitted, 0);
+        assert_eq!(settled.uploaded_bytes, 0);
+        assert_eq!(settled.upload_calls, 0);
+        assert_eq!(
+            settled.emission.composite_for(boundary).map(|composite| composite.composite),
+            Some(Composite::Clean)
+        );
+
+        let mut unrelated_signal = FrameSignals::new();
+        unrelated_signal.data_changed(LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT)));
+        let signaled = window.draw(scroller(true, offset, 0), &unrelated_signal)?;
+        assert!(signaled.emission.patch.is_empty());
+        assert_eq!(signaled.emission.stats.nodes_emitted, 0);
+        assert_eq!(
+            signaled
+                .emission
+                .composite_for(boundary)
+                .map(|composite| composite.composite),
+            Some(Composite::Clean)
+        );
+
+        let returned = window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+        assert!(returned.emission.patch.is_empty());
+        assert_eq!(
+            returned.emission.composite_for(boundary).map(|composite| composite.composite),
+            Some(Composite::TransformOnly)
+        );
+
+        let idle = window.draw(scroller(true, 0.0, 0), &FrameSignals::new())?;
+        assert!(idle.emission.patch.is_empty());
+        assert!(idle.emission.damage.is_empty());
+        assert_eq!(idle.emission.stats.nodes_emitted, 0);
+        Ok(())
+    }
+
     /// **Phase 2 gate #2** (§4.0, §4.1, §8): removing `.boundary()` from gate
     /// #1's case degrades the scroll to a per-tick recomposite but does **not**
     /// reintroduce a full rebuild.
@@ -1980,6 +2105,33 @@ mod tests {
     }
 
     #[test]
+    fn clipping_keeps_a_partial_shadow_and_retains_its_shader_clip() {
+        let mut emission = Emission::new();
+        emission.shadow(Shadow {
+            origin: [20.0, 20.0],
+            size: [40.0, 40.0],
+            color: [0.0, 0.0, 0.0, 0.5],
+            corner_radii: [8.0; 4],
+            blur_radius: 12.0,
+        });
+        emission.clip_to(LayoutRect {
+            x: 10.0,
+            y: 30.0,
+            width: 32.0,
+            height: 18.0,
+        });
+
+        assert_eq!(emission.shadows()[0].size, [40.0, 40.0]);
+        assert_eq!(
+            emission.shadow_clips()[0],
+            ShadowClip {
+                origin: [10.0, 30.0],
+                size: [32.0, 18.0],
+            }
+        );
+    }
+
+    #[test]
     fn clipping_intersects_existing_path_and_backdrop_masks() {
         let mut emission = Emission::default();
         emission.paths.push(Path::new(
@@ -2036,6 +2188,7 @@ mod tests {
             depth: 0,
             outcome: crate::reconcile::plan::NodeOutcome::Uncached,
             invalidation: Invalidation::all(),
+            external_surface: None,
         };
         plan.push(node);
         node.depth = 4;

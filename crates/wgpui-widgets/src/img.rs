@@ -329,6 +329,13 @@ impl ImageEngine {
         source: ImageSourceId,
         frame_index: u32,
     ) -> Option<TilePlacementOfFrame> {
+        let frame_index = match self.cache.get(source) {
+            Some(image) => {
+                let frame_count = u32::try_from(image.frame_count()).ok()?;
+                frame_index % frame_count
+            }
+            None => return None,
+        };
         let key = ImageRasterKey {
             source: source.as_raw(),
             frame_index,
@@ -458,6 +465,7 @@ impl Img {
             .borrow()
             .frame_index_at(self.source, elapsed)
             .unwrap_or(0);
+        self.started = started;
         self.frame_index = frame_index;
         self.automatic_frame = true;
         self
@@ -558,7 +566,15 @@ impl Img {
             self.clone()
         };
         let [width, height] = image.layout_size();
-        Description::new::<Img>()
+        let is_active_animation = image.load_state == ImageLoadState::Ready
+            && image.automatic_frame
+            && image
+                .engine
+                .borrow()
+                .cache
+                .get(image.source)
+                .is_some_and(|source| source.is_animated());
+        let description = Description::new::<Img>()
             .diff_key(image.diff_key())
             .style(LayoutStyle {
                 size: LayoutSize {
@@ -570,7 +586,12 @@ impl Img {
             })
             .emit(move |context: &EmitContext, emission: &mut Emission| {
                 image.emit_into(context, emission);
-            })
+            });
+        if is_active_animation {
+            description.active_animation()
+        } else {
+            description
+        }
     }
 
     pub fn emit_into(&self, context: &EmitContext, emission: &mut Emission) {
@@ -732,6 +753,32 @@ mod tests {
         let source = cache
             .hold(DecodedImage::from_frames(vec![frame]).expect("one frame is a valid image"))
             .expect("holding a decoded image must succeed");
+        let engine = Rc::new(RefCell::new(ImageEngine::new(
+            cache,
+            Box::new(FakeTiles {
+                requests: Rc::clone(&counters.requests),
+                decodes: Rc::clone(&counters.decodes),
+                ..FakeTiles::default()
+            }),
+        )));
+        (engine, source, counters)
+    }
+
+    fn animated_engine() -> (SharedImageEngine, ImageSourceId, TileCounters) {
+        use crate::image_cache::{DecodedFrame, DecodedImage};
+
+        let counters = TileCounters::default();
+        let mut cache = ImageCache::new();
+        let frames = (0..2)
+            .map(|frame_index| DecodedFrame {
+                size: [16, 16],
+                texels: vec![frame_index as u8; 16 * 16 * 4],
+                delay: std::time::Duration::from_millis(10),
+            })
+            .collect();
+        let source = cache
+            .hold(DecodedImage::from_frames(frames).expect("two frames are a valid image"))
+            .expect("holding an animated image must succeed");
         let engine = Rc::new(RefCell::new(ImageEngine::new(
             cache,
             Box::new(FakeTiles {
@@ -1124,6 +1171,40 @@ mod tests {
             "and exactly one of them paid for a decode — forty avatars sharing \
              one source is the case this cache exists for, and a claim about \
              work *not* happening is only checkable by counting it when it does"
+        );
+    }
+
+    #[test]
+    fn automatic_animation_marks_the_description_active() {
+        let (engine, source, _) = animated_engine();
+        let description = Img::new(source, engine).describe();
+
+        assert!(description.has_active_animation());
+    }
+
+    #[test]
+    fn a_non_ready_animation_does_not_keep_the_frame_loop_alive() {
+        let (engine, source, _) = animated_engine();
+        let description = Img::new(source, engine)
+            .load_state(ImageLoadState::Loading)
+            .describe();
+
+        assert!(!description.has_active_animation());
+    }
+
+    #[test]
+    fn equivalent_looped_frame_indices_share_atlas_residency() {
+        let (engine, source, counters) = animated_engine();
+        let first = Img::new(source, Rc::clone(&engine)).frame_index(0);
+        let wrapped = Img::new(source, Rc::clone(&engine)).frame_index(2);
+
+        assert!(emitted(&first, [0.0, 0.0, 16.0, 16.0]).is_some());
+        assert!(emitted(&wrapped, [0.0, 0.0, 16.0, 16.0]).is_some());
+        assert_eq!(counters.requests.get(), 2);
+        assert_eq!(
+            counters.decodes.get(),
+            1,
+            "frame indices loop through the decoded image and must not duplicate atlas tiles"
         );
     }
 }

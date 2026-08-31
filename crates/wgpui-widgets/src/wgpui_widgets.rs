@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod animation;
+pub mod assets;
 pub mod canvas;
 pub mod div;
 pub mod image_cache;
@@ -17,6 +18,10 @@ pub mod svg;
 pub mod text;
 pub mod wgpu_surface;
 
+pub use canvas::{
+    Canvas, CanvasContext, IntoCanvasBounds, IntoCanvasColor, PathBuilder, PathStyle, canvas, fill,
+};
 pub use div::interactivity::style::{
     BoxShadow, Corners, DivStyle, Edges, LinearGradient, Pattern, RadialGradient,
 };
+pub use styled::{TextAlign, TextOverflow};

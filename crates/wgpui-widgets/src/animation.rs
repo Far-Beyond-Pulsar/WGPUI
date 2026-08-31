@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use wgpui_core::element::Element;
 use wgpui_core::reconcile::description::{Description, ElementId};
-use wgpui_core::window::animation::AnimationScheduler;
+use wgpui_core::window::animation::{AnimationScheduler, animation_start};
 
 /// An animation definition, compatible with the legacy public names.
 #[derive(Clone)]
@@ -71,7 +71,7 @@ impl AnimationTimeline {
         for (index, animation) in self.animations.iter().enumerate() {
             let duration = animation.duration;
             if duration.is_zero() || elapsed >= duration {
-                if !animation.oneshot && index == 0 && self.animations.len() == 1 {
+                if !animation.oneshot {
                     let progress = if duration.is_zero() {
                         1.0
                     } else {
@@ -152,7 +152,8 @@ impl<E: crate::div::IntoDescription> AnimationExt for E {
         animations: Vec<Animation>,
         animator: impl Fn(Self, usize, f32) -> Self + 'static,
     ) -> AnimationElement<Self> {
-        let started = Instant::now();
+        let id = id.into();
+        let started = animation_start(&id, Instant::now());
         let timeline = match AnimationTimeline::new(animations, started) {
             Some(timeline) => timeline,
             None => AnimationTimeline {
@@ -161,7 +162,7 @@ impl<E: crate::div::IntoDescription> AnimationExt for E {
             },
         };
         AnimationElement {
-            id: id.into(),
+            id,
             element: self,
             timeline,
             animator: Box::new(animator),
@@ -191,6 +192,9 @@ impl<E: crate::div::IntoDescription> AnimationElement<E> {
                 .into_description();
         if description.element_id().is_none() {
             description = description.id(self.id);
+        }
+        if !sample.finished {
+            description = description.active_animation();
         }
         description
     }
@@ -284,6 +288,52 @@ mod tests {
         let mut scheduler = AnimationScheduler::new();
         timeline.request_next_frame(start + Duration::from_millis(25), &mut scheduler);
         assert!(scheduler.take_request());
+    }
+
+    #[test]
+    fn a_repeating_definition_stays_active_when_it_is_part_of_a_chain() {
+        let start = Instant::now();
+        let timeline = AnimationTimeline::new(
+            vec![
+                Animation::new(Duration::from_millis(10)).repeat(),
+                Animation::new(Duration::from_millis(10)),
+            ],
+            start,
+        )
+        .expect("definitions");
+
+        let sample = timeline.sample_at(start + Duration::from_millis(25));
+        assert_eq!(sample.animation_index, 0);
+        assert!(!sample.finished);
+        assert_eq!(sample.progress, 0.5);
+    }
+
+    #[test]
+    fn active_animation_metadata_survives_as_a_description_property() {
+        let description = div()
+            .bg([1.0, 0.0, 0.0, 1.0])
+            .with_animation(
+                "active",
+                Animation::new(Duration::from_secs(1)).repeat(),
+                |element, progress| element.opacity(progress),
+            )
+            .describe_after(Duration::from_millis(100));
+
+        assert!(description.has_active_animation());
+    }
+
+    #[test]
+    fn finished_animation_does_not_keep_the_frame_loop_alive() {
+        let description = div()
+            .bg([1.0, 0.0, 0.0, 1.0])
+            .with_animation(
+                "finished",
+                Animation::new(Duration::from_millis(10)),
+                |element, progress| element.opacity(progress),
+            )
+            .describe_after(Duration::from_millis(10));
+
+        assert!(!description.has_active_animation());
     }
 
     #[test]

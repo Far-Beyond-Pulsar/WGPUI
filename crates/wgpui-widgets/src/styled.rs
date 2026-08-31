@@ -51,12 +51,12 @@ use crate::div::interactivity::style::{
 };
 pub use wgpui_core::color::LinearColorStop;
 use wgpui_core::color::{Background, ColorSpace, Hsla, Rgba};
-use wgpui_core::geometry::{DefiniteLength, Pixels, Rems, px};
+use wgpui_core::geometry::{AbsoluteLength, DefiniteLength, Pixels, Rems, px};
 use wgpui_layout::taffy_tree::{
     AlignContent, AlignItems, Dimension, Display, FlexDirection, FlexWrap, LayoutStyle,
     LengthPercentage, LengthPercentageAuto, Overflow, Position,
 };
-use wgpui_text::shaping::FontWeight;
+use wgpui_text::shaping::{FontWeight, SharedString};
 
 /// One `rem`, in pixels.
 ///
@@ -66,6 +66,19 @@ use wgpui_text::shaping::FontWeight;
 /// scale methods below resolve against this constant; a `rem`-aware surface is
 /// the alias crate's problem, not this file's.
 pub const REM: f32 = 16.0;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextOverflow {
+    Truncate(SharedString),
+}
 
 pub trait IntoStylePixels {
     fn into_style_pixels(self) -> f32;
@@ -91,6 +104,15 @@ impl IntoStylePixels for DefiniteLength {
                 wgpui_core::geometry::AbsoluteLength::Rems(rems) => rems.0 * REM,
             },
             DefiniteLength::Fraction(fraction) => fraction * REM,
+        }
+    }
+}
+
+impl IntoStylePixels for AbsoluteLength {
+    fn into_style_pixels(self) -> f32 {
+        match self {
+            AbsoluteLength::Pixels(pixels) => pixels.value(),
+            AbsoluteLength::Rems(rems) => rems.0 * REM,
         }
     }
 }
@@ -148,6 +170,12 @@ impl IntoStyleDimension for DefiniteLength {
             },
             DefiniteLength::Fraction(fraction) => Dimension::percent(fraction),
         }
+    }
+}
+
+impl IntoStyleDimension for AbsoluteLength {
+    fn into_style_dimension(self) -> Dimension {
+        Dimension::length(self.into_style_pixels())
     }
 }
 
@@ -311,6 +339,11 @@ pub trait Styled: Sized {
         self
     }
 
+    fn flex_wrap_reverse(mut self) -> Self {
+        self.layout_style().flex_wrap = FlexWrap::WrapReverse;
+        self
+    }
+
     /// `flex-wrap: nowrap`.
     fn flex_nowrap(mut self) -> Self {
         self.layout_style().flex_wrap = FlexWrap::NoWrap;
@@ -335,6 +368,14 @@ pub trait Styled: Sized {
         self
     }
 
+    fn flex_initial(mut self) -> Self {
+        let style = self.layout_style();
+        style.flex_grow = 0.0;
+        style.flex_shrink = 1.0;
+        style.flex_basis = Dimension::auto();
+        self
+    }
+
     /// `flex: none`.
     fn flex_none(mut self) -> Self {
         let style = self.layout_style();
@@ -346,6 +387,11 @@ pub trait Styled: Sized {
     /// `flex-shrink: 0`.
     fn flex_shrink_0(mut self) -> Self {
         self.layout_style().flex_shrink = 0.0;
+        self
+    }
+
+    fn flex_shrink(mut self) -> Self {
+        self.layout_style().flex_shrink = 1.0;
         self
     }
 
@@ -436,6 +482,11 @@ pub trait Styled: Sized {
 
     fn overflow_x_scroll(mut self) -> Self {
         self.layout_style().overflow.x = Overflow::Scroll;
+        self
+    }
+
+    fn scrollbar_width(mut self, width: impl IntoStylePixels) -> Self {
+        self.layout_style().scrollbar_width = width.into_style_pixels();
         self
     }
 
@@ -538,6 +589,11 @@ pub trait Styled: Sized {
         self
     }
 
+    fn content_normal(mut self) -> Self {
+        self.layout_style().align_content = None;
+        self
+    }
+
     fn self_center(mut self) -> Self {
         self.layout_style().align_self = Some(AlignItems::Center);
         self
@@ -553,6 +609,21 @@ pub trait Styled: Sized {
         self
     }
 
+    fn self_flex_start(mut self) -> Self {
+        self.layout_style().align_self = Some(AlignItems::FlexStart);
+        self
+    }
+
+    fn self_flex_end(mut self) -> Self {
+        self.layout_style().align_self = Some(AlignItems::FlexEnd);
+        self
+    }
+
+    fn self_baseline(mut self) -> Self {
+        self.layout_style().align_self = Some(AlignItems::Baseline);
+        self
+    }
+
     fn self_stretch(mut self) -> Self {
         self.layout_style().align_self = Some(AlignItems::Stretch);
         self
@@ -560,6 +631,20 @@ pub trait Styled: Sized {
 
     fn basis(mut self, pixels: impl IntoStyleDimension) -> Self {
         self.layout_style().flex_basis = pixels.into_style_dimension();
+        self
+    }
+
+    fn flex_basis(self, pixels: impl IntoStyleDimension) -> Self {
+        self.basis(pixels)
+    }
+
+    fn aspect_ratio(mut self, ratio: f32) -> Self {
+        self.layout_style().aspect_ratio = Some(ratio);
+        self
+    }
+
+    fn aspect_square(mut self) -> Self {
+        self.layout_style().aspect_ratio = Some(1.0);
         self
     }
 
@@ -687,6 +772,22 @@ pub trait Styled: Sized {
         self
     }
 
+    fn mt(self, pixels: impl IntoStylePixels) -> Self {
+        self.m_t(pixels)
+    }
+
+    fn mr(self, pixels: impl IntoStylePixels) -> Self {
+        self.m_r(pixels)
+    }
+
+    fn mb(self, pixels: impl IntoStylePixels) -> Self {
+        self.m_b(pixels)
+    }
+
+    fn ml(self, pixels: impl IntoStylePixels) -> Self {
+        self.m_l(pixels)
+    }
+
     /// Top padding.
     fn pt(mut self, pixels: impl IntoStylePixels) -> Self {
         self.layout_style().padding.top = LengthPercentage::length(pixels.into_style_pixels());
@@ -811,6 +912,19 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Blur the pixels already rendered behind this element.
+    fn backdrop_blur(mut self, radius: impl IntoStylePixels) -> Self {
+        let radius = radius.into_style_pixels();
+        self.style().backdrop_blur = radius.is_finite().then_some(radius.max(0.0));
+        self
+    }
+
+    /// Disable backdrop filtering.
+    fn backdrop_blur_none(mut self) -> Self {
+        self.style().backdrop_blur = None;
+        self
+    }
+
     /// Set the element opacity using the spelling used by the native examples.
     fn with_opacity(self, opacity: f32) -> Self {
         self.opacity(opacity)
@@ -921,6 +1035,14 @@ pub trait Styled: Sized {
         self
     }
 
+    fn border_x(self, pixels: impl IntoStylePixels + Copy) -> Self {
+        self.border_l(pixels).border_r(pixels)
+    }
+
+    fn border_y(self, pixels: impl IntoStylePixels + Copy) -> Self {
+        self.border_t(pixels).border_b(pixels)
+    }
+
     fn border_t_1(self) -> Self {
         self.border_t(1.0)
     }
@@ -934,7 +1056,10 @@ pub trait Styled: Sized {
         self.border_l(1.0)
     }
     fn border_y_1(self) -> Self {
-        self.border_t_1().border_b_1()
+        self.border_y(1.0)
+    }
+    fn border_x_1(self) -> Self {
+        self.border_x(1.0)
     }
     fn border_l_3(self) -> Self {
         self.border_l(3.0)
@@ -1113,22 +1238,36 @@ pub trait Styled: Sized {
         self
     }
 
-    fn text_gradient_horizontal(mut self, from: LinearColorStop, to: LinearColorStop) -> Self {
+    fn text_gradient(
+        mut self,
+        angle: f32,
+        from: impl Into<LinearColorStop>,
+        to: impl Into<LinearColorStop>,
+    ) -> Self {
+        let from = from.into();
+        let to = to.into();
         self.style().text_gradient = Some(vec![
             (from.color.into(), from.percentage),
             (to.color.into(), to.percentage),
         ]);
-        self.style().text_gradient_angle = Some(90.0);
+        self.style().text_gradient_angle = Some(angle);
         self
     }
 
-    fn text_gradient_vertical(mut self, from: LinearColorStop, to: LinearColorStop) -> Self {
-        self.style().text_gradient = Some(vec![
-            (from.color.into(), from.percentage),
-            (to.color.into(), to.percentage),
-        ]);
-        self.style().text_gradient_angle = Some(180.0);
-        self
+    fn text_gradient_horizontal(
+        self,
+        from: impl Into<LinearColorStop>,
+        to: impl Into<LinearColorStop>,
+    ) -> Self {
+        self.text_gradient(90.0, from, to)
+    }
+
+    fn text_gradient_vertical(
+        self,
+        from: impl Into<LinearColorStop>,
+        to: impl Into<LinearColorStop>,
+    ) -> Self {
+        self.text_gradient(180.0, from, to)
     }
 
     fn text_size(mut self, size: impl IntoStylePixels) -> Self {
@@ -1154,13 +1293,25 @@ pub trait Styled: Sized {
     fn text_2xl(self) -> Self {
         self.text_size(24.0)
     }
-    fn text_center(mut self) -> Self {
-        self.style().text_alignment = 1;
+    fn text_align(mut self, align: TextAlign) -> Self {
+        self.style().text_alignment = match align {
+            TextAlign::Left => 0,
+            TextAlign::Center => 1,
+            TextAlign::Right => 2,
+        };
         self
     }
-    fn text_right(mut self) -> Self {
-        self.style().text_alignment = 2;
-        self
+
+    fn text_left(self) -> Self {
+        self.text_align(TextAlign::Left)
+    }
+
+    fn text_center(self) -> Self {
+        self.text_align(TextAlign::Center)
+    }
+
+    fn text_right(self) -> Self {
+        self.text_align(TextAlign::Right)
     }
     fn font_weight(mut self, weight: FontWeight) -> Self {
         self.style().text_weight = Some(weight);
@@ -1193,8 +1344,20 @@ pub trait Styled: Sized {
         self
     }
 
+    fn whitespace_normal(mut self) -> Self {
+        self.style().text_white_space_nowrap = false;
+        self
+    }
+
     fn text_ellipsis(mut self) -> Self {
         self.style().text_ellipsis = true;
+        self
+    }
+
+    fn text_overflow(mut self, overflow: TextOverflow) -> Self {
+        match overflow {
+            TextOverflow::Truncate(_) => self.style().text_ellipsis = true,
+        }
         self
     }
 

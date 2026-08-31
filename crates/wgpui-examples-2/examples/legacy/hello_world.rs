@@ -1,6 +1,6 @@
 use wgpui::{
-    App, Application, Bounds, Context, SharedString, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    App, Application, Bounds, SharedString, WindowBounds, WindowOptions, div, prelude::*, px, rgb,
+    size,
 };
 
 struct HelloWorld {
@@ -8,7 +8,7 @@ struct HelloWorld {
 }
 
 impl Render for HelloWorld {
-    fn render(&mut self) -> impl IntoElement {
+    fn render(&mut self) -> impl IntoElement + 'static {
         div()
             .flex()
             .flex_col()
@@ -87,9 +87,9 @@ impl Render for HelloWorld {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(500.), px(500.0)), cx);
-        cx.open_window(
+    if let Err(error) = Application::new().run(|cx: &mut App| {
+        let bounds = Bounds::centered(None::<()>, size(px(500.), px(500.0)), cx);
+        if let Err(error) = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
@@ -99,8 +99,13 @@ fn main() {
                     text: "World".into(),
                 })
             },
-        )
-        .unwrap();
+        ) {
+            eprintln!("failed to open hello-world window: {error}");
+            cx.quit();
+            return;
+        }
         cx.activate(true);
-    });
+    }) {
+        eprintln!("native application failed: {error}");
+    }
 }

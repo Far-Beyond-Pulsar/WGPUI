@@ -47,6 +47,8 @@ use wgpui_core::scene::atlas::{
     AtlasEviction, AtlasKey, AtlasKind, GlyphRasterKey, ImageRasterKey, ImageTile, ImageTileSource,
     RasterizedGlyph, RasterizedImage,
 };
+#[cfg(feature = "devtools")]
+use wgpui_devtools::{AtlasPackingSnapshot, AtlasPageRecord, AtlasPlacementRecord, SnapshotLimits};
 
 /// Side length of a page, in texels, when the atlas opens one.
 ///
@@ -341,6 +343,44 @@ impl GlyphAtlas {
             tiles: self.tiles_by_key.len(),
             ..self.stats
         }
+    }
+
+    #[cfg(feature = "devtools")]
+    pub fn resource_snapshot(&self, limits: SnapshotLimits) -> AtlasPackingSnapshot {
+        let pages = self
+            .pages
+            .iter()
+            .map(|page| AtlasPageRecord {
+                page_id: page.index,
+                kind: atlas_kind_tag(page.kind),
+                width: self.page_size,
+                height: self.page_size,
+                live_tiles: match self.live_tiles_in_page(page.index) {
+                    Some(count) => u32::try_from(count).unwrap_or(u32::MAX),
+                    None => 0,
+                },
+            })
+            .collect();
+        let mut placements = self
+            .tiles_by_key
+            .values()
+            .filter_map(|placement| {
+                let page_id = placement.tile.page()?;
+                let slot = placement.tile.slot()?;
+                let tile_id = page_id.checked_shl(24)?.checked_add(slot)?;
+                Some(AtlasPlacementRecord {
+                    tile_id,
+                    page_id,
+                    kind: atlas_kind_tag(placement.kind),
+                    x: placement.origin[0] as u32,
+                    y: placement.origin[1] as u32,
+                    width: placement.size[0] as u32,
+                    height: placement.size[1] as u32,
+                })
+            })
+            .collect::<Vec<_>>();
+        placements.sort_unstable_by_key(|placement| placement.tile_id);
+        AtlasPackingSnapshot::new(pages, placements, limits)
     }
 
     /// Where `key`'s raster lives, if it is resident.
@@ -787,6 +827,14 @@ impl GlyphAtlas {
             .iter()
             .find(|page| page.index == page_index)
             .map(|page| page.live)
+    }
+}
+
+#[cfg(feature = "devtools")]
+const fn atlas_kind_tag(kind: AtlasKind) -> u8 {
+    match kind {
+        AtlasKind::Monochrome => 0,
+        AtlasKind::Polychrome => 1,
     }
 }
 

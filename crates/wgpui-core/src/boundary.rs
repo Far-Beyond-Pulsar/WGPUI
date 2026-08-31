@@ -19,11 +19,15 @@
 //! [`crate::invalidation::reason::Reason`].
 
 pub mod compositor;
+pub mod diagnostics;
 pub mod identity;
 pub mod nested;
 pub mod policy;
 
 pub use compositor::{BoundaryComposite, BoundaryState, Composite, Compositor, TiledVisit};
+pub use diagnostics::{
+    DamagePlan, DamageRegion, DebugCapture, DebugRoot, DebugRootInput, DebugSnapshot, DebugTile,
+};
 pub use identity::BoundaryIdentity;
 pub use nested::{
     ClipChange, Damage, DamageReason, HierarchicalTileKey, ScrollRootConfig, ScrollRootId,

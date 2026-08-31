@@ -1,21 +1,15 @@
 use wgpui::{
-    App, Application, Bounds, Context, FocusHandle, KeyBinding, Window, WindowBounds,
-    WindowOptions, actions, div, prelude::*, px, rgb, size,
+    App, Application, Bounds, EntityFactory, KeyBinding, WindowBounds, WindowOptions, actions, div,
+    prelude::*, px, rgb, size,
 };
 
 actions!(example, [CloseWindow]);
 
-struct ExampleWindow {
-    focus_handle: FocusHandle,
-}
+struct ExampleWindow {}
 
 impl Render for ExampleWindow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self) -> impl IntoElement + 'static {
         div()
-            .on_action(|_: &CloseWindow, window, _| {
-                window.remove_window();
-            })
-            .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
             .gap_3()
@@ -35,8 +29,9 @@ impl Render for ExampleWindow {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        let mut bounds = Bounds::centered(None, size(px(500.), px(500.0)), cx);
+    if let Err(error) = Application::new().run(|cx: &mut App| {
+        let mut bounds = Bounds::centered(None::<()>, size(px(500.), px(500.0)), cx);
+        cx.on_action(|_: &CloseWindow, cx| cx.request_close());
 
         cx.bind_keys([KeyBinding::new("cmd-w", CloseWindow, None)]);
         cx.on_window_closed(|cx, _window_id| {
@@ -46,37 +41,31 @@ fn main() {
         })
         .detach();
 
-        cx.open_window(
+        if let Err(error) = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |window, cx| {
-                cx.activate(false);
-                cx.new(|cx| {
-                    let focus_handle = cx.focus_handle();
-                    focus_handle.focus(window, cx);
-                    ExampleWindow { focus_handle }
-                })
-            },
-        )
-        .unwrap();
+            |_, cx| cx.new(|_| ExampleWindow {}),
+        ) {
+            eprintln!("failed to open first window: {error}");
+            cx.quit();
+            return;
+        }
 
         bounds.origin.x += bounds.size.width;
 
-        cx.open_window(
+        if let Err(error) = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |window, cx| {
-                cx.new(|cx| {
-                    let focus_handle = cx.focus_handle();
-                    focus_handle.focus(window, cx);
-                    ExampleWindow { focus_handle }
-                })
-            },
-        )
-        .unwrap();
-    });
+            |_, cx| cx.new(|_| ExampleWindow {}),
+        ) {
+            eprintln!("failed to open second window: {error}");
+            cx.quit();
+        }
+    }) {
+        eprintln!("native application failed: {error}");
+    }
 }

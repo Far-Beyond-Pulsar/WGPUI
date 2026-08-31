@@ -10,12 +10,14 @@ path = "src/wgpui_wgpu.rs"
 doctest = false
 
 [dependencies]
+arboard = "3.6.1"
  wgpui-devtools = { path = "../wgpui-devtools", optional = true }
 # Phase 3's compute passes dispatch shader source and consume input encodings
 # that wgpui-core owns (§3.1: "shader source as text, buffer/binding layout
 # descriptors as plain Rust structs"). The edge runs one way only — wgpui-core
 # names nothing here, and cannot, since it is forbidden a live device.
 wgpui-core = { path = "../wgpui-core" }
+wgpui-http-client = { path = "../wgpui-http-client" }
 # Phase 6's `window/frame_loop.rs` drives the whole of §2's picture, which means
 # it holds the `LayoutTree` the reconciler builds and `Emitter::emit` reads.
 # `wgpui-core` already depends on this crate for exactly that type; naming it
@@ -81,6 +83,8 @@ rand = "0.10"
 # rasterization alongside the production renderer in one process.
 wgpui-text = { path = "../wgpui-text" }
 lyon = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [features]
 default = []

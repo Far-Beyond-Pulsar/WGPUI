@@ -5,11 +5,12 @@ edition = "2024"
 publish = false
 
 [lib]
-path = "src/wgpui.rs"
+path = "src/lib.rs"
 doctest = false
 
 [dependencies]
 wgpui-core = { path = "../wgpui-core" }
+wgpui-http-client = { path = "../wgpui-http-client" }
 wgpui-layout = { path = "../wgpui-layout" }
 wgpui-text = { path = "../wgpui-text" }
 wgpui-wgpu = { path = "../wgpui-wgpu" }

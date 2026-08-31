@@ -48,7 +48,7 @@ use wgpui_core::occlusion::{
     CoverageItem, PoisonRegion, encode_coverage_items, encode_poison_regions, quad_coverage_item,
 };
 use wgpui_core::ordering::encode_ordering_items;
-use wgpui_core::patch::primitive::{PrimitiveKind, Quad};
+use wgpui_core::patch::primitive::{Primitive, PrimitiveKind, Quad, Shadow, ShadowClip};
 use wgpui_core::scene::atlas::AtlasKind;
 use wgpui_core::scene::layer::LayerId;
 use wgpui_core::scene::{Scene, UploadRange};
@@ -70,6 +70,9 @@ use crate::render::pipelines::{
     PolySpritePipeline, QuadPipeline, ShadowPipeline, TARGET_FORMAT, UnderlinePipeline,
 };
 use crate::render::readback::{ReadbackError, StagingReader, read_texture_rgba8};
+use crate::render::resources::{
+    NativeResourceDimensions, NativeResourceId, NativeResourceRegistry, NativeResourceRole,
+};
 use crate::render::surface_registry::SurfaceRegistry;
 use crate::render::textures::external_surface::{
     CompositeConsumer, CompositePlan, plan_composites,
@@ -105,8 +108,9 @@ impl std::fmt::Display for FrameError {
                 formatter,
                 "backdrop filtering requires a copyable render-target texture"
             ),
-            FrameError::DebugOverlayUnavailable =>
-                write!(formatter, "tile refresh diagnostics could not be prepared"),
+            FrameError::DebugOverlayUnavailable => {
+                write!(formatter, "tile refresh diagnostics could not be prepared")
+            }
         }
     }
 }
@@ -241,6 +245,15 @@ pub struct OffscreenTarget {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
+    resource_registry: NativeResourceRegistry,
+    resource_id: NativeResourceId,
+}
+
+impl Drop for OffscreenTarget {
+    fn drop(&mut self) {
+        self.resource_registry
+            .evict(self.resource_id, self.resource_registry.current_frame());
+    }
 }
 
 impl OffscreenTarget {
@@ -264,11 +277,32 @@ impl OffscreenTarget {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let resource_registry = NativeResourceRegistry;
+        let resource_id = resource_registry.register_texture(
+            "frame target",
+            NativeResourceRole::Surface,
+            NativeResourceDimensions {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            &format!("{TARGET_FORMAT:?}"),
+            u64::from(width.max(1))
+                .saturating_mul(u64::from(height.max(1)))
+                .saturating_mul(u64::from(TARGET_FORMAT.block_copy_size(None).unwrap_or(4))),
+            (wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC)
+                .bits() as u64,
+            0,
+        );
         OffscreenTarget {
             texture,
             view,
             width: width.max(1),
             height: height.max(1),
+            resource_registry,
+            resource_id,
         }
     }
 
@@ -354,6 +388,7 @@ pub struct RenderTarget<'a> {
 
 /// Everything a frame needs that outlives one: pipelines, arenas, pools.
 pub struct FrameRenderer {
+    frame: u64,
     ordering: OrderingPass,
     occlusion: OcclusionPass,
     indirect: IndirectArgsPass,
@@ -431,7 +466,11 @@ pub struct FrameRenderer {
     /// texture view which a destroyed page invalidates.
     page_params: HashMap<u32, wgpu::Buffer>,
     reader: StagingReader,
-    uploaded_generation: Option<u64>,
+    /// Identity of the scene whose resident bytes currently occupy the GPU
+    /// arenas. Upload ranges are deltas within one scene; they cannot describe
+    /// the first frame of a different scene, even when the two scenes happen
+    /// to have equal-sized arenas.
+    uploaded_scene: Option<usize>,
     backdrop_snapshot: Option<wgpu::Texture>,
     backdrop_snapshot_view: Option<wgpu::TextureView>,
     backdrop_sampler: wgpu::Sampler,
@@ -444,6 +483,8 @@ pub struct FrameRenderer {
     debug_buffer_capacity: u64,
     debug_bind_group: Option<wgpu::BindGroup>,
     debug_tiles: Vec<DebugTile>,
+    #[cfg(feature = "devtools")]
+    capture: Option<crate::render::capture::GpuCaptureAdapter>,
 }
 
 impl FrameRenderer {
@@ -454,6 +495,7 @@ impl FrameRenderer {
         let (debug_bind_group_layout, debug_pipeline) = create_debug_pipeline(device);
         let debug_buffer_capacity = std::mem::size_of::<DebugTile>() as u64;
         FrameRenderer {
+            frame: 0,
             ordering: OrderingPass::new(device),
             occlusion: OcclusionPass::new(device),
             indirect: IndirectArgsPass::new(device),
@@ -501,7 +543,7 @@ impl FrameRenderer {
             backdrop_plan_builds: 0,
             page_params: HashMap::new(),
             reader: StagingReader::new(),
-            uploaded_generation: None,
+            uploaded_scene: None,
             backdrop_snapshot: None,
             backdrop_snapshot_view: None,
             backdrop_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
@@ -528,7 +570,38 @@ impl FrameRenderer {
             debug_buffer_capacity,
             debug_bind_group: None,
             debug_tiles: Vec::new(),
+            #[cfg(feature = "devtools")]
+            capture: None,
         }
+    }
+
+    /// Arm one capture for the next rendered frame.
+    #[cfg(feature = "devtools")]
+    pub fn arm_capture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        request: crate::render::capture::CaptureRequest,
+    ) -> Result<(), crate::render::capture::CaptureError> {
+        let capture = self
+            .capture
+            .get_or_insert_with(|| crate::render::capture::GpuCaptureAdapter::new(device, queue));
+        capture.arm(device, request)
+    }
+
+    /// Poll a capture's delayed timestamp results without blocking rendering.
+    #[cfg(feature = "devtools")]
+    pub fn poll_capture(&mut self, device: &wgpu::Device) -> Result<(), crate::render::capture::CaptureError> {
+        let Some(capture) = self.capture.as_mut() else {
+            return Ok(());
+        };
+        capture.poll(device)
+    }
+
+    /// Take the most recently frozen capture, if one was armed.
+    #[cfg(feature = "devtools")]
+    pub fn take_capture(&mut self) -> Option<crate::render::capture::GpuCapture> {
+        self.capture.as_mut()?.take_capture()
     }
 
     /// Set transient diagnostic rectangles for the next render.
@@ -797,12 +870,16 @@ impl FrameRenderer {
         damage: Option<Rect>,
     ) -> Result<FrameOutput, FrameError> {
         #[cfg(feature = "devtools")]
+        wgpui_devtools::begin_global_backend_frame();
+        #[cfg(feature = "devtools")]
         let _instrumentation_span = {
             static HOOKS: std::sync::OnceLock<wgpui_devtools::hooks::DevtoolsHooks> =
                 std::sync::OnceLock::new();
             let hooks = HOOKS.get_or_init(Default::default);
             wgpui_core::hooks::Span::new(hooks, "frame: render")
         };
+        self.frame = self.frame.saturating_add(1);
+        NativeResourceRegistry.begin_frame(self.frame);
         self.textures.begin_frame();
         let mut timing = FrameTiming::default();
         let upload_calls_before = self.scene_upload_calls();
@@ -846,6 +923,8 @@ impl FrameRenderer {
         let sprite_resident = input.scene.poly_sprites.resident_bytes();
         let path_resident = input.scene.paths.resident_bytes();
         let backdrop_resident = input.scene.backdrop_filters.resident_bytes();
+        let scene_identity = input.scene as *const Scene as usize;
+        let scene_changed = self.uploaded_scene != Some(scene_identity);
         let shadows_grew = self
             .shadow_arena
             .reserve(device, shadow_resident.len() as u64);
@@ -863,15 +942,16 @@ impl FrameRenderer {
         let backdrops_grew = self
             .backdrop_arena
             .reserve(device, backdrop_resident.len() as u64);
-        if shadows_grew
+        let upload_all = shadows_grew
             || grew
             || underlines_grew
             || glyphs_grew
             || sprites_grew
             || paths_grew
             || backdrops_grew
-            || self.uploaded_generation.is_none()
-        {
+            || scene_changed
+            || matches!(input.dirty, Dirty::All);
+        if upload_all {
             self.shadow_arena.upload_all(device, queue, shadow_resident);
             self.arena.upload_all(device, queue, resident);
             self.underline_arena
@@ -881,7 +961,7 @@ impl FrameRenderer {
             self.path_arena.upload_all(device, queue, path_resident);
             self.backdrop_arena
                 .upload_all(device, queue, backdrop_resident);
-            self.uploaded_generation = Some(0);
+            self.uploaded_scene = Some(scene_identity);
         } else {
             // Filtered by kind rather than handed the whole list: an
             // `UploadRange` is a byte span *within one kind's arena*, so
@@ -932,6 +1012,12 @@ impl FrameRenderer {
                 &kind_uploads(input.uploads, PrimitiveKind::BackdropFilter),
             );
         }
+        upload_shadow_clips(
+            self.shadow_arena.buffer(),
+            queue,
+            input.scene,
+            if upload_all { Dirty::All } else { input.dirty },
+        );
         queue.write_buffer(
             &self.globals,
             0,
@@ -1555,12 +1641,75 @@ impl FrameRenderer {
             self.atlas_page_bind_groups(device, queue, input.atlas, AtlasKind::Polychrome);
         let composite_frame_group = self.composite.frame_bind_group(device, &self.globals);
 
+        #[cfg(feature = "devtools")]
+        let capture_frame = self.capture.as_mut().and_then(|capture| capture.begin_frame());
+        #[cfg(feature = "devtools")]
+        let capture_resources = if capture_frame.is_some() {
+            self.capture.as_mut().map(|capture| {
+                let pipelines = [
+                    "damage clear",
+                    "shadows",
+                    "quads",
+                    "paths",
+                    "underlines",
+                    "glyphs",
+                    "sprites",
+                    "composites",
+                ]
+                .into_iter()
+                .filter_map(|label| {
+                    capture.register_resource(
+                        crate::render::capture::ResourceKind::Pipeline,
+                        label,
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+                let bind_groups = [
+                    "frame bind groups",
+                    "slot-base bind groups",
+                    "atlas-page bind groups",
+                ]
+                .into_iter()
+                .filter_map(|label| {
+                    capture.register_resource(
+                        crate::render::capture::ResourceKind::BindGroup,
+                        label,
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+                let arguments = capture.register_resource(
+                    crate::render::capture::ResourceKind::Buffer,
+                    "indirect arguments",
+                    None,
+                );
+                (pipelines, bind_groups, arguments)
+            })
+        } else {
+            None
+        };
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
+        let scissor = damage.map(|damage| scissor_rect(damage, target.width, target.height));
+        #[cfg(feature = "devtools")]
+        let capture_scope = self.capture.as_mut().and_then(|capture| {
+            capture.record_begin_render_pass(
+                "frame",
+                Vec::new(),
+                [0, 0, target.width, target.height],
+                scissor,
+            );
+            capture.write_timestamp_scope(
+                &mut encoder,
+                "frame",
+                crate::render::capture::Attribution::Unknown,
+            )
+        });
         let debug_tiles = self.debug_tiles.clone();
         let mut stats;
-        let scissor = damage.map(|damage| scissor_rect(damage, target.width, target.height));
         if scissor.is_some_and(|[_, _, width, height]| width > 0 && height > 0) {
             let clear_color = [
                 target.clear.r as f32,
@@ -1605,6 +1754,20 @@ impl FrameRenderer {
                 pass.set_pipeline(&self.damage_clear_pipeline);
                 pass.set_bind_group(0, &self.damage_clear_bind_group, &[]);
                 pass.draw(0..3, 0..1);
+            }
+            #[cfg(feature = "devtools")]
+            if let Some((pipelines, bind_groups, arguments)) = capture_resources.as_ref()
+                && let Some(capture) = self.capture.as_mut()
+            {
+                for pipeline in pipelines {
+                    capture.record_set_pipeline(*pipeline);
+                }
+                for (index, bind_group) in bind_groups.iter().enumerate() {
+                    capture.record_set_bind_group(index as u32, *bind_group, &[]);
+                }
+                if let Some(arguments) = arguments {
+                    capture.record_multi_draw_indirect(*arguments, 0, 1, None);
+                }
             }
             let started = Instant::now();
             // First, and under everything: `PrimitiveKind::ALL` declares
@@ -1738,11 +1901,28 @@ impl FrameRenderer {
                 };
                 pass.set_pipeline(&self.debug_pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
-                pass.draw(0..4, 0..u32::try_from(debug_tiles.len()).unwrap_or(u32::MAX));
+                pass.draw(
+                    0..4,
+                    0..u32::try_from(debug_tiles.len()).unwrap_or(u32::MAX),
+                );
             }
             timing.draw_issue = started.elapsed();
         }
+        #[cfg(feature = "devtools")]
+        if let Some(capture) = self.capture.as_mut() {
+            capture.end_timestamp_scope(&mut encoder, capture_scope);
+            capture.record_end_render_pass();
+            capture.resolve_readback(device, &mut encoder);
+            capture.record_submit(1);
+        }
         queue.submit(Some(encoder.finish()));
+        #[cfg(feature = "devtools")]
+        if capture_frame.is_some()
+            && let Some(capture) = self.capture.as_mut()
+        {
+            capture.start_readback_maps();
+            capture.finish_frame();
+        }
         self.shadow_plan = Some(shadow_plan);
         self.quad_plan = Some(quad_plan);
         self.underline_plan = Some(underline_plan);
@@ -1878,7 +2058,7 @@ fn create_debug_pipeline(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu:
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
                     min_binding_size: std::num::NonZeroU64::new(
-                        std::mem::size_of::<DebugTile>() as u64,
+                        std::mem::size_of::<DebugTile>() as u64
                     ),
                 },
                 count: None,
@@ -1943,6 +2123,50 @@ fn layer_shadow_bounds(scene: &Scene, layer: LayerId) -> Vec<Rect> {
             translate_rect(Rect::from_origin_size(origin, size), translation)
         })
         .collect()
+}
+
+/// Upload inherited shadow clips only for layers whose scene bytes were part of
+/// this frame's upload. Clean retained frames therefore do no clip work.
+fn upload_shadow_clips(
+    buffer: &wgpu::Buffer,
+    queue: &wgpu::Queue,
+    scene: &Scene,
+    dirty: Dirty<'_>,
+) {
+    if dirty.is_empty() {
+        return;
+    }
+    for layer in scene.layers.ids() {
+        if !dirty.contains(layer) {
+            continue;
+        }
+        let range = scene.shadows.slab(layer);
+        for (ordinal, key) in scene.shadows.keys(layer).into_iter().enumerate() {
+            let clip = scene
+                .shadow_clips
+                .get(layer, key)
+                .copied()
+                .unwrap_or(ShadowClip::UNCLIPPED);
+            let Some(offset) = usize::try_from(range.base)
+                .ok()
+                .and_then(|base| base.checked_add(ordinal))
+                .and_then(|slot| slot.checked_mul(Shadow::SLOT_STRIDE))
+            else {
+                continue;
+            };
+            let Some(offset) = offset.checked_add(64) else {
+                continue;
+            };
+            let Some(offset) = u64::try_from(offset).ok() else {
+                continue;
+            };
+            let mut bytes = [0u8; 16];
+            for (index, value) in clip.origin.into_iter().chain(clip.size).enumerate() {
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            queue.write_buffer(buffer, offset, &bytes);
+        }
+    }
 }
 
 /// One layer's underlines as bounding rectangles, in arena slot order.

@@ -57,14 +57,17 @@ impl WrappedLine {
     /// which is the difference between a wrapped paragraph's box and the box it
     /// would have needed unwrapped.
     pub fn size(&self, line_height: f32) -> [f32; 2] {
-        let mut widest: f32 = 0.0;
-        for (start, end) in self.visual_ranges() {
-            let width = self.advance_between(start, end);
-            if width > widest {
-                widest = width;
-            }
-        }
-        [widest, line_height * self.visual_line_count() as f32]
+        let widths = self.visual_line_widths(None);
+        [widths.iter().copied().fold(0.0, f32::max), line_height * widths.len() as f32]
+    }
+
+    /// The widths of the visual lines, optionally limited to a line clamp.
+    pub fn visual_line_widths(&self, max_lines: Option<usize>) -> Vec<f32> {
+        self.visual_ranges()
+            .into_iter()
+            .take(max_lines.unwrap_or(usize::MAX))
+            .map(|(start, end)| self.advance_between(start, end))
+            .collect()
     }
 
     /// The byte range of each visual line, in order.
@@ -126,8 +129,24 @@ impl WrappedLine {
         line_height: f32,
         tiles: &mut dyn GlyphTileSource,
     ) -> Vec<GlyphRun> {
+        self.glyph_runs_limited(placement, line_height, tiles, None)
+    }
+
+    /// Convert only the first `max_lines` visual lines to patch payloads.
+    pub fn glyph_runs_limited(
+        &self,
+        placement: RunPlacement,
+        line_height: f32,
+        tiles: &mut dyn GlyphTileSource,
+        max_lines: Option<usize>,
+    ) -> Vec<GlyphRun> {
         let mut runs = Vec::new();
-        for (line_number, (start, end)) in self.visual_ranges().into_iter().enumerate() {
+        for (line_number, (start, end)) in self
+            .visual_ranges()
+            .into_iter()
+            .take(max_lines.unwrap_or(usize::MAX))
+            .enumerate()
+        {
             let Some(fragment) = self.fragment(start, end) else {
                 continue;
             };
@@ -255,6 +274,16 @@ mod tests {
             "the box must be the wrapped width, not the unwrapped one: {width}"
         );
         assert_eq!(height, 40.0);
+    }
+
+    #[test]
+    fn visual_line_widths_respect_a_line_clamp() {
+        let wrapped = WrappedLine::new(shaped("aa bb cc dd"), "aa bb cc dd", 30.0);
+        let all = wrapped.visual_line_widths(None);
+        let first_two = wrapped.visual_line_widths(Some(2));
+
+        assert!(all.len() > 2);
+        assert_eq!(first_two, all[..2]);
     }
 
     #[test]

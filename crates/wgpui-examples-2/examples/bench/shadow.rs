@@ -1,5 +1,5 @@
 use wgpui::{
-    App, Application, Bounds, BoxShadow, Context, Div, SharedString, Window, WindowBounds,
+    App, Application, ApplicationError, Bounds, BoxShadow, Div, SharedString, WindowBounds,
     WindowOptions, div, hsla, point, prelude::*, px, relative, rgb, size,
 };
 
@@ -84,7 +84,7 @@ fn example(label: impl Into<SharedString>, example: impl IntoElement) -> impl In
 }
 
 impl Render for Shadow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self) -> impl IntoElement + 'static {
         div()
             .id("shadow-example")
             .overflow_y_scroll()
@@ -568,9 +568,9 @@ impl Render for Shadow {
     }
 }
 
-fn main() {
+fn main() -> Result<(), ApplicationError> {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1000.0), px(800.0)), cx);
+        let bounds = Bounds::centered(None::<()>, size(px(1000.0), px(800.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -581,5 +581,5 @@ fn main() {
         .unwrap();
 
         cx.activate(true);
-    });
+    })
 }

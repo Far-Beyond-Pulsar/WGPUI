@@ -45,6 +45,7 @@ pub mod application;
 pub use crate::debug::{PerformanceDebug, TileRefreshFlash};
 pub mod frame_loop;
 pub mod resize_detector;
+pub mod surface;
 
 use std::sync::Arc;
 
@@ -204,8 +205,8 @@ pub struct SurfaceStats {
 fn present_mode(
     capabilities: &wgpu::SurfaceCapabilities,
 ) -> Result<wgpu::PresentMode, WindowError> {
-    const PREFERENCE: [wgpu::PresentMode; 2] =
-        [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox];
+    const PREFERENCE: [wgpu::PresentMode; 3] =
+        [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo];
     PREFERENCE
         .into_iter()
         .find(|mode| capabilities.present_modes.contains(mode))
@@ -463,6 +464,8 @@ impl WindowSurface {
         self.window.pre_present_notify();
         queue.present(texture);
         self.stats.presents += 1;
+        #[cfg(feature = "devtools")]
+        wgpui_devtools::present_global_backend_frame();
     }
 }
 

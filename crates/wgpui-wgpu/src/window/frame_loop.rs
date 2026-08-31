@@ -30,24 +30,31 @@
 //! The resulting glyph runs still enter the ordinary retained patch protocol;
 //! no text-specific draw path bypasses reconciliation.
 
-use wgpui_core::boundary::compositor::{Composite, CompositeEntry, TiledVisit};
-use wgpui_core::geometry::Rect;
+use wgpui_core::boundary::compositor::{
+    Composite, CompositeEntry, CompositeSource, TiledVisit, visible_composites,
+};
+use wgpui_core::geometry::{Pixels, Rect};
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::invalidation::request::FrameSignals;
 use wgpui_core::patch::PatchError;
 use wgpui_core::patch::apply::apply;
 use wgpui_core::patch::emit::{Emission, Emit, EmitContext, EmitError, Emitter, FrameEmission};
-use wgpui_core::patch::primitive::{Glyph, GlyphRun, Material, Quad};
-use wgpui_core::reconcile::description::{Description, DescriptionInteraction, RawText};
+use wgpui_core::patch::primitive::{Glyph, GlyphRun, Material, Quad, Underline};
+use wgpui_core::reconcile::description::{
+    Description, DescriptionInteraction, RawText, TextDecoration, TextOptions,
+};
 use wgpui_core::reconcile::diff_key::{ReconcileKey, compare_by_equality};
+use wgpui_core::reconcile::instance::InstanceKey;
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
 use wgpui_core::reconcile::walk::shared_walk;
 use wgpui_core::scene::Scene;
 use wgpui_core::scene::layer::LayerId;
 use wgpui_core::scene::tile::TileCoord;
+use wgpui_core::window::ScrollRootHandle;
 use wgpui_layout::taffy_tree::{
-    Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree, definite,
+    BoxSizing, Dimension, Display, FlexDirection, LayoutSize, LayoutStyle, LayoutTree,
+    LengthPercentage, definite,
 };
 
 use crate::debug::{DebugTile, PerformanceDebug};
@@ -57,13 +64,18 @@ use crate::render::draw::DrawMode;
 use crate::render::frame::{
     Dirty, FrameError, FrameInput, FrameOutput, FrameRenderer, OffscreenTarget, RenderTarget,
 };
+use crate::render::surface_registry::SurfaceRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
-use wgpui_text::patch::{RunPlacement, glyph_runs};
+use wgpui_text::line::WrappedLine;
+use wgpui_text::line_layout::x_for_index;
+use wgpui_text::patch::RunPlacement;
 use wgpui_text::raster::GlyphRasterizer;
-use wgpui_text::shaping::{FontRun, SharedString, TextShaper};
+use wgpui_text::shaping::{
+    Font, FontRun, FontStyle, FontWeight, ShapedLine, SharedString, TextShaper,
+};
 
 /// Why a frame could not be produced.
 #[derive(Debug)]
@@ -144,8 +156,8 @@ pub struct LoopFrame {
     /// The GPU half.
     pub frame: FrameOutput,
     pub interactions: Vec<InteractionRegistration>,
-    /// Whether the native handler should schedule another frame for a fading
-    /// diagnostic overlay.
+    /// Whether the native handler should schedule another frame for an active
+    /// animation or a fading diagnostic overlay.
     pub needs_redraw: bool,
 }
 
@@ -154,7 +166,30 @@ pub struct InteractionRegistration {
     pub address: wgpui_core::reconcile::instance::InstanceKey,
     pub bounds: Rect,
     pub order: u64,
+    pub parent: Option<usize>,
+    pub focus: Option<wgpui_core::window::FocusHandle>,
     pub interaction: DescriptionInteraction,
+    pub scroll_root: Option<ScrollRootRegistration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScrollRootRegistration {
+    pub handle: ScrollRootHandle,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct WalkFrame {
+    origin: [f32; 2],
+    layout_origin: [f32; 2],
+    scroll_offset: [f32; 2],
+    clip: Option<Rect>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct WalkNode {
+    bounds: Rect,
+    layout_bounds: Rect,
+    visible_bounds: Rect,
 }
 
 impl LoopFrame {
@@ -226,26 +261,40 @@ pub struct FrameLoop {
     last_viewport: Option<[f32; 2]>,
     viewport_recomputes: u64,
     tile_flash_frames: HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), u32>,
-    tile_refresh_rates:
-        HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), TileRefreshRate>,
+    tile_refresh_rates: HashMap<(wgpui_core::scene::layer::BoundaryId, TileCoord), TileRefreshRate>,
     damage_refresh_regions: Vec<DamageRefreshRegion>,
     interaction_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     scale_factor: f32,
+    surface_registry: Arc<SurfaceRegistry>,
+    automatic_scroll_roots: HashMap<InstanceKey, ScrollRootHandle>,
 }
 
 #[derive(Clone)]
 struct PreparedText {
+    paragraphs: Arc<Vec<PreparedParagraph>>,
+}
+
+#[derive(Clone)]
+struct PreparedParagraph {
+    text: Arc<str>,
+    line: Arc<ShapedLine>,
+}
+
+struct RenderedText {
     width: f32,
     height: f32,
-    baseline: f32,
-    runs: Arc<Vec<CoreGlyphRun>>,
+    runs: Vec<CoreGlyphRun>,
+    underlines: Vec<Underline>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct TextCacheKey {
     value: Arc<str>,
     font_size_bits: u32,
+    weight: u16,
+    italic: bool,
+    letter_spacing_bits: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -301,6 +350,8 @@ impl FrameLoop {
             interaction_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             scale_factor: 1.0,
+            surface_registry: Arc::new(SurfaceRegistry::new()),
+            automatic_scroll_roots: HashMap::new(),
         }
     }
 
@@ -345,6 +396,13 @@ impl FrameLoop {
     /// Update the opt-in diagnostics used by subsequent frames.
     pub fn set_performance_debug(&mut self, debug: PerformanceDebug) {
         self.performance_debug = debug;
+    }
+
+    /// Use the registry owned by the native window for external surface
+    /// composites. Keeping this on the frame loop makes surface lookup part of
+    /// the same retained frame transaction as scene rendering.
+    pub fn set_surface_registry(&mut self, registry: Arc<SurfaceRegistry>) {
+        self.surface_registry = registry;
     }
 
     /// Mark a hitbox region whose hover state changed. This is consumed by the
@@ -461,8 +519,9 @@ impl FrameLoop {
         description: Description,
         input: &LoopInput<'_>,
     ) -> Result<LoopFrame, LoopError> {
+        let active_animation = description.has_active_animation();
         let mut description = description;
-        self.materialize_raw_text(&mut description)?;
+        self.materialize_raw_text(&mut description, Some((input.target.width.max(1)) as f32))?;
         let mut plan = self.reconciler.reconcile(description, &mut self.layout)?;
         let root = plan
             .root()
@@ -473,10 +532,44 @@ impl FrameLoop {
         self.layout
             .compute_layout(root, definite(width, height))
             .map_err(EmitError::from)?;
+        let mut layout_changed = false;
+        for index in 0..plan.nodes().len() {
+            let Some(mut callback) = plan.take_layout_callback(index) else {
+                continue;
+            };
+            let node = plan.nodes().get(index).ok_or(LoopError::NoRoot)?;
+            let bounds = self
+                .layout
+                .layout_of(node.layout_node)
+                .map_err(EmitError::from)?;
+            let mut content = wgpui_layout::taffy_tree::LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.width,
+                height: bounds.height,
+            };
+            for child in self
+                .layout
+                .children(node.layout_node)
+                .map_err(EmitError::from)?
+            {
+                let child_bounds = self.layout.layout_of(child).map_err(EmitError::from)?;
+                content.width = content.width.max(child_bounds.x + child_bounds.width);
+                content.height = content.height.max(child_bounds.y + child_bounds.height);
+            }
+            layout_changed |= callback.apply_with_content(bounds, content);
+        }
+        self.prime_scroll_offsets(&mut plan);
+        let walk = self.collect_walk(&plan)?;
+        let (scroll_roots, offsets_changed) = self.update_scroll_roots(&mut plan, &walk);
+        if offsets_changed {
+            self.prime_scroll_offsets(&mut plan);
+        }
         let interactions = self.collect_interactions(
             &mut plan,
             input.signals,
             Rect::from_origin_size([0.0, 0.0], [width, height]),
+            scroll_roots,
         )?;
         let emission = self
             .emitter
@@ -490,6 +583,32 @@ impl FrameLoop {
             self.viewport_recomputes += 1;
         }
         let interaction_dirty_regions = self.interaction_dirty_regions.clone();
+        let mut composite_entries = input.composites.to_vec();
+        composite_entries.extend(emission.external_surfaces.iter().copied());
+        let visible_composites = visible_composites(&composite_entries);
+        let external_damage_regions: Vec<Rect> = emission
+            .external_surfaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, composite)| {
+                let CompositeSource::External(id) = composite.source else {
+                    return None;
+                };
+                let visible = visible_composites
+                    .get(input.composites.len() + index)
+                    .copied()
+                    .unwrap_or(true);
+                if !visible {
+                    return None;
+                }
+                self.surface_registry
+                    .has_unconsumed_frame(crate::render::surface_registry::SurfaceId::from_raw(
+                        id.as_raw(),
+                    ))
+                    .then(|| composite.visible())
+            })
+            .filter(|region| !region.is_empty())
+            .collect();
         let transform_only = emission
             .composites
             .iter()
@@ -500,6 +619,7 @@ impl FrameLoop {
             Rect::from_origin_size([0.0, 0.0], viewport),
             viewport_changed,
             &interaction_dirty_regions,
+            &external_damage_regions,
         );
         self.interaction_dirty_regions.clear();
         let debug_damage = debug_tiles.iter().fold(None, |damage, tile| {
@@ -511,9 +631,12 @@ impl FrameLoop {
                 ),
             ))
         });
-        let has_debug_damage = debug_damage.is_some();
-        let needs_redraw = !debug_tiles.is_empty();
+        let needs_redraw = active_animation || layout_changed || !debug_tiles.is_empty();
         self.renderer.set_debug_tiles(debug_tiles);
+        let external_damage = external_damage_regions
+            .iter()
+            .copied()
+            .fold(None, |damage, region| Some(union_damage(damage, region)));
         let can_preserve_presentation = input
             .target
             .source
@@ -532,6 +655,9 @@ impl FrameLoop {
             if let Some(debug_damage) = debug_damage {
                 damage = Some(union_damage(damage, debug_damage));
             }
+            if let Some(external_damage) = external_damage {
+                damage = Some(union_damage(damage, external_damage));
+            }
             Some(damage.unwrap_or(Rect::EMPTY))
         };
 
@@ -542,18 +668,14 @@ impl FrameLoop {
             scene: &self.scene,
             clip: Rect::from_origin_size([0.0, 0.0], [width, height]),
             poison: &[],
-            dirty: if viewport_changed
-                || transform_only
-                || has_debug_damage
-                || !can_preserve_presentation
-            {
+            dirty: if viewport_changed || transform_only || !can_preserve_presentation {
                 Dirty::All
             } else {
                 Dirty::Some(&dirty_layers)
             },
             uploads: uploads.entries(),
-            composites: input.composites,
-            registry: None,
+            composites: &composite_entries,
+            registry: Some(&self.surface_registry),
             atlas: input.atlas.or(owned_atlas),
             viewport: [width, height],
             mode: input.mode,
@@ -611,6 +733,7 @@ impl FrameLoop {
         viewport: Rect,
         viewport_changed: bool,
         interaction_dirty_regions: &[Rect],
+        external_damage_regions: &[Rect],
     ) -> Vec<DebugTile> {
         if !flash.enabled {
             self.tile_flash_frames.clear();
@@ -646,7 +769,10 @@ impl FrameLoop {
                 let key = (visit.boundary, *tile);
                 let tile_rect = screen_tile_rect(visit, *tile);
                 let presentation_changed = viewport_changed
-                    || emission.damage.iter().any(|region| region.intersects(&tile_rect));
+                    || emission
+                        .damage
+                        .iter()
+                        .any(|region| region.intersects(&tile_rect));
                 let interaction_changed = interaction_dirty_regions
                     .iter()
                     .any(|region| region.intersects(&tile_rect));
@@ -656,6 +782,9 @@ impl FrameLoop {
                     self.record_tile_refresh(key, now);
                 }
             }
+        }
+        for region in external_damage_regions.iter().copied() {
+            self.record_damage_refresh(region, flash.duration_frames.max(1), now);
         }
         if self.tile_flash_frames.is_empty() && self.damage_refresh_regions.is_empty() {
             return Vec::new();
@@ -729,13 +858,16 @@ impl FrameLoop {
         key: (wgpui_core::scene::layer::BoundaryId, TileCoord),
         now: Instant,
     ) {
-        let rate = self.tile_refresh_rates.entry(key).or_insert(TileRefreshRate {
-            window_start: now,
-            samples: 0,
-            updates: 0,
-            frames_per_second: 0.0,
-            regular: false,
-        });
+        let rate = self
+            .tile_refresh_rates
+            .entry(key)
+            .or_insert(TileRefreshRate {
+                window_start: now,
+                samples: 0,
+                updates: 0,
+                frames_per_second: 0.0,
+                regular: false,
+            });
         rate.samples = rate.samples.saturating_add(1);
         rate.updates = rate.updates.saturating_add(1);
         let elapsed = now.duration_since(rate.window_start).as_secs_f32();
@@ -784,13 +916,21 @@ impl FrameLoop {
         plan: &mut wgpui_core::reconcile::plan::FramePlan,
         signals: &FrameSignals,
         viewport: Rect,
+        scroll_roots: HashMap<InstanceKey, ScrollRootRegistration>,
     ) -> Result<Vec<InteractionRegistration>, LoopError> {
         let walked =
             shared_walk(plan, &self.layout, signals, Some(viewport)).map_err(EmitError::from)?;
         let mut result = Vec::new();
+        let mut ancestors = Vec::<Option<usize>>::new();
         for index in 0..plan.nodes().len() {
             let node = plan.nodes()[index];
-            if let Some(interaction) = plan.take_interaction(index) {
+            let depth = usize::try_from(node.depth).unwrap_or(usize::MAX);
+            ancestors.truncate(depth);
+            let parent = ancestors.iter().rev().find_map(|candidate| *candidate);
+            ancestors.push(None);
+            let scroll_root = scroll_roots.get(&node.address).cloned();
+            let interaction = plan.take_interaction(index);
+            if interaction.is_some() || scroll_root.is_some() {
                 let geometry = walked.get(index).ok_or(LoopError::NoRoot)?;
                 let visible_bounds = geometry.visible_bounds;
                 if !visible_bounds.is_empty() {
@@ -798,113 +938,615 @@ impl FrameLoop {
                         address: node.address,
                         bounds: visible_bounds,
                         order: index as u64,
-                        interaction,
+                        parent,
+                        focus: interaction.as_ref().and_then(|interaction| interaction.focus_handle()),
+                        interaction: interaction.unwrap_or_else(|| {
+                            DescriptionInteraction::new(|_, _, _| {
+                                wgpui_core::window::EventResult::IGNORED
+                            })
+                        }),
+                        scroll_root,
                     });
+                    if let Some(ancestor) = ancestors.get_mut(depth) {
+                        *ancestor = Some(result.len() - 1);
+                    }
                 }
             }
         }
         Ok(result)
     }
 
-    fn materialize_raw_text(&mut self, description: &mut Description) -> Result<(), LoopError> {
-        self.materialize_raw_text_with_metrics(description, None, None)
+    fn prime_scroll_offsets(&self, plan: &mut wgpui_core::reconcile::plan::FramePlan) {
+        for index in 0..plan.nodes().len() {
+            if !plan.has_automatic_scroll(index) {
+                continue;
+            }
+            let address = plan.nodes()[index].address;
+            let Some(handle) = self.automatic_scroll_roots.get(&address) else {
+                continue;
+            };
+            plan.set_scroll_offset(
+                index,
+                [handle.offset().x.value(), handle.offset().y.value()],
+            );
+        }
     }
 
-    fn materialize_raw_text_with_metrics(
+    fn collect_walk(
+        &self,
+        plan: &wgpui_core::reconcile::plan::FramePlan,
+    ) -> Result<Vec<WalkNode>, LoopError> {
+        let mut frames = Vec::<WalkFrame>::new();
+        let mut result = Vec::with_capacity(plan.nodes().len());
+        for node in plan.nodes() {
+            let rectangle = self
+                .layout
+                .layout_of(node.layout_node)
+                .map_err(EmitError::from)?;
+            frames.truncate(node.depth as usize);
+            let parent = frames.last().copied().unwrap_or_default();
+            let layout_origin = [
+                parent.layout_origin[0] + rectangle.x,
+                parent.layout_origin[1] + rectangle.y,
+            ];
+            let origin = [
+                parent.origin[0] + parent.scroll_offset[0] + rectangle.x,
+                parent.origin[1] + parent.scroll_offset[1] + rectangle.y,
+            ];
+            let bounds = Rect::from_origin_size(origin, [rectangle.width, rectangle.height]);
+            let layout_bounds = Rect::from_origin_size(
+                layout_origin,
+                [rectangle.width, rectangle.height],
+            );
+            let visible_bounds = parent
+                .clip
+                .map_or(bounds, |clip| bounds.intersect(&clip));
+            let clip = if node.clip_children {
+                Some(parent.clip.map_or(bounds, |parent| bounds.intersect(&parent)))
+            } else {
+                parent.clip
+            };
+            result.push(WalkNode {
+                bounds,
+                layout_bounds,
+                visible_bounds,
+            });
+            frames.push(WalkFrame {
+                origin,
+                layout_origin,
+                scroll_offset: node.scroll_offset,
+                clip,
+            });
+        }
+        Ok(result)
+    }
+
+    fn update_scroll_roots(
+        &mut self,
+        plan: &mut wgpui_core::reconcile::plan::FramePlan,
+        walk: &[WalkNode],
+    ) -> (HashMap<InstanceKey, ScrollRootRegistration>, bool) {
+        let mut active = HashMap::new();
+        let mut offsets_changed = false;
+        for index in 0..plan.nodes().len() {
+            let node = plan.nodes()[index];
+            let axes = plan.scroll_axes(index).unwrap_or([false, false]);
+            if !plan.has_automatic_scroll(index) || axes == [false, false] {
+                continue;
+            }
+            let Some(geometry) = walk.get(index) else {
+                continue;
+            };
+            let content_size = self.content_size(index, plan, walk);
+            let handle = self
+                .automatic_scroll_roots
+                .entry(node.address)
+                .or_insert_with(|| ScrollRootHandle::new(axes))
+                .clone();
+            handle.set_viewport(
+                wgpui_core::geometry::size(
+                    Pixels(geometry.bounds.width()),
+                    Pixels(geometry.bounds.height()),
+                ),
+                wgpui_core::geometry::size(Pixels(content_size[0]), Pixels(content_size[1])),
+                axes,
+            );
+            offsets_changed |= plan.set_scroll_offset(
+                index,
+                [handle.offset().x.value(), handle.offset().y.value()],
+            );
+            if !geometry.visible_bounds.is_empty()
+                && axes.iter().enumerate().any(|(axis, enabled)| {
+                    *enabled
+                        && content_size[axis]
+                            > [geometry.bounds.width(), geometry.bounds.height()][axis]
+                })
+            {
+                active.insert(node.address, ScrollRootRegistration { handle });
+            }
+        }
+        self.automatic_scroll_roots
+            .retain(|address, _| plan.nodes().iter().any(|node| node.address == *address));
+        (active, offsets_changed)
+    }
+
+    fn content_size(
+        &self,
+        root_index: usize,
+        plan: &wgpui_core::reconcile::plan::FramePlan,
+        walk: &[WalkNode],
+    ) -> [f32; 2] {
+        let Some(root) = walk.get(root_index) else {
+            return [0.0, 0.0];
+        };
+        let root_depth = plan.nodes()[root_index].depth;
+        let mut content_size = [root.bounds.width(), root.bounds.height()];
+        let mut index = root_index + 1;
+        while let Some(node) = plan.nodes().get(index) {
+            if node.depth <= root_depth {
+                break;
+            }
+            let bounds = &walk[index].layout_bounds;
+            content_size[0] = content_size[0].max(bounds.max_x - root.layout_bounds.min_x);
+            content_size[1] = content_size[1].max(bounds.max_y - root.layout_bounds.min_y);
+            index += 1;
+        }
+        content_size
+    }
+
+    fn materialize_raw_text(
         &mut self,
         description: &mut Description,
-        inherited_size: Option<f32>,
-        inherited_color: Option<[f32; 4]>,
+        inherited_width: Option<f32>,
     ) -> Result<(), LoopError> {
+        let inherited_options = TextOptions::default();
+        self.materialize_raw_text_with_options(description, &inherited_options, inherited_width)
+    }
+
+    fn materialize_raw_text_with_options(
+        &mut self,
+        description: &mut Description,
+        inherited: &TextOptions,
+        inherited_width: Option<f32>,
+    ) -> Result<(), LoopError> {
+        let mut options = merge_text_options(inherited, description.text_options_value());
+        let (legacy_size, legacy_color) = description.text_metrics_value();
+        options.size = options.size.or(legacy_size);
+        options.color = options.color.or(legacy_color);
+        let available_width = resolve_text_width(description, inherited_width);
+
         if let Some(raw) = description.take_raw_text() {
             let value = raw.shared_value();
-            let (local_size, local_color) = description.text_metrics_value();
-            let font_size = local_size.or(inherited_size);
-            let color = local_color.or(inherited_color);
-            let font_size = font_size
-                .filter(|size| size.is_finite() && *size > 0.0)
-                .unwrap_or(14.0)
-                * self.scale_factor;
+            let font_size = valid_text_size(options.size) * self.scale_factor;
+            let weight = options.weight.unwrap_or(400);
+            let italic = options.italic.unwrap_or(false);
+            let letter_spacing = options.letter_spacing.unwrap_or(0.0) * font_size;
             let key = TextCacheKey {
                 value: Arc::clone(&value),
                 font_size_bits: font_size.to_bits(),
+                weight,
+                italic,
+                letter_spacing_bits: letter_spacing.to_bits(),
             };
             let prepared = match self.prepared_text.get(&key).cloned() {
                 Some(prepared) => prepared,
-                None => self.prepare_text(raw, font_size)?,
+                None => self.prepare_text(
+                    raw,
+                    font_size,
+                    FontWeight(weight as f32),
+                    italic,
+                    letter_spacing,
+                )?,
             };
-            let text_color = color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            let runs = Arc::new(
-                prepared
-                    .runs
-                    .iter()
-                    .map(|run| {
-                        let mut run = run.clone();
-                        run.color = text_color;
-                        run
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let baseline = prepared.baseline;
-            description.set_intrinsic_size(prepared.width, prepared.height);
+            let layout_width = available_width.filter(|width| width.is_finite() && *width > 0.0);
+            let rendered = self.layout_text(&prepared, &options, layout_width)?;
+            description.set_intrinsic_size(rendered.width, rendered.height);
+            let runs = Arc::new(rendered.runs);
+            let underlines = Arc::new(rendered.underlines);
             description.set_text_emitter(move |context: &EmitContext, emission: &mut Emission| {
+                for underline in underlines.iter() {
+                    let mut positioned = *underline;
+                    positioned.origin[0] += context.bounds.x;
+                    positioned.origin[1] += context.bounds.y;
+                    emission.underline(positioned);
+                }
                 for run in runs.iter() {
                     let mut positioned = run.clone();
                     for glyph in &mut positioned.glyphs {
                         glyph.position[0] += context.bounds.x;
-                        glyph.position[1] += context.bounds.y + baseline;
+                        glyph.position[1] += context.bounds.y;
                     }
                     emission.glyph_run(positioned);
                 }
             });
         }
-        let (local_size, local_color) = description.text_metrics_value();
-        let effective_size = local_size.or(inherited_size);
-        let effective_color = local_color.or(inherited_color);
+
         for child in description.child_descriptions_mut() {
-            self.materialize_raw_text_with_metrics(child, effective_size, effective_color)?;
+            self.materialize_raw_text_with_options(child, &options, available_width)?;
         }
         Ok(())
     }
 
-    fn prepare_text(&mut self, raw: RawText, font_size: f32) -> Result<PreparedText, LoopError> {
+    fn layout_text(
+        &mut self,
+        prepared: &PreparedText,
+        options: &TextOptions,
+        available_width: Option<f32>,
+    ) -> Result<RenderedText, LoopError> {
+        let font_size = valid_text_size(options.size) * self.scale_factor;
+        let default_line_height =
+            (font_size * 1.618_034).max(prepared.paragraphs.first().map_or(0.0, |paragraph| {
+                paragraph.line.ascent + paragraph.line.descent
+            }));
+        let line_height = options
+            .line_height
+            .filter(|height| height.is_finite() && *height > 0.0)
+            .unwrap_or(default_line_height);
+        let nowrap = options.nowrap.unwrap_or(false);
+        let max_lines = options.line_clamp.filter(|lines| *lines > 0);
+        let text_color = options.color.unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        let mut output_runs = Vec::new();
+        let mut output_underlines = Vec::new();
+        let mut block_width: f32 = 0.0;
+        let mut block_height: f32 = 0.0;
+        let mut visual_lines = 0usize;
+
+        for paragraph in prepared.paragraphs.iter() {
+            if max_lines.is_some_and(|limit| visual_lines >= limit) {
+                break;
+            }
+            let mut paragraph_text = Arc::clone(&paragraph.text);
+            let mut paragraph_line = Arc::clone(&paragraph.line);
+            if options.ellipsis.unwrap_or(false)
+                && max_lines.is_none()
+                && let Some(width) = available_width
+                && paragraph_line.width > width
+            {
+                let truncated = self.truncate_line(
+                    paragraph_text.as_ref(),
+                    &paragraph_line,
+                    width,
+                    font_size,
+                    options,
+                )?;
+                paragraph_text = truncated.0;
+                paragraph_line = truncated.1;
+            }
+            let wrapped = if nowrap || available_width.is_none() {
+                WrappedLine::unwrapped(paragraph_line.clone())
+            } else {
+                WrappedLine::new(
+                    paragraph_line.clone(),
+                    paragraph_text.as_ref(),
+                    available_width.unwrap_or(0.0),
+                )
+            };
+            let remaining_lines = max_lines.map(|limit| limit.saturating_sub(visual_lines));
+            let widths = wrapped.visual_line_widths(remaining_lines);
+            let paragraph_width = widths.iter().copied().fold(0.0, f32::max);
+            let alignment_width = available_width.unwrap_or(paragraph_width);
+            block_width = block_width.max(paragraph_width);
+            let baseline = (line_height - paragraph_line.ascent - paragraph_line.descent).max(0.0)
+                * 0.5
+                + paragraph_line.ascent;
+            let line_offset = if options.alignment == Some(1) {
+                (alignment_width - paragraph_width).max(0.0) * 0.5
+            } else if options.alignment == Some(2) {
+                (alignment_width - paragraph_width).max(0.0)
+            } else {
+                0.0
+            };
+            let mut source = AtlasTileSource::new(&mut self.text_atlas, |key| {
+                self.text_rasterizer
+                    .rasterize(&mut self.text_shaper, key)
+                    .ok()
+            });
+            let runs = wrapped.glyph_runs_limited(
+                RunPlacement {
+                    origin: [line_offset, baseline],
+                    color: text_color,
+                    ..RunPlacement::default()
+                },
+                line_height,
+                &mut source,
+                remaining_lines,
+            );
+            let rendered_lines = widths.len();
+            output_runs.extend(colorize_glyph_runs(
+                runs,
+                options.gradient.as_deref(),
+                options.gradient_angle,
+                paragraph_width,
+                line_height * rendered_lines as f32,
+                baseline,
+                text_color,
+            ));
+
+            if rendered_lines > 0 {
+                if let Some(decoration) = options.underline {
+                    for line_number in 0..rendered_lines {
+                        output_underlines.push(underline_for_line(
+                            decoration,
+                            line_offset,
+                            widths.get(line_number).copied().unwrap_or(0.0),
+                            baseline
+                                + line_number as f32 * line_height
+                                + paragraph_line.descent * 0.618,
+                            text_color,
+                        ));
+                    }
+                }
+                if let Some(decoration) = options.strikethrough {
+                    for line_number in 0..rendered_lines {
+                        output_underlines.push(underline_for_line(
+                            decoration,
+                            line_offset,
+                            widths.get(line_number).copied().unwrap_or(0.0),
+                            baseline + line_number as f32 * line_height
+                                - (paragraph_line.ascent + paragraph_line.descent) * 0.5,
+                            text_color,
+                        ));
+                    }
+                }
+            }
+            visual_lines += rendered_lines;
+            block_height += rendered_lines as f32 * line_height;
+        }
+
+        Ok(RenderedText {
+            width: block_width,
+            height: block_height,
+            runs: output_runs,
+            underlines: output_underlines,
+        })
+    }
+
+    fn truncate_line(
+        &mut self,
+        text: &str,
+        line: &Arc<ShapedLine>,
+        width: f32,
+        font_size: f32,
+        options: &TextOptions,
+    ) -> Result<(Arc<str>, Arc<ShapedLine>), LoopError> {
+        let Some(font_id) = line.runs.first().map(|run| run.font_id) else {
+            return Ok((Arc::from(""), Arc::clone(line)));
+        };
+        let mut suffix_run = FontRun::new("…".len(), font_id);
+        suffix_run.weight = FontWeight(options.weight.unwrap_or(400) as f32);
+        suffix_run.style = if options.italic.unwrap_or(false) {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        };
+        suffix_run.letter_spacing = options.letter_spacing.unwrap_or(0.0) * font_size;
+        let suffix = self
+            .text_shaper
+            .shape_line(&SharedString::from("…"), font_size, &[suffix_run])
+            .map_err(|error| LoopError::Text(error.to_string()))?;
+        let suffix_width = suffix.width;
+        let mut keep = 0usize;
+        for (index, _) in text.char_indices() {
+            if x_for_index(line, index) + suffix_width <= width {
+                keep = index;
+            }
+        }
+        if x_for_index(line, text.len()) + suffix_width <= width {
+            keep = text.len();
+        }
+        let mut candidate = text[..keep].to_owned();
+        candidate.push('…');
+        let candidate_shared = SharedString::from(candidate);
+        let mut run = FontRun::new(candidate_shared.len(), font_id);
+        run.weight = suffix_run.weight;
+        run.style = suffix_run.style;
+        run.letter_spacing = options.letter_spacing.unwrap_or(0.0) * font_size;
+        let shaped = self
+            .text_shaper
+            .shape_line(&candidate_shared, font_size, &[run])
+            .map_err(|error| LoopError::Text(error.to_string()))?;
+        Ok((Arc::from(candidate_shared.as_str()), shaped))
+    }
+
+    fn prepare_text(
+        &mut self,
+        raw: RawText,
+        font_size: f32,
+        weight: FontWeight,
+        italic: bool,
+        letter_spacing: f32,
+    ) -> Result<PreparedText, LoopError> {
         let value = raw.shared_value();
-        let shared = SharedString::from(value.as_ref());
-        let font = wgpui_text::shaping::font("Segoe UI");
+        let font = Font {
+            family: SharedString::from("Segoe UI"),
+            weight,
+            style: if italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
+            ..Font::default()
+        };
         let font_id = self
             .text_shaper
             .resolve_font(&font)
             .map_err(|error| LoopError::Text(error.to_string()))?;
-        let font_runs = vec![FontRun::new(shared.len(), font_id)];
-        let line = self
-            .text_shaper
-            .shape_line(&shared, font_size, &font_runs)
-            .map_err(|error| LoopError::Text(error.to_string()))?;
-        let placement = RunPlacement {
-            color: [1.0, 1.0, 1.0, 1.0],
-            ..RunPlacement::default()
-        };
-        let mut source = AtlasTileSource::new(&mut self.text_atlas, |key| {
-            self.text_rasterizer
-                .rasterize(&mut self.text_shaper, key)
-                .ok()
-        });
-        let (converted, _) = glyph_runs(&line, placement, &mut source);
-        let height = 20.0_f32.max(line.ascent + line.descent);
-        let prepared = PreparedText {
-            width: line.width,
-            height,
-            baseline: (height - line.ascent - line.descent) * 0.5 + line.ascent,
-            runs: Arc::new(converted),
-        };
+        let mut lines = Vec::new();
+        for paragraph in value.split('\n') {
+            let shared = SharedString::from(paragraph);
+            let mut run = FontRun::new(shared.len(), font_id);
+            run.weight = weight;
+            run.style = font.style;
+            run.letter_spacing = letter_spacing;
+            let line = self
+                .text_shaper
+                .shape_line(&shared, font_size, &[run])
+                .map_err(|error| LoopError::Text(error.to_string()))?;
+            lines.push(PreparedParagraph {
+                text: Arc::from(paragraph),
+                line,
+            });
+        }
+        let paragraphs = Arc::new(lines);
+        let prepared = PreparedText { paragraphs };
         self.prepared_text.insert(
             TextCacheKey {
                 value,
                 font_size_bits: font_size.to_bits(),
+                weight: weight.0 as u16,
+                italic,
+                letter_spacing_bits: letter_spacing.to_bits(),
             },
             prepared.clone(),
         );
         Ok(prepared)
+    }
+}
+
+fn valid_text_size(size: Option<f32>) -> f32 {
+    size.filter(|size| size.is_finite() && *size > 0.0)
+        .unwrap_or(14.0)
+}
+
+fn merge_text_options(parent: &TextOptions, local: &TextOptions) -> TextOptions {
+    TextOptions {
+        size: local.size.or(parent.size),
+        line_height: local.line_height.or(parent.line_height),
+        color: local.color.or(parent.color),
+        weight: local.weight.or(parent.weight),
+        italic: local.italic.or(parent.italic),
+        alignment: local.alignment.or(parent.alignment),
+        nowrap: local.nowrap.or(parent.nowrap),
+        ellipsis: local.ellipsis.or(parent.ellipsis),
+        line_clamp: local.line_clamp.or(parent.line_clamp),
+        letter_spacing: local.letter_spacing.or(parent.letter_spacing),
+        underline: local.underline.or(parent.underline),
+        strikethrough: local.strikethrough.or(parent.strikethrough),
+        gradient: local.gradient.clone().or_else(|| parent.gradient.clone()),
+        gradient_angle: local.gradient_angle.or(parent.gradient_angle),
+    }
+}
+
+fn resolve_text_width(description: &Description, inherited_width: Option<f32>) -> Option<f32> {
+    let dimension = description.layout_style().size.width;
+    let width = if dimension.is_auto() {
+        inherited_width
+    } else if dimension.tag() == Dimension::length(0.0).tag() {
+        let width = dimension.value();
+        width.is_finite().then_some(width).filter(|width| *width > 0.0)
+    } else if dimension.tag() == Dimension::percent(0.0).tag() {
+        let percent = dimension.value();
+        inherited_width
+            .map(|width| width * percent)
+            .filter(|width| width.is_finite() && *width > 0.0)
+    } else {
+        inherited_width
+    }?;
+
+    let content_width = if description.layout_style().box_sizing == BoxSizing::BorderBox {
+        width - horizontal_box_insets(description.layout_style())
+    } else {
+        width
+    };
+    content_width.is_finite().then_some(content_width.max(0.0))
+}
+
+fn horizontal_box_insets(style: &LayoutStyle) -> f32 {
+    [
+        style.padding.left,
+        style.padding.right,
+        style.border.left,
+        style.border.right,
+    ]
+    .into_iter()
+    .map(fixed_length)
+    .sum()
+}
+
+fn fixed_length(value: LengthPercentage) -> f32 {
+    let raw = value.into_raw();
+    (raw.tag() == LengthPercentage::length(0.0).into_raw().tag())
+        .then_some(raw.value())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(0.0)
+}
+
+fn gradient_color(stops: &[([f32; 4], f32)], mut position: f32, fallback: [f32; 4]) -> [f32; 4] {
+    if stops.is_empty() {
+        return fallback;
+    }
+    position = position.clamp(0.0, 1.0);
+    let mut ordered = stops.to_vec();
+    ordered.sort_by(|left, right| left.1.total_cmp(&right.1));
+    if position <= ordered[0].1 {
+        return ordered[0].0;
+    }
+    for pair in ordered.windows(2) {
+        let (left, right) = (pair[0], pair[1]);
+        if position <= right.1 {
+            let range = (right.1 - left.1).max(f32::EPSILON);
+            let amount = ((position - left.1) / range).clamp(0.0, 1.0);
+            return std::array::from_fn(|channel| {
+                left.0[channel] + (right.0[channel] - left.0[channel]) * amount
+            });
+        }
+    }
+    ordered.last().map_or(fallback, |stop| stop.0)
+}
+
+fn colorize_glyph_runs(
+    runs: Vec<CoreGlyphRun>,
+    stops: Option<&[([f32; 4], f32)]>,
+    angle: Option<f32>,
+    width: f32,
+    height: f32,
+    origin_y: f32,
+    fallback: [f32; 4],
+) -> Vec<CoreGlyphRun> {
+    let Some(stops) = stops else {
+        return runs;
+    };
+    let denominator = width.max(1.0);
+    let vertical_denominator = height.max(1.0);
+    let vertical = angle.is_some_and(|angle| (angle.abs() - 180.0).abs() < 45.0);
+    let mut output = Vec::new();
+    for run in runs {
+        for glyph in run.glyphs {
+            let position = if vertical {
+                (glyph.position[1] - origin_y) / vertical_denominator
+            } else {
+                glyph.position[0] / denominator
+            };
+            output.push(CoreGlyphRun {
+                color: gradient_color(stops, position, fallback),
+                glyphs: vec![glyph],
+            });
+        }
+    }
+    output
+}
+
+fn underline_for_line(
+    decoration: TextDecoration,
+    x: f32,
+    width: f32,
+    y: f32,
+    fallback: [f32; 4],
+) -> Underline {
+    let thickness = decoration.thickness.max(1.0);
+    Underline {
+        origin: [x, y],
+        size: [
+            width,
+            if decoration.wavy {
+                thickness * 3.0
+            } else {
+                thickness
+            },
+        ],
+        color: decoration.color.unwrap_or(fallback),
+        thickness,
+        wavy: decoration.wavy,
     }
 }
 
@@ -1041,6 +1683,126 @@ mod debug_refresh_region_tests {
         ]);
 
         assert_eq!(selected.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod text_materialization_tests {
+    use super::*;
+    use wgpui_core::reconcile::description::Description;
+
+    #[test]
+    fn local_text_options_override_inherited_values() {
+        let inherited = TextOptions {
+            size: Some(16.0),
+            color: Some([1.0, 0.0, 0.0, 1.0]),
+            nowrap: Some(true),
+            ..TextOptions::default()
+        };
+        let local = TextOptions {
+            size: Some(20.0),
+            color: Some([0.0, 1.0, 0.0, 1.0]),
+            ..TextOptions::default()
+        };
+
+        let merged = merge_text_options(&inherited, &local);
+        assert_eq!(merged.size, Some(20.0));
+        assert_eq!(merged.color, Some([0.0, 1.0, 0.0, 1.0]));
+        assert_eq!(merged.nowrap, Some(true));
+    }
+
+    #[test]
+    fn auto_sized_text_keeps_its_intrinsic_width() {
+        let description = Description::new::<()>().style(LayoutStyle {
+            size: LayoutSize {
+                width: Dimension::auto(),
+                height: Dimension::auto(),
+            },
+            ..LayoutStyle::default()
+        });
+
+        assert_eq!(resolve_text_width(&description, Some(240.0)), Some(240.0));
+    }
+
+    #[test]
+    fn inherited_text_width_excludes_border_box_insets() {
+        let description = Description::new::<()>().style(LayoutStyle {
+            size: LayoutSize {
+                width: Dimension::length(250.0),
+                height: Dimension::auto(),
+            },
+            padding: wgpui_layout::taffy_tree::LayoutSides {
+                left: LengthPercentage::length(16.0),
+                right: LengthPercentage::length(16.0),
+                top: LengthPercentage::length(0.0),
+                bottom: LengthPercentage::length(0.0),
+            },
+            border: wgpui_layout::taffy_tree::LayoutSides {
+                left: LengthPercentage::length(1.0),
+                right: LengthPercentage::length(1.0),
+                top: LengthPercentage::length(0.0),
+                bottom: LengthPercentage::length(0.0),
+            },
+            ..LayoutStyle::default()
+        });
+
+        assert_eq!(resolve_text_width(&description, Some(800.0)), Some(216.0));
+    }
+
+    #[test]
+    fn a_text_gradient_interpolates_between_stops() {
+        let color = gradient_color(
+            &[([1.0, 0.0, 0.0, 1.0], 0.0), ([0.0, 0.0, 1.0, 1.0], 1.0)],
+            0.5,
+            [0.0; 4],
+        );
+        assert_eq!(color, [0.5, 0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn a_gradient_keeps_every_glyph_while_assigning_per_glyph_color() {
+        let run = CoreGlyphRun {
+            color: [1.0; 4],
+            glyphs: vec![
+                Glyph::ZERO,
+                Glyph {
+                    position: [10.0, 0.0],
+                    ..Glyph::ZERO
+                },
+            ],
+        };
+        let runs = colorize_glyph_runs(
+            vec![run],
+            Some(&[([1.0, 0.0, 0.0, 1.0], 0.0), ([0.0, 0.0, 1.0, 1.0], 1.0)]),
+            Some(90.0),
+            10.0,
+            10.0,
+            0.0,
+            [1.0; 4],
+        );
+
+        assert_eq!(runs.len(), 2);
+        assert_ne!(runs[0].color, runs[1].color);
+        assert_eq!(runs.iter().map(|run| run.glyphs.len()).sum::<usize>(), 2);
+    }
+
+    #[test]
+    fn wavy_decorations_reserve_three_times_the_stroke_height() {
+        let underline = underline_for_line(
+            TextDecoration {
+                thickness: 2.0,
+                color: None,
+                wavy: true,
+            },
+            4.0,
+            30.0,
+            12.0,
+            [0.2, 0.3, 0.4, 1.0],
+        );
+
+        assert_eq!(underline.origin, [4.0, 12.0]);
+        assert_eq!(underline.size, [30.0, 6.0]);
+        assert_eq!(underline.color, [0.2, 0.3, 0.4, 1.0]);
     }
 }
 

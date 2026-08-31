@@ -1276,7 +1276,7 @@ mod tests {
     #[test]
     fn the_shader_agrees_with_the_protocol_about_a_shadow_slot() {
         // `QuadSlot`'s drift hazard, one kind over.
-        assert_eq!(ShadowPipeline::arena_slot_stride(), 4 * 16);
+        assert_eq!(ShadowPipeline::arena_slot_stride(), 5 * 16);
         let shader = super::super::shaders::SHADOWS_WGSL;
         assert!(shader.contains("struct ShadowSlot"));
         for field in ["origin_size", "color", "corner_radii", "blur"] {

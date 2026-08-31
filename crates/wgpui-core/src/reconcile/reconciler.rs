@@ -246,11 +246,17 @@ impl Reconciler {
         let clip_children = description.clips_children();
         let Description {
             type_id,
+            type_name,
             diff_key,
             boundary,
             scroll_offset,
+            scroll_axes,
+            automatic_scroll,
             emitter,
             interaction,
+            scroll_info,
+            layout_callback,
+            external_surface,
             layout_style,
             children,
             ..
@@ -320,9 +326,17 @@ impl Reconciler {
             depth: position.depth,
             outcome,
             invalidation,
+            external_surface,
         });
+        context
+            .plan
+            .set_scroll_metadata(plan_index, scroll_axes, automatic_scroll);
         context.plan.set_emitter(plan_index, emitter);
         context.plan.set_interaction(plan_index, interaction);
+        context.plan.set_scroll_info(plan_index, scroll_info);
+        context
+            .plan
+            .set_layout_callback(plan_index, layout_callback);
 
         let child_position = WalkPosition {
             depth: position.depth + 1,
@@ -372,7 +386,7 @@ impl Reconciler {
         if outcome == NodeOutcome::Reused {
             self.instances.touch(instance_key, self.frame);
         } else {
-            self.instances.store(
+            self.instances.store_with_type_name(
                 instance_key,
                 RetainedElement {
                     type_id,
@@ -382,6 +396,7 @@ impl Reconciler {
                     children: child_instances,
                 },
                 self.frame,
+                Some(type_name),
             );
         }
         context.plan.set_layout_node(plan_index, layout_node);
@@ -437,13 +452,25 @@ impl Reconciler {
             depth: position.depth,
             outcome,
             invalidation: Invalidation::all(),
+            external_surface: description.external_surface,
         });
+        context.plan.set_scroll_metadata(
+            plan_index,
+            description.scroll_axes,
+            description.automatic_scroll,
+        );
         context
             .plan
             .set_emitter(plan_index, description.emitter.take());
         context
             .plan
             .set_interaction(plan_index, description.interaction.take());
+        context
+            .plan
+            .set_scroll_info(plan_index, description.scroll_info);
+        context
+            .plan
+            .set_layout_callback(plan_index, description.layout_callback.take());
 
         let child_position = WalkPosition {
             depth: position.depth + 1,

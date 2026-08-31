@@ -19,7 +19,10 @@
 //! each entry into one `write_buffer`. Keeping it as data is also what makes
 //! §5.0's gate checkable at all without a GPU.
 
+use crate::patch::RecordKey;
 use crate::patch::primitive::PrimitiveKind;
+use crate::scene::layer::LayerId;
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 /// The smallest size class a slab reservation is ever rounded up to, in slots.
@@ -54,7 +57,7 @@ pub fn size_class(count: u32) -> Option<u32> {
 /// `count` is how many slots the owner currently occupies; `capacity` is the
 /// size-class-rounded reservation containing them (`capacity >= count`, both
 /// zero for [`SlabRange::EMPTY`]). `base` is the index of the first slot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SlabRange {
     /// Index of the first reserved slot in the kind's arena.
     pub base: u32,
@@ -129,7 +132,7 @@ impl SlabRange {
 /// This is the headless half of §5.0's contract. `wgpui-wgpu` (§3.5,
 /// `render/buffers/upload.rs`) turns each entry into exactly one
 /// `write_buffer(offset, size)`; nothing in `wgpui-core` ever does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UploadRange {
     /// Which kind's arena these bytes belong to.
     pub kind: PrimitiveKind,
@@ -137,6 +140,46 @@ pub struct UploadRange {
     pub byte_offset: u64,
     /// Byte length. Always a whole number of slots.
     pub byte_length: u64,
+}
+
+/// The kind of change represented by one primitive-slot diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SlotChange {
+    /// A new record now occupies the slots.
+    Inserted,
+    /// An existing record changed without moving its slots.
+    Updated,
+    /// A record's slots moved because a neighbouring record changed size or
+    /// the allocator relocated the layer.
+    Reflowed,
+    /// A record no longer occupies the slots.
+    Removed,
+}
+
+/// An owned description of one primitive record's slot change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PrimitiveSlotDiff {
+    /// Primitive kind and arena.
+    pub kind: PrimitiveKind,
+    /// Owning retained layer.
+    pub layer: LayerId,
+    /// Stable record address.
+    pub key: RecordKey,
+    /// Why the record's slots changed.
+    pub change: SlotChange,
+    /// Previous layer-relative slot span, when the record was resident.
+    pub old: Option<SlotSpan>,
+    /// Current layer-relative slot span, when the record is resident.
+    pub new: Option<SlotSpan>,
+}
+
+/// A layer-relative span of primitive slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SlotSpan {
+    /// First slot relative to the layer's reservation.
+    pub start: u32,
+    /// Number of slots occupied.
+    pub count: u32,
 }
 
 impl UploadRange {

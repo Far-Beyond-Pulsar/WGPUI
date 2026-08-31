@@ -290,6 +290,12 @@ impl LayoutTree {
         })
     }
 
+    /// A live node's retained style, for diagnostics and backend adapters.
+    pub fn style_of(&self, node: LayoutNodeId) -> Result<LayoutStyle, LayoutError> {
+        self.require_live(node)?;
+        Ok(self.tree.style(node.to_taffy())?.clone())
+    }
+
     /// Remove every node not touched this frame.
     ///
     /// Safe regardless of removal order among the swept set: `TaffyTree`
@@ -423,6 +429,35 @@ mod tests {
         assert_eq!(tree.stats().nodes_reused, 3);
         assert_eq!(tree.end_frame(), 0);
         assert_eq!(tree.live_node_count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn aspect_ratio_is_applied_by_the_retained_layout_tree() -> Result<(), LayoutError> {
+        let mut tree = LayoutTree::new();
+        let node = tree.request_layout(
+            LayoutStyle {
+                size: TaffySize {
+                    width: Dimension::length(120.0),
+                    height: Dimension::auto(),
+                },
+                aspect_ratio: Some(2.0),
+                ..LayoutStyle::default()
+            },
+            &[],
+        )?;
+
+        tree.compute_layout(node, definite(120.0, 80.0))?;
+
+        assert_eq!(
+            tree.layout_of(node)?,
+            LayoutRect {
+                x: 0.0,
+                y: 0.0,
+                width: 120.0,
+                height: 60.0,
+            }
+        );
         Ok(())
     }
 

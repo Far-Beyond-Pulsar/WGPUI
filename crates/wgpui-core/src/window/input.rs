@@ -1,4 +1,8 @@
 use crate::boundary::Pixels;
+use crate::geometry::Rect;
+use std::any::Any;
+use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers {
@@ -6,6 +10,11 @@ pub struct Modifiers {
     pub control: bool,
     pub alt: bool,
     pub command: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModifiersChangedEvent {
+    pub modifiers: Modifiers,
 }
 impl Modifiers {
     pub const fn none() -> Self {
@@ -70,6 +79,37 @@ pub struct KeyUpEvent {
     pub key: String,
     pub modifiers: Modifiers,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextInputEvent {
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImeEvent {
+    Enabled,
+    Preedit {
+        text: String,
+        selection: Option<Range<usize>>,
+    },
+    Commit(String),
+    Disabled,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardItem {
+    text: Option<String>,
+}
+
+impl ClipboardItem {
+    pub fn new_string(text: String) -> Self {
+        Self { text: Some(text) }
+    }
+
+    pub fn text(&self) -> Option<String> {
+        self.text.clone()
+    }
+}
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct MouseDownEvent {
     pub button: MouseButton,
@@ -110,6 +150,65 @@ impl MouseMoveEvent {
     pub fn dragging(&self) -> bool {
         self.buttons.left || self.buttons.right || self.buttons.middle
     }
+}
+
+#[derive(Clone)]
+pub struct DragData {
+    value: Arc<dyn Any>,
+    pub position: [Pixels; 2],
+}
+
+impl DragData {
+    pub fn new<T: 'static>(value: T) -> Self {
+        Self {
+            value: Arc::new(value),
+            position: [Pixels::ZERO; 2],
+        }
+    }
+
+    pub fn new_arc(value: Arc<dyn Any>) -> Self {
+        Self {
+            value,
+            position: [Pixels::ZERO; 2],
+        }
+    }
+
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        self.value.downcast_ref()
+    }
+
+    pub fn type_id(&self) -> std::any::TypeId {
+        (*self.value).type_id()
+    }
+
+    pub fn with_position(mut self, position: [Pixels; 2]) -> Self {
+        self.position = position;
+        self
+    }
+}
+
+impl std::fmt::Debug for DragData {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DragData")
+            .field("type_id", &self.type_id())
+            .field("position", &self.position)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DragHoverEvent {
+    pub position: [Pixels; 2],
+    pub hovered: bool,
+    pub data: DragData,
+}
+
+#[derive(Clone, Debug)]
+pub struct DropEvent {
+    pub position: [Pixels; 2],
+    pub bounds: Rect,
+    pub data: DragData,
 }
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ScrollWheelEvent {
@@ -212,10 +311,13 @@ impl EventResult {
         propagate: true,
     };
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum InputEvent {
+    ModifiersChanged(ModifiersChangedEvent),
     KeyDown(KeyDownEvent),
     KeyUp(KeyUpEvent),
+    TextInput(TextInputEvent),
+    Ime(ImeEvent),
     MouseDown(MouseDownEvent),
     MouseUp(MouseUpEvent),
     MouseMove(MouseMoveEvent),
@@ -223,6 +325,15 @@ pub enum InputEvent {
     MouseLeave(MouseMoveEvent),
     Scroll(ScrollWheelEvent),
     Click(ClickEvent),
+    Focus(FocusEvent),
+    DragHover(DragHoverEvent),
+    Drop(DropEvent),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FocusEvent {
+    pub focused: bool,
+    pub visible: bool,
 }
 
 #[cfg(test)]
@@ -246,5 +357,15 @@ mod tests {
         assert!(click.standard_click() && click.first_focus());
         assert_eq!(click.click_count(), 2);
         assert_eq!(click.mouse_position(), Some([Pixels(4.0), Pixels(5.0)]));
+    }
+
+    #[test]
+    fn drag_data_keeps_type_identity_and_position_without_copying_payload() {
+        let data = DragData::new(String::from("payload"));
+        assert_eq!(data.downcast_ref::<String>().map(String::as_str), Some("payload"));
+        assert!(data.downcast_ref::<u32>().is_none());
+        let positioned = data.with_position([Pixels(7.0), Pixels(8.0)]);
+        assert_eq!(positioned.position, [Pixels(7.0), Pixels(8.0)]);
+        assert_eq!(positioned.downcast_ref::<String>().map(String::as_str), Some("payload"));
     }
 }
