@@ -748,6 +748,7 @@ impl App {
     pub fn notify(&mut self) {
         *self.notifications.borrow_mut() += 1;
     }
+    #[allow(clippy::new_ret_no_self, clippy::wrong_self_convention)]
     pub fn new<T>(&mut self, build: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
         self.new_entity(build)
     }
