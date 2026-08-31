@@ -15,6 +15,7 @@ pub mod memory;
 pub mod perf_ab_tests;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub mod render_stats;
+pub mod resource_snapshot;
 
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use hooks::DevtoolsHooks;
@@ -28,7 +29,13 @@ pub use memory::{
 pub use perf_ab_tests::Sample;
 #[cfg(any(feature = "flamegraph", feature = "render-stats", feature = "perf-ab"))]
 pub use render_stats::{Scope, Snapshot, TimerSnapshot};
-
 pub use capture::{
     CaptureConfig, CaptureExport, CaptureRecorder, CaptureSnapshot, FrameSnapshot, RecorderConfig,
+};
+pub use resource_snapshot::{
+    AtlasPackingSnapshot, AtlasPageRecord, AtlasPlacementRecord, BufferElementType,
+    BufferViewSnapshot, ByteRange, IndirectDrawRecord, IndirectDrawSnapshot, RedactionPolicy,
+    ResourceSnapshot, SlabAllocationRecord, SlabMapSnapshot, SnapshotError, SnapshotHeader,
+    SnapshotLimits, TileOccupancyRecord, TileOccupancySnapshot, TruncationMetadata,
+    TypedBufferView, TypedValue, SNAPSHOT_HEADER_BYTES, SNAPSHOT_MAGIC, SNAPSHOT_SCHEMA_VERSION,
 };
