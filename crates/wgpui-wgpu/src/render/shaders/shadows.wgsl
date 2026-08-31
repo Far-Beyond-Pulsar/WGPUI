@@ -59,6 +59,8 @@ struct SlotBase {
     base: u32,
     padding_0: u32,
     translation: vec2<f32>,
+    clip_origin: vec2<f32>,
+    clip_size: vec2<f32>,
 };
 
 // 64 bytes, matching `wgpui_core::patch::primitive::Shadow::SLOT_STRIDE` and the
@@ -174,6 +176,13 @@ fn vertex_main(
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    if slot.clip_size.x >= 0.0 {
+        let clip_max = slot.clip_origin + slot.clip_size;
+        if in.position.x < slot.clip_origin.x || in.position.y < slot.clip_origin.y
+            || in.position.x >= clip_max.x || in.position.y >= clip_max.y {
+            discard;
+        }
+    }
     // The unexpanded rectangle — see this file's header.
     let shadow = shadows[in.arena_index];
     let half_size = shadow.origin_size.zw / 2.0;

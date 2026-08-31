@@ -23,6 +23,5 @@ fn main() -> Result<(), ApplicationError> {
         let _ = interaction.focus_manager();
         div().id("button").w(160.0).h(48.0).bg(rgb(0x2050a0))
     })
-    .with_frame_limit(1_000_000)
     .run()
 }

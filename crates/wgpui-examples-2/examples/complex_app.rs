@@ -21,8 +21,7 @@ fn main() -> Result<(), ApplicationError> {
         window.performance_debug().set_tile_refresh_flash(
             wgpui::TileRefreshFlash::enabled()
                 .with_tile_size(256.0, 256.0)
-                .with_color([1.0, 0.0, 1.0, 0.35])
-                .with_viewport_grid(true),
+                .with_color([1.0, 0.0, 1.0, 0.35]),
         );
         let _ = window.interaction();
         let selected = selected.get();
@@ -225,7 +224,6 @@ fn main() -> Result<(), ApplicationError> {
                     .child(div().text_xs().text_color(rgb(0x8291ad)).child("WGPUI 2.0 native backend")),
             )
     })
-    .with_frame_limit(1_000_000)
     .run()
 }
 

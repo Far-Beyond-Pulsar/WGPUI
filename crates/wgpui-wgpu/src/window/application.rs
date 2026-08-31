@@ -852,7 +852,7 @@ impl Handler {
                     && all_other_windows_reached_limit
                 {
                     event_loop.exit();
-                } else {
+                } else if self.max_frames.is_some() || frame.needs_redraw {
                     live.window.request_redraw();
                 }
             }
@@ -1097,8 +1097,10 @@ impl winit::application::ApplicationHandler for Handler {
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         self.create_pending_windows(event_loop);
-        for live in &self.live {
-            live.window.request_redraw();
+        if self.max_frames.is_some() {
+            for live in &self.live {
+                live.window.request_redraw();
+            }
         }
     }
 }

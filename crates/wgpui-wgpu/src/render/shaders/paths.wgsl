@@ -7,6 +7,8 @@ struct SlotBase {
     base: u32,
     padding_0: u32,
     translation: vec2<f32>,
+    clip_origin: vec2<f32>,
+    clip_size: vec2<f32>,
 }
 
 struct PathVertex {
@@ -37,9 +39,22 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let clip_origin = vertex.clip_origin + slot.translation;
     let top_left = screen_position - clip_origin;
     let bottom_right = clip_origin + vertex.clip_size - screen_position;
+    var clip_distances = vec4<f32>(top_left.x, bottom_right.x, top_left.y, bottom_right.y);
+    if slot.clip_size.x >= 0.0 {
+        let layer_clip_max = slot.clip_origin + slot.clip_size;
+        clip_distances = min(
+            clip_distances,
+            vec4<f32>(
+                screen_position.x - slot.clip_origin.x,
+                layer_clip_max.x - screen_position.x,
+                screen_position.y - slot.clip_origin.y,
+                layer_clip_max.y - screen_position.y,
+            ),
+        );
+    }
     return VertexOutput(
         vec4<f32>(device_position, 0.0, 1.0), vertex.color, vertex.st,
-        vec4<f32>(top_left.x, bottom_right.x, top_left.y, bottom_right.y));
+        clip_distances);
 }
 
 @fragment
