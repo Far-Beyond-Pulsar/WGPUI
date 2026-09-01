@@ -27,6 +27,7 @@ use wgpui_core::window::{
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
     TextInputEvent,
 };
+use wgpui_core::window::{TimerHandle, TimerState};
 use wgpui_core::window::{
     WindowAppearance, WindowBackgroundAppearance, WindowDecorations, WindowKind,
 };
@@ -94,6 +95,7 @@ pub struct Window {
     hover_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     animation_clock: AnimationClock,
+    animation_frame_requested: AtomicBool,
     last_click: Option<ClickState>,
 }
 
@@ -288,6 +290,10 @@ impl Window {
     }
 
     pub fn request_animation_frame(&self) {
+        // The redraw is delivered by Winit on a later event-loop turn. The
+        // flag makes repeated requests coalesce and keeps this request alive
+        // until that redraw is consumed.
+        self.animation_frame_requested.store(true, Ordering::Release);
         self.request_redraw();
     }
 
@@ -308,8 +314,31 @@ impl Window {
     }
 
     pub fn refresh(&mut self) {
+        tracing::warn!("full repaint forced by Window::refresh; targeted invalidation should generally be preferred");
         self.interaction.refresh();
         self.request_redraw();
+    }
+
+    pub fn schedule_timer(&mut self, delay: Duration) -> TimerHandle {
+        let timer = self.interaction.schedule_timer(delay);
+        self.request_redraw();
+        timer
+    }
+
+    pub fn cancel_timer(&mut self, timer: TimerHandle) -> bool {
+        self.interaction.cancel_timer(timer)
+    }
+
+    pub fn timer_state(&self, timer: TimerHandle) -> Option<TimerState> {
+        self.interaction.timer_state(timer)
+    }
+
+    pub fn next_timer_deadline(&self) -> Option<Instant> {
+        self.interaction.next_timer_deadline()
+    }
+
+    pub fn take_due_timers(&mut self, now: Instant) -> Vec<wgpui_core::window::TimerId> {
+        self.interaction.take_due_timers(now)
     }
 
     pub fn take_hover_dirty_regions(&mut self) -> Vec<Rect> {
@@ -1680,6 +1709,21 @@ impl Handler {
             .window_decorations
             .map(|decorations| decorations == WindowDecorations::Server)
             .unwrap_or(options.titlebar.is_some());
+        if options.window_decorations == Some(WindowDecorations::Client) {
+            log::warn!("client window decorations are lowered as a borderless Winit window; WGPUI does not provide native client chrome");
+        }
+        if !options.is_movable {
+            log::warn!("non-movable windows are not supported by the cross-platform Winit boundary; the request is not applied");
+        }
+        if options.app_id.is_some() {
+            log::warn!("WindowOptions::app_id is not supported by the cross-platform Winit boundary; the request is not applied");
+        }
+        if options.tabbing_identifier.is_some() {
+            log::warn!("WindowOptions::tabbing_identifier is not supported by the cross-platform Winit boundary; the request is not applied");
+        }
+        if options.display_id.is_some() {
+            log::warn!("WindowOptions::display_id is not supported by the cross-platform Winit boundary; the request is not applied");
+        }
         let attributes = winit::window::Window::default_attributes()
             .with_title(title)
             .with_resizable(resizable)
@@ -1759,6 +1803,7 @@ impl Handler {
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             animation_clock: AnimationClock::new(),
+            animation_frame_requested: AtomicBool::new(false),
             last_click: None,
         };
         let mut frame_loop = FrameLoop::new(&context.device);
@@ -1839,6 +1884,14 @@ impl Handler {
                 .all(|(other_index, live)| other_index == index || live.frames >= limit)
         });
         let live = &mut self.live[index];
+        let animation_frame_requested = live
+            .window
+            .animation_frame_requested
+            .swap(false, Ordering::AcqRel);
+        let due_timer_count = live.window.take_due_timers(Instant::now()).len();
+        if due_timer_count > 0 {
+            log::debug!("window timer deadline reached: {due_timer_count} timer(s)");
+        }
         if let Some((width, height)) = live.resizes.take_pending() {
             live.surface.resize(&live.context.device, width, height);
         }
@@ -1936,7 +1989,7 @@ impl Handler {
                     && all_other_windows_reached_limit
                 {
                     event_loop.exit();
-                } else if self.max_frames.is_some() || frame.needs_redraw {
+                } else if animation_frame_requested || self.max_frames.is_some() || frame.needs_redraw {
                     live.window.request_redraw();
                 }
             }
@@ -2310,10 +2363,23 @@ impl winit::application::ApplicationHandler for Handler {
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         self.app.run_pending_tasks();
         self.create_pending_windows(event_loop);
+        let now = Instant::now();
+        let timer_deadline = self
+            .live
+            .iter()
+            .filter_map(|live| live.window.next_timer_deadline())
+            .min();
         if self.max_frames.is_some() || self.app.has_pending_tasks() || self.app.close_requested() {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             for live in &self.live {
                 live.window.request_redraw();
+            }
+        } else if let Some(deadline) = timer_deadline {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+            if deadline <= now {
+                for live in &self.live {
+                    live.window.request_redraw();
+                }
             }
         } else {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);

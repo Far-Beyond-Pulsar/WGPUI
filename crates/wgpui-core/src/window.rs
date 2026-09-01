@@ -91,6 +91,10 @@ pub struct WindowOptions {
     pub window_background: WindowBackgroundAppearance,
     pub window_min_size: Option<Size<Pixels>>,
     pub window_decorations: Option<WindowDecorations>,
+    pub display_id: Option<u64>,
+    pub is_movable: bool,
+    pub app_id: Option<String>,
+    pub tabbing_identifier: Option<String>,
 }
 
 impl Default for WindowOptions {
@@ -110,6 +114,10 @@ impl Default for WindowOptions {
             window_background: WindowBackgroundAppearance::Opaque,
             window_min_size: None,
             window_decorations: None,
+            display_id: None,
+            is_movable: true,
+            app_id: None,
+            tabbing_identifier: None,
         }
     }
 }
@@ -483,6 +491,12 @@ impl Window {
     }
     pub fn cancel_timer(&mut self, timer: TimerHandle) -> bool {
         self.timers.cancel(timer)
+    }
+    pub fn next_timer_deadline(&self) -> Option<Instant> {
+        self.timers.next_deadline()
+    }
+    pub fn timer_state(&self, timer: TimerHandle) -> Option<TimerState> {
+        self.timers.state(timer)
     }
     pub fn take_due_timers(&mut self, now: Instant) -> Vec<TimerId> {
         self.timers.due(now)
