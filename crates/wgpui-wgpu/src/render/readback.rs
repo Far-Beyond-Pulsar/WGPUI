@@ -169,7 +169,7 @@ fn read_texture_rgba8_inner(
         .map_err(|_| ReadbackError::Cancelled)?
         .map_err(ReadbackError::Map)?;
 
-    let pixels = {
+    let mut pixels = {
         let view = slice.get_mapped_range().map_err(ReadbackError::Range)?;
         let mut pixels = Vec::with_capacity((unpadded * height) as usize);
         for row in 0..height {
@@ -181,6 +181,14 @@ fn read_texture_rgba8_inner(
         pixels
     };
     staging.unmap();
+    if matches!(
+        texture.format(),
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    ) {
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
     Ok(pixels)
 }
 

@@ -14,7 +14,7 @@
 //! # The one thing that made this small, and it was checked rather than assumed
 //!
 //! Every render pipeline Phases 4–5.6 built is compiled against
-//! [`crate::render::pipelines::TARGET_FORMAT`] (`Rgba8Unorm`), and a
+//! [`crate::render::pipelines::TARGET_FORMAT`] (`Bgra8Unorm`), and a
 //! `RenderPipeline`'s colour target format is fixed at creation. Had the
 //! swapchain been unable to offer that format, this phase would have needed
 //! either format-parametric pipelines or an offscreen-plus-blit path — both
@@ -474,7 +474,7 @@ impl WindowSurface {
 /// Phase 6's Milestone A needs its clear to be unambiguous evidence: black is
 /// what an uncleared attachment, a failed draw, and a device-lost swapchain all
 /// look like, so black on screen proves nothing. Fully saturated magenta is
-/// produced by no default path in this crate — `TARGET_FORMAT` is `Rgba8Unorm`,
+/// produced by no default path in this crate — `TARGET_FORMAT` is `Bgra8Unorm`,
 /// so this reads back as exactly `[255, 0, 255, 255]` with no colour-space
 /// conversion to argue about.
 pub const PROOF_MAGENTA: wgpu::Color = wgpu::Color {
