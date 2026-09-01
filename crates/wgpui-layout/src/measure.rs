@@ -17,6 +17,20 @@ impl IntrinsicSize {
         Self { width, height }
     }
 
+    /// Whether both dimensions can safely participate in layout.
+    ///
+    /// Estimates are hints, so an unavailable or malformed value must use the
+    /// exact layout path. In particular, clamping a negative value or allowing
+    /// a non-finite value would turn a bad hint into an incorrect constraint.
+    pub fn is_valid(self) -> bool {
+        self.width.is_finite() && self.height.is_finite() && self.width >= 0.0 && self.height >= 0.0
+    }
+
+    /// Return this estimate only when both dimensions are layout-safe.
+    pub fn validated(self) -> Option<Self> {
+        self.is_valid().then_some(self)
+    }
+
     pub fn clamped(self) -> Self {
         Self {
             width: self.width.max(0.0),
