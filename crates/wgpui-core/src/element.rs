@@ -13,6 +13,18 @@ use std::sync::Arc;
 pub trait Element: 'static {
     /// Lower this element into the description consumed by reconciliation.
     fn into_description(self) -> Description;
+
+    /// Lower this element while retaining access to the live window and app.
+    fn into_description_in(
+        self,
+        _window: &mut crate::window::Window,
+        _app: &crate::app::App,
+    ) -> Description
+    where
+        Self: Sized,
+    {
+        self.into_description()
+    }
 }
 
 /// Converts a value into a native [`Element`].
@@ -26,6 +38,16 @@ pub trait IntoElement: Sized {
     /// Lower this value into the per-frame description.
     fn into_description(self) -> Description {
         Element::into_description(self.into_element())
+    }
+
+    /// Lower this value with a live window and app available to nested
+    /// context-aware components.
+    fn into_description_in(
+        self,
+        window: &mut crate::window::Window,
+        app: &crate::app::App,
+    ) -> Description {
+        Element::into_description_in(self.into_element(), window, app)
     }
 }
 
@@ -121,56 +143,42 @@ impl<E: IntoElement + 'static> Element for Stateful<E> {
         }
         description
     }
+
+    fn into_description_in(
+        self,
+        window: &mut crate::window::Window,
+        app: &crate::app::App,
+    ) -> Description {
+        let Stateful {
+            element,
+            element_id,
+            ..
+        } = self;
+        let mut description = element.into_description_in(window, app);
+        if let Some(element_id) = element_id {
+            description = description.id(element_id);
+        }
+        description
+    }
 }
 
 /// A stateless component whose value is consumed when it is rendered.
 pub trait RenderOnce: 'static + Sized {
     /// Produce this component's native element tree.
-    ///
-    /// Native `RenderOnce` deliberately receives no window or app context:
-    /// element construction is a pure value-to-description step, while
-    /// retained services belong to the reconciliation and scene layers.
-    fn render(self) -> impl IntoElement + 'static;
-
-    /// Lower this component's rendered tree into the per-frame description.
-    fn into_description(self) -> Description {
-        IntoElement::into_description(self.render())
-    }
+    fn render(
+        self,
+        window: &mut crate::window::Window,
+        cx: &mut crate::app::App,
+    ) -> impl IntoElement + 'static;
 }
 
 /// A retained view that is rendered again when its entity is invalidated.
 pub trait Render: 'static + Sized {
     /// Produce this view's native element tree for the current frame.
-    ///
-    /// Native `Render` deliberately receives no window or app context for the
-    /// same reason as [`RenderOnce`].
-    fn render(&mut self) -> impl IntoElement + 'static;
-}
-
-/// A compatibility view rendered with the runtime context used by the
-/// original GPUI API.
-///
-/// This remains a separate trait because Rust does not overload trait methods
-/// by arity. The returned element is still lowered into the same native
-/// description and retained scene as [`Render`]; the window and context are
-/// only available while the view is being built.
-pub trait LegacyRender: 'static + Sized {
-    /// Produce this view's element tree using the live window and entity
-    /// context for this frame.
     fn render(
         &mut self,
         window: &mut crate::window::Window,
         cx: &mut crate::app::Context<Self>,
-    ) -> impl IntoElement + 'static;
-}
-
-/// A compatibility component rendered with the original application context.
-pub trait LegacyRenderOnce: 'static {
-    /// Produce this component's element tree using the live window and app.
-    fn render(
-        self,
-        window: &mut crate::window::Window,
-        cx: &mut crate::app::App,
     ) -> impl IntoElement + 'static;
 }
 
@@ -182,7 +190,23 @@ pub struct EntityElement<T: Render> {
 impl<T: Render> Element for EntityElement<T> {
     fn into_description(self) -> Description {
         self.entity
-            .update(|value, _context| value.render().into_description())
+            .update_in(&mut crate::window::Window::new(), |value, window, context| {
+                value
+                    .render(window, context)
+                    .into_description_in(window, context)
+            })
+    }
+
+    fn into_description_in(
+        self,
+        window: &mut crate::window::Window,
+        _app: &crate::app::App,
+    ) -> Description {
+        self.entity.update_in(window, |value, window, context| {
+            value
+                .render(window, context)
+                .into_description_in(window, context)
+        })
     }
 }
 
@@ -195,28 +219,12 @@ impl<T: Render> IntoElement for crate::app::Entity<T> {
 }
 
 /// Render a view into the description consumed by reconciliation.
-pub fn render_description<R: Render>(view: &mut R) -> Description {
-    view.render().into_description()
-}
-
-/// Render a compatibility view with the live runtime context and lower it
-/// into the native description consumed by reconciliation.
-pub fn render_legacy_description<R: LegacyRender>(
+pub fn render_description<R: Render>(
     view: &mut R,
     window: &mut crate::window::Window,
     cx: &mut crate::app::Context<R>,
 ) -> Description {
-    view.render(window, cx).into_description()
-}
-
-/// Render a compatibility component with the live application context and
-/// lower it into the native description consumed by reconciliation.
-pub fn render_legacy_once_description<R: LegacyRenderOnce>(
-    view: R,
-    window: &mut crate::window::Window,
-    cx: &mut crate::app::App,
-) -> Description {
-    view.render(window, cx).into_description()
+    view.render(window, cx).into_description_in(window, cx)
 }
 
 /// The element generated by `#[derive(IntoElement)]` for a [`RenderOnce`]
@@ -239,7 +247,20 @@ impl<C: RenderOnce> Component<C> {
 
 impl<C: RenderOnce> Element for Component<C> {
     fn into_description(self) -> Description {
-        self.component.render().into_description()
+        let mut window = crate::window::Window::new();
+        let mut app = crate::app::App::create();
+        Element::into_description_in(self, &mut window, &app)
+    }
+
+    fn into_description_in(
+        self,
+        window: &mut crate::window::Window,
+        app: &crate::app::App,
+    ) -> Description {
+        let mut app = app.clone();
+        self.component
+            .render(window, &mut app)
+            .into_description_in(window, &app)
     }
 }
 
@@ -284,7 +305,11 @@ mod tests {
     }
 
     impl Render for View {
-        fn render(&mut self) -> impl IntoElement + 'static {
+        fn render(
+            &mut self,
+            _window: &mut crate::window::Window,
+            _context: &mut crate::app::Context<Self>,
+        ) -> impl IntoElement + 'static {
             Panel {
                 children: vec![Description::new::<u32>().id(self.value as u64)],
             }
@@ -294,7 +319,11 @@ mod tests {
     struct Badge(u32);
 
     impl RenderOnce for Badge {
-        fn render(self) -> impl IntoElement + 'static {
+        fn render(
+            self,
+            _window: &mut crate::window::Window,
+            _app: &mut crate::app::App,
+        ) -> impl IntoElement + 'static {
             Description::new::<Self>().id(self.0 as u64)
         }
     }
@@ -305,8 +334,12 @@ mod tests {
 
     #[test]
     fn render_and_render_once_lower_real_descriptions() {
-        let mut view = View { value: 7 };
-        let description = render_description(&mut view);
+        let app = App::create();
+        let view = app.new_entity(View { value: 7 });
+        let mut window = crate::window::Window::new();
+        let description = view.update_in(&mut window, |view, window, context| {
+            render_description(view, window, context)
+        });
         assert_eq!(description.type_id(), std::any::TypeId::of::<Panel>());
         assert_eq!(description.child_descriptions().len(), 1);
         assert_eq!(badge(9).element_id(), Some(&ElementId::Integer(9)));

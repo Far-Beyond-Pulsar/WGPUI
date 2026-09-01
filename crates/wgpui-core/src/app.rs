@@ -10,7 +10,7 @@ use std::sync::{
 };
 
 use crate::action::Action;
-use crate::element::{IntoElement, LegacyRender, Render, render_legacy_description};
+use crate::element::{IntoElement, Render};
 use crate::reconcile::description::Description;
 use crate::window::{KeyBinding, KeyDownEvent, Keymap, Menu, WindowOptions};
 use futures::channel::oneshot;
@@ -365,41 +365,10 @@ impl App {
                 let entity = build_root_view(window, app);
                 WindowRenderer {
                     render: Box::new(move |window, _app| {
-                        entity.update_in(window, |value, _window, _context| {
-                            value.render().into_description()
-                        })
-                    }),
-                }
-            }),
-        });
-        Ok(())
-    }
-
-    /// Queue a window whose root view uses the legacy context-aware render
-    /// contract. The legacy context is supplied only while producing each
-    /// frame's description; no runtime handle is retained in the description
-    /// or scene.
-    pub fn open_legacy_window<V: LegacyRender>(
-        &mut self,
-        options: WindowOptions,
-        build_root_view: impl FnOnce(&mut crate::window::Window, &mut App) -> Entity<V> + 'static,
-    ) -> Result<(), &'static str> {
-        if self.quit_requested() {
-            return Err("application is quitting");
-        }
-        if self.close_requested() {
-            return Err("application is closing");
-        }
-        let id = self.reserve_window();
-        self.state.borrow_mut().pending_windows.push(WindowRequest {
-            id,
-            options,
-            build: Box::new(move |window, app| {
-                let entity = build_root_view(window, app);
-                WindowRenderer {
-                    render: Box::new(move |window, _app| {
                         entity.update_in(window, |value, window, context| {
-                            render_legacy_description(value, window, context)
+                            value
+                                .render(window, context)
+                                .into_description_in(window, context)
                         })
                     }),
                 }
@@ -836,18 +805,22 @@ mod tests {
     struct TestRoot;
 
     impl Render for TestRoot {
-        fn render(&mut self) -> impl IntoElement + 'static {
+        fn render(
+            &mut self,
+            _window: &mut crate::window::Window,
+            _context: &mut Context<Self>,
+        ) -> impl IntoElement + 'static {
             Description::new::<Self>()
         }
     }
 
-    struct LegacyTestRoot {
+    struct ContextTestRoot {
         expected_entity: Option<EntityId>,
         received_window: bool,
         received_context: bool,
     }
 
-    impl LegacyRender for LegacyTestRoot {
+    impl Render for ContextTestRoot {
         fn render(
             &mut self,
             window: &mut crate::window::Window,
@@ -876,9 +849,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_window_entry_point_renders_with_live_window_and_context() {
+    fn window_entry_point_renders_with_live_window_and_context() {
         let mut app = App::create();
-        let root = app.new_entity(LegacyTestRoot {
+        let root = app.new_entity(ContextTestRoot {
             expected_entity: None,
             received_window: false,
             received_context: false,
@@ -886,7 +859,7 @@ mod tests {
         let entity_id = root.entity_id();
         root.update(|value, _| value.expected_entity = Some(entity_id));
 
-        app.open_legacy_window(WindowOptions::default(), {
+        app.open_window(WindowOptions::default(), {
             let root = root.clone();
             move |_, _| root
         })

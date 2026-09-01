@@ -45,8 +45,7 @@ pub mod shaders;
 pub mod test_support;
 pub mod window;
 pub use element::{
-    Component, Element, IntoElement, LegacyRender, LegacyRenderOnce, Render, RenderOnce,
-    Stateful, render_description, render_legacy_description, render_legacy_once_description,
+    Component, Element, IntoElement, Render, RenderOnce, Stateful, render_description,
 };
 pub mod action;
 pub use action::Action;

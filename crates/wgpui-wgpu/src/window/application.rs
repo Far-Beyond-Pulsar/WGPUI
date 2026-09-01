@@ -125,6 +125,14 @@ impl From<arboard::Error> for ClipboardError {
 pub type DisplayId = winit::monitor::MonitorHandle;
 
 impl Window {
+    /// Access the underlying Winit window for platform-specific integration.
+    ///
+    /// WGPUI APIs should use this wrapper wherever possible; this escape hatch
+    /// is for integrations that specifically require Winit functionality.
+    pub fn winit_window(&self) -> &winit::window::Window {
+        &self.native
+    }
+
     pub fn id(&self) -> winit::window::WindowId {
         self.native.id()
     }
@@ -1041,6 +1049,11 @@ impl Window {
 }
 
 impl WindowHandle {
+    /// Access the underlying Winit window for platform-specific integration.
+    pub fn winit_window(&self) -> &winit::window::Window {
+        &self.native
+    }
+
     pub fn id(&self) -> winit::window::WindowId {
         self.native.id()
     }

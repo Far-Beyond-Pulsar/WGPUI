@@ -65,17 +65,8 @@ pub use wgpui_core::{
     WindowKind, WindowList,
 };
 pub use wgpui_core::{
-    Component, Element, IntoElement, LegacyRender, LegacyRenderOnce, Render, RenderOnce,
-    Stateful, render_description, render_legacy_description, render_legacy_once_description,
+    Component, Element, IntoElement, Render, RenderOnce, Stateful, render_description,
 };
-
-/// Compatibility rendering contracts and helpers.
-pub mod legacy {
-    pub use wgpui_core::{
-        LegacyRender, LegacyRenderOnce, render_legacy_description,
-        render_legacy_once_description,
-    };
-}
 pub use wgpui_layout::{
     AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
     LayoutTree, Measure,
@@ -141,8 +132,8 @@ pub fn wgpu_surface(handle: WgpuSurfaceHandle) -> WgpuSurface {
 
 pub mod prelude {
     pub use crate::{
-        Application, Description, Div, Element, EntityFactory, IntoElement, LegacyRender,
-        LegacyRenderOnce, Render, RenderOnce, Stateful, StatefulDiv, Styled, UniformList,
+        Application, Description, Div, Element, EntityFactory, IntoElement, Render, RenderOnce,
+        Stateful, StatefulDiv, Styled, UniformList,
         VirtualList, Window, WindowOptions, div, uniform_list, virtual_list,
     };
 }
