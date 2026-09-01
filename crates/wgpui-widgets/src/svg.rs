@@ -17,7 +17,7 @@
 //! So [`load`] is the whole of the loading half, and [`Svg`] is [`crate::img::Img`]
 //! with a key of its own.
 //!
-//! # What is deliberately not here: the tinted alpha-mask path
+//! # What is deliberately not here: the legacy tinted alpha-mask path
 //!
 //! The legacy backend has **two** SVG paths, and only one of them is this one.
 //! `SvgRenderer::render_single_frame` produces full-colour RGBA and is what
@@ -31,8 +31,9 @@
 //! `MonoSpritePipeline`, not in this phase's polychrome one. It is a genuinely
 //! separate piece of work — a second rasterisation mode, a second atlas kind for
 //! the same source, and a colour on the primitive that `PolySprite` does not
-//! carry — and it is named as open in docs/phase-6.2-results.md rather than
-//! quietly folded into "SVG works."
+//! carry — and it remains explicitly unsupported rather than quietly folded into
+//! "SVG works." `text_color` uses the supported RGBA path and creates an
+//! immutable derived image source instead.
 
 use std::any::Any;
 use wgpui_core::element::Element;
@@ -245,9 +246,6 @@ impl Element for SvgBuilder {
                 Some(image) => {
                     let source = resource_source_id(&resource);
                     self.svg.image = self.svg.image.set_decoded(source, image);
-                    if let Some(text_color) = self.svg.text_color {
-                        self.svg.image = self.svg.image.tint(text_color);
-                    }
                 }
                 None => {
                     self.svg.image = self
@@ -368,7 +366,7 @@ impl Svg {
         self
     }
 
-    /// Set the requested icon colour by tinting the cached RGBA frames.
+    /// Set the requested icon colour with an immutable derived RGBA source.
     pub fn text_color(mut self, color: impl Into<wgpui_core::color::Hsla>) -> Self {
         let color: [f32; 4] = color.into().into();
         self.text_color = Some(color);
@@ -520,6 +518,40 @@ mod tests {
             svg_with_engine(source, engine).rasterised_size(),
             Some([80, 40]),
             "20 x 2 (requested) x 2 (smoothing)"
+        );
+    }
+
+    #[test]
+    fn svg_text_colours_are_per_instance_and_reuse_matching_derived_sources() {
+        let engine = engine();
+        let source = load(&engine, DOCUMENT.as_bytes(), 1.0).expect("rasterises");
+        let original = engine
+            .borrow_mut()
+            .cache()
+            .get(source)
+            .expect("the SVG source is held")
+            .clone();
+        let red = svg_with_engine(source, Rc::clone(&engine))
+            .text_color(wgpui_core::color::rgb(0xff0000));
+        let green = svg_with_engine(source, Rc::clone(&engine))
+            .text_color(wgpui_core::color::rgb(0x00ff00));
+        let red_again = svg_with_engine(source, Rc::clone(&engine))
+            .text_color(wgpui_core::color::rgb(0xff0000));
+
+        assert_ne!(red.diff_key().source, green.diff_key().source);
+        assert_eq!(red.diff_key().source, red_again.diff_key().source);
+        assert_eq!(
+            red.diff_key().compare(&green.diff_key()),
+            Invalidation::DISPLAY
+        );
+        assert_eq!(
+            red.diff_key().compare(&red_again.diff_key()),
+            Invalidation::empty()
+        );
+        assert_eq!(
+            engine.borrow_mut().cache().get(source),
+            Some(&original),
+            "SVG recolouring never changes the shared raster"
         );
     }
 

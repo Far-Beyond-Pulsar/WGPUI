@@ -430,6 +430,8 @@ pub(crate) fn pending_engine(cache: ImageCache) -> SharedImageEngine {
 pub struct Img {
     element_id: Option<wgpui_core::reconcile::description::ElementId>,
     source: ImageSourceId,
+    render_source: ImageSourceId,
+    tint: Option<[f32; 4]>,
     frame_index: u32,
     load_state: ImageLoadState,
     requested_size: [f32; 2],
@@ -673,6 +675,15 @@ impl Img {
             .hold_at(source, (*image).clone())
             .is_ok();
         self.source = source;
+        self.render_source = self
+            .tint
+            .map(|color| {
+                self.engine
+                    .borrow_mut()
+                    .cache()
+                    .tinted_source(source, color)
+            })
+            .unwrap_or(source);
         self.load_state(if loaded {
             ImageLoadState::Ready
         } else {
@@ -685,6 +696,8 @@ impl Img {
         Self {
             element_id: None,
             source,
+            render_source: source,
+            tint: None,
             frame_index: 0,
             load_state: ImageLoadState::Ready,
             requested_size: [0.0, 0.0],
@@ -824,15 +837,20 @@ impl Img {
         self
     }
 
-    pub fn tint(self, color: [f32; 4]) -> Self {
-        self.engine.borrow_mut().cache().tint(self.source, color);
+    pub fn tint(mut self, color: [f32; 4]) -> Self {
+        self.tint = Some(color);
+        self.render_source = self
+            .engine
+            .borrow_mut()
+            .cache()
+            .tinted_source(self.source, color);
         self
     }
 
     /// This image's fingerprint.
     pub fn diff_key(&self) -> ImgKey {
         ImgKey {
-            source: self.source,
+            source: self.render_source,
             frame_index: self.frame_index,
             load_state: self.load_state,
             requested_size: self.requested_size,
@@ -962,7 +980,7 @@ impl Img {
         let placement = self
             .engine
             .borrow_mut()
-            .tile_for(self.source, self.frame_index);
+            .tile_for(self.render_source, self.frame_index);
         let natural = self.natural_size();
         let bounds = [
             context.bounds.x,
@@ -1534,6 +1552,104 @@ mod tests {
             "and exactly one of them paid for a decode — forty avatars sharing \
              one source is the case this cache exists for, and a claim about \
              work *not* happening is only checkable by counting it when it does"
+        );
+    }
+
+    #[test]
+    fn instances_with_different_tints_keep_distinct_immutable_sources() {
+        let (engine, source, counters) = engine_counting(1, 1);
+        let original = engine
+            .borrow()
+            .cache
+            .get(source)
+            .expect("the helper holds its source")
+            .clone();
+        let red = sized(&engine, source).tint([1.0, 0.0, 0.0, 0.5]);
+        let green = sized(&engine, source).tint([0.0, 1.0, 0.0, 1.0]);
+        let red_again = sized(&engine, source).tint([1.0, 0.0, 0.0, 0.5]);
+
+        assert_ne!(red.diff_key().source, green.diff_key().source);
+        assert_eq!(red.diff_key().source, red_again.diff_key().source);
+        assert_eq!(
+            red.diff_key().compare(&green.diff_key()),
+            Invalidation::DISPLAY
+        );
+        assert_eq!(
+            red.diff_key().compare(&red_again.diff_key()),
+            Invalidation::empty()
+        );
+        assert_eq!(
+            engine.borrow().cache.get(source),
+            Some(&original),
+            "tinting an instance never changes the shared base frame"
+        );
+        assert_eq!(
+            engine
+                .borrow()
+                .cache
+                .frame(red.diff_key().source, 0)
+                .map(|frame| frame.texels.as_slice()),
+            Some([255, 0, 0, 64].as_slice())
+        );
+        assert!(emitted(&red, [0.0, 0.0, 1.0, 1.0]).is_some());
+        assert!(emitted(&red_again, [0.0, 0.0, 1.0, 1.0]).is_some());
+        assert!(emitted(&green, [0.0, 0.0, 1.0, 1.0]).is_some());
+        assert_eq!(
+            counters.decodes.get(),
+            2,
+            "one atlas entry per distinct tint"
+        );
+    }
+
+    #[test]
+    fn a_tinted_animation_reuses_one_source_across_frames_and_preserves_delays() {
+        let (engine, source, counters) = animated_engine();
+        let first = Img::new(source, Rc::clone(&engine))
+            .frame_index(0)
+            .tint([0.8, 0.2, 0.1, 1.0]);
+        let second = Img::new(source, Rc::clone(&engine))
+            .frame_index(1)
+            .tint([0.8, 0.2, 0.1, 1.0]);
+
+        assert_eq!(first.diff_key().source, second.diff_key().source);
+        assert!(emitted(&first, [0.0, 0.0, 16.0, 16.0]).is_some());
+        assert!(emitted(&first, [0.0, 0.0, 16.0, 16.0]).is_some());
+        assert!(emitted(&second, [0.0, 0.0, 16.0, 16.0]).is_some());
+        assert_eq!(
+            counters.decodes.get(),
+            2,
+            "each animation frame is resident once"
+        );
+
+        let cache = engine.borrow();
+        let image = cache
+            .cache
+            .get(first.diff_key().source)
+            .expect("the tinted animation source is materialized");
+        assert_eq!(image.frame_count(), 2);
+        assert_eq!(
+            image.frames()[0].delay,
+            std::time::Duration::from_millis(10)
+        );
+        assert_eq!(
+            image.frames()[1].delay,
+            std::time::Duration::from_millis(10)
+        );
+        assert_eq!(
+            image.frames()[0].texels,
+            [204, 51, 26, 0]
+                .into_iter()
+                .cycle()
+                .take(16 * 16 * 4)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            image.frames()[1].texels,
+            [204, 51, 26, 1]
+                .into_iter()
+                .cycle()
+                .take(16 * 16 * 4)
+                .collect::<Vec<_>>()
         );
     }
 
