@@ -175,7 +175,8 @@ struct HelioRenderState {
 }
 
 struct SurfaceExample {
-    surface: WgpuSurfaceHandle,
+    surface: Option<WgpuSurfaceHandle>,
+    surface_error: Option<String>,
     /// Lazily initialised on the first render call, once the surface has a size.
     state: Option<HelioRenderState>,
     last_frame_time: std::time::Instant,
@@ -186,11 +187,13 @@ struct SurfaceExample {
 
 impl Render for SurfaceExample {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some((view, (dw, dh))) = self.surface.back_view_with_size() {
+        if let Some(surface) = self.surface.as_ref()
+            && let Some((view, (dw, dh))) = surface.back_view_with_size()
+        {
             let state = self.state.get_or_insert_with(|| {
-                let device = Arc::new(self.surface.device().clone());
-                let queue = Arc::new(self.surface.queue().clone());
-                let format = self.surface.format();
+                let device = Arc::new(surface.device().clone());
+                let queue = Arc::new(surface.queue().clone());
+                let format = surface.format();
                 build_helio_state(device, queue, dw, dh, format)
             });
 
@@ -278,7 +281,7 @@ impl Render for SurfaceExample {
                 log::error!("Helio render error: {:?}", e);
             }
             drop(view);
-            self.surface.swap_buffers();
+            surface.swap_buffers();
 
             self.frame_count = self.frame_count.wrapping_add(1);
             if now.duration_since(self.last_fps_update) >= std::time::Duration::from_secs(1) {
@@ -299,7 +302,9 @@ impl Render for SurfaceExample {
             .shadow_xl()
             .bg(rgb(0x000000))
             .m(wgpui::px(8.0))
-            .child(wgpu_surface(self.surface.clone()).absolute().inset_0())
+            .when_some(self.surface.as_ref(), |this, surface| {
+                this.child(wgpu_surface(surface.clone()).absolute().inset_0())
+            })
             .child(
                 div()
                     .absolute()
@@ -307,7 +312,10 @@ impl Render for SurfaceExample {
                     .left(wgpui::px(8.0))
                     .text_color(rgb(0x00aaff))
                     .text_xl()
-                    .child(format!("FPS: {:.1} | Helio Sky Renderer", self.display_fps)),
+                    .child(self.surface_error.as_deref().map_or_else(
+                        || format!("FPS: {:.1} | Helio Sky Renderer", self.display_fps),
+                        |error| format!("Helio unavailable: {error}"),
+                    )),
             )
     }
 }
@@ -488,26 +496,47 @@ fn build_helio_state(
     }
 }
 
+fn helio_device_requirements() -> wgpui::gpu::render::device::DeviceRequirements {
+    wgpui::gpu::render::device::DeviceRequirements::helio_external()
+}
+
 fn main() {
     env_logger::init();
-    Application::new().run(|cx: &mut App| {
-        _ = cx.open_window(
-            WindowOptions::default(),
-            |window: &mut Window, cx: &mut App| {
-                let surface = window
-                    .create_wgpu_surface(1720, 1080, wgpu::TextureFormat::Rgba8UnormSrgb)
-                    .expect("WgpuSurface not supported on this platform");
+    let result = Application::new()
+        .with_wgpu_requirements(helio_device_requirements())
+        .run(|cx: &mut App| {
+            if let Err(error) = cx.open_window(
+                WindowOptions::default(),
+                |window: &mut Window, cx: &mut App| {
+                    let (surface, surface_error) = match window.create_wgpu_surface(
+                        1720,
+                        1080,
+                        wgpu::TextureFormat::Rgba8UnormSrgb,
+                    ) {
+                        Ok(surface) => (Some(surface), None),
+                        Err(error) => {
+                            log::error!("WgpuSurface is unavailable: {error}");
+                            (None, Some(error.to_string()))
+                        }
+                    };
 
-                let now = std::time::Instant::now();
-                cx.new(|_cx| SurfaceExample {
-                    surface,
-                    state: None,
-                    last_frame_time: now,
-                    frame_count: 0,
-                    last_fps_update: now,
-                    display_fps: 0.0,
-                })
-            },
-        );
-    });
+                    let now = std::time::Instant::now();
+                    cx.new(|_cx| SurfaceExample {
+                        surface,
+                        surface_error,
+                        state: None,
+                        last_frame_time: now,
+                        frame_count: 0,
+                        last_fps_update: now,
+                        display_fps: 0.0,
+                    })
+                },
+            ) {
+                log::error!("could not open WGPU surface window: {error}");
+                cx.quit();
+            }
+        });
+    if let Err(error) = result {
+        eprintln!("wgpu_surface could not start: {error}");
+    }
 }

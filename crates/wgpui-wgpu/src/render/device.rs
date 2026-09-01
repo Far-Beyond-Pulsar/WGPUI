@@ -55,6 +55,12 @@ pub enum ContextError {
     NoAdapter(wgpu::RequestAdapterError),
     /// An adapter exists but would not open a device.
     NoDevice(wgpu::RequestDeviceError),
+    /// The adapter was found, but it cannot satisfy the requested capability
+    /// contract.
+    Unsupported {
+        adapter: String,
+        capability: CapabilityError,
+    },
 }
 
 impl std::fmt::Display for ContextError {
@@ -66,11 +72,152 @@ impl std::fmt::Display for ContextError {
             ContextError::NoDevice(error) => {
                 write!(formatter, "adapter would not open a device: {error}")
             }
+            ContextError::Unsupported {
+                adapter,
+                capability,
+            } => write!(
+                formatter,
+                "adapter {adapter:?} does not support {capability}"
+            ),
         }
     }
 }
 
 impl std::error::Error for ContextError {}
+
+/// A capability contract that is checked before `request_device` is called.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceRequirements {
+    required_features: wgpu::Features,
+    optional_features: wgpu::Features,
+    required_limits: Option<wgpu::Limits>,
+}
+
+impl DeviceRequirements {
+    /// Add features that the caller's rendering path cannot operate without.
+    pub fn require_features(mut self, features: wgpu::Features) -> Self {
+        self.required_features |= features;
+        self
+    }
+
+    /// Add features that enable an optimization or an alternate fast path.
+    pub fn prefer_features(mut self, features: wgpu::Features) -> Self {
+        self.optional_features |= features;
+        self
+    }
+
+    /// Require the supplied limits from the adapter. The supplied value is
+    /// passed to `request_device` unchanged after it is validated.
+    pub fn require_limits(mut self, limits: wgpu::Limits) -> Self {
+        self.required_limits = Some(limits);
+        self
+    }
+
+    /// The feature and limit contract used by WGPUI's retained renderer.
+    pub fn retained() -> Self {
+        Self::default().prefer_features(IndirectSupport::wanted())
+    }
+
+    /// The desktop Helio external graph's material table contract.
+    ///
+    /// Helio's GBuffer BGL 1 binds 256 textures and 256 samplers as arrays.
+    /// This is intentionally a named requirement: the feature is not enabled
+    /// for WGPUI devices unless an integration explicitly requests this path.
+    pub fn helio_external() -> Self {
+        let mut limits = wgpu::Limits::default();
+        limits.max_binding_array_elements_per_shader_stage = 256;
+        limits.max_binding_array_sampler_elements_per_shader_stage = 256;
+        Self::retained()
+            .require_features(wgpu::Features::TEXTURE_BINDING_ARRAY)
+            .require_limits(limits)
+    }
+}
+
+/// A capability mismatch found before device creation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityError {
+    MissingFeatures {
+        required: wgpu::Features,
+        missing: wgpu::Features,
+        available: wgpu::Features,
+    },
+    InsufficientLimits {
+        violations: Vec<LimitViolation>,
+    },
+}
+
+impl std::fmt::Display for CapabilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingFeatures {
+                required,
+                missing,
+                available,
+            } => write!(
+                formatter,
+                "required features {required:?}; missing {missing:?}; adapter exposes {available:?}"
+            ),
+            Self::InsufficientLimits { violations } => {
+                write!(
+                    formatter,
+                    "required limits are not supported: {violations:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CapabilityError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LimitViolation {
+    pub name: &'static str,
+    pub required: u64,
+    pub supported: u64,
+}
+
+#[derive(Clone, Debug)]
+struct NegotiatedDevice {
+    features: wgpu::Features,
+    limits: wgpu::Limits,
+}
+
+fn negotiate_device(
+    adapter_features: wgpu::Features,
+    adapter_limits: &wgpu::Limits,
+    requirements: &DeviceRequirements,
+) -> Result<NegotiatedDevice, CapabilityError> {
+    let missing = requirements.required_features & !adapter_features;
+    if !missing.is_empty() {
+        return Err(CapabilityError::MissingFeatures {
+            required: requirements.required_features,
+            missing,
+            available: adapter_features,
+        });
+    }
+
+    let limits = requirements
+        .required_limits
+        .clone()
+        .unwrap_or_else(|| adapter_limits.clone());
+    let mut violations = Vec::new();
+    limits.check_limits_with_fail_fn(adapter_limits, false, |name, required, supported| {
+        violations.push(LimitViolation {
+            name,
+            required,
+            supported,
+        });
+    });
+    if !violations.is_empty() {
+        return Err(CapabilityError::InsufficientLimits { violations });
+    }
+
+    Ok(NegotiatedDevice {
+        features: requirements.required_features
+            | (requirements.optional_features & adapter_features),
+        limits,
+    })
+}
 
 /// Which of §5.3's indirect-draw features the open device actually has.
 ///
@@ -264,6 +411,16 @@ pub fn context_for(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'_>>,
 ) -> Result<ComputeContext, ContextError> {
+    context_for_with_requirements(instance, surface, &DeviceRequirements::retained())
+}
+
+/// Open a device after checking the caller's required and optional
+/// capabilities against the selected adapter.
+pub fn context_for_with_requirements(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+    requirements: &DeviceRequirements,
+) -> Result<ComputeContext, ContextError> {
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
@@ -273,31 +430,29 @@ pub fn context_for(
     .map_err(ContextError::NoAdapter)?;
     let adapter_info = adapter.get_info();
 
-    // Best-effort, per this module's doc: whatever of §5.3's three features
-    // this adapter has, and nothing required. `request_device` rejects a
-    // feature the adapter does not advertise, so the intersection is the
-    // request rather than a retry loop.
-    let requested = IndirectSupport::wanted();
     let adapter_features = adapter.features();
+    let requirements = requirements.clone();
     #[cfg(feature = "devtools")]
-    let requested = if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
-        requested
-            | wgpu::Features::TIMESTAMP_QUERY
-            | (wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS & adapter_features)
-            | (wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES & adapter_features)
-    } else {
-        requested
+    let requirements = {
+        let mut requirements = requirements;
+        if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            requirements.optional_features |= wgpu::Features::TIMESTAMP_QUERY
+                | (wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS & adapter_features)
+                | (wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES & adapter_features);
+        }
+        requirements
     };
-    let requested = requested & adapter_features;
+    let negotiated = negotiate_device(adapter_features, &adapter.limits(), &requirements).map_err(
+        |capability| ContextError::Unsupported {
+            adapter: adapter_info.name.clone(),
+            capability,
+        },
+    )?;
 
-    // The adapter's own limits rather than `Limits::default()`: the ordering
-    // pass binds eight storage buffers in one group, which is exactly the
-    // downlevel default's ceiling, and leaving no headroom would make an
-    // unrelated later binding fail on hardware that has room for it.
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("wgpui compute"),
-        required_features: requested,
-        required_limits: adapter.limits(),
+        required_features: negotiated.features,
+        required_limits: negotiated.limits,
         ..Default::default()
     }))
     .map_err(ContextError::NoDevice)?;
@@ -389,6 +544,74 @@ mod tests {
                 first_instance: true,
                 multi_draw_count: true,
             }
+        );
+    }
+
+    #[test]
+    fn negotiation_selects_required_and_supported_optional_features() {
+        let required = wgpu::Features::TEXTURE_BINDING_ARRAY;
+        let optional = wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        let requirements = DeviceRequirements::default()
+            .require_features(required)
+            .prefer_features(optional);
+        let negotiated =
+            negotiate_device(required | optional, &wgpu::Limits::default(), &requirements)
+                .expect("supported capabilities should negotiate");
+
+        assert_eq!(negotiated.features, required | optional);
+    }
+
+    #[test]
+    fn negotiation_rejects_an_unsupported_required_feature() {
+        let requirements =
+            DeviceRequirements::default().require_features(wgpu::Features::TEXTURE_BINDING_ARRAY);
+        let error = negotiate_device(
+            wgpu::Features::empty(),
+            &wgpu::Limits::default(),
+            &requirements,
+        )
+        .expect_err("missing required feature must be reported");
+
+        assert!(matches!(
+            error,
+            CapabilityError::MissingFeatures {
+                missing,
+                ..
+            } if missing == wgpu::Features::TEXTURE_BINDING_ARRAY
+        ));
+    }
+
+    #[test]
+    fn negotiation_omits_an_unsupported_optional_feature() {
+        let optional = wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        let requirements = DeviceRequirements::default().prefer_features(optional);
+        let negotiated = negotiate_device(
+            wgpu::Features::empty(),
+            &wgpu::Limits::default(),
+            &requirements,
+        )
+        .expect("optional capabilities may be omitted");
+
+        assert_eq!(negotiated.features, wgpu::Features::empty());
+    }
+
+    #[test]
+    fn negotiation_rejects_limits_below_a_required_binding_array_size() {
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_binding_array_elements_per_shader_stage = 256;
+        let requirements = DeviceRequirements::default().require_limits(required_limits);
+        let error = negotiate_device(
+            wgpu::Features::empty(),
+            &wgpu::Limits::default(),
+            &requirements,
+        )
+        .expect_err("insufficient limits must be reported");
+
+        assert!(
+            matches!(error, CapabilityError::InsufficientLimits { violations }
+            if violations.iter().any(|violation| {
+                violation.name == "max_binding_array_elements_per_shader_stage"
+            }))
         );
     }
 }
