@@ -194,7 +194,7 @@ fn scale_example(colors: &Colors) -> impl IntoElement {
                             .with_easing(bounce(linear)),
                         |svg, delta| {
                             let scale = 0.8 + (delta * 0.4);
-                            svg.with_transformation(Transformation::scale(gpui_size(scale, scale)))
+                            svg.with_transformation(Transformation::scale(gpui_size(px(scale), px(scale))))
                         },
                     ),
             ),
@@ -231,7 +231,7 @@ fn combined_example(colors: &Colors) -> impl IntoElement {
                             let scale = 0.7 + (delta * 0.6);
                             svg.with_transformation(
                                 Transformation::rotate(percentage(delta))
-                                    .with_scaling(gpui_size(scale, scale)),
+                                    .with_scaling(gpui_size(px(scale), px(scale))),
                             )
                         },
                     ),

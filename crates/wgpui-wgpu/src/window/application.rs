@@ -1825,6 +1825,9 @@ impl LegacyImgBuilder {
     pub fn size_8(self) -> Self { self.size(32.0) }
     pub fn size_16(self) -> Self { self.size(64.0) }
     pub fn size_full(mut self) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).size_full()); self }
+    pub fn h(mut self, height: impl wgpui_widgets::styled::IntoStylePixels) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).h(height)); self }
+    pub fn w(mut self, width: impl wgpui_widgets::styled::IntoStylePixels) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).w(width)); self }
+    pub fn max_w_full(mut self) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).max_w_full()); self }
     pub fn object_fit(mut self, object_fit: wgpui_widgets::img::ObjectFit) -> Self {
         self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).object_fit(object_fit));
         self
