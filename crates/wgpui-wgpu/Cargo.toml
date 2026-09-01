@@ -18,6 +18,7 @@ arboard = "3.6.1"
 # names nothing here, and cannot, since it is forbidden a live device.
 wgpui-core = { path = "../wgpui-core" }
 wgpui-http-client = { path = "../wgpui-http-client" }
+wgpui-widgets = { path = "../wgpui-widgets" }
 # Phase 6's `window/frame_loop.rs` drives the whole of §2's picture, which means
 # it holds the `LayoutTree` the reconciler builds and `Emitter::emit` reads.
 # `wgpui-core` already depends on this crate for exactly that type; naming it
@@ -50,11 +51,14 @@ bytemuck = { version = "1.24", features = ["derive"] }
 # keeps the move mechanical — deleting the one `log::trace!` would be a change
 # to code §9's risk table specifically asks this phase not to change.
 log = "0.4.16"
+tracing = "0.1"
 # Phase 6: `src/window.rs` opens a real OS window and binds a `wgpu::Surface` to
 # it. Pinned to the same version the root gpui-ce crate already resolves, so the
 # two backends share one winit in the lock file rather than linking two copies
 # of a library that registers OS-level window classes.
 winit = "0.30.12"
+raw-window-handle = "0.6.2"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 # `tests/legacy_image_differential.rs` drives Phase 6.2's gate end to end: a real

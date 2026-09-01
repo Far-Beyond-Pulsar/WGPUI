@@ -311,10 +311,16 @@ pub enum Pattern {
 pub enum CursorStyle {
     #[default]
     Default,
+    Arrow,
+    IBeam,
     Pointer,
     Grab,
     Crosshair,
     NotAllowed,
+    ResizeUpDown,
+    ResizeLeftRight,
+    ResizeUpLeftDownRight,
+    ResizeUpRightDownLeft,
 }
 
 impl DivStyle {

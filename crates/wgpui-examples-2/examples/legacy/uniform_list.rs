@@ -7,7 +7,11 @@ struct UniformListExample {}
 
 impl Render for UniformListExample {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().bg(rgb(0xffffff)).child(
+        div()
+            .size_full()
+            .bg(rgb(0xffffff))
+            .text_color(rgb(0x000000))
+            .child(
             uniform_list(
                 "entries",
                 50,
@@ -30,7 +34,7 @@ impl Render for UniformListExample {
                     items
                 }),
             )
-            .h_full(),
+            .size_full(),
         )
     }
 }

@@ -86,7 +86,7 @@ impl Render for HelloWorld {
             .child(
                 div()
                     .id("panel")
-                    .on_click(cx.listener(Self::start_animation))
+                    .on_click(wgpui::public_listener(cx, Self::start_animation))
                     .absolute()
                     .top_8()
                     .left_8()

@@ -237,4 +237,45 @@ mod tests {
         assert_eq!(items, vec!["2", "3", "4"]);
         assert_eq!(*entity.read(&app), 3);
     }
+
+    #[test]
+    fn processor_passes_a_live_window_and_inner_context() {
+        let app = App::create();
+        let entity = app.new_entity(false);
+        let entity_id = entity.entity_id();
+        let context = Context::from_entity(entity.clone());
+        let mut processor = context.processor(move |value, range, window, inner_context| {
+            window.activate();
+            *value = window.is_active()
+                && inner_context.entity().entity_id() == entity_id
+                && range.start == 4;
+            Vec::<String>::new()
+        });
+
+        processor(4..5);
+
+        assert!(*entity.read(&app));
+    }
+
+    #[test]
+    fn context_spawn_uses_the_weak_handle_and_live_context() {
+        let app = App::create();
+        let entity = app.new_entity(0_u32);
+        let context = Context::from_entity(entity.clone());
+        let mut task = context.spawn(async move |handle, inner_context| {
+            assert_eq!(handle.entity_id(), inner_context.entity().entity_id());
+            handle
+                .update((), |value, callback_context| {
+                    *value += 1;
+                    callback_context.notify();
+                })
+                .expect("the entity should still be alive");
+            7_u32
+        });
+
+        app.run_pending_tasks();
+
+        assert_eq!(futures::executor::block_on(&mut task), Ok(7));
+        assert_eq!(*entity.read(&app), 1);
+    }
 }

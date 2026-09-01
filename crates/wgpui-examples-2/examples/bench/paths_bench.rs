@@ -8,7 +8,7 @@ const DEFAULT_WINDOW_WIDTH: Pixels = px(1024.0);
 const DEFAULT_WINDOW_HEIGHT: Pixels = px(768.0);
 
 struct PaintingViewer {
-    default_lines: Vec<(Path<Pixels>, Background)>,
+    default_lines: Vec<(Path, Background)>,
     _painting: bool,
 }
 
@@ -55,14 +55,11 @@ impl Render for PaintingViewer {
         window.request_animation_frame();
         let lines = self.default_lines.clone();
         div().size_full().child(
-            canvas(
-                move |_, _, _| {},
-                move |_, _, window, _| {
-                    for (path, color) in lines {
-                        window.paint_path(path, color);
-                    }
-                },
-            )
+            canvas(move |context, emission| {
+                for (path, color) in &lines {
+                    emission.path(context.path(path.clone(), *color));
+                }
+            })
             .size_full(),
         )
     }

@@ -1,6 +1,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use wgpui::{
+    AppAssetExt,
     Animation, AnimationExt, App, Application, Asset, AssetLogger, AssetSource, Bounds, Context,
     Hsla, ImageAssetLoader, ImageCacheError, ImgResourceLoader, LOADING_DELAY, Length, RenderImage,
     Resource, SharedString, Window, WindowBounds, WindowOptions, black, div, img, prelude::*,

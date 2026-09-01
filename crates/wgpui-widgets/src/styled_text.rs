@@ -42,9 +42,7 @@
 //! highlight), not a hypothetical one.
 
 use std::any::Any;
-use std::cell::RefCell;
 use std::ops::Range;
-use std::rc::Rc;
 use std::sync::Arc;
 use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
@@ -52,11 +50,11 @@ use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::patch::primitive::Underline;
 use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::diff_key::ReconcileKey;
-use wgpui_core::scene::atlas::GlyphTileSource;
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
-use wgpui_text::patch::{ConversionStats, RunPlacement, glyph_runs};
+pub use wgpui_text::engine::{SharedTextEngine, TextEngine};
+use wgpui_text::patch::RunPlacement;
 use wgpui_text::shaping::{
-    Font, FontRun, FontStyle, FontWeight, ShapeError, ShapedLine, SharedString, TextShaper,
+    Font, FontRun, FontStyle, FontWeight, ShapeError, SharedString,
 };
 
 /// The text properties that decide shaping, plus the one that does not.
@@ -156,6 +154,24 @@ impl HighlightStyle {
     }
 }
 
+impl From<FontWeight> for HighlightStyle {
+    fn from(weight: FontWeight) -> Self {
+        Self {
+            weight: Some(weight),
+            ..Self::default()
+        }
+    }
+}
+
+impl From<FontStyle> for HighlightStyle {
+    fn from(style: FontStyle) -> Self {
+        Self {
+            style: Some(style),
+            ..Self::default()
+        }
+    }
+}
+
 /// One highlighted range.
 pub type Highlight = (Range<usize>, HighlightStyle);
 
@@ -238,68 +254,6 @@ impl ReconcileKey for StyledTextKey {
     }
 }
 
-/// Shaping plus rasterisation, in the one place an element can reach both.
-///
-/// The two halves of the text path are separately owned by design (§3.3, §3.5)
-/// and an element needs both at once, so this is where they meet: it is the only
-/// type in this crate that holds a [`TextShaper`], and it holds a
-/// [`GlyphTileSource`] beside it so a shaped line can be converted in the same
-/// call.
-pub struct TextEngine {
-    shaper: TextShaper,
-    tiles: Box<dyn GlyphTileSource>,
-}
-
-impl TextEngine {
-    /// An engine shaping with `shaper` and rastering through `tiles`.
-    pub fn new(shaper: TextShaper, tiles: Box<dyn GlyphTileSource>) -> Self {
-        Self { shaper, tiles }
-    }
-
-    /// The shaper, for resolving fonts and for reading its counters.
-    pub fn shaper(&mut self) -> &mut TextShaper {
-        &mut self.shaper
-    }
-
-    /// Shape one line.
-    ///
-    /// Split out from [`TextEngine::convert`] by Phase 6.6, because underline
-    /// placement needs the line's own ascent, descent and per-glyph pen
-    /// positions — the same values `paint_line` reads — and those are gone once
-    /// the line has been reduced to `GlyphRun`s.
-    fn shape(
-        &mut self,
-        text: &SharedString,
-        font_size: f32,
-        runs: &[FontRun],
-    ) -> Result<Arc<ShapedLine>, ShapeError> {
-        self.shaper.shape_line(text, font_size, runs)
-    }
-
-    /// Convert an already-shaped line to patch payloads.
-    fn convert(
-        &mut self,
-        line: &ShapedLine,
-        placement: RunPlacement,
-        emission: &mut Emission,
-    ) -> ConversionStats {
-        let (converted, stats) = glyph_runs(line, placement, self.tiles.as_mut());
-        for run in converted {
-            emission.glyph_run(run);
-        }
-        stats
-    }
-}
-
-/// A [`TextEngine`] several elements share.
-///
-/// `Rc<RefCell<_>>` rather than a lock, for the reason `TextShaper`'s own doc
-/// gives: everything that reaches it runs on the frame's thread, so a lock here
-/// would be one nothing contends. Shared rather than owned per element because
-/// the shaping cache and the atlas are only useful if every row on screen is
-/// looking at the same ones.
-pub type SharedTextEngine = Rc<RefCell<TextEngine>>;
-
 /// Text with per-range style overrides.
 ///
 /// Like [`crate::wgpu_surface::WgpuSurface`] and [`crate::img::Img`], this is
@@ -333,8 +287,8 @@ impl StyledText {
     /// the `Arc` every frame from an equal `Vec` would defeat the pointer
     /// short-circuit the fingerprint depends on, and making that visible at the
     /// call site is better than accepting a `Vec` and silently paying for it.
-    pub fn with_highlights(mut self, highlights: Highlights) -> Self {
-        self.highlights = highlights;
+    pub fn with_highlights(mut self, highlights: impl Into<Highlights>) -> Self {
+        self.highlights = highlights.into();
         self
     }
 
@@ -441,7 +395,7 @@ impl StyledText {
             color: self.style.color,
             scale_factor: 1.0,
         };
-        let line = match engine.shape(&self.text, self.style.font_size, &runs) {
+        let line = match engine.shape_line(&self.text, self.style.font_size, &runs) {
             Ok(line) => line,
             Err(error) => {
                 // Shaping refused this line — a run-length mismatch or an
@@ -458,7 +412,7 @@ impl StyledText {
         // composites them: `Underline` sorts below `GlyphRun`, which is what
         // "painted under their layer's text" means on the primitive.
         self.emit_decorations(&line, placement.origin, emission);
-        engine.convert(&line, placement, emission);
+        engine.convert_line(&line, placement, emission);
     }
 
     /// Every [`Underline`] this text's highlight runs ask for.
@@ -685,14 +639,16 @@ impl Element for StyledText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use wgpui_core::patch::primitive::AtlasTileId;
     use wgpui_core::reconcile::description::ElementId;
     use wgpui_core::reconcile::instance::InstanceKey;
     use wgpui_core::reconcile::plan::{FramePlan, NodeOutcome, PlannedNode, RebuildReason};
     use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
-    use wgpui_core::scene::atlas::{GlyphRasterKey, GlyphTile};
+    use wgpui_core::scene::atlas::{GlyphRasterKey, GlyphTile, GlyphTileSource};
     use wgpui_layout::taffy_tree::LayoutTree;
-    use wgpui_text::shaping::font;
+    use wgpui_text::shaping::{font, ShapedLine, TextShaper};
 
     /// A tile source that hands out one tile per distinct raster key.
     ///
@@ -727,6 +683,17 @@ mod tests {
             font: font("Segoe UI"),
             ..TextStyle::default()
         }
+    }
+
+    #[test]
+    fn font_highlights_override_only_the_matching_font_axis() {
+        let weight = HighlightStyle::from(FontWeight::BOLD);
+        assert_eq!(weight.weight, Some(FontWeight::BOLD));
+        assert_eq!(weight.style, None);
+
+        let style = HighlightStyle::from(FontStyle::Italic);
+        assert_eq!(style.style, Some(FontStyle::Italic));
+        assert_eq!(style.weight, None);
     }
 
     fn text(engine: &SharedTextEngine, value: impl Into<SharedString>) -> StyledText {
@@ -1022,14 +989,14 @@ mod tests {
     /// Shape the same line the element will, so a test can compute the legacy
     /// placement from the line's own metrics rather than from magic numbers.
     fn shaped(engine: &SharedTextEngine, element: &StyledText) -> Arc<ShapedLine> {
-        let mut borrowed = engine.borrow_mut();
+        let borrowed = engine.borrow_mut();
         let font_id = borrowed
             .shaper()
             .resolve_font(&element.style.font)
             .expect("some face exists");
         let runs = element.font_runs(font_id);
         borrowed
-            .shape(&element.text, element.style.font_size, &runs)
+            .shape_line(&element.text, element.style.font_size, &runs)
             .expect("the line must shape")
     }
 

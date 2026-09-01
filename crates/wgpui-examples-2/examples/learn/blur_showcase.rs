@@ -9,9 +9,8 @@ mod example_prelude;
 
 use example_prelude::init_example;
 use wgpui::{
-    App, Application, Bounds, Context, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Render, ScrollHandle, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px,
-    rgb, rgba, size,
+    App, Application, Bounds, Context, MouseButton, MouseMoveEvent, Pixels, Render, ScrollHandle,
+    Window, WindowBounds, WindowOptions, div, point, prelude::*, px, rgb, rgba, size,
 };
 
 const SCROLLBAR_THUMB_WIDTH: Pixels = px(6.);
@@ -71,58 +70,50 @@ impl BlurShowcase {
                     .rounded_full()
                     .bg(rgba(0xffffff55))
                     .hover(|this| this.bg(rgba(0xffffff88)))
-                    .child(
-                        canvas(
-                            |_, _, _| (),
-                            move |thumb_bounds, _, window, _| {
-                                window.on_mouse_event({
-                                    let entity = entity.clone();
-                                    move |ev: &MouseDownEvent, _, _, cx| {
-                                        if !thumb_bounds.contains(&ev.position) {
-                                            return;
-                                        }
-
-                                        let drag_offset = ev.position.y - thumb_bounds.origin.y;
-                                        entity.update(cx, |this, _| {
-                                            this.scrollbar_drag_offset = Some(drag_offset);
-                                        })
-                                    }
-                                });
-                                window.on_mouse_event({
-                                    let entity = entity.clone();
-                                    move |_: &MouseUpEvent, _, _, cx| {
-                                        entity.update(cx, |this, _| {
-                                            this.scrollbar_drag_offset = None;
-                                        })
-                                    }
-                                });
-
-                                let scroll_handle = scroll_handle.clone();
-                                window.on_mouse_event(move |ev: &MouseMoveEvent, _, _, cx| {
-                                    if !ev.dragging() {
-                                        return;
-                                    }
-
-                                    let Some(drag_offset) = entity.read(cx).scrollbar_drag_offset
-                                    else {
-                                        return;
-                                    };
-
-                                    let thumb_top = (ev.position.y - bounds.origin.y - drag_offset)
-                                        .clamp(px(0.), track_room);
-                                    let scrolled_fraction = if track_room > px(0.) {
-                                        thumb_top / track_room
-                                    } else {
-                                        0.
-                                    };
-                                    let offset_y = max_offset.height * scrolled_fraction;
-                                    scroll_handle.set_offset(point(px(0.), -offset_y));
-                                    cx.notify(entity.entity_id());
+                    .on_mouse_down(MouseButton::Left, {
+                        let entity = entity.clone();
+                        move |event, _, cx| {
+                            if let wgpui::InputEvent::MouseDown(mouse_down) = event {
+                                let pointer = point(mouse_down.position[0], mouse_down.position[1]);
+                                let drag_offset = pointer.y - (bounds.origin.y + thumb_top);
+                                entity.update(cx, |this, _| {
+                                    this.scrollbar_drag_offset = Some(drag_offset);
                                 })
-                            },
-                        )
-                        .size_full(),
-                    ),
+                            }
+                        }
+                    })
+                    .on_mouse_up(MouseButton::Left, {
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, _| {
+                                this.scrollbar_drag_offset = None;
+                            })
+                        }
+                    })
+                    .on_mouse_move({
+                        let entity = entity.clone();
+                        let scroll_handle = scroll_handle.clone();
+                        move |event: &MouseMoveEvent, _, cx| {
+                            if !event.dragging() {
+                                return;
+                            }
+
+                            let Some(drag_offset) = entity.read(cx).scrollbar_drag_offset else {
+                                return;
+                            };
+
+                            let thumb_top = (event.position[1] - bounds.origin.y - drag_offset)
+                                .clamp(px(0.), track_room);
+                            let scrolled_fraction = if track_room > px(0.) {
+                                thumb_top / track_room
+                            } else {
+                                0.
+                            };
+                            let offset_y = max_offset.height * scrolled_fraction;
+                            scroll_handle.set_offset(point(px(0.), -offset_y));
+                            cx.notify(entity.entity_id());
+                        }
+                    }),
             )
             .into_any_element()
     }

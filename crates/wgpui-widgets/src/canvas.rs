@@ -14,7 +14,7 @@ use lyon::tessellation::{
     BuffersBuilder, FillOptions, FillTessellator, FillVertex, StrokeOptions, StrokeTessellator,
     StrokeVertex, VertexBuffers,
 };
-use wgpui_core::color::{Hsla, Rgba};
+use wgpui_core::color::{Background, Hsla, Rgba};
 use wgpui_core::element::Element;
 use wgpui_core::geometry::{Bounds, Pixels, Point};
 use wgpui_core::patch::emit::{Emission, EmitContext};
@@ -29,6 +29,11 @@ use crate::styled::Styled;
 /// retained scene.
 pub trait IntoCanvasColor {
     fn into_canvas_color(self) -> [f32; 4];
+}
+
+/// Convert a public retained material into the path payload used by a canvas.
+pub trait IntoCanvasMaterial {
+    fn into_canvas_material(self) -> ([f32; 4], Material);
 }
 
 /// Convert a native rectangle into canvas coordinates.
@@ -66,6 +71,58 @@ impl IntoCanvasColor for Rgba {
 impl IntoCanvasColor for Hsla {
     fn into_canvas_color(self) -> [f32; 4] {
         self.into()
+    }
+}
+
+impl<T: IntoCanvasColor> IntoCanvasMaterial for T {
+    fn into_canvas_material(self) -> ([f32; 4], Material) {
+        (self.into_canvas_color(), Material::Solid)
+    }
+}
+
+impl IntoCanvasMaterial for Material {
+    fn into_canvas_material(self) -> ([f32; 4], Material) {
+        ([0.0; 4], self)
+    }
+}
+
+impl IntoCanvasMaterial for Background {
+    fn into_canvas_material(self) -> ([f32; 4], Material) {
+        match self {
+            Background::Solid(color) => (color.into(), Material::Solid),
+            Background::LinearGradient { angle, colors, .. } => (
+                [0.0; 4],
+                Material::Linear {
+                    direction: [angle.to_radians().cos(), angle.to_radians().sin()],
+                    colors: [colors[0].color.into(), colors[1].color.into()],
+                },
+            ),
+            Background::RadialGradient {
+                center,
+                radius,
+                colors,
+                ..
+            } => (
+                [0.0; 4],
+                Material::Radial {
+                    center,
+                    radius,
+                    colors: [colors[0].color.into(), colors[1].color.into()],
+                },
+            ),
+            Background::PatternSlash {
+                color,
+                width,
+                interval,
+            } => (
+                [0.0; 4],
+                Material::Slash {
+                    color: color.into(),
+                    width,
+                    interval,
+                },
+            ),
+        }
     }
 }
 
@@ -117,11 +174,11 @@ impl CanvasContext {
     }
 
     /// Apply the canvas bounds as a conservative per-path mask.
-    pub fn path(&self, path: Path, color: impl IntoCanvasColor) -> Path {
-        path.with_color(color.into_canvas_color()).with_clip(
-            [self.bounds.x, self.bounds.y],
-            [self.bounds.width, self.bounds.height],
-        )
+    pub fn path(&self, path: Path, material: impl IntoCanvasMaterial) -> Path {
+        let (color, material) = material.into_canvas_material();
+        path.with_color(color)
+            .with_material(material)
+            .with_clip([self.bounds.x, self.bounds.y], [self.bounds.width, self.bounds.height])
     }
 
     /// Make a backdrop filter covering the canvas bounds.

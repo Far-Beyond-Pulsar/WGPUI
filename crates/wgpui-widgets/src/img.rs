@@ -48,7 +48,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::time::Instant;
+use std::{path::PathBuf, time::Instant};
 use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::{Emission, EmitContext};
@@ -58,7 +58,7 @@ use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_core::scene::atlas::{ImageRasterKey, ImageTileSource};
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 
-use crate::assets::Resource;
+use crate::assets::{AssetRegistry, Resource};
 use crate::image_cache::ImageCache;
 use crate::styled::IntoStylePixels;
 
@@ -471,16 +471,55 @@ pub fn img_with_engine(source: ImageSourceId, engine: SharedImageEngine) -> Img 
 /// An additive resource-backed image builder.
 pub struct ImgBuilder {
     image: Img,
+    resource: Option<Resource>,
+    resolver: Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>,
 }
 
+pub trait IntoImageInput: 'static {
+    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>);
+}
+
+impl IntoImageInput for Resource {
+    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { (Some(self), None) }
+}
+
+impl IntoImageInput for PathBuf {
+    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) {
+        Resource::from(self).into_image_input()
+    }
+}
+
+impl<F> IntoImageInput for F
+where
+    F: FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource + 'static,
+{
+    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { (None, Some(Box::new(self))) }
+}
+
+impl IntoImageInput for String { fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { Resource::from(self).into_image_input() } }
+impl IntoImageInput for &'static str { fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { Resource::from(self).into_image_input() } }
+
 /// Construct an image from a resource using the retained image representation.
-pub fn img(source: impl Into<Resource>) -> ImgBuilder {
+pub fn img(source: impl IntoImageInput) -> ImgBuilder {
+    let (resource, resolver) = source.into_image_input();
+    let initial_resource = resource.clone().unwrap_or_else(|| Resource::Embedded("pending-image".into()));
     ImgBuilder {
-        image: Img::from_resource(source.into()),
+        image: Img::from_resource(initial_resource),
+        resource,
+        resolver,
     }
 }
 
 impl ImgBuilder {
+    pub fn from_decoded(source: ImageSourceId, image: std::sync::Arc<crate::assets::RenderImage>) -> Self {
+        let mut cache = ImageCache::new();
+        let load_state = cache.hold_at(source, (*image).clone()).is_ok();
+        Self {
+            image: Img::new(source, pending_engine(cache)).load_state(if load_state { ImageLoadState::Ready } else { ImageLoadState::Failed }),
+            resource: None,
+            resolver: None,
+        }
+    }
     pub fn size(mut self, size: impl IntoStylePixels) -> Self {
         let size = size.into_style_pixels();
         self.image = self.image.size(size, size);
@@ -536,9 +575,51 @@ impl Element for ImgBuilder {
     fn into_description(self) -> Description {
         self.image.into_description()
     }
+
+    fn into_description_in(
+        self,
+        _window: &mut wgpui_core::window::Window,
+        app: &wgpui_core::App,
+    ) -> Description {
+        let resource = match (self.resource, self.resolver) {
+            (Some(resource), _) => resource,
+            (None, Some(resolver)) => resolver(_window, &mut app.clone()),
+            (None, None) => return self.image.into_description(),
+        };
+        let Some(registry) = app.global::<AssetRegistry>() else { return self.image.into_description(); };
+        match registry.load_cached(resource.clone()) {
+            Ok(image) => {
+                let source = resource_source_id(&resource);
+                let load_state = if self.image.engine.borrow_mut().cache().hold_at(source, (*image).clone()).is_ok() {
+                    ImageLoadState::Ready
+                } else { ImageLoadState::Failed };
+                self.image.load_state(load_state).into_description()
+            }
+            Err(_) => self.image.load_state(ImageLoadState::Failed).into_description(),
+        }
+    }
 }
 
 impl Img {
+    pub(crate) fn set_decoded(
+        mut self,
+        source: ImageSourceId,
+        image: std::sync::Arc<crate::assets::RenderImage>,
+    ) -> Self {
+        let loaded = self
+            .engine
+            .borrow_mut()
+            .cache()
+            .hold_at(source, (*image).clone())
+            .is_ok();
+        self.source = source;
+        self.load_state(if loaded {
+            ImageLoadState::Ready
+        } else {
+            ImageLoadState::Failed
+        })
+    }
+
     /// An image showing `source`, at its first frame, ready, unsized, unstyled.
     pub fn new(source: ImageSourceId, engine: SharedImageEngine) -> Self {
         Self {

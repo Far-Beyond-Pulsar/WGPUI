@@ -36,8 +36,8 @@ pub use wgpui_core::invalidation;
 pub use wgpui_core::patch;
 pub use wgpui_core::patch::emit::{Emit, EmitContext, Emitter, FrameEmission};
 pub use wgpui_core::patch::primitive::{
-    AtlasTileId, BackdropFilter, Glyph, GlyphRun, Path, PathVertex, PolySprite, Quad, Shadow,
-    ShadowClip, Underline,
+    AtlasTileId, BackdropFilter, Glyph, GlyphRun, Material, Path, PathVertex, PolySprite, Quad,
+    Shadow, ShadowClip, Underline,
 };
 pub use wgpui_core::reconcile;
 pub use wgpui_core::reconcile::description::{
@@ -76,6 +76,14 @@ pub use wgpui_wgpu::window::application::{
     AppWindowExt, Component, Render, RenderOnce, render_description,
 };
 pub use wgpui_core::element::IntoElement;
+
+pub trait IntoAnyElement {
+    fn into_any_element(self) -> Description;
+}
+
+impl<T: IntoElement> IntoAnyElement for T {
+    fn into_any_element(self) -> Description { self.into_description() }
+}
 pub use wgpui_layout::{
     AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
     LayoutTree, Measure,
@@ -86,15 +94,17 @@ pub use wgpui_layout::taffy_tree::{
 };
 pub use wgpui_macros::IntoElement;
 pub use wgpui_text::patch::{RunPlacement, glyph_runs};
+pub use wgpui_text::engine::{SharedTextEngine, SharedTextShaper, TextEngine};
 pub use wgpui_text::shaping::{
-    Font, FontId, FontRun, FontStyle, FontWeight, SharedString, TextMeasurement, TextShaper,
+    font, Font, FontId, FontRun, FontStyle, FontWeight, SharedString, TextMeasurement, TextShaper,
 };
 pub use wgpui_widgets::animation::{
     Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline, Transformation,
     bounce, ease_in_out, ease_out_quint, linear, percentage, quadratic,
 };
 pub use wgpui_widgets::canvas::{
-    Canvas, CanvasContext, IntoCanvasBounds, IntoCanvasColor, PathBuilder, PathStyle, canvas, fill,
+    Canvas, CanvasContext, IntoCanvasBounds, IntoCanvasColor, IntoCanvasMaterial, PathBuilder,
+    PathStyle, canvas, fill,
 };
 pub use wgpui_widgets::div::StatefulDiv;
 pub use wgpui_widgets::div::interactivity::style::{
@@ -105,7 +115,7 @@ pub use wgpui_widgets::image_cache::{
     DecodedFrame, DecodedImage, ImageCache, ImageDecodeError, decode, decode_async, decode_svg_at,
 };
 pub use wgpui_widgets::img::{
-    img, img_with_engine, ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img,
+    img_with_engine, ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img,
     ImgBuilder, ObjectFit, SharedImageEngine,
 };
 pub use wgpui_widgets::list;
@@ -135,6 +145,15 @@ impl Default for LayerPolicy {
     fn default() -> Self {
         Self {
             overdraw_margin: Size::ZERO,
+        }
+    }
+}
+
+impl From<LayerPolicy> for BoundaryPolicy {
+    fn from(policy: LayerPolicy) -> Self {
+        Self {
+            buffering: Buffering::Margin(Some(policy.overdraw_margin)),
+            ..Self::default()
         }
     }
 }
@@ -267,23 +286,29 @@ pub use wgpui_widgets::styled::{
     TextOverflow,
 };
 pub use wgpui_widgets::styled_text::{
-    Highlight, HighlightStyle, StrikethroughStyle, StyledText, TextEngine, TextStyle,
-    UnderlineStyle,
+    Highlight, HighlightStyle, StrikethroughStyle, StyledText, TextStyle, UnderlineStyle,
 };
 pub use wgpui_widgets::svg::{
     svg, svg_with_engine, load as load_svg, Svg, SvgBuilder, SvgKey,
 };
 pub use wgpui_widgets::wgpu_surface::{SurfaceId, SurfaceStyle, WgpuSurface, WgpuSurfaceKey};
 pub use wgpui_widgets::assets::{
-    AssetLoadError, AssetSource, ImageAssetLoader, ImageSource, Resource, SharedUri,
+    Asset, AssetLoadError, AssetLogger, AssetRegistry, AssetSource, ImageAssetLoader, ImageCacheError,
+    ImageSource, ImgResourceLoader, LOADING_DELAY, RenderImage, Resource, SharedUri,
 };
+pub use wgpui_widgets::animation::pulsating_between;
 
 pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 pub use wgpui_wgpu::window::application::{
-    Application, ApplicationError, ClipboardError, ConfiguredApplication, DisplayId, FrameReport,
-    NativeApplication, Window, WindowHandle, WindowOptions,
+    entity_view, public_listener, public_value_listener, public_window_callback, img, AppAssetExt,
+    AssetRef, Application, ApplicationError, ClipboardError, ConfiguredApplication, Decorations,
+    Display as NativeDisplay, DisplayId, EntityView, FrameReport, IntoLegacyImageSource,
+    LegacyImageSource, LegacyImgBuilder, NativeApplication, PromptButton, PromptError, PromptLevel,
+    ResizeEdge, TilingState, Window, WindowHandle, WindowObserver, WindowOptions,
+    WindowServiceError,
 };
-pub use wgpui_wgpu::window::surface::WgpuSurfaceHandle;
+pub use wgpui_wgpu::window::surface::{SurfaceResizeError, WgpuSurfaceHandle};
+pub use wgpui_wgpu::window::WindowError;
 
 /// Lower a native WGPU surface handle into a retained surface element.
 pub fn wgpu_surface(handle: WgpuSurfaceHandle) -> WgpuSurface {
@@ -292,9 +317,9 @@ pub fn wgpu_surface(handle: WgpuSurfaceHandle) -> WgpuSurface {
 
 pub mod prelude {
     pub use crate::{
-        AppWindowExt, Application, Description, Div, Element, EntityFactory, IntoElement, Render,
-        RenderOnce,
-        Stateful, StatefulDiv, Styled, UniformList,
-        VirtualList, Window, WindowOptions, div, uniform_list, virtual_list,
+        App, AppWindowExt, Application, Component, Context, Description, Div, Element,
+        Entity, EntityFactory, IntoAnyElement, IntoElement, Render, RenderOnce, Stateful,
+        StatefulDiv, Styled, UniformList, VirtualList, WeakEntity, Window, WindowOptions, div,
+        uniform_list, virtual_list,
     };
 }

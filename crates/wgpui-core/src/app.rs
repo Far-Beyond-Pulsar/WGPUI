@@ -191,6 +191,10 @@ impl App {
         self.pending_tasks.load(Ordering::Acquire) != 0
     }
 
+    pub fn background_executor(&self) -> crate::window::BackgroundExecutor {
+        crate::window::BackgroundExecutor
+    }
+
     /// Installs application-scoped state shared by cloned application handles.
     pub fn set_global<T: 'static>(&mut self, value: T) {
         self.state
@@ -751,6 +755,33 @@ mod tests {
         assert_eq!(weak.entity_id(), entity.entity_id());
         drop(entity);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn weak_entity_accessors_report_dropped_entities_and_update_live_entities() {
+        let app = App::create();
+        let entity = app.new_entity(1_u32);
+        let weak = entity.downgrade();
+
+        assert_eq!(weak.read_with(&app, |value, _| *value), Ok(1));
+        let mut window = crate::window::Window::new();
+        assert_eq!(
+            weak.update_in(&mut window, |value, window, _| {
+                window.activate();
+                *value += 1;
+                *value
+            }),
+            Ok(2)
+        );
+        assert!(window.is_active());
+        assert_eq!(*entity.read(&app), 2);
+
+        drop(entity);
+        assert_eq!(weak.read_with(&app, |value, _| *value), Err(EntityError::Dropped));
+        assert_eq!(
+            weak.update_in(&mut window, |_, _, _| ()),
+            Err(EntityError::Dropped)
+        );
     }
 
     #[test]

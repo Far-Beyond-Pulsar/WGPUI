@@ -58,7 +58,7 @@ use wgpui_layout::taffy_tree::{
 };
 
 use crate::debug::{DebugTile, PerformanceDebug};
-use crate::render::atlas::{AtlasTileSource, GlyphAtlas};
+use crate::render::atlas::{GlyphAtlas, SharedAtlasTileSource};
 use crate::render::atlas_upload::AtlasTextures;
 use crate::render::draw::DrawMode;
 use crate::render::frame::{
@@ -71,6 +71,7 @@ use std::time::Instant;
 use wgpui_core::patch::primitive::GlyphRun as CoreGlyphRun;
 use wgpui_text::line::WrappedLine;
 use wgpui_text::line_layout::x_for_index;
+use wgpui_text::engine::{SharedTextEngine, SharedTextShaper, TextEngine};
 use wgpui_text::patch::RunPlacement;
 use wgpui_text::raster::GlyphRasterizer;
 use wgpui_text::shaping::{
@@ -251,9 +252,8 @@ pub struct FrameLoop {
     emitter: Emitter,
     scene: Scene,
     renderer: FrameRenderer,
-    text_shaper: TextShaper,
-    text_rasterizer: GlyphRasterizer,
-    text_atlas: GlyphAtlas,
+    text_engine: SharedTextEngine,
+    text_atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
     atlas_textures: AtlasTextures,
     presentation_target: Option<OffscreenTarget>,
     prepared_text: HashMap<TextCacheKey, PreparedText>,
@@ -329,16 +329,27 @@ struct DebugRefreshRegion {
 impl FrameLoop {
     /// Build every pipeline once, and start with an empty scene.
     pub fn new(device: &wgpu::Device) -> FrameLoop {
+        let text_atlas = std::rc::Rc::new(std::cell::RefCell::new(GlyphAtlas::default()));
+        let text_shaper: SharedTextShaper = std::rc::Rc::new(std::cell::RefCell::new(TextShaper::new()));
+        let text_rasterizer = std::rc::Rc::new(std::cell::RefCell::new(GlyphRasterizer::new()));
+        let text_tiles = SharedAtlasTileSource::new(
+            std::rc::Rc::clone(&text_atlas),
+            text_shaper.clone(),
+            text_rasterizer,
+        );
+        let text_engine = std::rc::Rc::new(std::cell::RefCell::new(
+            TextEngine::new_with_shared_shaper(text_shaper, Box::new(text_tiles)),
+        ));
+        let atlas_page_size = text_atlas.borrow().page_size();
         FrameLoop {
             reconciler: Reconciler::new(),
             layout: LayoutTree::new(),
             emitter: Emitter::new(),
             scene: Scene::new(),
             renderer: FrameRenderer::new(device),
-            text_shaper: TextShaper::new(),
-            text_rasterizer: GlyphRasterizer::new(),
-            text_atlas: GlyphAtlas::default(),
-            atlas_textures: AtlasTextures::new(GlyphAtlas::default().page_size()),
+            text_engine,
+            text_atlas,
+            atlas_textures: AtlasTextures::new(atlas_page_size),
             presentation_target: None,
             prepared_text: HashMap::new(),
             frames: 0,
@@ -358,6 +369,10 @@ impl FrameLoop {
     /// The resident scene, for inspection.
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+
+    pub fn text_engine(&self) -> SharedTextEngine {
+        self.text_engine.clone()
     }
 
     /// How many frames this loop has drawn.
@@ -662,7 +677,7 @@ impl FrameLoop {
         };
 
         self.atlas_textures
-            .sync(device, queue, &mut self.text_atlas);
+            .sync(device, queue, &mut self.text_atlas.borrow_mut());
         let owned_atlas = Some(&self.atlas_textures);
         let frame_input = FrameInput {
             scene: &self.scene,
@@ -1236,11 +1251,7 @@ impl FrameLoop {
             } else {
                 0.0
             };
-            let mut source = AtlasTileSource::new(&mut self.text_atlas, |key| {
-                self.text_rasterizer
-                    .rasterize(&mut self.text_shaper, key)
-                    .ok()
-            });
+            let mut text_engine = self.text_engine.borrow_mut();
             let runs = wrapped.glyph_runs_limited(
                 RunPlacement {
                     origin: [line_offset, baseline],
@@ -1248,7 +1259,7 @@ impl FrameLoop {
                     ..RunPlacement::default()
                 },
                 line_height,
-                &mut source,
+                text_engine.tiles(),
                 remaining_lines,
             );
             let rendered_lines = widths.len();
@@ -1321,7 +1332,8 @@ impl FrameLoop {
         };
         suffix_run.letter_spacing = options.letter_spacing.unwrap_or(0.0) * font_size;
         let suffix = self
-            .text_shaper
+            .text_engine
+            .borrow_mut()
             .shape_line(&SharedString::from("…"), font_size, &[suffix_run])
             .map_err(|error| LoopError::Text(error.to_string()))?;
         let suffix_width = suffix.width;
@@ -1342,7 +1354,8 @@ impl FrameLoop {
         run.style = suffix_run.style;
         run.letter_spacing = options.letter_spacing.unwrap_or(0.0) * font_size;
         let shaped = self
-            .text_shaper
+            .text_engine
+            .borrow_mut()
             .shape_line(&candidate_shared, font_size, &[run])
             .map_err(|error| LoopError::Text(error.to_string()))?;
         Ok((Arc::from(candidate_shared.as_str()), shaped))
@@ -1368,7 +1381,9 @@ impl FrameLoop {
             ..Font::default()
         };
         let font_id = self
-            .text_shaper
+            .text_engine
+            .borrow_mut()
+            .shaper()
             .resolve_font(&font)
             .map_err(|error| LoopError::Text(error.to_string()))?;
         let mut lines = Vec::new();
@@ -1379,7 +1394,8 @@ impl FrameLoop {
             run.style = font.style;
             run.letter_spacing = letter_spacing;
             let line = self
-                .text_shaper
+                .text_engine
+                .borrow_mut()
                 .shape_line(&shared, font_size, &[run])
                 .map_err(|error| LoopError::Text(error.to_string()))?;
             lines.push(PreparedParagraph {

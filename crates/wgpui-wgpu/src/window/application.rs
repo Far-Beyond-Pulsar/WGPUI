@@ -1,10 +1,12 @@
 //! Native application lifecycle for the retained WGPUI renderer.
 
 use std::any::{Any, TypeId};
+use std::cell::Cell;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use wgpui_core::app::App;
@@ -27,6 +29,7 @@ use wgpui_core::window::{
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
     TextInputEvent,
 };
+use wgpui_core::window::{TimerHandle, TimerState};
 use wgpui_core::window::{
     WindowAppearance, WindowBackgroundAppearance, WindowDecorations, WindowKind,
 };
@@ -40,6 +43,11 @@ use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
 use crate::window::surface::WgpuSurfaceHandle;
 use crate::window::{Acquired, WindowError, WindowSurface};
+use wgpui_text::engine::SharedTextEngine;
+use wgpui_widgets::assets::Resource;
+use wgpui_widgets::assets::{Asset, AssetRegistry, ImageCacheError, RenderImage};
+use wgpui_widgets::img::ImgBuilder;
+use wgpui_widgets::styled::Styled;
 
 fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
     let fallback = size(Pixels(options.width as f32), Pixels(options.height as f32));
@@ -60,6 +68,77 @@ type CloseHandler = Box<dyn FnMut(&mut Window) -> bool>;
 type AppInitializer = Box<dyn FnOnce(&mut App)>;
 type WindowBuildCallback = Box<dyn FnMut(&mut Window, &mut App) -> Description>;
 
+thread_local! {
+    static CALLBACK_WINDOW: Cell<*mut Window> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Adapt a public-window callback to the backend-neutral widget callback ABI.
+///
+/// The adapter is only valid while the callback is dispatched by a live WGPU
+/// window. Keeping this conversion here avoids making either core or widgets
+/// depend on the concrete backend window.
+pub fn public_window_callback<E, F>(mut callback: F) -> impl FnMut(
+    &E,
+    &mut wgpui_core::window::Window,
+    &mut App,
+) + 'static
+where
+    F: FnMut(&E, &mut Window, &mut App) + 'static,
+{
+    move |event, _core_window, app| {
+        CALLBACK_WINDOW.with(|slot| {
+            let pointer = slot.get();
+            assert!(!pointer.is_null(), "public window callback outside WGPU dispatch");
+            // SAFETY: the dispatch guard installs the pointer from the
+            // currently borrowed Window and restores it before returning.
+            unsafe { callback(event, &mut *pointer, app) };
+        });
+    }
+}
+
+/// Adapt an entity listener whose callback receives the public WGPU window.
+pub fn public_listener<T: 'static, E: ?Sized>(
+    context: &wgpui_core::app::Context<T>,
+    callback: impl Fn(&mut T, &E, &mut Window, &mut wgpui_core::app::Context<T>) + 'static,
+) -> impl Fn(&E, &mut wgpui_core::window::Window, &mut App) + 'static {
+    let entity = context.entity().downgrade();
+    move |event, core_window, _app| {
+        CALLBACK_WINDOW.with(|slot| {
+            let pointer = slot.get();
+            assert!(!pointer.is_null(), "public listener outside WGPU dispatch");
+            let Some(entity) = entity.upgrade() else {
+                return;
+            };
+            // SAFETY: see `public_window_callback`.
+            entity.update_in(core_window, |value, _window, context| unsafe {
+                callback(value, event, &mut *pointer, context);
+            });
+        });
+    }
+}
+
+/// Adapt an entity listener whose event is passed by value, such as the
+/// boolean delivered by hover transitions.
+pub fn public_value_listener<T: 'static, E: 'static>(
+    context: &wgpui_core::app::Context<T>,
+    mut callback: impl FnMut(&mut T, E, &mut Window, &mut wgpui_core::app::Context<T>) + 'static,
+) -> impl FnMut(E, &mut wgpui_core::window::Window, &mut App) + 'static {
+    let entity = context.entity().downgrade();
+    move |event, core_window, _app| {
+        CALLBACK_WINDOW.with(|slot| {
+            let pointer = slot.get();
+            assert!(!pointer.is_null(), "public value listener outside WGPU dispatch");
+            let Some(entity) = entity.upgrade() else {
+                return;
+            };
+            // SAFETY: see `public_window_callback`.
+            entity.update_in(core_window, |value, _window, context| unsafe {
+                callback(value, event, &mut *pointer, context);
+            });
+        });
+    }
+}
+
 enum ImmediatePaint {
     Quad(Quad),
     Path(Path),
@@ -67,6 +146,8 @@ enum ImmediatePaint {
 
 pub struct Window {
     native: Arc<winit::window::Window>,
+    text_engine: SharedTextEngine,
+    gpu_adapter: wgpu::Adapter,
     gpu_device: wgpu::Device,
     gpu_queue: wgpu::Queue,
     surface_registry: Arc<SurfaceRegistry>,
@@ -94,7 +175,12 @@ pub struct Window {
     hover_dirty_regions: Vec<Rect>,
     performance_debug: PerformanceDebug,
     animation_clock: AnimationClock,
+    animation_frame_requested: AtomicBool,
     last_click: Option<ClickState>,
+    bounds_observers: Vec<(Arc<AtomicBool>, Box<dyn FnMut(Bounds<Pixels>)>)>,
+    appearance_observers: Vec<(Arc<AtomicBool>, Box<dyn FnMut(WindowAppearance)>)>,
+    observed_bounds: Option<Bounds<Pixels>>,
+    observed_appearance: WindowAppearance,
 }
 
 #[derive(Copy, Clone)]
@@ -133,16 +219,249 @@ impl From<arboard::Error> for ClipboardError {
     }
 }
 
-/// The monitor containing a window, when the platform reports one.
-pub type DisplayId = winit::monitor::MonitorHandle;
+/// Stable identifier for a display reported by the active native event loop.
+pub type DisplayId = u64;
+
+/// A native display snapshot suitable for positioning a WGPU window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Display {
+    id: DisplayId,
+    bounds: Bounds<Pixels>,
+    scale_factor: f64,
+    name: Option<String>,
+}
+
+pub struct WindowObserver {
+    active: Arc<AtomicBool>,
+}
+
+impl WindowObserver {
+    pub fn detach(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for WindowObserver {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl Display {
+    pub fn id(&self) -> DisplayId {
+        self.id
+    }
+
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        self.bounds
+    }
+
+    pub fn scale_factor(&self) -> f64 {
+        self.scale_factor
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
+static DISPLAYS: OnceLock<Mutex<Vec<Display>>> = OnceLock::new();
+
+fn displays() -> Vec<Display> {
+    DISPLAYS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map(|displays| displays.clone())
+        .unwrap_or_default()
+}
+
+fn display_id(monitor: &winit::monitor::MonitorHandle) -> DisplayId {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in monitor
+        .name()
+        .unwrap_or_default()
+        .bytes()
+        .chain(monitor.position().x.to_le_bytes())
+        .chain(monitor.position().y.to_le_bytes())
+        .chain(monitor.size().width.to_le_bytes())
+        .chain(monitor.size().height.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn refresh_displays(event_loop: &winit::event_loop::ActiveEventLoop) {
+    let monitors = event_loop.available_monitors().map(|monitor| {
+        let scale_factor = monitor.scale_factor();
+        let position = monitor.position();
+        let monitor_size = monitor.size();
+        Display {
+            id: display_id(&monitor),
+            bounds: Bounds::new(
+                point(
+                    Pixels(position.x as f32 / scale_factor as f32),
+                    Pixels(position.y as f32 / scale_factor as f32),
+                ),
+                size(
+                    Pixels(monitor_size.width as f32 / scale_factor as f32),
+                    Pixels(monitor_size.height as f32 / scale_factor as f32),
+                ),
+            ),
+            scale_factor,
+            name: monitor.name(),
+        }
+    });
+    if let Ok(mut displays) = DISPLAYS.get_or_init(|| Mutex::new(Vec::new())).lock() {
+        *displays = monitors.collect();
+    }
+}
+
+/// Native window decoration state used by custom chrome examples.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Decorations {
+    Server,
+    Client { tiling: TilingState },
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TilingState {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl TilingState {
+    pub fn is_tiled(self) -> bool {
+        self.top || self.right || self.bottom || self.left
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResizeEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowServiceError {
+    Native(String),
+}
+
+impl std::fmt::Display for WindowServiceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native(error) => write!(formatter, "native window operation failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WindowServiceError {}
+
+fn resize_direction(edge: ResizeEdge) -> winit::window::ResizeDirection {
+    match edge {
+        ResizeEdge::Top => winit::window::ResizeDirection::North,
+        ResizeEdge::Right => winit::window::ResizeDirection::East,
+        ResizeEdge::Bottom => winit::window::ResizeDirection::South,
+        ResizeEdge::Left => winit::window::ResizeDirection::West,
+        ResizeEdge::TopLeft => winit::window::ResizeDirection::NorthWest,
+        ResizeEdge::TopRight => winit::window::ResizeDirection::NorthEast,
+        ResizeEdge::BottomLeft => winit::window::ResizeDirection::SouthWest,
+        ResizeEdge::BottomRight => winit::window::ResizeDirection::SouthEast,
+    }
+}
+
+fn validate_prompt_buttons(buttons: &[PromptButton]) -> Result<(), PromptError> {
+    if !matches!(buttons.len(), 1 | 2) {
+        return Err(PromptError::UnsupportedButtonCount(buttons.len()));
+    }
+    let labels_supported = match buttons {
+        [button] => button.label.eq_ignore_ascii_case("ok"),
+        [ok, cancel] => {
+            ok.label.eq_ignore_ascii_case("ok") && cancel.label.eq_ignore_ascii_case("cancel")
+        }
+        _ => false,
+    };
+    if labels_supported {
+        Ok(())
+    } else {
+        Err(PromptError::UnsupportedButtonLabels)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PromptLevel {
+    Info,
+    Warning,
+    Error,
+    Question,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptButton {
+    label: String,
+}
+
+impl PromptButton {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self { label: label.into() }
+    }
+
+    pub fn ok(label: impl Into<String>) -> Self {
+        Self::new(label)
+    }
+
+    pub fn cancel(label: impl Into<String>) -> Self {
+        Self::new(label)
+    }
+}
+
+impl From<&str> for PromptButton {
+    fn from(label: &str) -> Self {
+        Self::new(label)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptError {
+    UnsupportedButtonCount(usize),
+    UnsupportedButtonLabels,
+    Native(String),
+}
+
+impl std::fmt::Display for PromptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedButtonCount(count) => {
+                write!(formatter, "native prompt supports one or two buttons, got {count}")
+            }
+            Self::UnsupportedButtonLabels => {
+                formatter.write_str("native prompt cannot display custom button labels")
+            }
+            Self::Native(error) => write!(formatter, "native prompt failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PromptError {}
 
 /// A stateless component rendered with the public WGPU window.
 pub trait RenderOnce: 'static + Sized {
+    /// Build the element tree for this owned component.
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement;
 }
 
 /// A retained view rendered with the public WGPU window.
 pub trait Render: 'static + Sized {
+    /// Build the element tree for the current frame.
     fn render(
         &mut self,
         window: &mut Window,
@@ -155,9 +474,41 @@ pub struct Component<C: RenderOnce> {
     component: C,
 }
 
+/// Element wrapper for an entity implementing the public [`Render`] trait.
+pub struct EntityView<T: Render> {
+    entity: wgpui_core::app::Entity<T>,
+}
+
+pub fn entity_view<T: Render>(entity: wgpui_core::app::Entity<T>) -> EntityView<T> {
+    EntityView { entity }
+}
+
+impl<T: Render> CoreElement for EntityView<T> {
+    fn into_description(self) -> Description {
+        Description::deferred(move |window, app| {
+            let Some(window) = window.downcast_mut::<Window>() else {
+                return Description::new::<Self>();
+            };
+            let description = self.entity.update((), |value, context| {
+                let _scope = wgpui_core::element::enter_contextual_render_scope();
+                let element = value.render(window, context);
+                let app = app.clone();
+                IntoElement::into_description_in(element, window.interaction_mut(), &app)
+            });
+            description
+        })
+    }
+}
+
 impl<C: RenderOnce> Component<C> {
+    /// Wrap an owned component in an element.
     pub fn new(component: C) -> Self {
         Self { component }
+    }
+
+    /// Borrow the component before it is consumed during lowering.
+    pub fn component(&self) -> &C {
+        &self.component
     }
 }
 
@@ -176,6 +527,8 @@ impl<C: RenderOnce> CoreElement for Component<C> {
 
 /// Public application extension that queues a WGPU-window root view.
 pub trait AppWindowExt {
+    fn displays(&self) -> Vec<Display>;
+
     fn open_window<V: Render>(
         &mut self,
         options: WindowOptions,
@@ -201,6 +554,10 @@ pub fn render_description<R: Render>(
 }
 
 impl AppWindowExt for App {
+    fn displays(&self) -> Vec<Display> {
+        displays()
+    }
+
     fn open_window<V: Render>(
         &mut self,
         options: WindowOptions,
@@ -283,11 +640,21 @@ impl Window {
     pub fn scale_factor(&self) -> f64 {
         self.scale_factor
     }
+
+    /// Access the renderer-backed text engine for this window.
+    pub fn text_engine(&self) -> SharedTextEngine {
+        self.text_engine.clone()
+    }
+
     pub fn request_redraw(&self) {
         self.native.request_redraw();
     }
 
     pub fn request_animation_frame(&self) {
+        // The redraw is delivered by Winit on a later event-loop turn. The
+        // flag makes repeated requests coalesce and keeps this request alive
+        // until that redraw is consumed.
+        self.animation_frame_requested.store(true, Ordering::Release);
         self.request_redraw();
     }
 
@@ -308,8 +675,31 @@ impl Window {
     }
 
     pub fn refresh(&mut self) {
+        tracing::warn!("full repaint forced by Window::refresh; targeted invalidation should generally be preferred");
         self.interaction.refresh();
         self.request_redraw();
+    }
+
+    pub fn schedule_timer(&mut self, delay: Duration) -> TimerHandle {
+        let timer = self.interaction.schedule_timer(delay);
+        self.request_redraw();
+        timer
+    }
+
+    pub fn cancel_timer(&mut self, timer: TimerHandle) -> bool {
+        self.interaction.cancel_timer(timer)
+    }
+
+    pub fn timer_state(&self, timer: TimerHandle) -> Option<TimerState> {
+        self.interaction.timer_state(timer)
+    }
+
+    pub fn next_timer_deadline(&self) -> Option<Instant> {
+        self.interaction.next_timer_deadline()
+    }
+
+    pub fn take_due_timers(&mut self, now: Instant) -> Vec<wgpui_core::window::TimerId> {
+        self.interaction.take_due_timers(now)
     }
 
     pub fn take_hover_dirty_regions(&mut self) -> Vec<Rect> {
@@ -350,6 +740,18 @@ impl Window {
         height: u32,
         format: wgpu::TextureFormat,
     ) -> Result<WgpuSurfaceHandle, WindowError> {
+        if width == 0 || height == 0 {
+            return Err(WindowError::InvalidSurfaceSize { width, height });
+        }
+        let allowed_usages = self
+            .gpu_adapter
+            .get_texture_format_features(format)
+            .allowed_usages;
+        let required_usages =
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        if !allowed_usages.contains(required_usages) {
+            return Err(WindowError::UnsupportedSurfaceFormat(format));
+        }
         Ok(WgpuSurfaceHandle::new(
             Arc::clone(&self.surface_registry),
             &self.gpu_device,
@@ -411,6 +813,15 @@ impl Window {
     pub fn is_active(&self) -> bool {
         self.native.has_focus()
     }
+    pub fn is_focused(&self, handle: &FocusHandle) -> bool {
+        self.interaction.is_focused(handle)
+    }
+    pub fn focus_visible(&self) -> bool {
+        self.interaction.focus_manager().focus_visible()
+    }
+    pub fn focused(&self) -> Option<FocusId> {
+        self.interaction.focused()
+    }
     pub fn set_background_appearance(&mut self, appearance: WindowBackgroundAppearance) {
         self.native
             .set_transparent(appearance != WindowBackgroundAppearance::Opaque);
@@ -438,8 +849,56 @@ impl Window {
         self.native.set_decorations(decorations);
         self.decorations = decorations;
     }
-    pub fn window_decorations(&self) -> WindowDecorations {
-        window_decorations_for(self.decorations)
+    pub fn window_decorations(&self) -> Decorations {
+        if self.decorations {
+            Decorations::Server
+        } else {
+            Decorations::Client {
+                tiling: TilingState::default(),
+            }
+        }
+    }
+
+    pub fn observe_bounds(
+        &mut self,
+        callback: impl FnMut(Bounds<Pixels>) + 'static,
+    ) -> WindowObserver {
+        let active = Arc::new(AtomicBool::new(true));
+        self.bounds_observers
+            .push((Arc::clone(&active), Box::new(callback)));
+        WindowObserver { active }
+    }
+
+    pub fn observe_appearance(
+        &mut self,
+        callback: impl FnMut(WindowAppearance) + 'static,
+    ) -> WindowObserver {
+        let active = Arc::new(AtomicBool::new(true));
+        self.appearance_observers
+            .push((Arc::clone(&active), Box::new(callback)));
+        WindowObserver { active }
+    }
+
+    /// Show a native modal prompt and return the zero-based selected button.
+    ///
+    /// Winit exposes the native window handle but no cross-platform dialog
+    /// primitive. Windows therefore uses its owner-aware message box; other
+    /// platforms return an explicit unsupported-operation error. Custom button
+    /// labels are rejected because a message box cannot display them.
+    pub fn prompt<B, C>(
+        &self,
+        level: PromptLevel,
+        message: &str,
+        detail: Option<&str>,
+        buttons: &[B],
+        _cx: C,
+    ) -> wgpui_core::app::Task<Result<usize, PromptError>>
+    where
+        B: Clone + Into<PromptButton>,
+    {
+        let buttons = buttons.iter().cloned().map(Into::into).collect::<Vec<_>>();
+        let result = native_prompt(self, level, message, detail, &buttons);
+        wgpui_core::app::Task::ready(result)
     }
 
     /// Record the requested client inset without claiming that Winit applied
@@ -511,7 +970,30 @@ impl Window {
         }
     }
     pub fn current_monitor(&self) -> Option<DisplayId> {
-        self.native.current_monitor()
+        self.native.current_monitor().map(|monitor| display_id(&monitor))
+    }
+
+    pub fn mouse_position(&self) -> Point<Pixels> {
+        point(self.cursor[0], self.cursor[1])
+    }
+
+    pub fn start_window_move(&self) -> Result<(), WindowServiceError> {
+        self.native
+            .drag_window()
+            .map_err(|error| WindowServiceError::Native(error.to_string()))
+    }
+
+    pub fn start_window_resize(&self, edge: ResizeEdge) -> Result<(), WindowServiceError> {
+        self.native
+            .drag_resize_window(resize_direction(edge))
+            .map_err(|error| WindowServiceError::Native(error.to_string()))
+    }
+
+    pub fn show_window_menu(&self, position: [Pixels; 2]) {
+        self.native.show_window_menu(winit::dpi::LogicalPosition::new(
+            position[0].value().max(0.0) as u32,
+            position[1].value().max(0.0) as u32,
+        ));
     }
     pub fn close(&mut self) {
         self.close_requested.store(true, Ordering::Release);
@@ -582,6 +1064,15 @@ impl Window {
         self.interaction.handle_input(event)
     }
     pub fn handle_input_with_app(&mut self, event: InputEvent, app: &mut App) -> bool {
+        CALLBACK_WINDOW.with(|slot| {
+            let previous = slot.replace(self as *mut Window);
+            let handled = self.handle_input_with_app_inner(event, app);
+            slot.set(previous);
+            handled
+        })
+    }
+
+    fn handle_input_with_app_inner(&mut self, event: InputEvent, app: &mut App) -> bool {
         if self.interactions.is_empty() {
             return self.interaction.handle_input(event);
         }
@@ -1254,6 +1745,24 @@ impl Window {
 
     pub fn begin_frame(&mut self) {
         self.state_frame = self.state_frame.wrapping_add(1);
+        let bounds = self.bounds();
+        if self.observed_bounds != Some(bounds) {
+            self.observed_bounds = Some(bounds);
+            for (active, callback) in &mut self.bounds_observers {
+                if active.load(Ordering::Acquire) {
+                    callback(bounds);
+                }
+            }
+        }
+        let appearance = self.appearance();
+        if self.observed_appearance != appearance {
+            self.observed_appearance = appearance;
+            for (active, callback) in &mut self.appearance_observers {
+                if active.load(Ordering::Acquire) {
+                    callback(appearance);
+                }
+            }
+        }
     }
 
     pub fn end_frame(&mut self) -> usize {
@@ -1526,14 +2035,17 @@ impl Application {
 
     /// Configures the client used by URI resource loading in this application.
     pub fn with_http_client(self, client: BoxedHttpClient) -> ConfiguredApplication {
-        ConfiguredApplication { http_client: client }
+        ConfiguredApplication { http_client: Some(client), assets: Arc::new(()) }
     }
 
     /// Retain the application-builder shape used by asset-backed examples.
     /// Asset resolution is owned by the widget layer; the native lifecycle
     /// does not need to inspect the source while constructing the event loop.
-    pub fn with_assets<T: 'static>(self, _assets: T) -> Self {
-        self
+    pub fn with_assets<T: wgpui_widgets::assets::AssetSource>(self, assets: T) -> ConfiguredApplication {
+        ConfiguredApplication {
+            http_client: None,
+            assets: Arc::new(assets),
+        }
     }
 
     pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
@@ -1545,7 +2057,12 @@ impl Application {
             )),
             max_frames: None,
             initialize: Some(Box::new(initialize)),
-            app: App::create(),
+            app: {
+                let mut app = App::create();
+                app.set_global(AssetRegistry::new(Arc::new(())));
+                app.set_global(AssetRequests::default());
+                app
+            },
             live: Vec::new(),
             failure: None,
         };
@@ -1558,14 +2075,278 @@ impl Application {
 
 /// An [`Application`] with an explicitly configured native HTTP client.
 pub struct ConfiguredApplication {
-    http_client: BoxedHttpClient,
+    http_client: Option<BoxedHttpClient>,
+    assets: Arc<dyn wgpui_widgets::assets::AssetSource>,
+}
+
+#[derive(Clone)]
+pub struct AssetRef {
+    key: String,
+    state: Arc<std::sync::Mutex<AssetState>>,
+}
+
+#[derive(Clone)]
+enum AssetState {
+    Loading,
+    Ready(Arc<RenderImage>),
+    Failed(String),
+}
+
+impl AssetRef {
+    pub fn is_loading(&self) -> bool {
+        match self.state.lock() {
+            Ok(state) => matches!(*state, AssetState::Loading),
+            Err(poisoned) => matches!(*poisoned.into_inner(), AssetState::Loading),
+        }
+    }
+
+    pub fn error(&self) -> Option<String> {
+        match self.state.lock() {
+            Ok(state) => match &*state {
+                AssetState::Failed(error) => Some(error.clone()),
+                _ => None,
+            },
+            Err(poisoned) => match &*poisoned.into_inner() {
+                AssetState::Failed(error) => Some(error.clone()),
+                _ => None,
+            },
+        }
+    }
+}
+
+pub enum LegacyImageSource {
+    Resource(Resource),
+    Deferred(Box<dyn FnOnce(&mut Window, &mut App) -> AssetRef>),
+}
+
+pub struct LegacyImgBuilder {
+    source: LegacyImageSource,
+    image: Option<ImgBuilder>,
+    fallback: Option<Box<dyn Fn() -> Description>>,
+    loading: Option<Box<dyn Fn() -> Description>>,
+    border: bool,
+    border_color: Option<wgpui_core::color::Hsla>,
+    click_handler: Option<Box<dyn FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut App)>>,
+}
+
+pub trait IntoLegacyImageSource: 'static {
+    fn into_legacy_source(self) -> LegacyImageSource;
+}
+
+impl IntoLegacyImageSource for Resource {
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self) }
+}
+impl IntoLegacyImageSource for std::path::PathBuf {
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self.into()) }
+}
+impl IntoLegacyImageSource for String {
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self.into()) }
+}
+impl IntoLegacyImageSource for &'static str {
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self.into()) }
+}
+impl<F> IntoLegacyImageSource for F
+where
+    F: FnOnce(&mut Window, &mut App) -> AssetRef + 'static,
+{
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Deferred(Box::new(self)) }
+}
+
+pub fn img(source: impl IntoLegacyImageSource) -> LegacyImgBuilder {
+    LegacyImgBuilder {
+        source: source.into_legacy_source(),
+        image: None,
+        fallback: None,
+        loading: None,
+        border: false,
+        border_color: None,
+        click_handler: None,
+    }
+}
+
+impl LegacyImgBuilder {
+    pub fn id(mut self, id: impl Into<wgpui_core::reconcile::description::ElementId>) -> Self {
+        self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).id(id)); self
+    }
+    pub fn size(mut self, size: impl wgpui_widgets::styled::IntoStylePixels) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).size(size)); self }
+    pub fn size_12(self) -> Self { self.size(48.0) }
+    pub fn size_8(self) -> Self { self.size(32.0) }
+    pub fn size_16(self) -> Self { self.size(64.0) }
+    pub fn size_full(mut self) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).size_full()); self }
+    pub fn h(mut self, height: impl wgpui_widgets::styled::IntoStylePixels) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).h(height)); self }
+    pub fn w(mut self, width: impl wgpui_widgets::styled::IntoStylePixels) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).w(width)); self }
+    pub fn max_w_full(mut self) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).max_w_full()); self }
+    pub fn object_fit(mut self, object_fit: wgpui_widgets::img::ObjectFit) -> Self {
+        self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).object_fit(object_fit));
+        self
+    }
+    pub fn border_1(mut self) -> Self { self.border = true; self }
+    pub fn border_color(mut self, color: impl Into<wgpui_core::color::Hsla>) -> Self { self.border_color = Some(color.into()); self }
+    pub fn on_click<F>(mut self, handler: F) -> Self
+    where F: FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut App) + 'static { self.click_handler = Some(Box::new(handler)); self }
+    pub fn with_fallback<F>(mut self, fallback: F) -> Self where F: Fn() -> Description + 'static { self.fallback = Some(Box::new(fallback)); self }
+    pub fn with_loading<F>(mut self, loading: F) -> Self where F: Fn() -> Description + 'static { self.loading = Some(Box::new(loading)); self }
+}
+
+impl CoreElement for LegacyImgBuilder {
+    fn into_description(self) -> Description { Description::deferred(move |window, app| { let Some(window) = window.downcast_mut::<Window>() else { return Description::new::<Self>(); }; self.resolve(window, app) }) }
+    fn into_description_in(self, _window: &mut wgpui_core::window::Window, _app: &App) -> Description { wgpui_core::Element::into_description(self) }
+}
+
+impl LegacyImgBuilder {
+    fn resolve(self, window: &mut Window, app: &mut App) -> Description {
+        let Self { source, image, fallback, loading, border, border_color, click_handler } = self;
+        let asset = match source {
+            LegacyImageSource::Resource(resource) => {
+                let key = format!("resource:{resource:?}");
+                let state = match app.global::<AssetRegistry>().and_then(|registry| registry.load_cached(resource).ok()) {
+                    Some(image) => AssetState::Ready(image),
+                    None => AssetState::Failed("asset could not be resolved".into()),
+                };
+                AssetRef { key, state: Arc::new(std::sync::Mutex::new(state)) }
+            }
+            LegacyImageSource::Deferred(resolve) => resolve(window, app),
+        };
+        let state = match asset.state.lock() {
+            Ok(state) => state.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let description = match state {
+            AssetState::Ready(image_data) => {
+                let source = wgpui_widgets::img::ImageSourceId::from_raw(crate::window::application::asset_source_id(&asset.key));
+                let image = image.unwrap_or_else(|| ImgBuilder::from_decoded(source, image_data));
+                wgpui_core::Element::into_description(image)
+            }
+            AssetState::Loading => loading.map_or_else(|| Description::new::<()>(), |render| render()),
+            AssetState::Failed(_) => fallback.map_or_else(|| Description::new::<()>(), |render| render()),
+        };
+        let description = if border {
+            let mut container = wgpui_widgets::div::div().border_1();
+            if let Some(color) = border_color {
+                container = container.border_color(color);
+            }
+            wgpui_core::Element::into_description(container.child(description))
+        } else {
+            description
+        };
+        if let Some(mut handler) = click_handler { wgpui_core::Element::into_description(wgpui_widgets::div::div().on_click(move |event, window, app| handler(event, window, app)).child(description)) } else { description }
+    }
+}
+
+fn asset_source_id(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new(); key.hash(&mut hasher); hasher.finish().max(1)
+}
+
+pub trait AssetImageOutput: Send + 'static {
+    fn into_image_result(self) -> Result<Arc<RenderImage>, ImageCacheError>;
+}
+
+impl AssetImageOutput for Result<Arc<RenderImage>, ImageCacheError> {
+    fn into_image_result(self) -> Result<Arc<RenderImage>, ImageCacheError> { self }
+}
+
+struct AssetRequests(std::sync::Mutex<std::collections::HashMap<String, AssetRef>>);
+
+impl Default for AssetRequests {
+    fn default() -> Self { Self(std::sync::Mutex::new(std::collections::HashMap::new())) }
+}
+
+pub trait AppAssetExt {
+    fn remove_asset<A: Asset>(&mut self, source: &A::Source);
+}
+
+impl AppAssetExt for App {
+    fn remove_asset<A: Asset>(&mut self, source: &A::Source) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        if let Some(requests) = self.global::<AssetRequests>() {
+            let key = format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish());
+            requests.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&key);
+        }
+    }
+}
+
+impl Window {
+    pub fn use_asset<A>(
+        &mut self,
+        source: &A::Source,
+        app: &mut App,
+    ) -> AssetRef
+    where
+        A: Asset,
+        A::Output: AssetImageOutput,
+    {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        let key = format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish());
+        if app.global::<AssetRequests>().is_none() {
+            app.set_global(AssetRequests::default());
+        }
+        let Some(requests) = app.global::<AssetRequests>() else {
+            return AssetRef {
+                key,
+                state: Arc::new(std::sync::Mutex::new(AssetState::Failed(
+                    "asset request registry is unavailable".into(),
+                ))),
+            };
+        };
+        let mut entries = requests.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(asset) = entries.get(&key) {
+            return asset.clone();
+        }
+        let state = Arc::new(std::sync::Mutex::new(AssetState::Loading));
+        let redraw = {
+            let native = Arc::clone(&self.native);
+            Arc::new(move || native.request_redraw()) as Arc<dyn Fn() + Send + Sync>
+        };
+        let asset = AssetRef { key: key.clone(), state: Arc::clone(&state) };
+        entries.insert(key, asset.clone());
+        let mut asset_app = app.clone();
+        let future = A::load(source.clone(), &mut asset_app);
+        let task = app.background_spawn(async move {
+            let result = future.await.into_image_result();
+            let new_state = match result {
+                Ok(image) => AssetState::Ready(image),
+                Err(error) => AssetState::Failed(error.to_string()),
+            };
+            match state.lock() {
+                Ok(mut state) => *state = new_state,
+                Err(poisoned) => {
+                    let mut state = poisoned.into_inner();
+                    *state = new_state;
+                }
+            }
+            redraw();
+        });
+        task.detach();
+        asset
+    }
+
+    pub fn remove_asset<A: Asset>(&mut self, source: &A::Source, app: &mut App) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        if let Some(requests) = app.global::<AssetRequests>() {
+            let key = format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish());
+            requests.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&key);
+        }
+    }
 }
 
 impl ConfiguredApplication {
     pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut app = App::create();
-        app.set_http_client(self.http_client);
+        if let Some(client) = self.http_client {
+            app.set_http_client(client);
+        } else {
+            app.install_default_http_client();
+        }
+        app.set_global(AssetRegistry::new(self.assets));
+        app.set_global(AssetRequests::default());
         let mut handler = Handler {
             initial: Some((
                 WindowOptions::default(),
@@ -1680,6 +2461,21 @@ impl Handler {
             .window_decorations
             .map(|decorations| decorations == WindowDecorations::Server)
             .unwrap_or(options.titlebar.is_some());
+        if options.window_decorations == Some(WindowDecorations::Client) {
+            log::warn!("client window decorations are lowered as a borderless Winit window; WGPUI does not provide native client chrome");
+        }
+        if !options.is_movable {
+            log::warn!("non-movable windows are not supported by the cross-platform Winit boundary; the request is not applied");
+        }
+        if options.app_id.is_some() {
+            log::warn!("WindowOptions::app_id is not supported by the cross-platform Winit boundary; the request is not applied");
+        }
+        if options.tabbing_identifier.is_some() {
+            log::warn!("WindowOptions::tabbing_identifier is not supported by the cross-platform Winit boundary; the request is not applied");
+        }
+        if options.display_id.is_some() {
+            log::warn!("WindowOptions::display_id is not supported by the cross-platform Winit boundary; the request is not applied");
+        }
         let attributes = winit::window::Window::default_attributes()
             .with_title(title)
             .with_resizable(resizable)
@@ -1730,8 +2526,13 @@ impl Handler {
         let mut resizes = ResizeDetector::new();
         resizes.seed(width, height);
         let mode = DrawMode::best_available(context.indirect);
+        let mut frame_loop = FrameLoop::new(&context.device);
+        frame_loop.set_surface_registry(Arc::clone(&surface_registry));
+        let text_engine = frame_loop.text_engine();
         let window = Window {
             native,
+            text_engine,
+            gpu_adapter: context.adapter.clone(),
             gpu_device: context.device.clone(),
             gpu_queue: context.queue.clone(),
             surface_registry: Arc::clone(&surface_registry),
@@ -1759,10 +2560,13 @@ impl Handler {
             hover_dirty_regions: Vec::new(),
             performance_debug: PerformanceDebug::default(),
             animation_clock: AnimationClock::new(),
+            animation_frame_requested: AtomicBool::new(false),
             last_click: None,
+            bounds_observers: Vec::new(),
+            appearance_observers: Vec::new(),
+            observed_bounds: None,
+            observed_appearance: WindowAppearance::Light,
         };
-        let mut frame_loop = FrameLoop::new(&context.device);
-        frame_loop.set_surface_registry(surface_registry);
         self.live.push(Live {
             id,
             frame_loop,
@@ -1839,6 +2643,14 @@ impl Handler {
                 .all(|(other_index, live)| other_index == index || live.frames >= limit)
         });
         let live = &mut self.live[index];
+        let animation_frame_requested = live
+            .window
+            .animation_frame_requested
+            .swap(false, Ordering::AcqRel);
+        let due_timer_count = live.window.take_due_timers(Instant::now()).len();
+        if due_timer_count > 0 {
+            log::debug!("window timer deadline reached: {due_timer_count} timer(s)");
+        }
         if let Some((width, height)) = live.resizes.take_pending() {
             live.surface.resize(&live.context.device, width, height);
         }
@@ -1936,7 +2748,7 @@ impl Handler {
                     && all_other_windows_reached_limit
                 {
                     event_loop.exit();
-                } else if self.max_frames.is_some() || frame.needs_redraw {
+                } else if animation_frame_requested || self.max_frames.is_some() || frame.needs_redraw {
                     live.window.request_redraw();
                 }
             }
@@ -2012,6 +2824,7 @@ impl winit::application::ApplicationHandler for Handler {
         if !self.live.is_empty() {
             return;
         }
+        refresh_displays(event_loop);
         if let Some(initialize) = self.initialize.take() {
             initialize(&mut self.app);
         }
@@ -2085,6 +2898,7 @@ impl winit::application::ApplicationHandler for Handler {
         let mode = DrawMode::best_available(context.indirect);
         let window = Window {
             native,
+            gpu_adapter: context.adapter.clone(),
             gpu_device: context.device.clone(),
             gpu_queue: context.queue.clone(),
             surface_registry: Arc::clone(&surface_registry),
@@ -2109,6 +2923,10 @@ impl winit::application::ApplicationHandler for Handler {
             performance_debug: PerformanceDebug::default(),
             animation_clock: AnimationClock::new(),
             last_click: None,
+            bounds_observers: Vec::new(),
+            appearance_observers: Vec::new(),
+            observed_bounds: None,
+            observed_appearance: WindowAppearance::Light,
         };
         let mut frame_loop = FrameLoop::new(&context.device);
         frame_loop.set_surface_registry(surface_registry);
@@ -2310,10 +3128,23 @@ impl winit::application::ApplicationHandler for Handler {
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         self.app.run_pending_tasks();
         self.create_pending_windows(event_loop);
+        let now = Instant::now();
+        let timer_deadline = self
+            .live
+            .iter()
+            .filter_map(|live| live.window.next_timer_deadline())
+            .min();
         if self.max_frames.is_some() || self.app.has_pending_tasks() || self.app.close_requested() {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             for live in &self.live {
                 live.window.request_redraw();
+            }
+        } else if let Some(deadline) = timer_deadline {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+            if deadline <= now {
+                for live in &self.live {
+                    live.window.request_redraw();
+                }
             }
         } else {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
@@ -2509,6 +3340,30 @@ mod tests {
     }
 
     #[test]
+    fn public_window_service_types_keep_native_direction_and_prompt_contracts() {
+        assert_eq!(
+            resize_direction(ResizeEdge::BottomRight),
+            winit::window::ResizeDirection::SouthEast
+        );
+        assert_eq!(
+            validate_prompt_buttons(&[PromptButton::ok("OK")]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_prompt_buttons(&[PromptButton::ok("OK"), PromptButton::cancel("Cancel")]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_prompt_buttons(&[PromptButton::new("确定")]),
+            Err(PromptError::UnsupportedButtonLabels)
+        );
+        assert_eq!(
+            validate_prompt_buttons(&[]),
+            Err(PromptError::UnsupportedButtonCount(0))
+        );
+    }
+
+    #[test]
     fn immediate_paints_are_lowered_as_retained_description_children() {
         let path = Path::new(
             vec![
@@ -2537,5 +3392,77 @@ mod tests {
             .child_descriptions()
             .first()
             .is_some_and(Description::emits));
+    }
+
+    #[test]
+    fn public_callback_adapter_matches_core_widget_callback_abi() {
+        let _element = wgpui_widgets::div::div().on_click(public_window_callback(
+            |_: &wgpui_core::window::ClickEvent, _window: &mut Window, _app: &mut App| {},
+        ));
+    }
+}
+
+fn native_prompt(
+    window: &Window,
+    level: PromptLevel,
+    message: &str,
+    detail: Option<&str>,
+    buttons: &[PromptButton],
+) -> Result<usize, PromptError> {
+    validate_prompt_buttons(buttons)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING,
+            MB_OK, MB_YESNO, MessageBoxW,
+        };
+
+        let flags = match (buttons.len(), level) {
+            (1, PromptLevel::Info) => MB_OK | MB_ICONINFORMATION,
+            (1, PromptLevel::Warning) => MB_OK | MB_ICONWARNING,
+            (1, PromptLevel::Error) => MB_OK | MB_ICONERROR,
+            (1, PromptLevel::Question) => MB_OK | MB_ICONQUESTION,
+            (2, PromptLevel::Info) => MB_YESNO | MB_ICONINFORMATION,
+            (2, PromptLevel::Warning) => MB_YESNO | MB_ICONWARNING,
+            (2, PromptLevel::Error) => MB_YESNO | MB_ICONERROR,
+            (2, PromptLevel::Question) => MB_YESNO | MB_ICONQUESTION,
+            _ => return Err(PromptError::UnsupportedButtonCount(buttons.len())),
+        };
+        let caption = detail.unwrap_or("WGPUI");
+        let message = message.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let caption = caption.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let window_handle = window
+            .native
+            .window_handle()
+            .map_err(|error| PromptError::Native(error.to_string()))?;
+        let hwnd = match window_handle.as_raw() {
+            RawWindowHandle::Win32(handle) => handle.hwnd.get() as *mut std::ffi::c_void,
+            _ => {
+                return Err(PromptError::Native(
+                    "window is not backed by a Win32 native handle".to_string(),
+                ));
+            }
+        };
+        let result = unsafe {
+            MessageBoxW(hwnd, message.as_ptr(), caption.as_ptr(), flags)
+        };
+        return match result {
+            IDOK | IDYES => Ok(0),
+            0 => Err(PromptError::Native("MessageBoxW returned no result".to_string())),
+            _ => Ok(1),
+        };
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        let _ = level;
+        let _ = message;
+        let _ = detail;
+        Err(PromptError::Native(
+            "native prompts are not implemented on this platform".to_string(),
+        ))
     }
 }

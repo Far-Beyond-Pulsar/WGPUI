@@ -311,6 +311,10 @@ pub fn bounce(easing: impl Fn(f32) -> f32 + 'static) -> impl Fn(f32) -> f32 + 's
     }
 }
 
+pub fn pulsating_between(minimum: f32, maximum: f32) -> impl Fn(f32) -> f32 + 'static {
+    move |value| minimum + (maximum - minimum) * (0.5 - 0.5 * (std::f32::consts::PI * 2.0 * value).cos())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

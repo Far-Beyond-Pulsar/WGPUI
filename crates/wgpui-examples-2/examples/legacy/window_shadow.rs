@@ -1,7 +1,7 @@
 use wgpui::{
-    App, Application, Bounds, Context, CursorStyle, Decorations, HitboxBehavior, Hsla, MouseButton,
+    App, Application, Bounds, Context, CursorStyle, Decorations, Hsla, MouseButton,
     Pixels, Point, ResizeEdge, Size, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions, black, canvas, div, green, point, prelude::*, px, rgb, size,
+    WindowDecorations, WindowOptions, black, div, green, point, prelude::*, px, rgb, size,
     transparent_black, white,
 };
 
@@ -20,162 +20,125 @@ impl Render for WindowShadow {
         let shadow_size = px(10.0);
         let border_size = px(1.0);
         let grey = rgb(0x808080);
-        window.set_client_inset(shadow_size);
 
-        div()
-            .id("window-backdrop")
-            .bg(transparent_black())
-            .map(|div| match decorations {
-                Decorations::Server => div,
-                Decorations::Client { tiling, .. } => div
-                    .bg(wgpui::transparent_black())
-                    .child(
-                        canvas(
-                            |_bounds, window, _cx| {
-                                window.insert_hitbox(
-                                    Bounds::new(
-                                        point(px(0.0), px(0.0)),
-                                        window.window_bounds().get_bounds().size,
-                                    ),
-                                    HitboxBehavior::Normal,
-                                )
-                            },
-                            move |_bounds, hitbox, window, _cx| {
-                                let mouse = window.mouse_position();
-                                let size = window.window_bounds().get_bounds().size;
-                                let Some(edge) = resize_edge(mouse, shadow_size, size) else {
+        let backdrop = div().id("window-backdrop").bg(transparent_black());
+        let backdrop = match decorations {
+            Decorations::Server => backdrop,
+            Decorations::Client { tiling } => backdrop
+                .bg(wgpui::transparent_black())
+                .child(
+                    div()
+                        .size_full()
+                        .absolute()
+                        .on_mouse_move(wgpui::public_window_callback(|_, window, _| {
+                            window.request_redraw();
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            wgpui::public_window_callback(move |event: &wgpui::InputEvent, window, _| {
+                                let wgpui::InputEvent::MouseDown(event) = event else {
                                     return;
                                 };
-                                window.set_cursor_style(
-                                    match edge {
-                                        ResizeEdge::Top | ResizeEdge::Bottom => {
-                                            CursorStyle::ResizeUpDown
-                                        }
-                                        ResizeEdge::Left | ResizeEdge::Right => {
-                                            CursorStyle::ResizeLeftRight
-                                        }
-                                        ResizeEdge::TopLeft | ResizeEdge::BottomRight => {
-                                            CursorStyle::ResizeUpLeftDownRight
-                                        }
-                                        ResizeEdge::TopRight | ResizeEdge::BottomLeft => {
-                                            CursorStyle::ResizeUpRightDownLeft
-                                        }
-                                    },
-                                    &hitbox,
-                                );
-                            },
-                        )
-                        .size_full()
-                        .absolute(),
-                    )
-                    .when(!(tiling.top || tiling.right), |div| {
-                        div.rounded_tr(rounding)
-                    })
-                    .when(!(tiling.top || tiling.left), |div| div.rounded_tl(rounding))
-                    .when(!tiling.top, |div| div.pt(shadow_size))
-                    .when(!tiling.bottom, |div| div.pb(shadow_size))
-                    .when(!tiling.left, |div| div.pl(shadow_size))
-                    .when(!tiling.right, |div| div.pr(shadow_size))
-                    .on_mouse_move(|_e, window, _cx| window.refresh())
-                    .on_mouse_down(MouseButton::Left, move |e, window, _cx| {
-                        let size = window.window_bounds().get_bounds().size;
-                        let pos = e.position;
+                                let size = window.window_bounds().get_bounds().size;
+                                let position = point(event.position[0], event.position[1]);
+                                let result = match resize_edge(position, shadow_size, size) {
+                                    Some(edge) => window.start_window_resize(edge),
+                                    None => window.start_window_move(),
+                                };
+                                if let Err(error) = result {
+                                    eprintln!("window interaction failed: {error}");
+                                }
+                            }),
+                        ),
+                )
+                .when(!(tiling.top || tiling.right), |div| div.rounded_tr(rounding.into()))
+                .when(!(tiling.top || tiling.left), |div| div.rounded_tl(rounding.into()))
+                .when(!tiling.top, |div| div.pt(shadow_size))
+                .when(!tiling.bottom, |div| div.pb(shadow_size))
+                .when(!tiling.left, |div| div.pl(shadow_size))
+                .when(!tiling.right, |div| div.pr(shadow_size)),
+        };
 
-                        match resize_edge(pos, shadow_size, size) {
-                            Some(edge) => window.start_window_resize(edge),
-                            None => window.start_window_move(),
-                        };
-                    }),
-            })
-            .size_full()
+        let content = div().cursor(CursorStyle::Arrow);
+        let content = match decorations {
+            Decorations::Server => content,
+            Decorations::Client { tiling } => content
+                .border_color(grey)
+                .when(!(tiling.top || tiling.right), |div| div.rounded_tr(rounding.into()))
+                .when(!(tiling.top || tiling.left), |div| div.rounded_tl(rounding.into()))
+                .when(!tiling.top, |div| div.border_t(border_size))
+                .when(!tiling.bottom, |div| div.border_b(border_size))
+                .when(!tiling.left, |div| div.border_l(border_size))
+                .when(!tiling.right, |div| div.border_r(border_size))
+                .when(!tiling.is_tiled(), |div| {
+                    div.shadow(vec![wgpui::BoxShadow {
+                        color: Hsla {
+                            h: 0.,
+                            s: 0.,
+                            l: 0.,
+                            a: 0.4,
+                        },
+                        blur_radius: px(shadow_size.value() / 2.),
+                        spread_radius: px(0.),
+                        offset: point(px(0.0), px(0.0)),
+                    }])
+                }),
+        };
+
+        let titlebar = div()
+            .flex()
+            .bg(white())
+            .size(px(300.0))
+            .justify_center()
+            .items_center()
+            .shadow_lg()
+            .border_1()
+            .border_color(rgb(0x0000ff))
+            .text_xl()
+            .text_color(rgb(0xffffff))
             .child(
                 div()
-                    .cursor(CursorStyle::Arrow)
-                    .map(|div| match decorations {
-                        Decorations::Server => div,
-                        Decorations::Client { tiling } => div
-                            .border_color(grey)
-                            .when(!(tiling.top || tiling.right), |div| {
-                                div.rounded_tr(rounding)
-                            })
-                            .when(!(tiling.top || tiling.left), |div| div.rounded_tl(rounding))
-                            .when(!tiling.top, |div| div.border_t(border_size))
-                            .when(!tiling.bottom, |div| div.border_b(border_size))
-                            .when(!tiling.left, |div| div.border_l(border_size))
-                            .when(!tiling.right, |div| div.border_r(border_size))
-                            .when(!tiling.is_tiled(), |div| {
-                                div.shadow(vec![wgpui::BoxShadow {
-                                    color: Hsla {
-                                        h: 0.,
-                                        s: 0.,
-                                        l: 0.,
-                                        a: 0.4,
-                                    },
-                                    blur_radius: shadow_size / 2.,
-                                    spread_radius: px(0.),
-                                    offset: point(px(0.0), px(0.0)),
-                                }])
-                            }),
-                    })
-                    .on_mouse_move(|_e, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .bg(wgpui::rgb(0xCCCCFF))
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .justify_around()
-                    .child(
-                        div().w_full().flex().flex_row().justify_around().child(
-                            div()
-                                .flex()
-                                .bg(white())
-                                .size(px(300.0))
-                                .justify_center()
-                                .items_center()
-                                .shadow_lg()
-                                .border_1()
-                                .border_color(rgb(0x0000ff))
-                                .text_xl()
-                                .text_color(rgb(0xffffff))
-                                .child(
-                                    div()
-                                        .id("hello")
-                                        .w(px(200.0))
-                                        .h(px(100.0))
-                                        .bg(green())
-                                        .shadow(vec![wgpui::BoxShadow {
-                                            color: Hsla {
-                                                h: 0.,
-                                                s: 0.,
-                                                l: 0.,
-                                                a: 1.0,
-                                            },
-                                            blur_radius: px(20.0),
-                                            spread_radius: px(0.0),
-                                            offset: point(px(0.0), px(0.0)),
-                                        }])
-                                        .map(|div| match decorations {
-                                            Decorations::Server => div,
-                                            Decorations::Client { .. } => div
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    |_e, window, _| {
-                                                        window.start_window_move();
-                                                    },
-                                                )
-                                                .on_click(|e, window, _| {
-                                                    if e.is_right_click() {
-                                                        window.show_window_menu(e.position());
-                                                    }
-                                                })
-                                                .text_color(black())
-                                                .child("this is the custom titlebar"),
-                                        }),
-                                ),
-                        ),
-                    ),
-            )
+                    .id("hello")
+                    .w(px(200.0))
+                    .h(px(100.0))
+                    .bg(green())
+                    .shadow(vec![wgpui::BoxShadow {
+                        color: Hsla {
+                            h: 0.,
+                            s: 0.,
+                            l: 0.,
+                            a: 1.0,
+                        },
+                        blur_radius: px(20.0),
+                        spread_radius: px(0.0),
+                        offset: point(px(0.0), px(0.0)),
+                    }]),
+            );
+        let titlebar = match decorations {
+            Decorations::Server => titlebar,
+            Decorations::Client { .. } => titlebar
+                .on_mouse_down(
+                    MouseButton::Left,
+                    wgpui::public_window_callback(|_e, window, _| {
+                        if let Err(error) = window.start_window_move() {
+                            eprintln!("window move failed: {error}");
+                        }
+                    }),
+                )
+                .on_click(wgpui::public_window_callback(|e: &wgpui::ClickEvent, window, _| {
+                    if e.is_right_click() {
+                        window.show_window_menu(e.position());
+                    }
+                }))
+                .text_color(black())
+                .child("this is the custom titlebar"),
+        };
+
+        backdrop
+            .size_full()
+            .child(content.bg(wgpui::rgb(0xCCCCFF)).size_full().flex().flex_col().justify_around().child(
+                div().w_full().flex().flex_row().justify_around().child(titlebar),
+            ))
     }
 }
 
@@ -214,9 +177,8 @@ fn main() {
             },
             |window, cx| {
                 cx.new(|cx| {
-                    cx.observe_window_appearance(window, |_, window, _| {
-                        window.refresh();
-                    })
+                    let handle = window.handle();
+                    window.observe_appearance(move |_| handle.request_redraw())
                     .detach();
                     WindowShadow {}
                 })

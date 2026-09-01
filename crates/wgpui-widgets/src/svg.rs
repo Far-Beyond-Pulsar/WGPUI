@@ -42,7 +42,7 @@ use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 
-use crate::assets::Resource;
+use crate::assets::{AssetRegistry, Resource};
 use crate::image_cache::{ImageCache, ImageDecodeError, decode_svg_at};
 use crate::img::{
     ImageSourceId, ImageStyle, Img, SharedImageEngine, pending_engine, resource_source_id,
@@ -212,6 +212,33 @@ impl SvgBuilder {
 
 impl Element for SvgBuilder {
     fn into_description(self) -> Description {
+        self.svg.into_description()
+    }
+
+    fn into_description_in(
+        mut self,
+        _window: &mut wgpui_core::window::Window,
+        app: &wgpui_core::App,
+    ) -> Description {
+        let Some(path) = self.svg.path.clone() else {
+            return self.svg.into_description();
+        };
+        let Some(registry) = app.global::<AssetRegistry>() else {
+            return self.svg.load_state(crate::img::ImageLoadState::Failed).into_description();
+        };
+        let resource = Resource::from(path);
+        match registry.load_cached(resource.clone()) {
+            Ok(image) => {
+                let source = resource_source_id(&resource);
+                self.svg.image = self.svg.image.set_decoded(source, image);
+                if let Some(text_color) = self.svg.text_color {
+                    self.svg.image = self.svg.image.tint(text_color);
+                }
+            }
+            Err(_) => {
+                self.svg.image = self.svg.image.load_state(crate::img::ImageLoadState::Failed);
+            }
+        }
         self.svg.into_description()
     }
 }

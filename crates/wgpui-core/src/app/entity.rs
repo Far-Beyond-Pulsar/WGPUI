@@ -69,13 +69,13 @@ impl<T> Entity<T> {
                 .expect("an entity cannot be read before its constructor completes")
         })
     }
-    pub fn read_with<R>(&self, _app: &App, access: impl FnOnce(&T, &App) -> R) -> R {
+    pub fn read_with<R>(&self, app: &App, access: impl FnOnce(&T, &App) -> R) -> R {
         access(
             self.value
                 .borrow()
                 .as_ref()
                 .expect("an entity cannot be read before its constructor completes"),
-            &self.app,
+            app,
         )
     }
     pub fn update<A, R>(&self, _access_context: A, access: impl FnOnce(&mut T, &mut Context<T>) -> R) -> R {
@@ -142,6 +142,21 @@ impl<T> WeakEntity<T> {
             app: self.app.clone(),
         })
     }
+
+    pub fn read_with<R>(
+        &self,
+        app: &App,
+        access: impl FnOnce(&T, &App) -> R,
+    ) -> Result<R, EntityError> {
+        let value = self.value.upgrade().ok_or(EntityError::Dropped)?;
+        Ok(access(
+            value
+                .borrow()
+                .as_ref()
+                .expect("an entity cannot be read before its constructor completes"),
+            app,
+        ))
+    }
     pub fn update<A, R>(
         &self,
         _access_context: A,
@@ -150,6 +165,16 @@ impl<T> WeakEntity<T> {
         self.upgrade()
             .ok_or(EntityError::Dropped)
             .map(|entity| entity.update((), access))
+    }
+
+    pub fn update_in<R>(
+        &self,
+        window: &mut crate::window::Window,
+        access: impl FnOnce(&mut T, &mut crate::window::Window, &mut Context<T>) -> R,
+    ) -> Result<R, EntityError> {
+        self.upgrade()
+            .ok_or(EntityError::Dropped)
+            .map(|entity| entity.update_in(window, access))
     }
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

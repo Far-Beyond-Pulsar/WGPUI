@@ -19,7 +19,7 @@ fn button(text: &str, on_click: impl Fn(&mut Window, &mut App) + 'static) -> imp
         .rounded_sm()
         .cursor_pointer()
         .child(text.to_string())
-        .on_click(move |_, window, cx| on_click(window, cx))
+        .on_click(wgpui::public_window_callback(move |_, window, cx| on_click(window, cx)))
 }
 
 impl Render for SubWindow {
@@ -182,18 +182,16 @@ impl Render for WindowDemo {
                 )
                 .unwrap();
             }))
-            .child(button("Hide Application", |window, cx| {
+            .child(button("Hide Application", |_window, cx| {
                 cx.hide();
+                let mut app = cx.clone();
 
                 // Restore the application after 3 seconds
-                window
-                    .spawn(cx, async move |cx| {
-                        Timer::after(std::time::Duration::from_secs(3)).await;
-                        cx.update(|_, cx| {
-                            cx.activate(false);
-                        })
-                    })
-                    .detach();
+                cx.spawn(async move {
+                    Timer::after(std::time::Duration::from_secs(3)).await;
+                    app.activate(false);
+                })
+                .detach();
             }))
             .child(button("Resize", |window, _| {
                 let content_size = window.bounds().size;
@@ -205,14 +203,15 @@ impl Render for WindowDemo {
                     "Are you sure?",
                     None,
                     &["Ok", "Cancel"],
-                    cx,
+                    &mut *cx,
                 );
 
-                cx.spawn(async move |_| {
-                    if answer.await.unwrap() == 0 {
-                        println!("You have clicked Ok");
-                    } else {
-                        println!("You have clicked Cancel");
+                cx.spawn(async move {
+                    match answer.await {
+                        Ok(Ok(0)) => println!("You have clicked Ok"),
+                        Ok(Ok(_)) => println!("You have clicked Cancel"),
+                        Ok(Err(error)) => eprintln!("Prompt failed: {error}"),
+                        Err(error) => eprintln!("Prompt task failed: {error}"),
                     }
                 })
                 .detach();
@@ -223,14 +222,15 @@ impl Render for WindowDemo {
                     "Are you sure?",
                     None,
                     &[PromptButton::ok("确定"), PromptButton::cancel("取消")],
-                    cx,
+                    &mut *cx,
                 );
 
-                cx.spawn(async move |_| {
-                    if answer.await.unwrap() == 0 {
-                        println!("You have clicked Ok");
-                    } else {
-                        println!("You have clicked Cancel");
+                cx.spawn(async move {
+                    match answer.await {
+                        Ok(Ok(0)) => println!("You have clicked Ok"),
+                        Ok(Ok(_)) => println!("You have clicked Cancel"),
+                        Ok(Err(error)) => eprintln!("Prompt failed: {error}"),
+                        Err(error) => eprintln!("Prompt task failed: {error}"),
                     }
                 })
                 .detach();
@@ -251,8 +251,8 @@ fn main() {
             },
             |window, cx| {
                 cx.new(|cx| {
-                    cx.observe_window_bounds(window, move |_, window, _| {
-                        println!("Window bounds changed: {:?}", window.bounds());
+                    window.observe_bounds(move |bounds| {
+                        println!("Window bounds changed: {:?}", bounds);
                     })
                     .detach();
 

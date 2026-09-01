@@ -292,7 +292,7 @@ struct StylingExample {
 impl StylingExample {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        window.focus(&focus_handle, &mut *cx);
 
         let buttons = vec![
             cx.focus_handle().tab_index(1).tab_stop(true),
@@ -322,8 +322,8 @@ impl Render for StylingExample {
         div()
             .id("app")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::on_tab))
-            .on_action(cx.listener(Self::on_tab_prev))
+            .on_action(wgpui::public_listener(cx, Self::on_tab))
+            .on_action(wgpui::public_listener(cx, Self::on_tab_prev))
             .size_full()
             .p_6()
             .bg(colors.background)

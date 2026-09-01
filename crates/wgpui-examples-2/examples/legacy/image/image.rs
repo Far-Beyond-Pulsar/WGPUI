@@ -166,7 +166,7 @@ fn main() {
 
             let window_options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("Image Example")),
+                    title: Some("Image Example".to_string()),
                     appears_transparent: false,
                     ..Default::default()
                 }),
@@ -179,7 +179,7 @@ fn main() {
                 ..Default::default()
             };
 
-            cx.open_window(window_options, |_, cx| {
+            cx.open_window(window_options, move |_, cx| {
                 cx.new(|_| ImageShowcase {
                     // Relative path to your root project path
                     local_resource: manifest_dir.join("examples/image/app-icon.png").into(),

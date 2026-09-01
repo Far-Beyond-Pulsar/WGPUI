@@ -80,6 +80,11 @@ pub enum WindowError {
     NoAlphaModes,
     /// The surface reports no present mode that can be configured.
     NoPresentModes,
+    /// A producer-owned surface was requested with a zero-sized extent.
+    InvalidSurfaceSize { width: u32, height: u32 },
+    /// The requested producer texture format is not renderable and sampleable
+    /// by the window's WGPU device.
+    UnsupportedSurfaceFormat(wgpu::TextureFormat),
 }
 
 impl std::fmt::Display for WindowError {
@@ -101,6 +106,14 @@ impl std::fmt::Display for WindowError {
             ),
             WindowError::NoAlphaModes => write!(formatter, "surface reports no alpha modes"),
             WindowError::NoPresentModes => write!(formatter, "surface reports no present modes"),
+            WindowError::InvalidSurfaceSize { width, height } => write!(
+                formatter,
+                "WGPU surface dimensions must be non-zero, got {width}x{height}"
+            ),
+            WindowError::UnsupportedSurfaceFormat(format) => write!(
+                formatter,
+                "WGPU surface format {format:?} is not supported for rendering and sampling"
+            ),
         }
     }
 }

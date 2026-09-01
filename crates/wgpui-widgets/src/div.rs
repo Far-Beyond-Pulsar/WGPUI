@@ -465,9 +465,9 @@ impl Div {
         self
     }
 
-    pub fn layer_with_policy(mut self, policy: BoundaryPolicy) -> Self {
+    pub fn layer_with_policy(mut self, policy: impl Into<BoundaryPolicy>) -> Self {
         self.boundary = true;
-        self.boundary_policy = Some(policy);
+        self.boundary_policy = Some(policy.into());
         self
     }
 
@@ -479,6 +479,12 @@ impl Div {
     pub fn id(mut self, element_id: impl Into<ElementId>) -> Self {
         self.element_id = Some(element_id.into());
         self
+    }
+
+    /// Transform this builder while retaining its concrete type for fluent
+    /// conditional construction.
+    pub fn map<R>(self, transform: impl FnOnce(Self) -> R) -> R {
+        transform(self)
     }
 
     /// Append one child.
@@ -731,6 +737,44 @@ pub trait StatefulDiv {
         + 'static,
     ) -> Self;
 
+    fn on_action<A: wgpui_core::action::Action, R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(
+            &A,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self;
+
+    fn on_mouse_move<R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(
+            &wgpui_core::window::MouseMoveEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self;
+
+    fn on_mouse_enter<R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(&mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R
+            + 'static,
+    ) -> Self;
+
+    fn on_drag<D: 'static, R: 'static>(
+        self,
+        data: D,
+        handler: impl FnMut(
+            &D,
+            [wgpui_core::boundary::Pixels; 2],
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self;
+
     fn track_focus(self, handle: &wgpui_core::window::FocusHandle) -> Self;
     fn tab_index(self, tab_index: i32) -> Self;
     fn tab_stop(self, tab_stop: bool) -> Self;
@@ -752,6 +796,48 @@ impl StatefulDiv for wgpui_core::element::Stateful<Div> {
         + 'static,
     ) -> Self {
         self.map_inner(|element| element.on_click(handler))
+    }
+
+    fn on_action<A: wgpui_core::action::Action, R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(&A, &mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R
+            + 'static,
+    ) -> Self {
+        self.map_inner(|element| element.on_action(handler))
+    }
+
+    fn on_mouse_move<R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(
+            &wgpui_core::window::MouseMoveEvent,
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.map_inner(|element| element.on_mouse_move(handler))
+    }
+
+    fn on_mouse_enter<R: events::IntoEventResult + 'static>(
+        self,
+        handler: impl FnMut(&mut wgpui_core::window::Window, &mut wgpui_core::app::App) -> R
+            + 'static,
+    ) -> Self {
+        self.map_inner(|element| element.on_mouse_enter(handler))
+    }
+
+    fn on_drag<D: 'static, R: 'static>(
+        self,
+        data: D,
+        handler: impl FnMut(
+            &D,
+            [wgpui_core::boundary::Pixels; 2],
+            &mut wgpui_core::window::Window,
+            &mut wgpui_core::app::App,
+        ) -> R
+            + 'static,
+    ) -> Self {
+        self.map_inner(|element| element.on_drag(data, handler))
     }
 
     fn track_focus(self, handle: &wgpui_core::window::FocusHandle) -> Self {
