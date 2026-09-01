@@ -119,6 +119,10 @@ pub use wgpui_widgets::img::{
     ImgBuilder, ObjectFit, SharedImageEngine,
 };
 pub use wgpui_widgets::list;
+pub use wgpui_widgets::list::{List, ListState, list};
+pub use wgpui_widgets::list::h_list::{
+    HList, HListArguments, HListState, HorizontalItemTransform, h_list,
+};
 pub use wgpui_widgets::list::uniform_list::{
     UniformItemTransform, UniformList, UniformListState, uniform_list,
 };
@@ -288,6 +292,7 @@ pub use wgpui_widgets::styled::{
 pub use wgpui_widgets::styled_text::{
     Highlight, HighlightStyle, StrikethroughStyle, StyledText, TextStyle, UnderlineStyle,
 };
+pub use wgpui_widgets::text::{Text, TextArguments, text, text_with_style};
 pub use wgpui_widgets::svg::{
     svg, svg_with_engine, load as load_svg, Svg, SvgBuilder, SvgKey,
 };
@@ -321,5 +326,6 @@ pub mod prelude {
         Entity, EntityFactory, IntoAnyElement, IntoElement, Render, RenderOnce, Stateful,
         StatefulDiv, Styled, UniformList, VirtualList, WeakEntity, Window, WindowOptions, div,
         uniform_list, virtual_list,
+        HList, List, Text, h_list, list, text,
     };
 }
