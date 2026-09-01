@@ -29,3 +29,14 @@ fn public_render_contract_uses_the_wgpu_window() {
     let _: &Owned = component.component();
     assert_element_contract::<Component<Owned>>();
 }
+
+#[test]
+fn public_window_keeps_core_interaction_and_winit_access_at_the_boundary() {
+    fn inspect_window(window: &mut wgpui::Window) {
+        let interaction = window.interaction_mut();
+        let _ = interaction.refresh_requested();
+        let _ = window.winit_window().id();
+    }
+
+    let _ = inspect_window;
+}
