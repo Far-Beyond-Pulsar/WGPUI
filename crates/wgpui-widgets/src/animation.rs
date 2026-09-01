@@ -7,8 +7,70 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use wgpui_core::element::Element;
+use wgpui_core::geometry::{Pixels, Point, Size};
 use wgpui_core::reconcile::description::{Description, ElementId};
 use wgpui_core::window::animation::{AnimationScheduler, animation_start};
+
+/// A transform that can be sampled by an animated element.
+///
+/// The retained image primitive currently applies scale and translation to
+/// its axis-aligned bounds. Rotation is kept in the value and reconciliation
+/// key so a renderer that supports affine sprites can consume it without
+/// changing the animation API.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transformation {
+    pub rotation: f32,
+    pub scale: [f32; 2],
+    pub translation: [f32; 2],
+}
+
+impl Default for Transformation {
+    fn default() -> Self {
+        Self {
+            rotation: 0.0,
+            scale: [1.0, 1.0],
+            translation: [0.0, 0.0],
+        }
+    }
+}
+
+impl Transformation {
+    pub fn rotate(rotation: f32) -> Self {
+        Self {
+            rotation,
+            ..Self::default()
+        }
+    }
+
+    pub fn scale(scale: Size<Pixels>) -> Self {
+        Self {
+            scale: [scale.width.value(), scale.height.value()],
+            ..Self::default()
+        }
+    }
+
+    pub fn translate(translation: Point<Pixels>) -> Self {
+        Self {
+            translation: [translation.x.value(), translation.y.value()],
+            ..Self::default()
+        }
+    }
+
+    pub fn with_scaling(mut self, scale: Size<Pixels>) -> Self {
+        self.scale = [scale.width.value(), scale.height.value()];
+        self
+    }
+
+    pub fn with_translation(mut self, translation: Point<Pixels>) -> Self {
+        self.translation = [translation.x.value(), translation.y.value()];
+        self
+    }
+
+    pub fn with_rotation(mut self, rotation: f32) -> Self {
+        self.rotation = rotation;
+        self
+    }
+}
 
 /// An animation definition, compatible with the legacy public names.
 #[derive(Clone)]
@@ -231,6 +293,24 @@ pub fn ease_out_quint(value: f32) -> f32 {
     1.0 - (1.0 - value).powi(5)
 }
 
+/// Convert normalized progress to one complete turn in degrees.
+pub fn percentage(value: f32) -> f32 {
+    value * 360.0
+}
+
+/// Add a soft overshoot to an easing function.
+pub fn bounce(easing: impl Fn(f32) -> f32 + 'static) -> impl Fn(f32) -> f32 + 'static {
+    move |value| {
+        let value = easing(value.clamp(0.0, 1.0));
+        if value < 0.5 {
+            2.0 * value * value
+        } else {
+            let remaining = 1.0 - value;
+            1.0 - 2.0 * remaining * remaining
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +437,24 @@ mod tests {
                 .compare(second.key().expect("key"))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn transformation_builders_preserve_independent_components() {
+        let transformed = Transformation::rotate(percentage(0.25))
+            .with_scaling(Size::new(Pixels(2.0), Pixels(3.0)))
+            .with_translation(Point::new(Pixels(4.0), Pixels(-5.0)));
+
+        assert_eq!(transformed.rotation, 90.0);
+        assert_eq!(transformed.scale, [2.0, 3.0]);
+        assert_eq!(transformed.translation, [4.0, -5.0]);
+    }
+
+    #[test]
+    fn bounce_stays_within_animation_progress() {
+        let easing = bounce(linear);
+        for value in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert!((0.0..=1.0).contains(&easing(value)));
+        }
     }
 }

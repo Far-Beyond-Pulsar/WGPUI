@@ -1,5 +1,7 @@
 use std::any::Any;
+use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use crate::div::interactivity::style::{DivStyle, classify_style_change};
 use crate::scroll::ScrollHandle;
@@ -13,6 +15,48 @@ use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_layout::taffy_tree::{
     Dimension, LayoutSides, LayoutSize, LengthPercentageAuto, Position,
 };
+
+#[derive(Clone, Default)]
+pub struct VirtualListScrollController {
+    state: Rc<RefCell<Option<(ScrollHandle, Rc<Vec<Pixels>>)>>>,
+}
+
+impl VirtualListScrollController {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn scroll_to_item(&self, index: usize) -> bool {
+        let state = self.state.borrow();
+        let Some((handle, heights)) = state.as_ref() else {
+            return false;
+        };
+        let Some(&height) = heights.get(index) else {
+            return false;
+        };
+        let start = heights
+            .iter()
+            .take(index)
+            .copied()
+            .fold(Pixels::ZERO, |total, height| total + height);
+        let end = start + height;
+        let viewport = handle.viewport().size.height;
+        let current_top = -handle.offset().y;
+        let current_bottom = current_top + viewport;
+        let target = if start < current_top {
+            start
+        } else if end > current_bottom {
+            end - viewport
+        } else {
+            current_top
+        };
+        handle.set_offset(Point::new(Pixels::ZERO, -target))
+    }
+
+    fn attach(&self, handle: ScrollHandle, heights: Rc<Vec<Pixels>>) {
+        *self.state.borrow_mut() = Some((handle, heights));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VirtualItemTransform {
@@ -205,21 +249,56 @@ pub struct VirtualList {
     style: DivStyle,
     state: VirtualListState,
     scroll_handle: Option<ScrollHandle>,
-    render_item: Box<dyn Fn(usize) -> Description>,
+    render_item: Box<dyn FnMut(usize) -> Description>,
 }
 
 pub fn virtual_list<F, I>(heights: Vec<Pixels>, render_item: F) -> VirtualList
 where
-    F: Fn(usize) -> I + 'static,
+    F: FnMut(usize) -> I + 'static,
     I: IntoElement + 'static,
 {
     VirtualList::new(heights, render_item)
 }
 
+pub fn vlist<T, F, I>(
+    entity: wgpui_core::app::Entity<T>,
+    element_id: impl Into<ElementId>,
+    heights: Rc<Vec<Pixels>>,
+    scroll_handle: ScrollHandle,
+    controller: VirtualListScrollController,
+    mut processor: F,
+) -> VirtualList
+where
+    T: 'static,
+    F: FnMut(&mut T, Range<usize>, &mut wgpui_core::window::Window, &mut wgpui_core::app::Context<T>)
+        -> Vec<I>
+        + 'static,
+    I: IntoElement + 'static,
+{
+    controller.attach(scroll_handle.clone(), heights.clone());
+    let weak_entity = entity.downgrade();
+    VirtualList::new(heights.as_ref().clone(), move |index| {
+        let Some(entity) = weak_entity.upgrade() else {
+            return Description::new::<VirtualListItem>();
+        };
+        let mut window = wgpui_core::window::Window::new();
+        entity
+            .update_in(&mut window, |value, window, context| {
+                processor(value, index..index.saturating_add(1), window, context)
+            })
+            .into_iter()
+            .next()
+            .map(IntoElement::into_description)
+            .unwrap_or_else(|| Description::new::<VirtualListItem>())
+    })
+    .id(element_id)
+    .track_scroll(&scroll_handle)
+}
+
 impl VirtualList {
-    pub fn new<F, I>(heights: Vec<Pixels>, render_item: F) -> Self
+    pub fn new<F, I>(heights: Vec<Pixels>, mut render_item: F) -> Self
     where
-        F: Fn(usize) -> I + 'static,
+        F: FnMut(usize) -> I + 'static,
         I: IntoElement + 'static,
     {
         Self {
@@ -250,7 +329,7 @@ impl VirtualList {
         &self.state
     }
 
-    fn item_description(&self, transform: VirtualItemTransform) -> Description {
+    fn item_description(&mut self, transform: VirtualItemTransform) -> Description {
         let style = wgpui_layout::taffy_tree::LayoutStyle {
             position: Position::Absolute,
             size: LayoutSize {
@@ -301,7 +380,8 @@ impl VirtualList {
             .state
             .transforms()
             .into_iter()
-            .map(|transform| self.item_description(transform));
+            .map(|transform| self.item_description(transform))
+            .collect::<Vec<_>>();
         let offset = self
             .scroll_handle
             .as_ref()
@@ -389,5 +469,21 @@ mod tests {
         .describe();
         assert!(!description.child_descriptions().is_empty());
         assert!(description.is_boundary());
+    }
+
+    #[test]
+    fn scroll_controller_uses_variable_row_offsets() {
+        let handle = ScrollHandle::new();
+        handle.set_viewport(
+            Bounds::default(),
+            Size::pixels(100.0, 30.0),
+        );
+        let controller = VirtualListScrollController::new();
+        let heights = Rc::new(vec![Pixels(10.0), Pixels(30.0), Pixels(20.0)]);
+        controller.attach(handle.clone(), heights);
+
+        assert!(controller.scroll_to_item(2));
+        assert_eq!(handle.offset().y, Pixels(-30.0));
+        assert!(!controller.scroll_to_item(3));
     }
 }

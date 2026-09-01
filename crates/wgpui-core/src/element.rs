@@ -28,7 +28,7 @@ pub trait Element: 'static {
 }
 
 /// Converts a value into a native [`Element`].
-pub trait IntoElement: Sized {
+pub trait IntoElement: Sized + 'static {
     /// The concrete element produced by this conversion.
     type Element: Element;
 

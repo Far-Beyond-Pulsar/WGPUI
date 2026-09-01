@@ -5,8 +5,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use wgpui_core::{App, Render};
-use wgpui_wgpu::window::application::{Application, WindowOptions};
+use wgpui_core::App;
+use wgpui_wgpu::window::application::{
+    AppWindowExt, Application, IntoElement, Render, Window, WindowOptions,
+};
 
 #[test]
 fn application_renders_two_independent_native_windows() {
@@ -63,7 +65,11 @@ struct TwoWindowRoot {
 }
 
 impl Render for TwoWindowRoot {
-    fn render(&mut self) -> impl wgpui_core::element::IntoElement + 'static {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _context: &mut wgpui_core::app::Context<Self>,
+    ) -> impl IntoElement + 'static {
         self.frames[self.index].fetch_add(1, Ordering::Relaxed);
         if self
             .frames

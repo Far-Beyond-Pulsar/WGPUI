@@ -1,5 +1,6 @@
 //! Native application lifecycle for the retained WGPUI renderer.
 
+use std::any::{Any, TypeId};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -9,15 +10,19 @@ use std::time::{Duration, Instant};
 use wgpui_core::app::App;
 use wgpui_core::boundary::Pixels;
 use wgpui_core::boundary::compositor::CompositeEntry;
-use wgpui_core::element::IntoElement;
+use wgpui_core::element::Element as CoreElement;
+pub use wgpui_core::element::IntoElement;
 use wgpui_core::geometry::{Bounds, Point, Rect, Size, WindowBounds, point, size};
 use wgpui_core::invalidation::request::FrameSignals;
+use wgpui_core::patch::emit::{Emission, EmitContext};
+use wgpui_core::patch::primitive::{Path, Quad};
 use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
 pub use wgpui_core::window::WindowOptions;
 use wgpui_core::window::{
-    AnimationClock, ClipboardItem, DragData, FocusEvent, ImeEvent, InputEvent, KeyDownEvent,
+    AnimationClock, ClipboardItem, DragData, FocusEvent, FocusHandle, FocusId, ImeEvent, InputEvent,
+    KeyDownEvent,
     KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton as CoreMouseButton,
     MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
     TextInputEvent,
@@ -53,7 +58,12 @@ fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
 /// A handle to the native window visible to the application callback.
 type CloseHandler = Box<dyn FnMut(&mut Window) -> bool>;
 type AppInitializer = Box<dyn FnOnce(&mut App)>;
-type WindowBuildCallback = Box<dyn FnMut(&mut Window) -> Description>;
+type WindowBuildCallback = Box<dyn FnMut(&mut Window, &mut App) -> Description>;
+
+enum ImmediatePaint {
+    Quad(Quad),
+    Path(Path),
+}
 
 pub struct Window {
     native: Arc<winit::window::Window>,
@@ -67,6 +77,8 @@ pub struct Window {
     last_frame: Option<FrameReport>,
     state: ElementStateStore,
     state_frame: u64,
+    state_entities: std::collections::HashMap<TypeId, Box<dyn Any>>,
+    immediate_paints: Vec<ImmediatePaint>,
     interaction: wgpui_core::window::Window,
     close_handler: Option<CloseHandler>,
     interaction_modifiers: Modifiers,
@@ -124,6 +136,100 @@ impl From<arboard::Error> for ClipboardError {
 /// The monitor containing a window, when the platform reports one.
 pub type DisplayId = winit::monitor::MonitorHandle;
 
+/// A stateless component rendered with the public WGPU window.
+pub trait RenderOnce: 'static + Sized {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement;
+}
+
+/// A retained view rendered with the public WGPU window.
+pub trait Render: 'static + Sized {
+    fn render(
+        &mut self,
+        window: &mut Window,
+        cx: &mut wgpui_core::app::Context<Self>,
+    ) -> impl IntoElement;
+}
+
+/// Element wrapper generated for [`RenderOnce`] components.
+pub struct Component<C: RenderOnce> {
+    component: C,
+}
+
+impl<C: RenderOnce> Component<C> {
+    pub fn new(component: C) -> Self {
+        Self { component }
+    }
+}
+
+impl<C: RenderOnce> CoreElement for Component<C> {
+    fn into_description(self) -> Description {
+        Description::deferred(move |window, app| {
+            let Some(window) = window.downcast_mut::<Window>() else {
+                return Description::new::<Self>();
+            };
+            let element = self.component.render(window, app);
+            let app = app.clone();
+            IntoElement::into_description_in(element, window.interaction_mut(), &app)
+        })
+    }
+}
+
+/// Public application extension that queues a WGPU-window root view.
+pub trait AppWindowExt {
+    fn open_window<V: Render>(
+        &mut self,
+        options: WindowOptions,
+        build_root_view: impl FnOnce(&mut Window, &mut App) -> wgpui_core::app::Entity<V> + 'static,
+    ) -> Result<(), &'static str>;
+}
+
+/// Render a public WGPU view into a description for the current frame.
+pub fn render_description<R: Render>(
+    view: &mut R,
+    window: &mut Window,
+    cx: &mut wgpui_core::app::Context<R>,
+) -> Description {
+    let element = view.render(window, cx);
+    let app = cx.app().clone();
+    IntoElement::into_description_in(element, window.interaction_mut(), &app)
+}
+
+impl AppWindowExt for App {
+    fn open_window<V: Render>(
+        &mut self,
+        options: WindowOptions,
+        build_root_view: impl FnOnce(&mut Window, &mut App) -> wgpui_core::app::Entity<V> + 'static,
+    ) -> Result<(), &'static str> {
+        self.enqueue_window(
+            options,
+            Box::new(move |app, window| {
+                let Some(window) = window.downcast_mut::<Window>() else {
+                    return wgpui_core::app::WindowRenderer {
+                        render: Box::new(|_, _| Description::new::<()>()),
+                    };
+                };
+                let entity = build_root_view(window, app);
+                wgpui_core::app::WindowRenderer {
+                    render: Box::new(move |app, window| {
+                        let Some(window) = window.downcast_mut::<Window>() else {
+                            return Description::new::<()>();
+                        };
+                        entity.update((), |value, context| {
+                            let element = value.render(window, context);
+                            let app = app.clone();
+                            IntoElement::into_description_in(
+                                element,
+                                window.interaction_mut(),
+                                &app,
+                            )
+                        })
+                    }),
+                }
+            }),
+        )
+    }
+}
+
 impl Window {
     /// Access the underlying Winit window for platform-specific integration.
     ///
@@ -167,6 +273,31 @@ impl Window {
     }
     pub fn request_redraw(&self) {
         self.native.request_redraw();
+    }
+
+    pub fn request_animation_frame(&self) {
+        self.request_redraw();
+    }
+
+    /// Queue a retained quad for the current frame.
+    pub fn paint_quad(&mut self, quad: Quad) {
+        self.immediate_paints.push(ImmediatePaint::Quad(quad));
+        self.request_redraw();
+    }
+
+    /// Queue a retained, already tessellated path for the current frame.
+    pub fn paint_path<C>(&mut self, path: Path, color: C)
+    where
+        C: Into<[f32; 4]>,
+    {
+        self.immediate_paints
+            .push(ImmediatePaint::Path(path.with_color(color.into())));
+        self.request_redraw();
+    }
+
+    pub fn refresh(&mut self) {
+        self.interaction.refresh();
+        self.request_redraw();
     }
 
     pub fn take_hover_dirty_regions(&mut self) -> Vec<Rect> {
@@ -295,6 +426,19 @@ impl Window {
         self.native.set_decorations(decorations);
         self.decorations = decorations;
     }
+    pub fn window_decorations(&self) -> WindowDecorations {
+        window_decorations_for(self.decorations)
+    }
+
+    /// Record the requested client inset without claiming that Winit applied
+    /// it. Winit does not expose a cross-platform client-area inset API; code
+    /// that needs platform-specific non-client geometry should use
+    /// [`Self::winit_window`].
+    pub fn set_client_inset(&mut self, inset: Pixels) {
+        log::warn!(
+            "client window insets are not supported by the WGPU/Winit backend; requested inset: {inset:?}"
+        );
+    }
     pub fn has_decorations(&self) -> bool {
         self.decorations
     }
@@ -361,6 +505,9 @@ impl Window {
         self.close_requested.store(true, Ordering::Release);
         self.native.request_redraw();
     }
+    pub fn remove_window(&mut self) {
+        self.close();
+    }
     pub fn close_requested(&self) -> bool {
         self.close_requested.load(Ordering::Acquire)
     }
@@ -383,6 +530,41 @@ impl Window {
     }
     pub fn interaction(&mut self) -> &mut wgpui_core::window::Window {
         &mut self.interaction
+    }
+
+    /// Borrow the backend-neutral interaction window used while lowering
+    /// descriptions and dispatching input.
+    pub fn interaction_mut(&mut self) -> &mut wgpui_core::window::Window {
+        &mut self.interaction
+    }
+
+    pub fn focus<A>(&mut self, handle: &FocusHandle, _cx: A) -> bool {
+        self.interaction.focus(handle)
+    }
+
+    pub fn focus_next<A>(&mut self, _cx: A) -> Option<FocusId> {
+        self.interaction.focus_next()
+    }
+
+    pub fn focus_prev<A>(&mut self, _cx: A) -> Option<FocusId> {
+        self.interaction.focus_previous()
+    }
+
+    /// Spawn work through the entity context associated with this window.
+    ///
+    /// The native window does not own an executor, so this delegates to the
+    /// context rather than creating a second task runtime.
+    pub fn spawn<T, F, R>(
+        &self,
+        cx: &wgpui_core::app::Context<T>,
+        make: F,
+    ) -> wgpui_core::app::Task<R>
+    where
+        T: 'static,
+        F: AsyncFnOnce(&wgpui_core::app::Context<T>) -> R + 'static,
+        R: 'static,
+    {
+        cx.spawn(async move |_entity, context| make(context).await)
     }
     pub fn handle_input(&mut self, event: InputEvent) -> bool {
         self.interaction.handle_input(event)
@@ -1025,7 +1207,26 @@ impl Window {
     /// Access state retained by an element scope. The store belongs to the
     /// logical window, not to a rendered layer, so cache boundaries cannot
     /// accidentally discard interactive state.
-    pub fn use_state<T: 'static, R>(
+    pub fn use_state<T: 'static>(
+        &mut self,
+        app: &mut App,
+        build: impl FnOnce(&mut Self, &mut App) -> T,
+    ) -> wgpui_core::app::Entity<T> {
+        if let Some(entity) = self
+            .state_entities
+            .get(&TypeId::of::<T>())
+            .and_then(|value| value.downcast_ref::<wgpui_core::app::Entity<T>>())
+        {
+            return entity.clone();
+        }
+        let value = build(self, app);
+        let entity = app.new_entity(value);
+        self.state_entities
+            .insert(TypeId::of::<T>(), Box::new(entity.clone()));
+        entity
+    }
+
+    pub fn use_state_in_scope<T: 'static, R>(
         &mut self,
         scope: StateScope,
         initialise: impl FnOnce() -> T,
@@ -1236,7 +1437,13 @@ where
         let mut handler = Handler {
             initial: Some((
                 self.options,
-                Box::new(move |window| (self.build)(window).into_description()),
+                Box::new(move |window, app| {
+                    IntoElement::into_description_in(
+                        (self.build)(window),
+                        window.interaction_mut(),
+                        app,
+                    )
+                }),
             )),
             max_frames: self.max_frames,
             initialize: Some(Box::new(initialize)),
@@ -1277,7 +1484,13 @@ where
         let mut handler = Handler {
             initial: Some((
                 self.options,
-                Box::new(move |window| (self.build)(window).into_description()),
+                Box::new(move |window, app| {
+                    IntoElement::into_description_in(
+                        (self.build)(window),
+                        window.interaction_mut(),
+                        app,
+                    )
+                }),
             )),
             max_frames: self.max_frames,
             initialize: None,
@@ -1304,12 +1517,19 @@ impl Application {
         ConfiguredApplication { http_client: client }
     }
 
+    /// Retain the application-builder shape used by asset-backed examples.
+    /// Asset resolution is owned by the widget layer; the native lifecycle
+    /// does not need to inspect the source while constructing the event loop.
+    pub fn with_assets<T: 'static>(self, _assets: T) -> Self {
+        self
+    }
+
     pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut handler = Handler {
             initial: Some((
                 WindowOptions::default(),
-                Box::new(|_| Description::new::<()>()),
+                Box::new(|_, _| Description::new::<()>()),
             )),
             max_frames: None,
             initialize: Some(Box::new(initialize)),
@@ -1337,7 +1557,7 @@ impl ConfiguredApplication {
         let mut handler = Handler {
             initial: Some((
                 WindowOptions::default(),
-                Box::new(|_| Description::new::<()>()),
+                Box::new(|_, _| Description::new::<()>()),
             )),
             max_frames: None,
             initialize: Some(Box::new(initialize)),
@@ -1394,6 +1614,35 @@ struct Handler {
     live: Vec<Live>,
     failure: Option<ApplicationError>,
     app: App,
+}
+
+fn window_decorations_for(server_decorations: bool) -> WindowDecorations {
+    if server_decorations {
+        WindowDecorations::Server
+    } else {
+        WindowDecorations::Client
+    }
+}
+
+fn append_immediate_paints(
+    mut description: Description,
+    paints: impl IntoIterator<Item = ImmediatePaint>,
+) -> Description {
+    for paint in paints {
+        description = description.child(
+            Description::new::<ImmediatePaint>().emit(
+                move |_context: &EmitContext, emission: &mut Emission| match &paint {
+                    ImmediatePaint::Quad(quad) => {
+                        emission.quad(quad.clone());
+                    }
+                    ImmediatePaint::Path(path) => {
+                        emission.path(path.clone());
+                    }
+                },
+            ),
+        );
+    }
+    description
 }
 
 impl Handler {
@@ -1481,6 +1730,8 @@ impl Handler {
             last_frame: None,
             state: ElementStateStore::new(),
             state_frame: 0,
+            state_entities: std::collections::HashMap::new(),
+            immediate_paints: Vec::new(),
             interaction: wgpui_core::window::Window::new(),
             close_handler: None,
             interaction_modifiers: Modifiers::default(),
@@ -1527,11 +1778,18 @@ impl Handler {
             }
             let mut first_error = None;
             for request in requests {
-                let mut renderer =
-                    (request.build)(&mut wgpui_core::window::Window::new(), &mut self.app);
-                let mut app = self.app.clone();
-                let build = Box::new(move |window: &mut Window| {
-                    (renderer.render)(&mut window.interaction, &mut app)
+                let mut request_build = Some(request.build);
+                let mut renderer = None;
+                let build = Box::new(move |window: &mut Window, app: &mut App| {
+                    if renderer.is_none()
+                        && let Some(build) = request_build.take()
+                    {
+                        renderer = Some(build(app, window));
+                    }
+                    renderer.as_mut().map_or_else(
+                        || Description::new::<()>(),
+                        |renderer| (renderer.render)(app, window),
+                    )
                 });
                 if let Err(error) =
                     self.create_window(event_loop, request.id, request.options, build)
@@ -1594,9 +1852,14 @@ impl Handler {
         let animation_clock = std::mem::take(&mut live.window.animation_clock);
         let (animation_clock, description) =
             wgpui_core::window::animation::with_animation_clock(animation_clock, || {
-                (live.build)(&mut live.window)
+                (live.build)(&mut live.window, &mut live.app)
             });
         live.window.animation_clock = animation_clock;
+        let description = description.resolve_deferred(&mut live.window, &mut live.app);
+        let description = append_immediate_paints(
+            description,
+            std::mem::take(&mut live.window.immediate_paints),
+        );
         live.window.end_frame();
         live.frame_loop
             .set_performance_debug(*live.window.performance_debug());
@@ -1809,6 +2072,8 @@ impl winit::application::ApplicationHandler for Handler {
             last_frame: None,
             state: ElementStateStore::new(),
             state_frame: 0,
+            state_entities: std::collections::HashMap::new(),
+            immediate_paints: Vec::new(),
             interaction: wgpui_core::window::Window::new(),
             close_handler: None,
             interaction_modifiers: Modifiers::default(),
@@ -2107,6 +2372,13 @@ mod tests {
     use super::*;
     use wgpui_core::geometry::{point, px, size};
 
+    fn spawn_accepts_a_context_async_closure<T: 'static>(
+        window: &Window,
+        context: &wgpui_core::app::Context<T>,
+    ) {
+        std::mem::drop(window.spawn(context, async move |_context| {}));
+    }
+
     #[test]
     fn window_bounds_override_fallback_size_and_preserve_position() {
         let options = WindowOptions {
@@ -2201,5 +2473,48 @@ mod tests {
                 appearance != WindowBackgroundAppearance::Opaque
             );
         }
+    }
+
+    #[test]
+    fn decoration_state_reports_the_native_decoration_mode() {
+        assert_eq!(
+            window_decorations_for(true),
+            WindowDecorations::Server
+        );
+        assert_eq!(
+            window_decorations_for(false),
+            WindowDecorations::Client
+        );
+    }
+
+    #[test]
+    fn immediate_paints_are_lowered_as_retained_description_children() {
+        let path = Path::new(
+            vec![
+                wgpui_core::patch::primitive::PathVertex {
+                    position: [0.0, 0.0],
+                    st: [0.0, 1.0],
+                },
+                wgpui_core::patch::primitive::PathVertex {
+                    position: [1.0, 0.0],
+                    st: [0.0, 1.0],
+                },
+                wgpui_core::patch::primitive::PathVertex {
+                    position: [0.0, 1.0],
+                    st: [0.0, 1.0],
+                },
+            ],
+            [1.0; 4],
+        );
+        let description = append_immediate_paints(
+            Description::new::<()>(),
+            [ImmediatePaint::Path(path)],
+        );
+
+        assert_eq!(description.child_descriptions().len(), 1);
+        assert!(description
+            .child_descriptions()
+            .first()
+            .is_some_and(Description::emits));
     }
 }

@@ -16,6 +16,8 @@ struct ScrollState {
     content_size: Size<Pixels>,
     pending: Option<Point<Pixels>>,
     revision: u64,
+    item_height: Option<Pixels>,
+    item_count: Option<usize>,
 }
 
 /// A cloneable handle for reading and changing a scroll container's retained
@@ -140,6 +142,38 @@ impl ScrollHandle {
         self.set_offset(point(-max.width, -max.height))
     }
 
+    pub fn scroll_to_item(&self, index: usize, strategy: crate::scroll::ScrollStrategy) -> bool {
+        let state = self.state.borrow();
+        if state.item_count.is_some_and(|item_count| index >= item_count) {
+            return false;
+        }
+        let Some(item_height) = state.item_height else {
+            return match strategy {
+                crate::scroll::ScrollStrategy::Top => self.scroll_to_top(),
+                crate::scroll::ScrollStrategy::Bottom => self.scroll_to_bottom(),
+            };
+        };
+        drop(state);
+        let start = item_height.scaled(index as f32);
+        let target = match strategy {
+            crate::scroll::ScrollStrategy::Top => start,
+            crate::scroll::ScrollStrategy::Bottom => {
+                start + item_height - self.viewport().size.height
+            }
+        };
+        self.set_offset(point(self.offset().x, -target))
+    }
+
+    pub(crate) fn set_item_height(&self, item_height: Pixels) {
+        self.state.borrow_mut().item_height = Some(item_height.max(Pixels::ZERO));
+    }
+
+    pub(crate) fn set_item_extent(&self, item_height: Pixels, item_count: usize) {
+        let mut state = self.state.borrow_mut();
+        state.item_height = Some(item_height.max(Pixels::ZERO));
+        state.item_count = Some(item_count);
+    }
+
     pub fn set_viewport(&self, viewport: Bounds<Pixels>, content_size: Size<Pixels>) -> bool {
         let mut state = self.state.borrow_mut();
         let max_offset = size(
@@ -220,5 +254,15 @@ mod tests {
         assert_eq!(info.content_size, [300.0, 240.0]);
         assert_eq!(info.max_offset, [300.0, 240.0]);
         assert_eq!(info.offset, [-20.0, -10.0]);
+    }
+
+    #[test]
+    fn scroll_to_item_rejects_indexes_outside_the_realized_list_extent() {
+        let handle = ScrollHandle::new();
+        handle.set_viewport(Bounds::default(), size(px(100.0), px(1000.0)));
+        handle.set_item_extent(px(20.0), 10);
+        assert!(!handle.scroll_to_item(10, crate::scroll::ScrollStrategy::Top));
+        assert!(handle.scroll_to_item(9, crate::scroll::ScrollStrategy::Top));
+        assert_eq!(handle.offset().y, px(-180.0));
     }
 }

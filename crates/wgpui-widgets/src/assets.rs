@@ -11,6 +11,7 @@ use std::sync::Arc;
 use futures::AsyncReadExt;
 use wgpui_core::{App, Task};
 use wgpui_http_client::{AppHttpClientExt, AsyncBody, BoxedHttpClient, StatusCode};
+use wgpui_text::shaping::SharedString;
 
 use crate::image_cache::{DecodedImage, ImageDecodeError, decode_async};
 
@@ -18,7 +19,7 @@ use crate::image_cache::{DecodedImage, ImageDecodeError, decode_async};
 pub trait AssetSource: 'static + Send + Sync {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'_, [u8]>>>;
 
-    fn list(&self, path: &str) -> anyhow::Result<Vec<String>>;
+    fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>>;
 }
 
 impl AssetSource for () {
@@ -26,10 +27,16 @@ impl AssetSource for () {
         Ok(None)
     }
 
-    fn list(&self, _path: &str) -> anyhow::Result<Vec<String>> {
+    fn list(&self, _path: &str) -> anyhow::Result<Vec<SharedString>> {
         Ok(Vec::new())
     }
 }
+
+/// A resource accepted by the native image loader.
+pub type ImageSource = Resource;
+
+/// A cheaply cloneable URI spelling used by the compatibility examples.
+pub type SharedUri = String;
 
 /// The three resource locations supported by the native loader.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -64,6 +71,12 @@ impl From<PathBuf> for Resource {
 impl From<Arc<std::path::Path>> for Resource {
     fn from(value: Arc<std::path::Path>) -> Self {
         Self::Path(value.as_ref().to_path_buf())
+    }
+}
+
+impl From<SharedString> for Resource {
+    fn from(value: SharedString) -> Self {
+        Self::from(value.as_str())
     }
 }
 

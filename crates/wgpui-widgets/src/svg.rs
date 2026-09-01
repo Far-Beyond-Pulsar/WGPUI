@@ -42,8 +42,13 @@ use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 
-use crate::image_cache::{ImageDecodeError, decode_svg_at};
-use crate::img::{ImageSourceId, ImageStyle, Img, SharedImageEngine};
+use crate::assets::Resource;
+use crate::image_cache::{ImageCache, ImageDecodeError, decode_svg_at};
+use crate::img::{
+    ImageSourceId, ImageStyle, Img, SharedImageEngine, pending_engine, resource_source_id,
+};
+use crate::animation::Transformation;
+use wgpui_text::shaping::SharedString;
 
 /// Rasterise SVG bytes into `engine`'s cache and return the source that holds
 /// them.
@@ -82,6 +87,8 @@ pub struct SvgKey {
     pub requested_size: [f32; 2],
     /// How that box is drawn.
     pub style: ImageStyle,
+    pub transformation: Transformation,
+    pub text_color: Option<[f32; 4]>,
 }
 
 impl ReconcileKey for SvgKey {
@@ -94,7 +101,11 @@ impl ReconcileKey for SvgKey {
             axes |= Invalidation::LAYOUT;
             axes |= Invalidation::DISPLAY;
         }
-        if previous.source != self.source || previous.style != self.style {
+        if previous.source != self.source
+            || previous.style != self.style
+            || previous.transformation != self.transformation
+            || previous.text_color != self.text_color
+        {
             axes |= Invalidation::DISPLAY;
         }
         axes
@@ -109,24 +120,216 @@ impl ReconcileKey for SvgKey {
 #[derive(Clone)]
 pub struct Svg {
     image: Img,
+    path: Option<SharedString>,
+    transformation: Transformation,
+    text_color: Option<[f32; 4]>,
 }
 
-/// An SVG showing the document `load` put at `source`.
-pub fn svg(source: ImageSourceId, engine: SharedImageEngine) -> Svg {
+/// Construct the authoritative source-ID/engine SVG.
+pub fn svg_with_engine(source: ImageSourceId, engine: SharedImageEngine) -> Svg {
     Svg::new(source, engine)
 }
 
+/// Construct an asset-backed SVG builder.
+pub fn svg() -> SvgBuilder {
+    SvgBuilder { svg: Svg::pending() }
+}
+
+pub struct SvgBuilder {
+    svg: Svg,
+}
+
+impl SvgBuilder {
+    pub fn path(mut self, path: impl Into<SharedString>) -> Self {
+        self.svg = self.svg.path(path);
+        self
+    }
+
+    pub fn size(self, size: impl crate::styled::IntoStylePixels) -> Self {
+        self.size_square(size)
+    }
+
+    fn size_square(mut self, size: impl crate::styled::IntoStylePixels) -> Self {
+        let size = size.into_style_pixels();
+        self.svg = self.svg.size(size, size);
+        self
+    }
+
+    pub fn size_8(mut self) -> Self {
+        self.svg = self.svg.size_8();
+        self
+    }
+
+    pub fn size_12(mut self) -> Self {
+        self.svg = self.svg.size_12();
+        self
+    }
+
+    pub fn size_16(mut self) -> Self {
+        self.svg = self.svg.size_16();
+        self
+    }
+
+    pub fn size_full(mut self) -> Self {
+        self.svg = self.svg.size_full();
+        self
+    }
+
+    pub fn h(mut self, height: impl crate::styled::IntoStylePixels) -> Self {
+        self.svg = self.svg.h(height);
+        self
+    }
+
+    pub fn w(mut self, width: impl crate::styled::IntoStylePixels) -> Self {
+        self.svg = self.svg.w(width);
+        self
+    }
+
+    pub fn max_w_full(mut self) -> Self {
+        self.svg = self.svg.max_w_full();
+        self
+    }
+
+    pub fn text_2xl(self) -> Self {
+        self.size_square(24.0)
+    }
+
+    pub fn overflow_hidden(mut self) -> Self {
+        self.svg = self.svg.overflow_hidden();
+        self
+    }
+
+    pub fn text_color(mut self, color: impl Into<wgpui_core::color::Hsla>) -> Self {
+        self.svg = self.svg.text_color(color);
+        self
+    }
+
+    pub fn with_transformation(mut self, transformation: Transformation) -> Self {
+        self.svg = self.svg.with_transformation(transformation);
+        self
+    }
+}
+
+impl Element for SvgBuilder {
+    fn into_description(self) -> Description {
+        self.svg.into_description()
+    }
+}
+
 impl Svg {
+    fn pending() -> Self {
+        Self::new(ImageSourceId::from_raw(1), pending_engine(ImageCache::new()))
+    }
+
+    pub fn from_resource(resource: Resource) -> Self {
+        let source = resource_source_id(&resource);
+        let mut cache = ImageCache::new();
+        let bytes = match &resource {
+            Resource::Path(path) => std::fs::read(path),
+            Resource::Embedded(path) => std::fs::read(path),
+            Resource::Uri(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "URI SVG loading requires an application-owned loader",
+            )),
+        };
+        let load_state = match bytes {
+            Ok(bytes) => match decode_svg_at(&bytes, 1.0) {
+                Ok(document) => match cache.hold_at(source, document) {
+                    Ok(_) => crate::img::ImageLoadState::Ready,
+                    Err(_) => crate::img::ImageLoadState::Loading,
+                },
+                Err(_) => crate::img::ImageLoadState::Loading,
+            },
+            Err(_) => crate::img::ImageLoadState::Loading,
+        };
+        Self::new(source, pending_engine(cache)).load_state(load_state)
+    }
+
     /// An SVG showing the document [`load`] put at `source`.
     pub fn new(source: ImageSourceId, engine: SharedImageEngine) -> Self {
         Self {
             image: Img::new(source, engine),
+            path: None,
+            transformation: Transformation::default(),
+            text_color: None,
         }
+    }
+
+    fn load_state(mut self, load_state: crate::img::ImageLoadState) -> Self {
+        self.image = self.image.load_state(load_state);
+        self
     }
 
     /// Request a size.
     pub fn size(mut self, width: f32, height: f32) -> Self {
         self.image = self.image.size(width, height);
+        self
+    }
+
+    pub fn size_8(self) -> Self {
+        self.size(32.0, 32.0)
+    }
+
+    pub fn size_12(self) -> Self {
+        self.size(48.0, 48.0)
+    }
+
+    pub fn size_16(self) -> Self {
+        self.size(64.0, 64.0)
+    }
+
+    pub fn size_full(mut self) -> Self {
+        self.image = self.image.size_full();
+        self
+    }
+
+    pub fn h(mut self, height: impl crate::styled::IntoStylePixels) -> Self {
+        self.image = self.image.h(height);
+        self
+    }
+
+    pub fn w(mut self, width: impl crate::styled::IntoStylePixels) -> Self {
+        self.image = self.image.w(width);
+        self
+    }
+
+    pub fn max_w_full(mut self) -> Self {
+        self.image = self.image.max_w_full();
+        self
+    }
+
+    /// Decode a local asset path into this SVG's retained source.
+    ///
+    /// URI resources stay in `Loading` until an application-owned loader
+    /// supplies an engine-backed source; no global loader is consulted here.
+    pub fn path(mut self, path: impl Into<SharedString>) -> Self {
+        let path = path.into();
+        self.path = Some(path.clone());
+        self.image = Self::from_resource(Resource::from(path)).image;
+        if let Some(text_color) = self.text_color {
+            self.image = self.image.tint(text_color);
+        }
+        self
+    }
+
+    /// Clip the SVG to its layout bounds.
+    ///
+    /// Sprite clipping is currently supplied by the parent description, so
+    /// this builder method is a compatibility spelling with no local state.
+    pub fn overflow_hidden(self) -> Self {
+        self
+    }
+
+    /// Set the requested icon colour by tinting the cached RGBA frames.
+    pub fn text_color(mut self, color: impl Into<wgpui_core::color::Hsla>) -> Self {
+        let color: [f32; 4] = color.into().into();
+        self.text_color = Some(color);
+        self.image = self.image.tint(color);
+        self
+    }
+
+    pub fn with_transformation(mut self, transformation: Transformation) -> Self {
+        self.transformation = transformation;
         self
     }
 
@@ -153,6 +356,8 @@ impl Svg {
             source: image.source,
             requested_size: image.requested_size,
             style: image.style,
+            transformation: self.transformation,
+            text_color: self.text_color,
         }
     }
 
@@ -184,7 +389,8 @@ impl Svg {
     /// Write this element's sprite into `emission`, for a caller driving
     /// emission directly.
     pub fn emit_into(&self, context: &EmitContext, emission: &mut Emission) {
-        self.image.emit_into(context, emission);
+        self.image
+            .emit_into_with_transform(context, emission, self.transformation);
     }
 }
 
@@ -246,7 +452,7 @@ mod tests {
     fn an_svg_loads_through_the_same_cache_an_image_does() {
         let engine = engine();
         let source = load(&engine, DOCUMENT.as_bytes(), 1.0).expect("a real document rasterises");
-        let element = svg(source, Rc::clone(&engine));
+        let element = svg_with_engine(source, Rc::clone(&engine));
         assert_eq!(
             element.rasterised_size(),
             Some([
@@ -262,7 +468,7 @@ mod tests {
         let engine = engine();
         let source = load(&engine, DOCUMENT.as_bytes(), 2.0).expect("rasterises");
         assert_eq!(
-            svg(source, engine).rasterised_size(),
+            svg_with_engine(source, engine).rasterised_size(),
             Some([80, 40]),
             "20 x 2 (requested) x 2 (smoothing)"
         );
@@ -273,7 +479,7 @@ mod tests {
         use wgpui_core::scene::layer::{BoundaryId, LayerId, LayerKey};
         let engine = engine();
         let source = load(&engine, DOCUMENT.as_bytes(), 1.0).expect("rasterises");
-        let element = svg(source, Rc::clone(&engine)).size(40.0, 40.0);
+        let element = svg_with_engine(source, Rc::clone(&engine)).size(40.0, 40.0);
 
         let mut emission = Emission::new();
         element.emit_into(
@@ -307,7 +513,7 @@ mod tests {
     fn each_field_of_the_key_reports_the_axes_it_affects() {
         let engine = engine();
         let source = load(&engine, DOCUMENT.as_bytes(), 1.0).expect("rasterises");
-        let base = svg(source, Rc::clone(&engine)).size(40.0, 40.0);
+        let base = svg_with_engine(source, Rc::clone(&engine)).size(40.0, 40.0);
 
         assert_eq!(
             base.diff_key().compare(&base.diff_key()),
@@ -334,7 +540,7 @@ mod tests {
 
         let other = load(&engine, DOCUMENT.as_bytes(), 1.0).expect("rasterises");
         assert_eq!(
-            svg(other, Rc::clone(&engine))
+            svg_with_engine(other, Rc::clone(&engine))
                 .size(40.0, 40.0)
                 .diff_key()
                 .compare(&base.diff_key()),
@@ -347,5 +553,43 @@ mod tests {
     #[test]
     fn bytes_that_are_not_a_document_are_reported_rather_than_rasterised_blank() {
         assert!(load(&engine(), b"<not-svg", 1.0).is_err());
+    }
+
+    #[test]
+    fn compatibility_builder_lowers_path_colour_and_transform_to_the_key() {
+        let description = svg()
+            .path("missing/icon.svg")
+            .size_16()
+            .text_color(wgpui_core::color::rgb(0xff3366))
+            .with_transformation(Transformation::rotate(90.0))
+            .into_description();
+        let key = description
+            .key()
+            .and_then(|key| key.as_any().downcast_ref::<SvgKey>())
+            .expect("SVG builders expose their retained SVG key");
+
+        assert_eq!(key.requested_size, [64.0, 64.0]);
+        assert_eq!(key.transformation.rotation, 90.0);
+        let text_color = key.text_color.expect("the tint is retained");
+        for (actual, expected) in text_color.into_iter().zip([1.0, 0.2, 0.4, 1.0]) {
+            assert!((actual - expected).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn compatibility_builder_sizing_aliases_reach_the_image_layout_request() {
+        let size = svg().size_12().into_description();
+        let key = size
+            .key()
+            .and_then(|key| key.as_any().downcast_ref::<SvgKey>())
+            .expect("SVG sizing is retained in the SVG key");
+        assert_eq!(key.requested_size, [48.0, 48.0]);
+
+        let text_size = svg().text_2xl().into_description();
+        let key = text_size
+            .key()
+            .and_then(|key| key.as_any().downcast_ref::<SvgKey>())
+            .expect("SVG text sizing is retained in the SVG key");
+        assert_eq!(key.requested_size, [24.0, 24.0]);
     }
 }

@@ -3,11 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use reqwest_client::ReqwestClient;
 use wgpui::{
-    App, AppContext, Application, AssetSource, Bounds, Context, ImageSource, KeyBinding, Menu,
-    MenuItem, Point, SharedString, SharedUri, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    actions, div, img, prelude::*, px, rgb, size,
+    App, AppHttpClientExt, Application, AssetSource, Bounds, Context, ImageSource,
+    KeyBinding, Menu, MenuItem, NullHttpClient, Point, SharedString, SharedUri, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, actions, div, img, prelude::*, px, rgb, size,
 };
 
 struct Assets {
@@ -155,8 +154,7 @@ fn main() {
             base: manifest_dir.join("examples"),
         })
         .run(move |cx: &mut App| {
-            let http_client = ReqwestClient::user_agent("gpui example").unwrap();
-            cx.set_http_client(Arc::new(http_client));
+            cx.set_http_client(Arc::new(NullHttpClient));
 
             cx.activate(true);
             cx.on_action(|_: &Quit, cx| cx.quit());

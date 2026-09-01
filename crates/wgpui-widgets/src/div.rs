@@ -52,8 +52,9 @@ pub mod interactivity;
 pub mod scroll_state;
 
 use crate::div::diff::DivDiffKey;
-use crate::div::interactivity::style::DivStyle;
+use crate::div::interactivity::style::{CursorStyle, DivStyle};
 use crate::styled::Styled;
+use wgpui_core::boundary::BoundaryPolicy;
 use wgpui_core::element::Element;
 use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::reconcile::description::{Description, ElementId, TextDecoration, TextOptions};
@@ -85,6 +86,7 @@ pub struct Div {
     style: DivStyle,
     children: Vec<Description>,
     boundary: bool,
+    boundary_policy: Option<BoundaryPolicy>,
     uncached: bool,
     scroll_offset: [f32; 2],
     estimated_size: Option<[f32; 2]>,
@@ -109,6 +111,7 @@ pub fn div() -> Div {
         style: DivStyle::default(),
         children: Vec::new(),
         boundary: false,
+        boundary_policy: None,
         uncached: false,
         scroll_offset: [0.0, 0.0],
         estimated_size: None,
@@ -351,6 +354,22 @@ impl Div {
         self
     }
 
+    pub fn tab_index(mut self, tab_index: i32) -> Self {
+        let handle = self
+            .focus_handle
+            .get_or_insert_with(wgpui_core::window::FocusHandle::new);
+        handle.tab_index = tab_index;
+        self
+    }
+
+    pub fn tab_stop(mut self, tab_stop: bool) -> Self {
+        let handle = self
+            .focus_handle
+            .get_or_insert_with(wgpui_core::window::FocusHandle::new);
+        handle.tab_stop = tab_stop;
+        self
+    }
+
     /// Resolve a hover style against the element's current resolved style.
     pub fn hover(mut self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
         self.hover_style = Some(Box::new(apply(self.style.clone())));
@@ -388,6 +407,18 @@ impl Div {
         self
     }
 
+    pub fn blur(mut self, radius: impl crate::styled::IntoStylePixels) -> Self {
+        let radius = radius.into_style_pixels();
+        self.style.backdrop_blur = radius.is_finite().then_some(radius.max(0.0));
+        self.boundary = true;
+        self
+    }
+
+    pub fn cursor(mut self, cursor: CursorStyle) -> Self {
+        self.style.cursor = cursor;
+        self
+    }
+
     pub fn is_hovered(&self) -> bool {
         self.interaction.is_hovered()
     }
@@ -419,6 +450,18 @@ impl Div {
     pub fn track_scroll(mut self, handle: &scroll_state::ScrollHandle) -> Self {
         self.scroll_handle = Some(handle.clone());
         self.boundary = true;
+        self
+    }
+
+    pub fn layer_keyed(mut self, key: impl Into<ElementId>) -> Self {
+        self.element_id = Some(key.into());
+        self.boundary = true;
+        self
+    }
+
+    pub fn layer_with_policy(mut self, policy: BoundaryPolicy) -> Self {
+        self.boundary = true;
+        self.boundary_policy = Some(policy);
         self
     }
 
@@ -500,6 +543,7 @@ impl Div {
             style,
             children,
             mut boundary,
+            boundary_policy,
             uncached,
             scroll_offset,
             estimated_size,
@@ -640,7 +684,10 @@ impl Div {
             description = description.id(element_id);
         }
         if boundary {
-            description = description.boundary();
+            description = match boundary_policy {
+                Some(policy) => description.boundary_with_policy(policy),
+                None => description.boundary(),
+            };
         }
         if uncached {
             description = description.uncached();
@@ -661,6 +708,10 @@ impl Div {
             paint.paint(context.bounds, emission);
         })
     }
+
+    pub fn into_any_element(self) -> Description {
+        self.describe()
+    }
 }
 
 pub trait StatefulDiv {
@@ -673,6 +724,15 @@ pub trait StatefulDiv {
         ) -> R
         + 'static,
     ) -> Self;
+
+    fn track_focus(self, handle: &wgpui_core::window::FocusHandle) -> Self;
+    fn tab_index(self, tab_index: i32) -> Self;
+    fn tab_stop(self, tab_stop: bool) -> Self;
+    fn focus(self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self;
+    fn focus_visible(self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self;
+    fn cursor(self, cursor: CursorStyle) -> Self;
+    fn blur(self, radius: impl crate::styled::IntoStylePixels) -> Self;
+    fn child(self, child: impl IntoDescription) -> Self;
 }
 
 impl StatefulDiv for wgpui_core::element::Stateful<Div> {
@@ -686,6 +746,38 @@ impl StatefulDiv for wgpui_core::element::Stateful<Div> {
         + 'static,
     ) -> Self {
         self.map_inner(|element| element.on_click(handler))
+    }
+
+    fn track_focus(self, handle: &wgpui_core::window::FocusHandle) -> Self {
+        self.map_inner(|element| element.track_focus(handle))
+    }
+
+    fn tab_index(self, tab_index: i32) -> Self {
+        self.map_inner(|element| element.tab_index(tab_index))
+    }
+
+    fn tab_stop(self, tab_stop: bool) -> Self {
+        self.map_inner(|element| element.tab_stop(tab_stop))
+    }
+
+    fn focus(self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
+        self.map_inner(|element| element.focus(apply))
+    }
+
+    fn focus_visible(self, apply: impl FnOnce(DivStyle) -> DivStyle) -> Self {
+        self.map_inner(|element| element.focus_visible(apply))
+    }
+
+    fn cursor(self, cursor: CursorStyle) -> Self {
+        self.map_inner(|element| element.cursor(cursor))
+    }
+
+    fn blur(self, radius: impl crate::styled::IntoStylePixels) -> Self {
+        self.map_inner(|element| element.blur(radius))
+    }
+
+    fn child(self, child: impl IntoDescription) -> Self {
+        self.map_inner(|element| element.child(child))
     }
 }
 
@@ -706,6 +798,7 @@ mod tests {
     use super::*;
     use crate::div::interactivity::style::{Corners, Edges};
     use wgpui_core::invalidation::request::FrameSignals;
+    use wgpui_core::geometry::px;
     use wgpui_core::patch::apply::apply;
     use wgpui_core::patch::emit::{EmitError, Emitter};
     use wgpui_core::reconcile::instance::InstanceKey;
@@ -724,6 +817,33 @@ mod tests {
             "Div grew to {} bytes; conditional styles must remain heap-owned",
             std::mem::size_of::<Div>()
         );
+    }
+
+    #[test]
+    fn div_style_compatibility_builders_update_retained_state() {
+        let div = div()
+            .blur(px(-4.0))
+            .cursor(CursorStyle::Pointer)
+            .tab_index(7)
+            .tab_stop(false);
+
+        assert_eq!(div.div_style().backdrop_blur, Some(0.0));
+        assert_eq!(div.div_style().cursor, CursorStyle::Pointer);
+    }
+
+    #[test]
+    fn layer_key_and_policy_are_preserved_in_the_description() {
+        let policy = BoundaryPolicy {
+            rasterize_above: 32,
+            ..BoundaryPolicy::default()
+        };
+        let description = div()
+            .layer_keyed("content")
+            .layer_with_policy(policy)
+            .describe();
+
+        assert_eq!(description.element_id(), Some(&ElementId::from("content")));
+        assert_eq!(description.boundary_policy(), Some(policy));
     }
 
     #[derive(Debug)]

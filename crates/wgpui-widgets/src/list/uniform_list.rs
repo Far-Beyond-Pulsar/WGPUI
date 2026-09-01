@@ -151,21 +151,62 @@ pub struct UniformList {
     style: DivStyle,
     state: UniformListState,
     scroll_handle: Option<ScrollHandle>,
-    render_item: Box<dyn Fn(usize) -> Description>,
+    render_item: Box<dyn FnMut(usize) -> Description>,
 }
 
-pub fn uniform_list<F, I>(item_count: usize, item_size: Size<Pixels>, render_item: F) -> UniformList
+pub trait UniformListArguments {
+    fn build(self) -> UniformList;
+}
+
+impl<F, I> UniformListArguments for (usize, Size<Pixels>, F)
 where
-    F: Fn(usize) -> I + 'static,
+    F: FnMut(usize) -> I + 'static,
     I: IntoElement + 'static,
 {
-    UniformList::new(item_count, item_size, render_item)
+    fn build(self) -> UniformList {
+        UniformList::new(self.0, self.1, self.2)
+    }
+}
+
+impl<F, I> UniformListArguments for (ElementId, usize, F)
+where
+    F: FnMut(Range<usize>) -> Vec<I> + 'static,
+    I: IntoElement + 'static,
+{
+    fn build(self) -> UniformList {
+        let (element_id, item_count, mut processor) = self;
+        UniformList::new(item_count, Size::pixels(0.0, 20.0), move |index| {
+            processor(index..index.saturating_add(1))
+                .into_iter()
+                .next()
+                .map(IntoElement::into_description)
+                .unwrap_or_else(|| Description::new::<UniformListItem>())
+        })
+        .id(element_id)
+    }
+}
+
+impl<F, I> UniformListArguments for (&str, usize, F)
+where
+    F: FnMut(Range<usize>) -> Vec<I> + 'static,
+    I: IntoElement + 'static,
+{
+    fn build(self) -> UniformList {
+        (ElementId::from(self.0), self.1, self.2).build()
+    }
+}
+
+pub fn uniform_list<A, B, C>(first: A, second: B, render_item: C) -> UniformList
+where
+    (A, B, C): UniformListArguments,
+{
+    (first, second, render_item).build()
 }
 
 impl UniformList {
-    pub fn new<F, I>(item_count: usize, item_size: Size<Pixels>, render_item: F) -> Self
+    pub fn new<F, I>(item_count: usize, item_size: Size<Pixels>, mut render_item: F) -> Self
     where
-        F: Fn(usize) -> I + 'static,
+        F: FnMut(usize) -> I + 'static,
         I: IntoElement + 'static,
     {
         Self {
@@ -196,7 +237,7 @@ impl UniformList {
         &self.state
     }
 
-    fn item_description(&self, transform: UniformItemTransform) -> Description {
+    fn item_description(&mut self, transform: UniformItemTransform) -> Description {
         let style = wgpui_layout::taffy_tree::LayoutStyle {
             position: Position::Absolute,
             size: LayoutSize {
@@ -232,6 +273,7 @@ impl UniformList {
     pub fn describe(mut self) -> Description {
         let content_size = self.state.content_size();
         if let Some(handle) = &self.scroll_handle {
+            handle.set_item_extent(self.state.item_size.height, self.state.item_count);
             if self.state.viewport != Size::default() && handle.viewport().size == Size::default() {
                 handle.set_viewport(
                     Bounds::new(Point::default(), self.state.viewport),
@@ -251,7 +293,8 @@ impl UniformList {
             .state
             .transforms()
             .into_iter()
-            .map(|transform| self.item_description(transform));
+            .map(|transform| self.item_description(transform))
+            .collect::<Vec<_>>();
         let offset = self
             .scroll_handle
             .as_ref()
@@ -322,6 +365,8 @@ impl Styled for UniformList {
 mod tests {
     use super::*;
     use crate::div::div;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     #[test]
     fn uniform_list_lowers_only_realized_items_and_retains_scroll_metadata() {
         let handle = ScrollHandle::new();
@@ -338,5 +383,25 @@ mod tests {
         );
         assert!(description.is_boundary());
         assert!(description.clips_children());
+    }
+
+    #[test]
+    fn processor_form_builds_rows_and_records_uniform_extent() {
+        let requested_ranges = Rc::new(RefCell::new(Vec::new()));
+        let observed_ranges = requested_ranges.clone();
+        let handle = ScrollHandle::new();
+        let description = uniform_list("messages", 10, move |range| {
+            observed_ranges.borrow_mut().push(range.clone());
+            vec![div().h(20.0).child(range.start.to_string())]
+        })
+        .viewport(Size::pixels(100.0, 40.0))
+        .track_scroll(&handle)
+        .describe();
+
+        assert_eq!(description.element_id(), Some(&ElementId::from("messages")));
+        assert_eq!(description.child_descriptions().len(), 3);
+        assert_eq!(requested_ranges.borrow().as_slice(), [0..1, 1..2, 2..3]);
+        assert!(handle.scroll_to_item(2, crate::scroll::ScrollStrategy::Top));
+        assert_eq!(handle.offset().y, Pixels(-40.0));
     }
 }

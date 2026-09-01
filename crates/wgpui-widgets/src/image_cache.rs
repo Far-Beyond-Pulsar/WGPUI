@@ -452,6 +452,20 @@ impl ImageCache {
         self.hold(decode(bytes)?)
     }
 
+    /// Decode `bytes` under a caller-selected stable source identity.
+    ///
+    /// Resource-backed builders use this so rebuilding an element does not
+    /// turn the same path into a different reconciliation key. The regular
+    /// [`Self::insert`] API remains the right choice for independently-created
+    /// decoded resources.
+    pub fn insert_at(
+        &mut self,
+        source: ImageSourceId,
+        bytes: &[u8],
+    ) -> Result<ImageSourceId, ImageDecodeError> {
+        self.hold_at(source, decode(bytes)?)
+    }
+
     /// Hold an already-decoded image under a fresh source id.
     ///
     /// For a caller that decoded elsewhere — a background task, a test, or
@@ -459,6 +473,16 @@ impl ImageCache {
     pub fn hold(&mut self, image: DecodedImage) -> Result<ImageSourceId, ImageDecodeError> {
         self.next_source += 1;
         let source = ImageSourceId::from_raw(self.next_source);
+        self.hold_at(source, image)
+    }
+
+    /// Hold an already-decoded image under a stable source identity.
+    pub fn hold_at(
+        &mut self,
+        source: ImageSourceId,
+        image: DecodedImage,
+    ) -> Result<ImageSourceId, ImageDecodeError> {
+        self.next_source = self.next_source.max(source.as_raw());
         self.images.insert(source, image);
         Ok(source)
     }
@@ -466,6 +490,23 @@ impl ImageCache {
     /// The decoded image for `source`, if it is held.
     pub fn get(&self, source: ImageSourceId) -> Option<&DecodedImage> {
         self.images.get(&source)
+    }
+
+    /// Apply an RGBA tint to every frame while preserving decoded alpha.
+    pub fn tint(&mut self, source: ImageSourceId, color: [f32; 4]) -> bool {
+        let Some(image) = self.images.get_mut(&source) else {
+            return false;
+        };
+        for frame in &mut image.frames {
+            for texel in frame.texels.chunks_exact_mut(4) {
+                let alpha = f32::from(texel[3]) / 255.0;
+                texel[0] = (color[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                texel[1] = (color[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+                texel[2] = (color[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+                texel[3] = (alpha * color[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+        true
     }
 
     /// One frame of one source.

@@ -20,6 +20,10 @@ glam = "0.33"
 rand = "0.10"
 lyon = "1"
 unicode-segmentation = "1.10"
+log = "0.4.16"
+ordered-float = "5.3.0"
+helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "04a38328c6d1329272072ade89d07098737df6b8" }
+helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "04a38328c6d1329272072ade89d07098737df6b8" }
 
 [[example]]
 name = "karaoke_text"
