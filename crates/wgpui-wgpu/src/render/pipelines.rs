@@ -65,11 +65,11 @@ use wgpui_core::patch::primitive::Primitive;
 
 /// Colour format every Phase 4 target uses.
 ///
-/// `Rgba8Unorm` rather than a float format: it is blendable everywhere without
-/// a device feature, and every comparison this phase makes is between two draw
-/// paths writing the same format, so quantisation is common to both sides
-/// rather than a source of disagreement.
-pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// `Bgra8Unorm` rather than a float format: it is blendable everywhere without
+/// a device feature and is the common non-sRGB presentation format on Metal,
+/// DX12, and Vulkan. Readback converts its native byte order to RGBA so image
+/// comparisons remain independent of the presentation format.
+pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 /// Straight-alpha `over`, the blend the legacy renderer's instanced pipelines
 /// use.
