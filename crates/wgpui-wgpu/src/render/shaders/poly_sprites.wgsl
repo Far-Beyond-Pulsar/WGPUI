@@ -32,12 +32,11 @@
 // correctly-sized layout box both produce — the two are identical anyway,
 // because a linear sample at a texel centre returns that texel.
 //
-// Where they differ is a *scaled* image: legacy interpolates and this takes the
-// nearest texel, so a downscaled photograph is visibly harsher here. That is a
-// real fidelity gap and it is named in docs/phase-6.2-results.md rather than
-// left for someone to discover. It is also a self-contained change — a sampler,
-// a bind-group entry, and normalised coordinates — held back only because
-// making it now would have cost this phase the exactness its gate is built on.
+// Where they differ is now only the sampling path: scaled images use the
+// filtering sampler, while natural-size images retain `textureLoad` so the
+// atlas byte-exact contract remains testable. The sampler is clamped to the
+// tile's half-texel bounds so atlas neighbours never participate in filtering,
+// including for transparent edges.
 //
 // # 3. The corner radius is a signed-distance cut, matching legacy
 //
@@ -178,9 +177,10 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sprite = sprites[in.arena_index];
 
     // Map the position within the drawn rectangle onto the tile. At the natural
-    // size this is the identity and the load is a 1:1 blit; otherwise it is
-    // nearest-neighbour. Guarded against a zero-sized rectangle, which is
-    // representable (`PolySprite::ZERO`) and would otherwise divide by zero.
+    // size this is the identity and the load is a 1:1 blit; otherwise the
+    // filtering sampler performs linear interpolation. Guarded against a
+    // zero-sized rectangle, which is representable (`PolySprite::ZERO`) and
+    // would otherwise divide by zero.
     let extent = max(sprite.size, vec2<f32>(1.0, 1.0));
     let scaled = in.local / extent * sprite.atlas_size;
     // Clamped rather than trusted: interpolation at the quad's far edge can land
