@@ -68,6 +68,7 @@ enum ImmediatePaint {
 
 pub struct Window {
     native: Arc<winit::window::Window>,
+    gpu_adapter: wgpu::Adapter,
     gpu_device: wgpu::Device,
     gpu_queue: wgpu::Queue,
     surface_registry: Arc<SurfaceRegistry>,
@@ -379,6 +380,18 @@ impl Window {
         height: u32,
         format: wgpu::TextureFormat,
     ) -> Result<WgpuSurfaceHandle, WindowError> {
+        if width == 0 || height == 0 {
+            return Err(WindowError::InvalidSurfaceSize { width, height });
+        }
+        let allowed_usages = self
+            .gpu_adapter
+            .get_texture_format_features(format)
+            .allowed_usages;
+        let required_usages =
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        if !allowed_usages.contains(required_usages) {
+            return Err(WindowError::UnsupportedSurfaceFormat(format));
+        }
         Ok(WgpuSurfaceHandle::new(
             Arc::clone(&self.surface_registry),
             &self.gpu_device,
@@ -1776,6 +1789,7 @@ impl Handler {
         let mode = DrawMode::best_available(context.indirect);
         let window = Window {
             native,
+            gpu_adapter: context.adapter.clone(),
             gpu_device: context.device.clone(),
             gpu_queue: context.queue.clone(),
             surface_registry: Arc::clone(&surface_registry),
@@ -2138,6 +2152,7 @@ impl winit::application::ApplicationHandler for Handler {
         let mode = DrawMode::best_available(context.indirect);
         let window = Window {
             native,
+            gpu_adapter: context.adapter.clone(),
             gpu_device: context.device.clone(),
             gpu_queue: context.queue.clone(),
             surface_registry: Arc::clone(&surface_registry),

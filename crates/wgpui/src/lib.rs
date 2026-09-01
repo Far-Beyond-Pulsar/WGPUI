@@ -292,7 +292,8 @@ pub use wgpui_wgpu::window::application::{
     Application, ApplicationError, ClipboardError, ConfiguredApplication, DisplayId, FrameReport,
     NativeApplication, Window, WindowHandle, WindowOptions,
 };
-pub use wgpui_wgpu::window::surface::WgpuSurfaceHandle;
+pub use wgpui_wgpu::window::surface::{SurfaceResizeError, WgpuSurfaceHandle};
+pub use wgpui_wgpu::window::WindowError;
 
 /// Lower a native WGPU surface handle into a retained surface element.
 pub fn wgpu_surface(handle: WgpuSurfaceHandle) -> WgpuSurface {

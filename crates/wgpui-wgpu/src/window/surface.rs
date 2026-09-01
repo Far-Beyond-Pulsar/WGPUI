@@ -2,6 +2,29 @@ use std::sync::Arc;
 
 use crate::render::surface_registry::{SurfaceId, SurfaceRegistry};
 
+/// Why a producer-owned surface could not be resized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceResizeError {
+    /// A WGPU texture cannot have a zero-sized extent.
+    ZeroSize,
+    /// The surface is currently being consumed by the compositor.
+    Busy,
+    /// The handle no longer refers to a registered surface.
+    NotFound,
+}
+
+impl std::fmt::Display for SurfaceResizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroSize => formatter.write_str("surface dimensions must be non-zero"),
+            Self::Busy => formatter.write_str("surface is busy with compositor presentation"),
+            Self::NotFound => formatter.write_str("surface is no longer registered"),
+        }
+    }
+}
+
+impl std::error::Error for SurfaceResizeError {}
+
 struct SurfaceInner {
     registry: Arc<SurfaceRegistry>,
     device: Arc<wgpu::Device>,
@@ -65,6 +88,33 @@ impl WgpuSurfaceHandle {
     /// The surface texture format.
     pub fn format(&self) -> wgpu::TextureFormat {
         self.inner.format
+    }
+
+    /// The current producer texture dimensions in physical pixels.
+    pub fn size(&self) -> Option<(u32, u32)> {
+        self.inner.registry.size(self.inner.id)
+    }
+
+    /// Resize all producer buffers while preserving this handle's identity.
+    ///
+    /// A resize is rejected while the compositor is consuming a published
+    /// frame. The caller should retry after the next presentation callback.
+    pub fn resize(&self, width: u32, height: u32) -> Result<(), SurfaceResizeError> {
+        if width == 0 || height == 0 {
+            return Err(SurfaceResizeError::ZeroSize);
+        }
+        if self.size().is_none() {
+            return Err(SurfaceResizeError::NotFound);
+        }
+        if self
+            .inner
+            .registry
+            .resize(self.device(), self.inner.id, width, height)
+        {
+            Ok(())
+        } else {
+            Err(SurfaceResizeError::Busy)
+        }
     }
 
     /// The current back buffer and its physical dimensions.
