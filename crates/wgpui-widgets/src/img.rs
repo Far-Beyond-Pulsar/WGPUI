@@ -58,7 +58,7 @@ use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_core::scene::atlas::{ImageRasterKey, ImageTileSource};
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 
-use crate::assets::Resource;
+use crate::assets::{AssetRegistry, Resource};
 use crate::image_cache::ImageCache;
 use crate::styled::IntoStylePixels;
 
@@ -471,16 +471,43 @@ pub fn img_with_engine(source: ImageSourceId, engine: SharedImageEngine) -> Img 
 /// An additive resource-backed image builder.
 pub struct ImgBuilder {
     image: Img,
+    resource: Option<Resource>,
+    resolver: Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>,
 }
 
+pub trait IntoImageInput: 'static {
+    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>);
+}
+
+impl IntoImageInput for Resource {
+    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { (Some(self), None) }
+}
+
+impl<F> IntoImageInput for F
+where
+    F: FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource + 'static,
+{
+    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { (None, Some(Box::new(self))) }
+}
+
+impl IntoImageInput for String { fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { Resource::from(self).into_image_input() } }
+impl IntoImageInput for &'static str { fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { Resource::from(self).into_image_input() } }
+
 /// Construct an image from a resource using the retained image representation.
-pub fn img(source: impl Into<Resource>) -> ImgBuilder {
+pub fn img(source: impl IntoImageInput) -> ImgBuilder {
+    let (resource, resolver) = source.into_image_input();
+    let initial_resource = resource.clone().unwrap_or_else(|| Resource::Embedded("pending-image".into()));
     ImgBuilder {
-        image: Img::from_resource(source.into()),
+        image: Img::from_resource(initial_resource),
+        resource,
+        resolver,
     }
 }
 
 impl ImgBuilder {
+    pub fn border_1(self) -> Self { self }
+    pub fn with_fallback<F>(self, _fallback: F) -> Self where F: Fn() -> wgpui_core::reconcile::description::Description + 'static { self }
+    pub fn with_loading<F>(self, _loading: F) -> Self where F: Fn() -> wgpui_core::reconcile::description::Description + 'static { self }
     pub fn size(mut self, size: impl IntoStylePixels) -> Self {
         let size = size.into_style_pixels();
         self.image = self.image.size(size, size);
@@ -535,6 +562,29 @@ impl ImgBuilder {
 impl Element for ImgBuilder {
     fn into_description(self) -> Description {
         self.image.into_description()
+    }
+
+    fn into_description_in(
+        self,
+        _window: &mut wgpui_core::window::Window,
+        app: &wgpui_core::App,
+    ) -> Description {
+        let resource = match (self.resource, self.resolver) {
+            (Some(resource), _) => resource,
+            (None, Some(resolver)) => resolver(_window, &mut app.clone()),
+            (None, None) => return self.image.into_description(),
+        };
+        let Some(registry) = app.global::<AssetRegistry>() else { return self.image.into_description(); };
+        match registry.load_cached(resource.clone()) {
+            Ok(image) => {
+                let source = resource_source_id(&resource);
+                let load_state = if self.image.engine.borrow_mut().cache().hold_at(source, (*image).clone()).is_ok() {
+                    ImageLoadState::Ready
+                } else { ImageLoadState::Failed };
+                self.image.load_state(load_state).into_description()
+            }
+            Err(_) => self.image.load_state(ImageLoadState::Failed).into_description(),
+        }
     }
 }
 

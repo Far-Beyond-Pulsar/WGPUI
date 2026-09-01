@@ -76,6 +76,14 @@ pub use wgpui_wgpu::window::application::{
     AppWindowExt, Component, Render, RenderOnce, render_description,
 };
 pub use wgpui_core::element::IntoElement;
+
+pub trait IntoAnyElement {
+    fn into_any_element(self) -> Description;
+}
+
+impl<T: IntoElement> IntoAnyElement for T {
+    fn into_any_element(self) -> Description { self.into_description() }
+}
 pub use wgpui_layout::{
     AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
     LayoutTree, Measure,
@@ -284,8 +292,10 @@ pub use wgpui_widgets::svg::{
 };
 pub use wgpui_widgets::wgpu_surface::{SurfaceId, SurfaceStyle, WgpuSurface, WgpuSurfaceKey};
 pub use wgpui_widgets::assets::{
-    AssetLoadError, AssetSource, ImageAssetLoader, ImageSource, Resource, SharedUri,
+    Asset, AssetLoadError, AssetLogger, AssetRegistry, AssetSource, ImageAssetLoader, ImageCacheError,
+    ImageSource, ImgResourceLoader, LOADING_DELAY, RenderImage, Resource, SharedUri,
 };
+pub use wgpui_widgets::animation::pulsating_between;
 
 pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 pub use wgpui_wgpu::window::application::{
@@ -304,7 +314,7 @@ pub mod prelude {
     pub use crate::{
         AppWindowExt, Application, Description, Div, Element, EntityFactory, IntoElement, Render,
         RenderOnce,
-        Stateful, StatefulDiv, Styled, UniformList,
+        Stateful, StatefulDiv, Styled, UniformList, IntoAnyElement,
         VirtualList, Window, WindowOptions, div, uniform_list, virtual_list,
     };
 }

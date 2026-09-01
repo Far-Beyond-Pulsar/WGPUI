@@ -6,14 +6,114 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
 
 use futures::AsyncReadExt;
-use wgpui_core::{App, Task};
+use wgpui_core::{App, TaskError};
 use wgpui_http_client::{AppHttpClientExt, AsyncBody, BoxedHttpClient, StatusCode};
 use wgpui_text::shaping::SharedString;
 
 use crate::image_cache::{DecodedImage, ImageDecodeError, decode_async};
+
+/// A typed, cancellable application asset operation.
+pub trait Asset: 'static {
+    type Source: Clone + Hash + Send + Sync + 'static;
+    type Output: Send + 'static;
+
+    fn load(
+        source: Self::Source,
+        app: &mut App,
+    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static;
+}
+
+/// Adds diagnostics and task ownership to an [`Asset`] load.
+pub struct AssetLogger<A>(PhantomData<A>);
+
+impl<A: Asset> AssetLogger<A> {
+    pub fn load(source: A::Source, app: &mut App) -> impl std::future::Future<Output = A::Output> {
+        A::load(source, app)
+    }
+}
+
+/// The public image representation returned by the compatibility loader.
+pub type RenderImage = DecodedImage;
+
+/// Errors from an application asset operation.
+#[derive(Debug)]
+pub enum ImageCacheError {
+    Load(AssetLoadError),
+    Cancelled(TaskError),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for ImageCacheError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(error) => error.fmt(formatter),
+            Self::Cancelled(error) => error.fmt(formatter),
+            Self::Other(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ImageCacheError {}
+impl From<AssetLoadError> for ImageCacheError {
+    fn from(error: AssetLoadError) -> Self { Self::Load(error) }
+}
+impl From<anyhow::Error> for ImageCacheError {
+    fn from(error: anyhow::Error) -> Self { Self::Other(error) }
+}
+
+/// Delay used by legacy image loading examples before a loading replacement is shown.
+pub const LOADING_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Application-owned source and decoded-image registry.
+pub struct AssetRegistry {
+    source: Arc<dyn AssetSource>,
+    entries: Mutex<HashMap<Resource, RegistryEntry>>,
+}
+
+#[derive(Clone)]
+struct RegistryEntry {
+    generation: u64,
+    image: Arc<RenderImage>,
+}
+
+impl AssetRegistry {
+    pub fn new(source: Arc<dyn AssetSource>) -> Self {
+        Self { source, entries: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn source(&self) -> &Arc<dyn AssetSource> { &self.source }
+
+    pub fn invalidate(&self, resource: &Resource) -> bool {
+        self.entries.lock().map(|mut entries| entries.remove(resource).is_some()).unwrap_or(false)
+    }
+
+    pub fn cached(&self, resource: &Resource) -> Option<Arc<RenderImage>> {
+        self.entries.lock().ok()?.get(resource).map(|entry| Arc::clone(&entry.image))
+    }
+
+    pub fn load_cached(&self, resource: Resource) -> Result<Arc<RenderImage>, ImageCacheError> {
+        if let Some(image) = self.cached(&resource) { return Ok(image); }
+        let image = futures::executor::block_on(ImageAssetLoader::load_with_client(
+            resource.clone(),
+            Arc::new(wgpui_http_client::NullHttpClient),
+            Arc::clone(&self.source),
+        ))?;
+        let image = Arc::new(image);
+        self.entries.lock().map_err(|_| anyhow::anyhow!("asset registry lock poisoned"))?
+            .insert(resource, RegistryEntry { generation: 0, image: Arc::clone(&image) });
+        Ok(image)
+    }
+}
+
+impl Default for AssetRegistry {
+    fn default() -> Self { Self::new(Arc::new(())) }
+}
 
 /// A source of embedded assets supplied by an application.
 pub trait AssetSource: 'static + Send + Sync {
@@ -116,19 +216,47 @@ impl std::error::Error for AssetLoadError {}
 /// The native equivalent of the legacy image asset loader.
 pub struct ImageAssetLoader;
 
+impl Asset for ImageAssetLoader {
+    type Source = Resource;
+    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+
+    fn load(source: Self::Source, app: &mut App) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+        let client = app.http_client();
+        let assets: Arc<dyn AssetSource> = app.global::<AssetRegistry>()
+            .map_or_else(|| Arc::new(()) as Arc<dyn AssetSource>, |registry| registry.source().clone());
+        async move {
+            let bytes = ImageAssetLoader::load_bytes(source, client, assets).await?;
+            Ok(Arc::new(decode_async(bytes).await.map_err(AssetLoadError::Decode)?))
+        }
+    }
+}
+
+pub struct ImgResourceLoader;
+impl Asset for ImgResourceLoader {
+    type Source = Resource;
+    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+    fn load(source: Self::Source, app: &mut App) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+        <ImageAssetLoader as Asset>::load(source, app)
+    }
+}
+
 impl ImageAssetLoader {
     /// Resolve and decode a resource on the app's background executor.
     pub fn load(
         source: impl Into<Resource>,
         app: &App,
         asset_source: Arc<dyn AssetSource>,
-    ) -> Task<Result<DecodedImage, AssetLoadError>> {
+    ) -> impl std::future::Future<Output = Result<Arc<RenderImage>, ImageCacheError>> {
         let client = app.http_client();
         let source = source.into();
-        app.background_spawn(async move {
+        let task = app.background_spawn(async move {
             let bytes = Self::load_bytes(source, client, asset_source).await?;
-            decode_async(bytes).await.map_err(AssetLoadError::Decode)
-        })
+            decode_async(bytes).await.map_err(AssetLoadError::Decode).map(Arc::new)
+        });
+        async move {
+            let result = task.await.map_err(ImageCacheError::Cancelled)?;
+            result.map_err(ImageCacheError::from)
+        }
     }
 
     /// Resolve and decode a resource with an explicitly selected client.
@@ -192,6 +320,26 @@ mod tests {
     use futures::future::BoxFuture;
     use std::sync::Mutex;
     use wgpui_http_client::{HttpClient, Request, Response};
+
+    struct MemoryAssets;
+    impl AssetSource for MemoryAssets {
+        fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'_, [u8]>>> {
+            Ok((path == "icon.svg").then_some(Cow::Borrowed(br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="4" height="2" fill="red"/></svg>"#)))
+        }
+        fn list(&self, _path: &str) -> anyhow::Result<Vec<SharedString>> { Ok(Vec::new()) }
+    }
+
+    #[test]
+    fn registry_decodes_caches_and_invalidates_application_assets() {
+        let registry = AssetRegistry::new(Arc::new(MemoryAssets));
+        let resource = Resource::Embedded("icon.svg".into());
+        let first = registry.load_cached(resource.clone()).expect("asset loads");
+        let second = registry.load_cached(resource.clone()).expect("cache hit");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(registry.invalidate(&resource));
+        assert!(registry.cached(&resource).is_none());
+        assert!(registry.load_cached(Resource::Embedded("missing.svg".into())).is_err());
+    }
 
     struct FakeClient {
         response: Mutex<Option<anyhow::Result<Response<AsyncBody>>>>,

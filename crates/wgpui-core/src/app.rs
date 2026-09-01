@@ -191,6 +191,10 @@ impl App {
         self.pending_tasks.load(Ordering::Acquire) != 0
     }
 
+    pub fn background_executor(&self) -> crate::window::BackgroundExecutor {
+        crate::window::BackgroundExecutor
+    }
+
     /// Installs application-scoped state shared by cloned application handles.
     pub fn set_global<T: 'static>(&mut self, value: T) {
         self.state

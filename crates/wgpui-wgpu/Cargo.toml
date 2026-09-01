@@ -18,6 +18,7 @@ arboard = "3.6.1"
 # names nothing here, and cannot, since it is forbidden a live device.
 wgpui-core = { path = "../wgpui-core" }
 wgpui-http-client = { path = "../wgpui-http-client" }
+wgpui-widgets = { path = "../wgpui-widgets" }
 # Phase 6's `window/frame_loop.rs` drives the whole of §2's picture, which means
 # it holds the `LayoutTree` the reconciler builds and `Emitter::emit` reads.
 # `wgpui-core` already depends on this crate for exactly that type; naming it

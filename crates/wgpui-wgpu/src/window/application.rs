@@ -32,6 +32,7 @@ use wgpui_core::window::{
     WindowAppearance, WindowBackgroundAppearance, WindowDecorations, WindowKind,
 };
 use wgpui_http_client::{AppHttpClientExt, BoxedHttpClient};
+use wgpui_widgets::assets::AssetRegistry;
 
 use crate::debug::PerformanceDebug;
 use crate::render::draw::DrawMode;
@@ -41,6 +42,7 @@ use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
 use crate::window::surface::WgpuSurfaceHandle;
 use crate::window::{Acquired, WindowError, WindowSurface};
+use wgpui_widgets::assets::Resource;
 
 fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
     let fallback = size(Pixels(options.width as f32), Pixels(options.height as f32));
@@ -1568,14 +1570,17 @@ impl Application {
 
     /// Configures the client used by URI resource loading in this application.
     pub fn with_http_client(self, client: BoxedHttpClient) -> ConfiguredApplication {
-        ConfiguredApplication { http_client: client }
+        ConfiguredApplication { http_client: Some(client), assets: Arc::new(()) }
     }
 
     /// Retain the application-builder shape used by asset-backed examples.
     /// Asset resolution is owned by the widget layer; the native lifecycle
     /// does not need to inspect the source while constructing the event loop.
-    pub fn with_assets<T: 'static>(self, _assets: T) -> Self {
-        self
+    pub fn with_assets<T: wgpui_widgets::assets::AssetSource>(self, assets: T) -> ConfiguredApplication {
+        ConfiguredApplication {
+            http_client: None,
+            assets: Arc::new(assets),
+        }
     }
 
     pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
@@ -1587,7 +1592,11 @@ impl Application {
             )),
             max_frames: None,
             initialize: Some(Box::new(initialize)),
-            app: App::create(),
+            app: {
+                let mut app = App::create();
+                app.set_global(AssetRegistry::new(Arc::new(())));
+                app
+            },
             live: Vec::new(),
             failure: None,
         };
@@ -1600,14 +1609,34 @@ impl Application {
 
 /// An [`Application`] with an explicitly configured native HTTP client.
 pub struct ConfiguredApplication {
-    http_client: BoxedHttpClient,
+    http_client: Option<BoxedHttpClient>,
+    assets: Arc<dyn wgpui_widgets::assets::AssetSource>,
+}
+
+impl Window {
+    pub fn use_asset<A: wgpui_widgets::assets::Asset>(
+        &mut self,
+        source: &A::Source,
+        _app: &mut App,
+    ) -> Resource {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        Resource::Embedded(format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish()))
+    }
+
 }
 
 impl ConfiguredApplication {
     pub fn run(self, initialize: impl FnOnce(&mut App) + 'static) -> Result<(), ApplicationError> {
         let event_loop = event_loop()?;
         let mut app = App::create();
-        app.set_http_client(self.http_client);
+        if let Some(client) = self.http_client {
+            app.set_http_client(client);
+        } else {
+            app.install_default_http_client();
+        }
+        app.set_global(AssetRegistry::new(self.assets));
         let mut handler = Handler {
             initial: Some((
                 WindowOptions::default(),
