@@ -312,9 +312,9 @@ pub fn wgpu_surface(handle: WgpuSurfaceHandle) -> WgpuSurface {
 
 pub mod prelude {
     pub use crate::{
-        AppWindowExt, Application, Description, Div, Element, EntityFactory, IntoElement, Render,
-        RenderOnce,
-        Stateful, StatefulDiv, Styled, UniformList, IntoAnyElement,
-        VirtualList, Window, WindowOptions, div, uniform_list, virtual_list,
+        App, AppWindowExt, Application, Component, Context, Description, Div, Element,
+        Entity, EntityFactory, IntoAnyElement, IntoElement, Render, RenderOnce, Stateful,
+        StatefulDiv, Styled, UniformList, VirtualList, WeakEntity, Window, WindowOptions, div,
+        uniform_list, virtual_list,
     };
 }

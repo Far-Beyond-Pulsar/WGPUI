@@ -143,11 +143,13 @@ pub type DisplayId = winit::monitor::MonitorHandle;
 
 /// A stateless component rendered with the public WGPU window.
 pub trait RenderOnce: 'static + Sized {
+    /// Build the element tree for this owned component.
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement;
 }
 
 /// A retained view rendered with the public WGPU window.
 pub trait Render: 'static + Sized {
+    /// Build the element tree for the current frame.
     fn render(
         &mut self,
         window: &mut Window,
@@ -161,8 +163,14 @@ pub struct Component<C: RenderOnce> {
 }
 
 impl<C: RenderOnce> Component<C> {
+    /// Wrap an owned component in an element.
     pub fn new(component: C) -> Self {
         Self { component }
+    }
+
+    /// Borrow the component before it is consumed during lowering.
+    pub fn component(&self) -> &C {
+        &self.component
     }
 }
 

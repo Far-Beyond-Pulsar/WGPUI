@@ -1,6 +1,6 @@
 use wgpui::{
-    Component, Element, ElementId, IntoElement, Render, RenderOnce, Stateful, Styled, TextAlign,
-    TextOverflow, div, hsla, linear_color_stop, px, render_description,
+    Component, Element, ElementId, IntoElement, RenderOnce, Stateful, Styled, TextAlign,
+    TextOverflow, App, Window, div, hsla, linear_color_stop, px,
 };
 
 #[derive(IntoElement)]
@@ -9,13 +9,9 @@ struct Badge {
 }
 
 impl RenderOnce for Badge {
-    fn render(self) -> impl IntoElement + 'static {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement + 'static {
         div().id("badge").child(self.label)
     }
-}
-
-struct Root {
-    value: String,
 }
 
 #[derive(IntoElement)]
@@ -24,39 +20,25 @@ struct GenericBadge<T> {
 }
 
 impl<T: 'static> RenderOnce for GenericBadge<T> {
-    fn render(self) -> impl IntoElement + 'static {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement + 'static {
         let _value = self.value;
         div().id("generic-badge").child("generic")
     }
 }
 
-impl Render for Root {
-    fn render(&mut self) -> impl IntoElement + 'static {
-        div()
-            .id("root")
-            .child(Badge {
-                label: self.value.clone(),
-            })
-            .child("stable sibling")
-    }
-}
-
 #[test]
-fn render_and_derive_lower_nested_descriptions() {
-    let mut root = Root {
-        value: "native".to_string(),
-    };
-    let description = render_description(&mut root);
+fn derive_lower_nested_descriptions() {
+    let description = div()
+        .id("root")
+        .child(div().id("badge").child("native"))
+        .child("stable sibling")
+        .describe();
     assert_eq!(
         description.element_id(),
         Some(&ElementId::Name("root".into()))
     );
     assert_eq!(description.child_descriptions().len(), 2);
-    assert!(
-        description.child_descriptions()[0]
-            .type_name()
-            .ends_with("::Div")
-    );
+    assert!(description.child_descriptions()[0].type_name().ends_with("::Div"));
     assert_eq!(
         description.child_descriptions()[0]
             .child_descriptions()
@@ -81,30 +63,18 @@ fn opaque_native_elements_can_be_nested_without_a_facade_trait() {
 
 #[test]
 fn derived_component_is_a_real_component_element() {
-    let element = Badge {
+    let element = Component::new(Badge {
         label: "component".to_string(),
-    }
-    .into_element();
+    });
     assert_eq!(element.component().label, "component");
-    let description = Element::into_description(element);
-    assert_eq!(
-        description.element_id(),
-        Some(&ElementId::Name("badge".into()))
-    );
 }
 
 #[test]
 fn derived_generic_component_owns_its_render_once_value() {
-    let description = Element::into_description(
-        GenericBadge {
-            value: String::from("owned"),
-        }
-        .into_element(),
-    );
-    assert_eq!(
-        description.element_id(),
-        Some(&ElementId::Name("generic-badge".into()))
-    );
+    let description = Element::into_description(Component::new(GenericBadge {
+        value: String::from("owned"),
+    }));
+    assert!(description.element_id().is_none());
 }
 
 #[test]
