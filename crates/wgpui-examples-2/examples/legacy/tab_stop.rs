@@ -61,9 +61,7 @@ impl Render for Example {
                 .bg(wgpui::black())
                 .text_color(wgpui::white())
                 .focus(tab_stop_style)
-                .shadow_sm(),
-            )
-            .id(id)
+                .shadow_sm()
         }
 
         div()
