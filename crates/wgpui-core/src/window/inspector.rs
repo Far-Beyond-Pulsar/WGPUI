@@ -24,7 +24,11 @@ impl InputEventFamily {
             Self::All => true,
             Self::Keyboard => matches!(
                 event,
-                super::input::InputEvent::KeyDown(_) | super::input::InputEvent::KeyUp(_)
+                super::input::InputEvent::KeyDown(_)
+                    | super::input::InputEvent::KeyUp(_)
+                    | super::input::InputEvent::TextInput(_)
+                    | super::input::InputEvent::Ime(_)
+                    | super::input::InputEvent::ModifiersChanged(_)
             ),
             Self::Pointer => matches!(
                 event,
@@ -34,7 +38,7 @@ impl InputEventFamily {
                     | super::input::InputEvent::MouseEnter(_)
                     | super::input::InputEvent::MouseLeave(_)
             ),
-            Self::Focus => false,
+            Self::Focus => matches!(event, super::input::InputEvent::Focus(_)),
             Self::Scroll => matches!(event, super::input::InputEvent::Scroll(_)),
             Self::Click => matches!(event, super::input::InputEvent::Click(_)),
         }
