@@ -90,11 +90,12 @@ function Get-DiagnosticDetails {
         [string]$NativeOutput
     )
 
-    $rustLines = @($StandardOutput -split "`r?`n") + @($StandardError -split "`r?`n")
-    $rustLines = @($rustLines | Where-Object { $_ -match "panic|panicked at|stack backtrace:|^\s+\d+:|^\s+at " })
+    $allOutputLines = @($StandardOutput -split "`r?`n") + @($StandardError -split "`r?`n")
+    $rustLines = @($allOutputLines | Where-Object { $_ -match "panic|panicked at|stack backtrace:|^\s+\d+:|^\s+at " })
     $nativeLines = @($NativeOutput -split "`r?`n" | Where-Object { $_ -match "Exception|FAULTING_IP|Access violation|\.ecxr|^\s*[0-9a-f`?]+\s+" })
     [ordered]@{
-        panic = @($rustLines | Where-Object { $_ -match "panicked at|panic!|thread '.*' panicked" } | Select-Object -First 3)
+        panic = @($allOutputLines | Where-Object { $_ -match "panicked at|panic!|thread '.*' panicked|RefCell already borrowed|Validation Error|wgpu error|Caused by:|required but not enabled" } | Select-Object -First 8)
+        errors = @($allOutputLines | Where-Object { $_ -match "RefCell already borrowed|Validation Error|wgpu error|Caused by:|required but not enabled" } | Select-Object -First 8)
         rust_stack = @($rustLines | Where-Object { $_ -match "stack backtrace:|^\s+\d+:|^\s+at " } | Select-Object -First 24)
         native_exception = @($nativeLines | Select-Object -First 12)
     }
@@ -248,7 +249,7 @@ while ($remaining.Count -gt 0) {
             $launch.Record.name, $launch.Record.pid, $launch.Record.exit_code, $launch.Record.status,
             $launch.Record.rust_backtrace, $launch.Record.native_exception)
         $launch.Process.Dispose()
-        $remaining.Remove($launch)
+        $null = $remaining.Remove($launch)
     }
 
     if ($remaining.Count -gt 0) {
@@ -282,7 +283,7 @@ $textLines.Add(("SUMMARY|total={0}|exited={1}|crashed={2}|launch-failed={3}|rust
 foreach ($record in $finalRecords | Sort-Object name) {
     $textLines.Add(("{0}|status={1}|exit={2}|pid={3}|rust-backtrace={4}|native-exception={5}" -f `
         $record.name, $record.status, $record.exit_code, $record.pid, $record.rust_backtrace, $record.native_exception))
-    foreach ($line in @($record.diagnostics.panic + $record.diagnostics.native_exception)) {
+    foreach ($line in @($record.diagnostics.panic + $record.diagnostics.errors + $record.diagnostics.native_exception)) {
         if ($line) {
             $textLines.Add(("DETAIL|{0}|{1}" -f $record.name, $line.Trim()))
         }
