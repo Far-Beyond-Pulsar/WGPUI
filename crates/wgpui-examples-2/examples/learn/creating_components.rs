@@ -205,7 +205,7 @@ impl RenderOnce for RenderOnceCounter {
                             .hover(move |style| style.bg(error_hover))
                             .child("−")
                             .when_some(self.on_decrement, |element, callback| {
-                                element.on_click(move |_, window, cx| callback(window, cx))
+                                element.on_click(wgpui::public_window_callback(move |_, window, cx| callback(window, cx)))
                             }),
                     )
                     .child(
@@ -220,7 +220,7 @@ impl RenderOnce for RenderOnceCounter {
                             .hover(move |style| style.bg(success_hover))
                             .child("+")
                             .when_some(self.on_increment, |element, callback| {
-                                element.on_click(move |_, window, cx| callback(window, cx))
+                                element.on_click(wgpui::public_window_callback(move |_, window, cx| callback(window, cx)))
                             }),
                     ),
             )
@@ -309,7 +309,7 @@ impl Render for RenderCounter {
                             .cursor_pointer()
                             .hover(move |style| style.bg(error_hover))
                             .child("−")
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .on_click(wgpui::public_listener(cx, |this, _, window, cx| {
                                 this.decrement(window, cx);
                             })),
                     )
@@ -324,7 +324,7 @@ impl Render for RenderCounter {
                             .cursor_pointer()
                             .hover(move |style| style.bg(success_hover))
                             .child("+")
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .on_click(wgpui::public_listener(cx, |this, _, window, cx| {
                                 this.increment(window, cx);
                             })),
                     ),
@@ -353,6 +353,7 @@ impl CreatingComponentsExample {
 impl Render for CreatingComponentsExample {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::for_appearance(window);
+        let mut app = cx.app();
         let render_once_count = self.render_once_count;
         let handle = cx.entity().downgrade();
 
@@ -389,7 +390,7 @@ impl Render for CreatingComponentsExample {
                     .flex()
                     .flex_row()
                     .gap_4()
-                    .child(use_state_counter(&colors, window, cx))
+                    .child(use_state_counter(&colors, window, &mut app))
                     .child(
                         RenderOnceCounter::new(colors.clone(), render_once_count)
                             .on_increment({
@@ -412,7 +413,7 @@ impl Render for CreatingComponentsExample {
                                     .ok();
                             }),
                     )
-                    .child(self.render_counter.clone()),
+                    .child(wgpui::entity_view(self.render_counter.clone())),
             )
     }
 }

@@ -12,9 +12,9 @@ struct ExampleWindow {
 impl Render for ExampleWindow {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .on_action(|_: &CloseWindow, window, _| {
+            .on_action(wgpui::public_window_callback(|_: &CloseWindow, window, _| {
                 window.remove_window();
-            })
+            }))
             .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
@@ -55,7 +55,7 @@ fn main() {
                 cx.activate(false);
                 cx.new(|cx| {
                     let focus_handle = cx.focus_handle();
-                    focus_handle.focus(window, cx);
+                    window.focus(&focus_handle, cx);
                     ExampleWindow { focus_handle }
                 })
             },
@@ -72,7 +72,7 @@ fn main() {
             |window, cx| {
                 cx.new(|cx| {
                     let focus_handle = cx.focus_handle();
-                    focus_handle.focus(window, cx);
+                    window.focus(&focus_handle, cx);
                     ExampleWindow { focus_handle }
                 })
             },

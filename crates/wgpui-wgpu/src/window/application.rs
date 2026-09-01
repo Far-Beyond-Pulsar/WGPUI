@@ -1,6 +1,7 @@
 //! Native application lifecycle for the retained WGPUI renderer.
 
 use std::any::{Any, TypeId};
+use std::cell::Cell;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -62,6 +63,55 @@ fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
 type CloseHandler = Box<dyn FnMut(&mut Window) -> bool>;
 type AppInitializer = Box<dyn FnOnce(&mut App)>;
 type WindowBuildCallback = Box<dyn FnMut(&mut Window, &mut App) -> Description>;
+
+thread_local! {
+    static CALLBACK_WINDOW: Cell<*mut Window> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Adapt a public-window callback to the backend-neutral widget callback ABI.
+///
+/// The adapter is only valid while the callback is dispatched by a live WGPU
+/// window. Keeping this conversion here avoids making either core or widgets
+/// depend on the concrete backend window.
+pub fn public_window_callback<E, F>(mut callback: F) -> impl FnMut(
+    &E,
+    &mut wgpui_core::window::Window,
+    &mut App,
+) + 'static
+where
+    F: FnMut(&E, &mut Window, &mut App) + 'static,
+{
+    move |event, _core_window, app| {
+        CALLBACK_WINDOW.with(|slot| {
+            let pointer = slot.get();
+            assert!(!pointer.is_null(), "public window callback outside WGPU dispatch");
+            // SAFETY: the dispatch guard installs the pointer from the
+            // currently borrowed Window and restores it before returning.
+            unsafe { callback(event, &mut *pointer, app) };
+        });
+    }
+}
+
+/// Adapt an entity listener whose callback receives the public WGPU window.
+pub fn public_listener<T: 'static, E: ?Sized>(
+    context: &wgpui_core::app::Context<T>,
+    callback: impl Fn(&mut T, &E, &mut Window, &mut wgpui_core::app::Context<T>) + 'static,
+) -> impl Fn(&E, &mut wgpui_core::window::Window, &mut App) + 'static {
+    let entity = context.entity().downgrade();
+    move |event, core_window, _app| {
+        CALLBACK_WINDOW.with(|slot| {
+            let pointer = slot.get();
+            assert!(!pointer.is_null(), "public listener outside WGPU dispatch");
+            let Some(entity) = entity.upgrade() else {
+                return;
+            };
+            // SAFETY: see `public_window_callback`.
+            entity.update_in(core_window, |value, _window, context| unsafe {
+                callback(value, event, &mut *pointer, context);
+            });
+        });
+    }
+}
 
 enum ImmediatePaint {
     Quad(Quad),
@@ -160,6 +210,32 @@ pub trait Render: 'static + Sized {
 /// Element wrapper generated for [`RenderOnce`] components.
 pub struct Component<C: RenderOnce> {
     component: C,
+}
+
+/// Element wrapper for an entity implementing the public [`Render`] trait.
+pub struct EntityView<T: Render> {
+    entity: wgpui_core::app::Entity<T>,
+}
+
+pub fn entity_view<T: Render>(entity: wgpui_core::app::Entity<T>) -> EntityView<T> {
+    EntityView { entity }
+}
+
+impl<T: Render> CoreElement for EntityView<T> {
+    fn into_description(self) -> Description {
+        Description::deferred(move |window, app| {
+            let Some(window) = window.downcast_mut::<Window>() else {
+                return Description::new::<Self>();
+            };
+            let description = self.entity.update((), |value, context| {
+                let _scope = wgpui_core::element::enter_contextual_render_scope();
+                let element = value.render(window, context);
+                let app = app.clone();
+                IntoElement::into_description_in(element, window.interaction_mut(), &app)
+            });
+            description
+        })
+    }
 }
 
 impl<C: RenderOnce> Component<C> {
@@ -634,6 +710,15 @@ impl Window {
         self.interaction.handle_input(event)
     }
     pub fn handle_input_with_app(&mut self, event: InputEvent, app: &mut App) -> bool {
+        CALLBACK_WINDOW.with(|slot| {
+            let previous = slot.replace(self as *mut Window);
+            let handled = self.handle_input_with_app_inner(event, app);
+            slot.set(previous);
+            handled
+        })
+    }
+
+    fn handle_input_with_app_inner(&mut self, event: InputEvent, app: &mut App) -> bool {
         if self.interactions.is_empty() {
             return self.interaction.handle_input(event);
         }
@@ -2655,5 +2740,12 @@ mod tests {
             .child_descriptions()
             .first()
             .is_some_and(Description::emits));
+    }
+
+    #[test]
+    fn public_callback_adapter_matches_core_widget_callback_abi() {
+        let _element = wgpui_widgets::div::div().on_click(public_window_callback(
+            |_: &wgpui_core::window::ClickEvent, _window: &mut Window, _app: &mut App| {},
+        ));
     }
 }

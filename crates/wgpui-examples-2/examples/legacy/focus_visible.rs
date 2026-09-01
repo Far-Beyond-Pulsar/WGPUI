@@ -1,6 +1,6 @@
 use wgpui::{
     App, Application, Bounds, Context, Div, ElementId, FocusHandle, KeyBinding, SharedString,
-    Stateful, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 
 actions!(example, [Tab, TabPrev, Quit]);
@@ -58,7 +58,7 @@ impl Example {
 
 impl Render for Example {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        fn button_base(id: impl Into<ElementId>, label: &'static str) -> Stateful<Div> {
+        fn button_base(id: impl Into<ElementId>, label: &'static str) -> Div {
             div()
                 .id(id)
                 .h_16()
@@ -77,9 +77,9 @@ impl Render for Example {
         div()
             .id("app")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::on_tab))
-            .on_action(cx.listener(Self::on_tab_prev))
-            .on_action(cx.listener(Self::on_quit))
+            .on_action(wgpui::public_listener(cx, Self::on_tab))
+            .on_action(wgpui::public_listener(cx, Self::on_tab_prev))
+            .on_action(wgpui::public_listener(cx, Self::on_quit))
             .size_full()
             .flex()
             .flex_col()
@@ -124,7 +124,7 @@ impl Render for Example {
                                     .focus(|style| {
                                         style.border_4().border_color(wgpui::rgb(0xfbbf24))
                                     })
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(wgpui::public_listener(cx, |this, _, _, cx| {
                                         this.message =
                                             "Clicked button 1 - focus border is visible!".into();
                                         cx.notify();
@@ -149,7 +149,7 @@ impl Render for Example {
                                     .focus_visible(|style| {
                                         style.border_4().border_color(wgpui::rgb(0x10b981))
                                     })
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(wgpui::public_listener(cx, |this, _, _, cx| {
                                         this.message =
                                             "Clicked button 2 - no border! Try Tab instead.".into();
                                         cx.notify();
@@ -179,7 +179,7 @@ impl Render for Example {
                                     .focus_visible(|style| {
                                         style.border_4().border_color(wgpui::rgb(0x10b981))
                                     })
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(wgpui::public_listener(cx, |this, _, _, cx| {
                                         this.message =
                                             "Clicked button 3 - yellow border. Tab shows green!"
                                                 .into();

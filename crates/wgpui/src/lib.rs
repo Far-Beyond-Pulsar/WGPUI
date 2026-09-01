@@ -299,8 +299,9 @@ pub use wgpui_widgets::animation::pulsating_between;
 
 pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 pub use wgpui_wgpu::window::application::{
-    Application, ApplicationError, ClipboardError, ConfiguredApplication, DisplayId, FrameReport,
-    NativeApplication, Window, WindowHandle, WindowOptions,
+    entity_view, public_listener, public_window_callback, Application, ApplicationError,
+    ClipboardError, ConfiguredApplication, DisplayId, EntityView, FrameReport, NativeApplication,
+    Window, WindowHandle, WindowOptions,
 };
 pub use wgpui_wgpu::window::surface::{SurfaceResizeError, WgpuSurfaceHandle};
 pub use wgpui_wgpu::window::WindowError;
