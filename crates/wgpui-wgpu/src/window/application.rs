@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use wgpui_core::app::App;
@@ -174,6 +175,10 @@ pub struct Window {
     animation_clock: AnimationClock,
     animation_frame_requested: AtomicBool,
     last_click: Option<ClickState>,
+    bounds_observers: Vec<(Arc<AtomicBool>, Box<dyn FnMut(Bounds<Pixels>)>)>,
+    appearance_observers: Vec<(Arc<AtomicBool>, Box<dyn FnMut(WindowAppearance)>)>,
+    observed_bounds: Option<Bounds<Pixels>>,
+    observed_appearance: WindowAppearance,
 }
 
 #[derive(Copy, Clone)]
@@ -212,8 +217,239 @@ impl From<arboard::Error> for ClipboardError {
     }
 }
 
-/// The monitor containing a window, when the platform reports one.
-pub type DisplayId = winit::monitor::MonitorHandle;
+/// Stable identifier for a display reported by the active native event loop.
+pub type DisplayId = u64;
+
+/// A native display snapshot suitable for positioning a WGPU window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Display {
+    id: DisplayId,
+    bounds: Bounds<Pixels>,
+    scale_factor: f64,
+    name: Option<String>,
+}
+
+pub struct WindowObserver {
+    active: Arc<AtomicBool>,
+}
+
+impl WindowObserver {
+    pub fn detach(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for WindowObserver {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl Display {
+    pub fn id(&self) -> DisplayId {
+        self.id
+    }
+
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        self.bounds
+    }
+
+    pub fn scale_factor(&self) -> f64 {
+        self.scale_factor
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
+static DISPLAYS: OnceLock<Mutex<Vec<Display>>> = OnceLock::new();
+
+fn displays() -> Vec<Display> {
+    DISPLAYS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map(|displays| displays.clone())
+        .unwrap_or_default()
+}
+
+fn display_id(monitor: &winit::monitor::MonitorHandle) -> DisplayId {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in monitor
+        .name()
+        .unwrap_or_default()
+        .bytes()
+        .chain(monitor.position().x.to_le_bytes())
+        .chain(monitor.position().y.to_le_bytes())
+        .chain(monitor.size().width.to_le_bytes())
+        .chain(monitor.size().height.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn refresh_displays(event_loop: &winit::event_loop::ActiveEventLoop) {
+    let monitors = event_loop.available_monitors().map(|monitor| {
+        let scale_factor = monitor.scale_factor();
+        let position = monitor.position();
+        let monitor_size = monitor.size();
+        Display {
+            id: display_id(&monitor),
+            bounds: Bounds::new(
+                point(
+                    Pixels(position.x as f32 / scale_factor as f32),
+                    Pixels(position.y as f32 / scale_factor as f32),
+                ),
+                size(
+                    Pixels(monitor_size.width as f32 / scale_factor as f32),
+                    Pixels(monitor_size.height as f32 / scale_factor as f32),
+                ),
+            ),
+            scale_factor,
+            name: monitor.name(),
+        }
+    });
+    if let Ok(mut displays) = DISPLAYS.get_or_init(|| Mutex::new(Vec::new())).lock() {
+        *displays = monitors.collect();
+    }
+}
+
+/// Native window decoration state used by custom chrome examples.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Decorations {
+    Server,
+    Client { tiling: TilingState },
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TilingState {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl TilingState {
+    pub fn is_tiled(self) -> bool {
+        self.top || self.right || self.bottom || self.left
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResizeEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowServiceError {
+    Native(String),
+}
+
+impl std::fmt::Display for WindowServiceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native(error) => write!(formatter, "native window operation failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WindowServiceError {}
+
+fn resize_direction(edge: ResizeEdge) -> winit::window::ResizeDirection {
+    match edge {
+        ResizeEdge::Top => winit::window::ResizeDirection::North,
+        ResizeEdge::Right => winit::window::ResizeDirection::East,
+        ResizeEdge::Bottom => winit::window::ResizeDirection::South,
+        ResizeEdge::Left => winit::window::ResizeDirection::West,
+        ResizeEdge::TopLeft => winit::window::ResizeDirection::NorthWest,
+        ResizeEdge::TopRight => winit::window::ResizeDirection::NorthEast,
+        ResizeEdge::BottomLeft => winit::window::ResizeDirection::SouthWest,
+        ResizeEdge::BottomRight => winit::window::ResizeDirection::SouthEast,
+    }
+}
+
+fn validate_prompt_buttons(buttons: &[PromptButton]) -> Result<(), PromptError> {
+    if !matches!(buttons.len(), 1 | 2) {
+        return Err(PromptError::UnsupportedButtonCount(buttons.len()));
+    }
+    let labels_supported = match buttons {
+        [button] => button.label.eq_ignore_ascii_case("ok"),
+        [ok, cancel] => {
+            ok.label.eq_ignore_ascii_case("ok") && cancel.label.eq_ignore_ascii_case("cancel")
+        }
+        _ => false,
+    };
+    if labels_supported {
+        Ok(())
+    } else {
+        Err(PromptError::UnsupportedButtonLabels)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PromptLevel {
+    Info,
+    Warning,
+    Error,
+    Question,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptButton {
+    label: String,
+}
+
+impl PromptButton {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self { label: label.into() }
+    }
+
+    pub fn ok(label: impl Into<String>) -> Self {
+        Self::new(label)
+    }
+
+    pub fn cancel(label: impl Into<String>) -> Self {
+        Self::new(label)
+    }
+}
+
+impl From<&str> for PromptButton {
+    fn from(label: &str) -> Self {
+        Self::new(label)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptError {
+    UnsupportedButtonCount(usize),
+    UnsupportedButtonLabels,
+    Native(String),
+}
+
+impl std::fmt::Display for PromptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedButtonCount(count) => {
+                write!(formatter, "native prompt supports one or two buttons, got {count}")
+            }
+            Self::UnsupportedButtonLabels => {
+                formatter.write_str("native prompt cannot display custom button labels")
+            }
+            Self::Native(error) => write!(formatter, "native prompt failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PromptError {}
 
 /// A stateless component rendered with the public WGPU window.
 pub trait RenderOnce: 'static + Sized {
@@ -289,6 +525,8 @@ impl<C: RenderOnce> CoreElement for Component<C> {
 
 /// Public application extension that queues a WGPU-window root view.
 pub trait AppWindowExt {
+    fn displays(&self) -> Vec<Display>;
+
     fn open_window<V: Render>(
         &mut self,
         options: WindowOptions,
@@ -314,6 +552,10 @@ pub fn render_description<R: Render>(
 }
 
 impl AppWindowExt for App {
+    fn displays(&self) -> Vec<Display> {
+        displays()
+    }
+
     fn open_window<V: Render>(
         &mut self,
         options: WindowOptions,
@@ -563,6 +805,15 @@ impl Window {
     pub fn is_active(&self) -> bool {
         self.native.has_focus()
     }
+    pub fn is_focused(&self, handle: &FocusHandle) -> bool {
+        self.interaction.is_focused(handle)
+    }
+    pub fn focus_visible(&self) -> bool {
+        self.interaction.focus_manager().focus_visible()
+    }
+    pub fn focused(&self) -> Option<FocusId> {
+        self.interaction.focused()
+    }
     pub fn set_background_appearance(&mut self, appearance: WindowBackgroundAppearance) {
         self.native
             .set_transparent(appearance != WindowBackgroundAppearance::Opaque);
@@ -590,8 +841,56 @@ impl Window {
         self.native.set_decorations(decorations);
         self.decorations = decorations;
     }
-    pub fn window_decorations(&self) -> WindowDecorations {
-        window_decorations_for(self.decorations)
+    pub fn window_decorations(&self) -> Decorations {
+        if self.decorations {
+            Decorations::Server
+        } else {
+            Decorations::Client {
+                tiling: TilingState::default(),
+            }
+        }
+    }
+
+    pub fn observe_bounds(
+        &mut self,
+        callback: impl FnMut(Bounds<Pixels>) + 'static,
+    ) -> WindowObserver {
+        let active = Arc::new(AtomicBool::new(true));
+        self.bounds_observers
+            .push((Arc::clone(&active), Box::new(callback)));
+        WindowObserver { active }
+    }
+
+    pub fn observe_appearance(
+        &mut self,
+        callback: impl FnMut(WindowAppearance) + 'static,
+    ) -> WindowObserver {
+        let active = Arc::new(AtomicBool::new(true));
+        self.appearance_observers
+            .push((Arc::clone(&active), Box::new(callback)));
+        WindowObserver { active }
+    }
+
+    /// Show a native modal prompt and return the zero-based selected button.
+    ///
+    /// Winit exposes the native window handle but no cross-platform dialog
+    /// primitive. Windows therefore uses its owner-aware message box; other
+    /// platforms return an explicit unsupported-operation error. Custom button
+    /// labels are rejected because a message box cannot display them.
+    pub fn prompt<B, C>(
+        &self,
+        level: PromptLevel,
+        message: &str,
+        detail: Option<&str>,
+        buttons: &[B],
+        _cx: C,
+    ) -> wgpui_core::app::Task<Result<usize, PromptError>>
+    where
+        B: Clone + Into<PromptButton>,
+    {
+        let buttons = buttons.iter().cloned().map(Into::into).collect::<Vec<_>>();
+        let result = native_prompt(self, level, message, detail, &buttons);
+        wgpui_core::app::Task::ready(result)
     }
 
     /// Record the requested client inset without claiming that Winit applied
@@ -663,7 +962,30 @@ impl Window {
         }
     }
     pub fn current_monitor(&self) -> Option<DisplayId> {
-        self.native.current_monitor()
+        self.native.current_monitor().map(|monitor| display_id(&monitor))
+    }
+
+    pub fn mouse_position(&self) -> Point<Pixels> {
+        point(self.cursor[0], self.cursor[1])
+    }
+
+    pub fn start_window_move(&self) -> Result<(), WindowServiceError> {
+        self.native
+            .drag_window()
+            .map_err(|error| WindowServiceError::Native(error.to_string()))
+    }
+
+    pub fn start_window_resize(&self, edge: ResizeEdge) -> Result<(), WindowServiceError> {
+        self.native
+            .drag_resize_window(resize_direction(edge))
+            .map_err(|error| WindowServiceError::Native(error.to_string()))
+    }
+
+    pub fn show_window_menu(&self, position: [Pixels; 2]) {
+        self.native.show_window_menu(winit::dpi::LogicalPosition::new(
+            position[0].value().max(0.0) as u32,
+            position[1].value().max(0.0) as u32,
+        ));
     }
     pub fn close(&mut self) {
         self.close_requested.store(true, Ordering::Release);
@@ -1415,6 +1737,24 @@ impl Window {
 
     pub fn begin_frame(&mut self) {
         self.state_frame = self.state_frame.wrapping_add(1);
+        let bounds = self.bounds();
+        if self.observed_bounds != Some(bounds) {
+            self.observed_bounds = Some(bounds);
+            for (active, callback) in &mut self.bounds_observers {
+                if active.load(Ordering::Acquire) {
+                    callback(bounds);
+                }
+            }
+        }
+        let appearance = self.appearance();
+        if self.observed_appearance != appearance {
+            self.observed_appearance = appearance;
+            for (active, callback) in &mut self.appearance_observers {
+                if active.load(Ordering::Acquire) {
+                    callback(appearance);
+                }
+            }
+        }
     }
 
     pub fn end_frame(&mut self) -> usize {
@@ -2210,6 +2550,10 @@ impl Handler {
             animation_clock: AnimationClock::new(),
             animation_frame_requested: AtomicBool::new(false),
             last_click: None,
+            bounds_observers: Vec::new(),
+            appearance_observers: Vec::new(),
+            observed_bounds: None,
+            observed_appearance: WindowAppearance::Light,
         };
         let mut frame_loop = FrameLoop::new(&context.device);
         frame_loop.set_surface_registry(surface_registry);
@@ -2470,6 +2814,7 @@ impl winit::application::ApplicationHandler for Handler {
         if !self.live.is_empty() {
             return;
         }
+        refresh_displays(event_loop);
         if let Some(initialize) = self.initialize.take() {
             initialize(&mut self.app);
         }
@@ -2568,6 +2913,10 @@ impl winit::application::ApplicationHandler for Handler {
             performance_debug: PerformanceDebug::default(),
             animation_clock: AnimationClock::new(),
             last_click: None,
+            bounds_observers: Vec::new(),
+            appearance_observers: Vec::new(),
+            observed_bounds: None,
+            observed_appearance: WindowAppearance::Light,
         };
         let mut frame_loop = FrameLoop::new(&context.device);
         frame_loop.set_surface_registry(surface_registry);
@@ -2981,6 +3330,30 @@ mod tests {
     }
 
     #[test]
+    fn public_window_service_types_keep_native_direction_and_prompt_contracts() {
+        assert_eq!(
+            resize_direction(ResizeEdge::BottomRight),
+            winit::window::ResizeDirection::SouthEast
+        );
+        assert_eq!(
+            validate_prompt_buttons(&[PromptButton::ok("OK")]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_prompt_buttons(&[PromptButton::ok("OK"), PromptButton::cancel("Cancel")]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_prompt_buttons(&[PromptButton::new("确定")]),
+            Err(PromptError::UnsupportedButtonLabels)
+        );
+        assert_eq!(
+            validate_prompt_buttons(&[]),
+            Err(PromptError::UnsupportedButtonCount(0))
+        );
+    }
+
+    #[test]
     fn immediate_paints_are_lowered_as_retained_description_children() {
         let path = Path::new(
             vec![
@@ -3016,5 +3389,70 @@ mod tests {
         let _element = wgpui_widgets::div::div().on_click(public_window_callback(
             |_: &wgpui_core::window::ClickEvent, _window: &mut Window, _app: &mut App| {},
         ));
+    }
+}
+
+fn native_prompt(
+    window: &Window,
+    level: PromptLevel,
+    message: &str,
+    detail: Option<&str>,
+    buttons: &[PromptButton],
+) -> Result<usize, PromptError> {
+    validate_prompt_buttons(buttons)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING,
+            MB_OK, MB_YESNO, MessageBoxW,
+        };
+
+        let flags = match (buttons.len(), level) {
+            (1, PromptLevel::Info) => MB_OK | MB_ICONINFORMATION,
+            (1, PromptLevel::Warning) => MB_OK | MB_ICONWARNING,
+            (1, PromptLevel::Error) => MB_OK | MB_ICONERROR,
+            (1, PromptLevel::Question) => MB_OK | MB_ICONQUESTION,
+            (2, PromptLevel::Info) => MB_YESNO | MB_ICONINFORMATION,
+            (2, PromptLevel::Warning) => MB_YESNO | MB_ICONWARNING,
+            (2, PromptLevel::Error) => MB_YESNO | MB_ICONERROR,
+            (2, PromptLevel::Question) => MB_YESNO | MB_ICONQUESTION,
+            _ => return Err(PromptError::UnsupportedButtonCount(buttons.len())),
+        };
+        let caption = detail.unwrap_or("WGPUI");
+        let message = message.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let caption = caption.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let window_handle = window
+            .native
+            .window_handle()
+            .map_err(|error| PromptError::Native(error.to_string()))?;
+        let hwnd = match window_handle.as_raw() {
+            RawWindowHandle::Win32(handle) => handle.hwnd.get() as *mut std::ffi::c_void,
+            _ => {
+                return Err(PromptError::Native(
+                    "window is not backed by a Win32 native handle".to_string(),
+                ));
+            }
+        };
+        let result = unsafe {
+            MessageBoxW(hwnd, message.as_ptr(), caption.as_ptr(), flags)
+        };
+        return match result {
+            IDOK | IDYES => Ok(0),
+            0 => Err(PromptError::Native("MessageBoxW returned no result".to_string())),
+            _ => Ok(1),
+        };
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        let _ = level;
+        let _ = message;
+        let _ = detail;
+        Err(PromptError::Native(
+            "native prompts are not implemented on this platform".to_string(),
+        ))
     }
 }

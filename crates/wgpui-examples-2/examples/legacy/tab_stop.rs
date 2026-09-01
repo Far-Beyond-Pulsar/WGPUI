@@ -61,7 +61,9 @@ impl Render for Example {
                 .bg(wgpui::black())
                 .text_color(wgpui::white())
                 .focus(tab_stop_style)
-                .shadow_sm()
+                .shadow_sm(),
+            )
+            .id(id)
         }
 
         div()
@@ -83,7 +85,7 @@ impl Render for Example {
                     .into_iter()
                     .enumerate()
                     .map(|(ix, item_handle)| {
-                        div()
+                        let item = div()
                             .id(("item", ix))
                             .track_focus(&item_handle)
                             .h_10()
@@ -97,13 +99,13 @@ impl Render for Example {
                                 item_handle.tab_stop
                                     && window.interaction_mut().is_focused(&item_handle),
                                 tab_stop_style,
-                            )
-                            .map(|this| match item_handle.tab_stop {
-                                true => this
-                                    .hover(|this| this.bg(wgpui::black().opacity(0.1)))
-                                    .child(format!("tab_index: {}", item_handle.tab_index)),
-                                false => this.opacity(0.4).child("tab_stop: false"),
-                            })
+                            );
+                        match item_handle.tab_stop {
+                            true => item
+                                .hover(|this| this.bg(wgpui::black().opacity(0.1)))
+                                .child(format!("tab_index: {}", item_handle.tab_index)),
+                            false => item.opacity(0.4).child("tab_stop: false"),
+                        }
                     }),
             )
             .child(

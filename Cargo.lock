@@ -5664,6 +5664,7 @@ dependencies = [
  "lyon",
  "pollster",
  "rand 0.10.0",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tracing",
@@ -5674,6 +5675,7 @@ dependencies = [
  "wgpui-layout",
  "wgpui-text",
  "wgpui-widgets",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

@@ -301,10 +301,11 @@ pub use wgpui_widgets::animation::pulsating_between;
 pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 pub use wgpui_wgpu::window::application::{
     entity_view, public_listener, public_value_listener, public_window_callback, img, AppAssetExt,
-    AssetRef, Application, ApplicationError, ClipboardError, ConfiguredApplication, DisplayId,
-    EntityView, FrameReport, IntoLegacyImageSource, LegacyImageSource, LegacyImgBuilder,
-    NativeApplication,
-    Window, WindowHandle, WindowOptions,
+    AssetRef, Application, ApplicationError, ClipboardError, ConfiguredApplication, Decorations,
+    Display as NativeDisplay, DisplayId, EntityView, FrameReport, IntoLegacyImageSource,
+    LegacyImageSource, LegacyImgBuilder, NativeApplication, PromptButton, PromptError, PromptLevel,
+    ResizeEdge, TilingState, Window, WindowHandle, WindowObserver, WindowOptions,
+    WindowServiceError,
 };
 pub use wgpui_wgpu::window::surface::{SurfaceResizeError, WgpuSurfaceHandle};
 pub use wgpui_wgpu::window::WindowError;

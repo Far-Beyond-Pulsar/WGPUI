@@ -57,6 +57,8 @@ tracing = "0.1"
 # two backends share one winit in the lock file rather than linking two copies
 # of a library that registers OS-level window classes.
 winit = "0.30.12"
+raw-window-handle = "0.6.2"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 # `tests/legacy_image_differential.rs` drives Phase 6.2's gate end to end: a real
