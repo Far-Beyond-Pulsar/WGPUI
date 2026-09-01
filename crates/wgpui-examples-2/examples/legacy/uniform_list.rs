@@ -34,7 +34,7 @@ impl Render for UniformListExample {
                     items
                 }),
             )
-            .h_full(),
+            .size_full(),
         )
     }
 }
