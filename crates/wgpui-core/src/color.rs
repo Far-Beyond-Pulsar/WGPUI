@@ -325,6 +325,15 @@ pub enum ColorSpace {
     Oklab,
 }
 
+impl fmt::Display for ColorSpace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Srgb => "srgb",
+            Self::Oklab => "oklab",
+        })
+    }
+}
+
 /// A stop in a background gradient.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GradientStop {

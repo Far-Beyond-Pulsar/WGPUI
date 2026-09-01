@@ -51,7 +51,7 @@ use crate::div::interactivity::style::{
 };
 pub use wgpui_core::color::LinearColorStop;
 use wgpui_core::color::{Background, ColorSpace, Hsla, Rgba};
-use wgpui_core::geometry::{AbsoluteLength, DefiniteLength, Pixels, Rems, px};
+use wgpui_core::geometry::{AbsoluteLength, DefiniteLength, Length, Pixels, Rems, px};
 use wgpui_layout::taffy_tree::{
     AlignContent, AlignItems, Dimension, Display, FlexDirection, FlexWrap, LayoutStyle,
     LengthPercentage, LengthPercentageAuto, Overflow, Position,
@@ -176,6 +176,15 @@ impl IntoStyleDimension for DefiniteLength {
 impl IntoStyleDimension for AbsoluteLength {
     fn into_style_dimension(self) -> Dimension {
         Dimension::length(self.into_style_pixels())
+    }
+}
+
+impl IntoStyleDimension for Length {
+    fn into_style_dimension(self) -> Dimension {
+        match self {
+            Length::Definite(value) => value.into_style_dimension(),
+            Length::Auto => Dimension::auto(),
+        }
     }
 }
 
@@ -1084,6 +1093,11 @@ pub trait Styled: Sized {
     /// Tailwind `rounded-sm`: 0.125rem.
     fn rounded_sm(self) -> Self {
         self.rounded(REM * 0.125)
+    }
+
+    /// Tailwind `rounded-xs`: 0.0625rem.
+    fn rounded_xs(self) -> Self {
+        self.rounded(REM * 0.0625)
     }
 
     /// Tailwind `rounded-md`: 0.375rem.

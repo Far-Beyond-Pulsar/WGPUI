@@ -333,8 +333,8 @@ impl StyledText {
     /// the `Arc` every frame from an equal `Vec` would defeat the pointer
     /// short-circuit the fingerprint depends on, and making that visible at the
     /// call site is better than accepting a `Vec` and silently paying for it.
-    pub fn with_highlights(mut self, highlights: Highlights) -> Self {
-        self.highlights = highlights;
+    pub fn with_highlights(mut self, highlights: impl Into<Highlights>) -> Self {
+        self.highlights = highlights.into();
         self
     }
 

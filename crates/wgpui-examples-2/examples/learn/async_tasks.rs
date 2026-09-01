@@ -92,12 +92,14 @@ impl BackgroundTaskDemo {
 
                 let partial_result = computation.await;
 
-                this.update(cx, |this, cx| {
-                    this.progress = i as u32 + 1;
-                    this.result = Some(partial_result);
-                    cx.notify();
-                })
-                .ok();
+                if let Ok(partial_result) = partial_result {
+                    this.update(cx, |this, cx| {
+                        this.progress = i as u32 + 1;
+                        this.result = Some(partial_result);
+                        cx.notify();
+                    })
+                    .ok();
+                }
             }
 
             this.update(cx, |this, cx| {
@@ -195,12 +197,20 @@ impl ReturnValueDemo {
                 })
                 .await;
 
-            this.update(cx, |this, cx| {
-                this.sum = Some(result);
-                this.is_calculating = false;
-                cx.notify();
-            })
-            .ok();
+            if let Ok(result) = result {
+                this.update(cx, |this, cx| {
+                    this.sum = Some(result);
+                    this.is_calculating = false;
+                    cx.notify();
+                })
+                .ok();
+            } else {
+                this.update(cx, |this, cx| {
+                    this.is_calculating = false;
+                    cx.notify();
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -476,7 +486,7 @@ fn button(
     id: impl Into<wgpui::ElementId>,
     label: &'static str,
     disabled: bool,
-) -> wgpui::Stateful<wgpui::Div> {
+) -> wgpui::Div {
     let disabled_bg = colors.surface_hover;
     let bg = colors.accent;
     let bg_hover = colors.accent_hover;
@@ -506,7 +516,7 @@ fn secondary_button(
     colors: &Colors,
     id: impl Into<wgpui::ElementId>,
     label: &'static str,
-) -> wgpui::Stateful<wgpui::Div> {
+) -> wgpui::Div {
     let bg = colors.surface_hover;
     let bg_hover = colors.border;
     let text = colors.text;

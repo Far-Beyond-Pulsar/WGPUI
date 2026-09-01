@@ -48,7 +48,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::time::Instant;
+use std::{path::PathBuf, time::Instant};
 use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::{Emission, EmitContext};
@@ -481,6 +481,12 @@ pub trait IntoImageInput: 'static {
 
 impl IntoImageInput for Resource {
     fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { (Some(self), None) }
+}
+
+impl IntoImageInput for PathBuf {
+    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) {
+        Resource::from(self).into_image_input()
+    }
 }
 
 impl<F> IntoImageInput for F
