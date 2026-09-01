@@ -2482,7 +2482,6 @@ impl LegacyImgBuilder {
         };
         let description = match state {
             AssetState::Ready(image_data) => {
-<<<<<<< HEAD
                 let source = wgpui_widgets::img::ImageSourceId::from_raw(crate::window::application::asset_source_id(&asset.key));
                 let image = match image {
                     Some(image) => image.with_decoded(source, image_data),
