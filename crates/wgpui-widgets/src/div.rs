@@ -76,7 +76,13 @@ where
     T: wgpui_core::element::IntoElement,
 {
     fn into_description(self) -> Description {
-        wgpui_core::element::IntoElement::into_description(self)
+        if wgpui_core::element::contextual_render_scope_active() {
+            Description::deferred_core_window(move |window, app| {
+                wgpui_core::element::IntoElement::into_description_in(self, window, app)
+            })
+        } else {
+            wgpui_core::element::IntoElement::into_description(self)
+        }
     }
 }
 

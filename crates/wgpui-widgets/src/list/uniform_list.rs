@@ -367,6 +367,32 @@ mod tests {
     use crate::div::div;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn processor_children_are_lowered_after_the_parent_update() {
+        let mut app = wgpui_core::app::App::create();
+        let entity = app.new_entity(0_usize);
+        let mut window = wgpui_core::window::Window::new();
+
+        let element = entity.update_in(&mut window, |_value, _window, context| {
+            let _scope = wgpui_core::element::enter_contextual_render_scope();
+            div().child(uniform_list(
+                "items",
+                1,
+                context.processor(|value, range, _window, _context| {
+                    *value += range.len();
+                    range.map(|index| div().id(index)).collect::<Vec<_>>()
+                }),
+            ))
+        });
+
+        let description = wgpui_core::element::IntoElement::into_description(element)
+            .resolve_deferred_core_window(&mut window, &mut app);
+
+        assert_eq!(*entity.read(&app), 1);
+        assert_eq!(description.node_count(), 4);
+    }
+
     #[test]
     fn uniform_list_lowers_only_realized_items_and_retains_scroll_metadata() {
         let handle = ScrollHandle::new();

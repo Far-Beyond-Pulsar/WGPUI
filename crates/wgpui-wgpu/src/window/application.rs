@@ -189,9 +189,15 @@ pub fn render_description<R: Render>(
     window: &mut Window,
     cx: &mut wgpui_core::app::Context<R>,
 ) -> Description {
-    let element = view.render(window, cx);
-    let app = cx.app().clone();
-    IntoElement::into_description_in(element, window.interaction_mut(), &app)
+    let element = {
+        let _scope = wgpui_core::element::enter_contextual_render_scope();
+        view.render(window, cx)
+    };
+    let mut app = cx.app().clone();
+    let description = IntoElement::into_description_in(element, window.interaction_mut(), &app);
+    let description = description.resolve_deferred(window, &mut app);
+    let description = description.resolve_deferred_core_window(window.interaction_mut(), &mut app);
+    description.resolve_deferred(window, &mut app)
 }
 
 impl AppWindowExt for App {
@@ -214,15 +220,21 @@ impl AppWindowExt for App {
                         let Some(window) = window.downcast_mut::<Window>() else {
                             return Description::new::<()>();
                         };
-                        entity.update((), |value, context| {
-                            let element = value.render(window, context);
-                            let app = app.clone();
-                            IntoElement::into_description_in(
-                                element,
-                                window.interaction_mut(),
-                                &app,
-                            )
-                        })
+                        let lower = entity.update((), |value, context| {
+                            let element = {
+                                let _scope =
+                                    wgpui_core::element::enter_contextual_render_scope();
+                                value.render(window, context)
+                            };
+                            Box::new(move |window: &mut Window, app: &mut App| {
+                                IntoElement::into_description_in(
+                                    element,
+                                    window.interaction_mut(),
+                                    app,
+                                )
+                            }) as Box<dyn FnOnce(&mut Window, &mut App) -> Description>
+                        });
+                        lower(window, app)
                     }),
                 }
             }),
@@ -1856,6 +1868,15 @@ impl Handler {
             });
         live.window.animation_clock = animation_clock;
         let description = description.resolve_deferred(&mut live.window, &mut live.app);
+        let description = description.resolve_deferred_core_window(
+            live.window.interaction_mut(),
+            &mut live.app,
+        );
+        let description = description.resolve_deferred(&mut live.window, &mut live.app);
+        let description = description.resolve_deferred_core_window(
+            live.window.interaction_mut(),
+            &mut live.app,
+        );
         let description = append_immediate_paints(
             description,
             std::mem::take(&mut live.window.immediate_paints),

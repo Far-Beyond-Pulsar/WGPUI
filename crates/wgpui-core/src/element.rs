@@ -7,7 +7,34 @@
 
 use crate::reconcile::description::{Description, ElementId};
 use crate::reconcile::state::{ElementStateStore, StateScope};
+use std::cell::Cell;
 use std::sync::Arc;
+
+thread_local! {
+    static CONTEXTUAL_RENDER_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+#[doc(hidden)]
+pub struct ContextualRenderScope;
+
+#[doc(hidden)]
+pub fn enter_contextual_render_scope() -> ContextualRenderScope {
+    CONTEXTUAL_RENDER_SCOPE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    ContextualRenderScope
+}
+
+#[doc(hidden)]
+pub fn contextual_render_scope_active() -> bool {
+    CONTEXTUAL_RENDER_SCOPE_DEPTH.with(|depth| depth.get() != 0)
+}
+
+impl Drop for ContextualRenderScope {
+    fn drop(&mut self) {
+        CONTEXTUAL_RENDER_SCOPE_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
 
 /// A value that can lower itself into the retained frontend description.
 pub trait Element: 'static {
