@@ -60,6 +60,17 @@ function Get-FrontMatterIssue {
     }
 }
 
+function Get-OriginRepository {
+    $remote = (& git config --get remote.origin.url 2>$null).Trim()
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($remote)) {
+        $match = [regex]::Match($remote, "github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$")
+        if ($match.Success) {
+            return $match.Groups[1].Value
+        }
+    }
+    return $null
+}
+
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     throw "The gh CLI is required."
 }
@@ -80,9 +91,9 @@ if ($duplicateTitles.Count -gt 0) {
 }
 
 if ([string]::IsNullOrWhiteSpace($Repo)) {
-    $Repo = (& gh repo view --json nameWithOwner --jq .nameWithOwner).Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($Repo)) {
-        throw "Could not determine the current GitHub repository. Pass -Repo OWNER/REPOSITORY."
+    $Repo = Get-OriginRepository
+    if ([string]::IsNullOrWhiteSpace($Repo)) {
+        throw "Could not determine the repository from remote.origin. Pass -Repo OWNER/REPOSITORY explicitly."
     }
 }
 
