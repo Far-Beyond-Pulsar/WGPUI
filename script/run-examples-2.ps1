@@ -94,8 +94,8 @@ function Get-DiagnosticDetails {
     $rustLines = @($allOutputLines | Where-Object { $_ -match "panic|panicked at|stack backtrace:|^\s+\d+:|^\s+at " })
     $nativeLines = @($NativeOutput -split "`r?`n" | Where-Object { $_ -match "Exception|FAULTING_IP|Access violation|\.ecxr|^\s*[0-9a-f`?]+\s+" })
     [ordered]@{
-        panic = @($allOutputLines | Where-Object { $_ -match "panicked at|panic!|thread '.*' panicked|RefCell already borrowed|Validation Error|wgpu error|Caused by:|required but not enabled" } | Select-Object -First 8)
-        errors = @($allOutputLines | Where-Object { $_ -match "RefCell already borrowed|Validation Error|wgpu error|Caused by:|required but not enabled" } | Select-Object -First 8)
+        panic = @($allOutputLines | Where-Object { $_ -match "panicked at|panic!|thread '.*' panicked|RefCell already borrowed|Validation Error|wgpu error|Caused by:|GBuffer BGL 1|Binding 2 entry is invalid|TEXTURE_BINDING_ARRAY|required but not enabled" } | Select-Object -First 10)
+        errors = @($allOutputLines | Where-Object { $_ -match "RefCell already borrowed|Validation Error|wgpu error|Caused by:|GBuffer BGL 1|Binding 2 entry is invalid|TEXTURE_BINDING_ARRAY|required but not enabled" } | Select-Object -First 10)
         rust_stack = @($rustLines | Where-Object { $_ -match "stack backtrace:|^\s+\d+:|^\s+at " } | Select-Object -First 24)
         native_exception = @($nativeLines | Select-Object -First 12)
     }
