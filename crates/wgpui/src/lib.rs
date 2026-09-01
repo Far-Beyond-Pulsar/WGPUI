@@ -139,6 +139,15 @@ impl Default for LayerPolicy {
     }
 }
 
+impl From<LayerPolicy> for BoundaryPolicy {
+    fn from(policy: LayerPolicy) -> Self {
+        Self {
+            buffering: Buffering::Margin(Some(policy.overdraw_margin)),
+            ..Self::default()
+        }
+    }
+}
+
 /// Process-wide render counters for diagnostics and examples.
 pub mod render_stats {
     use std::collections::BTreeMap;

@@ -99,6 +99,23 @@ impl ScrollHandle {
         true
     }
 
+    /// Set the retained offset using the legacy `scroll_to` spelling.
+    pub fn scroll_to(&self, offset: Point<Pixels>) -> bool {
+        self.set_offset(offset)
+    }
+
+    /// Whether both axes are at their origin.
+    pub fn is_at_top(&self) -> bool {
+        self.offset() == Point::default()
+    }
+
+    /// Whether both axes have reached their maximum scroll extent.
+    pub fn is_at_bottom(&self) -> bool {
+        let offset = self.offset();
+        let maximum = self.max_offset();
+        offset.x == -maximum.width && offset.y == -maximum.height
+    }
+
     pub fn scroll_by(&self, delta: Point<Pixels>) -> bool {
         let offset = self.offset();
         self.set_offset(point(offset.x + delta.x, offset.y + delta.y))
@@ -199,6 +216,11 @@ impl ScrollHandle {
         changed
     }
 
+    /// Update viewport and content bounds in one operation.
+    pub fn set_bounds(&self, viewport: Bounds<Pixels>, content_size: Size<Pixels>) -> bool {
+        self.set_viewport(viewport, content_size)
+    }
+
     pub fn set_content_size(&self, content_size: Size<Pixels>) -> bool {
         self.set_viewport(self.bounds(), content_size)
     }
@@ -232,6 +254,19 @@ mod tests {
         assert_eq!(handle.max_offset(), size(px(200.0), px(160.0)));
         assert!(handle.set_offset(point(px(-500.0), px(20.0))));
         assert_eq!(handle.offset(), point(px(-200.0), px(0.0)));
+    }
+
+    #[test]
+    fn bounds_and_scroll_aliases_preserve_clamping_and_edge_queries() {
+        let handle = ScrollHandle::new();
+        assert!(handle.set_bounds(
+            Bounds::new(point(px(0.0), px(0.0)), size(px(100.0), px(80.0))),
+            size(px(300.0), px(240.0)),
+        ));
+        assert!(handle.is_at_top());
+        assert!(handle.scroll_to(point(px(-500.0), px(-500.0))));
+        assert!(handle.is_at_bottom());
+        assert_eq!(handle.bounds().size, size(px(100.0), px(80.0)));
     }
     #[test]
     fn clones_share_state_and_noop_deltas_do_not_invalidate() {

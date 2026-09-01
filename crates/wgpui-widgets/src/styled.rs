@@ -673,10 +673,20 @@ pub trait Styled: Sized {
         self
     }
 
+    /// `width: 100%` using the long-form spelling used by the legacy API.
+    fn width_full(self) -> Self {
+        self.w_full()
+    }
+
     /// `height: 100%`.
     fn h_full(mut self) -> Self {
         self.layout_style().size.height = Dimension::percent(1.0);
         self
+    }
+
+    /// `height: 100%` using the long-form spelling used by the legacy API.
+    fn height_full(self) -> Self {
+        self.h_full()
     }
 
     /// Both dimensions at 100%.
@@ -1223,6 +1233,16 @@ pub trait Styled: Sized {
 
     fn cursor_pointer(mut self) -> Self {
         self.style().cursor = CursorStyle::Pointer;
+        self
+    }
+
+    fn cursor_arrow(mut self) -> Self {
+        self.style().cursor = CursorStyle::Arrow;
+        self
+    }
+
+    fn cursor_ibeam(mut self) -> Self {
+        self.style().cursor = CursorStyle::IBeam;
         self
     }
     fn cursor_grab(mut self) -> Self {
@@ -1917,6 +1937,14 @@ mod tests {
         assert_eq!(styled.0.layout.border.bottom, LengthPercentage::length(1.0));
         assert_eq!(styled.0.text_size, Some(20.0));
         assert_eq!(styled.0.text_color, Some([0.1, 0.2, 0.3, 1.0]));
+    }
+
+    #[test]
+    fn long_form_full_size_aliases_resolve_to_real_percent_dimensions() {
+        let styled = Styleable::default().width_full().height_full();
+
+        assert_eq!(styled.0.layout.size.width, Dimension::percent(1.0));
+        assert_eq!(styled.0.layout.size.height, Dimension::percent(1.0));
     }
 
     #[test]

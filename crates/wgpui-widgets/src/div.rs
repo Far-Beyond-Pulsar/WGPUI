@@ -465,9 +465,9 @@ impl Div {
         self
     }
 
-    pub fn layer_with_policy(mut self, policy: BoundaryPolicy) -> Self {
+    pub fn layer_with_policy(mut self, policy: impl Into<BoundaryPolicy>) -> Self {
         self.boundary = true;
-        self.boundary_policy = Some(policy);
+        self.boundary_policy = Some(policy.into());
         self
     }
 
