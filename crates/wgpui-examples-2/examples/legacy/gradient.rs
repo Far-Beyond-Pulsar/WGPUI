@@ -1,6 +1,7 @@
 use wgpui::{
-    App, Application, Bounds, ColorSpace, Context, Half, Render, Window, WindowOptions, canvas,
-    div, gradient_color_stop, linear_gradient, point, prelude::*, px, radial_gradient, size,
+    App, Application, ColorSpace, Context, PathBuilder, Render, Window, WindowOptions,
+    canvas, div, gradient_color_stop, linear_gradient, point, prelude::*, px, radial_gradient,
+    size,
 };
 
 struct GradientViewer {
@@ -43,7 +44,7 @@ impl Render for GradientViewer {
                                 .text_sm()
                                 .bg(wgpui::black())
                                 .text_color(wgpui::white())
-                                .child(format!("{}", color_space))
+                                .child(format!("{:?}", color_space))
                                 .active(|this| this.opacity(0.8))
                                 .on_click(wgpui::public_listener(cx, move |this, _, _, cx| {
                                     this.color_space = match this.color_space {
@@ -203,32 +204,27 @@ impl Render for GradientViewer {
                         .color_space(color_space)),
                     ),
             )
-            .child(div().h_16().child(canvas(
-                move |_, _, _| {},
-                move |bounds, _, window, _| {
-                    let size = size(bounds.size.width * 0.8, px(80.));
-                    let square_bounds = Bounds {
-                        origin: point(
-                            bounds.size.width.half() - size.width.half(),
-                            bounds.origin.y,
-                        ),
-                        size,
-                    };
-                    let height = square_bounds.size.height;
-                    let horizontal_offset = height;
-                    let vertical_offset = px(0.);
-                    let mut builder = wgpui::PathBuilder::fill();
-                    builder.move_to(square_bounds.bottom_left());
-                    builder
-                        .line_to(square_bounds.origin + point(horizontal_offset, vertical_offset));
-                    builder.line_to(
-                        square_bounds.top_right() + point(-horizontal_offset, vertical_offset),
-                    );
-
-                    builder.line_to(square_bounds.bottom_right());
-                    builder.line_to(square_bounds.bottom_left());
-                    let path = builder.build().unwrap();
-                    window.paint_path(
+            .child(div().h_16().child(canvas(move |context, emission| {
+                let bounds = context.bounds();
+                let width = bounds.width * 0.8;
+                let height = 80.0_f32.min(bounds.height.max(0.0));
+                let origin = point(
+                    px(bounds.x + (bounds.width - width) * 0.5),
+                    px(bounds.y + (bounds.height - height) * 0.5),
+                );
+                let path_size = size(px(width), px(height));
+                let bottom_left = origin + point(px(0.0), path_size.height);
+                let top_right = origin + point(path_size.width, px(0.0));
+                let bottom_right = origin + point(path_size.width, path_size.height);
+                let horizontal_offset = path_size.height;
+                let mut builder = PathBuilder::fill();
+                builder.move_to(bottom_left);
+                builder.line_to(origin + point(horizontal_offset, px(0.0)));
+                builder.line_to(top_right + point(-horizontal_offset, px(0.0)));
+                builder.line_to(bottom_right);
+                builder.line_to(bottom_left);
+                if let Ok(path) = builder.build() {
+                    emission.path(context.path(
                         path,
                         linear_gradient(
                             180.,
@@ -236,9 +232,9 @@ impl Render for GradientViewer {
                             gradient_color_stop(wgpui::blue(), 1.),
                         )
                         .color_space(color_space),
-                    );
-                },
-            )))
+                    ));
+                }
+            })))
             .child(
                 div()
                     .flex()

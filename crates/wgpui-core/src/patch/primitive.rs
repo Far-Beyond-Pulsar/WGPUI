@@ -188,7 +188,7 @@ impl std::fmt::Display for EncodeError {
                 "primitive encode destination is {} bytes, expected {}",
                 actual, expected
             ),
-            Self::InvalidMaterial => formatter.write_str("quad material is invalid"),
+            Self::InvalidMaterial => formatter.write_str("primitive material is invalid"),
         }
     }
 }
@@ -1062,11 +1062,13 @@ pub struct Path {
     pub bounds_origin: [f32; 2],
     /// Size of the axis-aligned bounds.
     pub bounds_size: [f32; 2],
+    /// Procedural material evaluated in the path's normalized bounds.
+    pub material: Material,
 }
 
 impl Path {
     /// Bytes one tessellated vertex occupies in the GPU arena.
-    pub const SLOT_STRIDE: usize = 48;
+    pub const SLOT_STRIDE: usize = 128;
     /// Byte offset of the position in the GPU vertex record.
     pub const POSITION_OFFSET: usize = 0;
     /// Byte offset of the curve coordinates in the GPU vertex record.
@@ -1077,6 +1079,12 @@ impl Path {
     pub const CLIP_ORIGIN_OFFSET: usize = 32;
     /// Byte offset of the content-mask size in the GPU vertex record.
     pub const CLIP_SIZE_OFFSET: usize = 40;
+    /// Byte offset of the path bounds origin in the GPU vertex record.
+    pub const BOUNDS_ORIGIN_OFFSET: usize = 48;
+    /// Byte offset of the path bounds size in the GPU vertex record.
+    pub const BOUNDS_SIZE_OFFSET: usize = 56;
+    /// Byte offset of the material in the GPU vertex record.
+    pub const MATERIAL_OFFSET: usize = 64;
 
     /// Build a path from a flat vertex stream.
     pub fn new(vertices: Vec<PathVertex>, color: [f32; 4]) -> Self {
@@ -1088,6 +1096,7 @@ impl Path {
             clip_size: bounds_size,
             bounds_origin,
             bounds_size,
+            material: Material::Solid,
         }
     }
 
@@ -1133,6 +1142,12 @@ impl Path {
         self.color = color;
         self
     }
+
+    /// Replace the material evaluated across the path's bounds.
+    pub fn with_material(mut self, material: Material) -> Self {
+        self.material = material;
+        self
+    }
 }
 
 impl Primitive for Path {
@@ -1144,6 +1159,9 @@ impl Primitive for Path {
     }
 
     fn encode(&self, destination: &mut [u8]) -> Result<(), EncodeError> {
+        if !self.material.is_valid() {
+            return Err(EncodeError::InvalidMaterial);
+        }
         let mut writer = SlotWriter::new(destination);
         for vertex in &self.vertices {
             writer.write_f32_array(vertex.position)?;
@@ -1151,6 +1169,9 @@ impl Primitive for Path {
             writer.write_f32_array(self.color)?;
             writer.write_f32_array(self.clip_origin)?;
             writer.write_f32_array(self.clip_size)?;
+            writer.write_f32_array(self.bounds_origin)?;
+            writer.write_f32_array(self.bounds_size)?;
+            self.material.encode(&mut writer)?;
         }
         writer.finish()
     }
@@ -1340,6 +1361,59 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn path_materials_encode_after_geometry_and_bounds() {
+        let material = Material::Linear {
+            direction: [0.0, 1.0],
+            colors: [[0.1, 0.2, 0.3, 1.0], [0.9, 0.8, 0.7, 1.0]],
+        };
+        let path = Path::new(
+            vec![PathVertex {
+                position: [10.0, 20.0],
+                st: [0.0, 1.0],
+            }],
+            [0.0; 4],
+        )
+        .with_material(material);
+        let mut bytes = vec![0u8; Path::SLOT_STRIDE];
+        path.encode(&mut bytes)
+            .expect("valid path material has a stable slot encoding");
+
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[Path::MATERIAL_OFFSET..Path::MATERIAL_OFFSET + 4]
+                    .try_into()
+                    .expect("material tag bytes")
+            ),
+            1
+        );
+        assert_eq!(
+            &bytes[Path::MATERIAL_OFFSET + 16..Path::MATERIAL_OFFSET + 32],
+            &[0.1f32, 0.2, 0.3, 1.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn path_rejects_invalid_materials_before_writing() {
+        let path = Path::new(
+            vec![PathVertex {
+                position: [0.0, 0.0],
+                st: [0.0, 1.0],
+            }],
+            [1.0; 4],
+        )
+        .with_material(Material::Linear {
+            direction: [0.0, 0.0],
+            colors: [[0.0; 4], [1.0; 4]],
+        });
+        let mut bytes = vec![0xAA; Path::SLOT_STRIDE];
+        assert_eq!(path.encode(&mut bytes), Err(EncodeError::InvalidMaterial));
+        assert!(bytes.iter().all(|byte| *byte == 0xAA));
     }
 
     #[test]
@@ -1675,12 +1749,15 @@ mod tests {
 
     #[test]
     fn path_and_backdrop_layouts_are_explicit_and_stable() {
-        assert_eq!(Path::SLOT_STRIDE, 48);
+        assert_eq!(Path::SLOT_STRIDE, 128);
         assert_eq!(Path::POSITION_OFFSET, 0);
         assert_eq!(Path::ST_OFFSET, 8);
         assert_eq!(Path::COLOR_OFFSET, 16);
         assert_eq!(Path::CLIP_ORIGIN_OFFSET, 32);
         assert_eq!(Path::CLIP_SIZE_OFFSET, 40);
+        assert_eq!(Path::BOUNDS_ORIGIN_OFFSET, 48);
+        assert_eq!(Path::BOUNDS_SIZE_OFFSET, 56);
+        assert_eq!(Path::MATERIAL_OFFSET, 64);
 
         assert_eq!(BackdropFilter::SLOT_STRIDE, 64);
         assert_eq!(BackdropFilter::ORIGIN_OFFSET, 0);

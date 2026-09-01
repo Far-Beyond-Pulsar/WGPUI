@@ -61,7 +61,7 @@
 //! not a renderer one. Recorded here because "poly_sprites exists" would
 //! otherwise read as "colour emoji work."
 
-use wgpui_core::patch::primitive::Primitive;
+use wgpui_core::patch::primitive::{Path, Primitive};
 
 /// Colour format every Phase 4 target uses.
 ///
@@ -443,6 +443,11 @@ impl PathPipeline {
             layout: &self.frame_layout,
             entries: &[buffer_entry(0, globals), buffer_entry(1, arena)],
         })
+    }
+
+    /// Bytes one tessellated vertex occupies in the path arena.
+    pub const fn arena_slot_stride() -> usize {
+        Path::SLOT_STRIDE
     }
 }
 
@@ -1270,6 +1275,23 @@ mod tests {
             "material_parameters",
         ] {
             assert!(shader.contains(field), "the shader dropped `{field}`");
+        }
+    }
+
+    #[test]
+    fn the_path_shader_agrees_with_the_protocol_about_a_materialized_slot() {
+        assert_eq!(PathPipeline::arena_slot_stride(), Path::SLOT_STRIDE);
+        let shader = super::super::shaders::PATHS_WGSL;
+        assert!(shader.contains("struct PathVertex"));
+        for field in [
+            "bounds_origin",
+            "bounds_size",
+            "material_kind",
+            "material_first",
+            "material_second",
+            "material_parameters",
+        ] {
+            assert!(shader.contains(field), "the path shader dropped `{field}`");
         }
     }
 
