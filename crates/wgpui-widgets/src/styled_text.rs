@@ -337,6 +337,51 @@ impl StyledText {
         runs
     }
 
+    fn font_runs_with_fallbacks(
+        &self,
+        shaper: &mut wgpui_text::shaping::TextShaper,
+        primary_font_id: wgpui_text::shaping::FontId,
+    ) -> Result<(Vec<FontRun>, Vec<usize>), ShapeError> {
+        let mut runs: Vec<FontRun> = Vec::new();
+        let mut unresolved = Vec::new();
+        for (index, character) in self.text.as_str().char_indices() {
+            let highlight = self
+                .highlights
+                .iter()
+                .find(|(range, _)| range.contains(&index))
+                .map(|(_, highlight)| *highlight);
+            let mut request = self.style.font.clone();
+            if let Some(highlight) = highlight {
+                if let Some(weight) = highlight.weight {
+                    request.weight = weight;
+                }
+                if let Some(style) = highlight.style {
+                    request.style = style;
+                }
+            }
+            let resolved_font_id = if character.is_control() {
+                Some(primary_font_id)
+            } else {
+                shaper.resolve_font_for_character(&request, character)?
+            };
+            let resolved_font_id = resolved_font_id.unwrap_or_else(|| {
+                unresolved.push(index);
+                primary_font_id
+            });
+            let run = self.font_run(character.len_utf8(), resolved_font_id, highlight);
+            if let Some(previous) = runs.last_mut()
+                && previous.font_id == run.font_id
+                && previous.weight == run.weight
+                && previous.style == run.style
+            {
+                previous.len += run.len;
+            } else {
+                runs.push(run);
+            }
+        }
+        Ok((runs, unresolved))
+    }
+
     fn font_run(
         &self,
         len: usize,
@@ -395,7 +440,21 @@ impl StyledText {
                 return;
             }
         };
-        let runs = self.font_runs(font_id);
+        let (runs, unresolved) = match self.font_runs_with_fallbacks(&mut engine.shaper(), font_id)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                report_shape_error(
+                    &self.text,
+                    &self.style,
+                    self.highlights.len(),
+                    "resolve_fallback_font",
+                    &error,
+                );
+                emit_shape_error_fallback(context, emission);
+                return;
+            }
+        };
         let placement = RunPlacement {
             origin: [context.bounds.x, context.bounds.y],
             color: self.style.color,
@@ -421,6 +480,28 @@ impl StyledText {
         // "painted under their layer's text" means on the primitive.
         self.emit_decorations(&line, placement.origin, emission);
         engine.convert_line(&line, placement, emission);
+        for index in unresolved {
+            let x = wgpui_text::line_layout::x_for_index(&line, index) + context.bounds.x;
+            emission.quad(Quad {
+                origin: [x, context.bounds.y],
+                size: [
+                    self.style.font_size.max(2.0) * 0.6,
+                    self.style.line_height.max(2.0),
+                ],
+                background: [1.0, 0.0, 0.0, 0.18],
+                border_color: [1.0, 0.0, 0.0, 1.0],
+                border_widths: [1.0; 4],
+                ..Quad::ZERO
+            });
+            eprintln!(
+                "target=wgpui_widgets::styled_text level=WARN event=unresolved_glyph byte_index={} character={:?}",
+                index,
+                self.text.as_str()[index..]
+                    .chars()
+                    .next()
+                    .unwrap_or(char::REPLACEMENT_CHARACTER)
+            );
+        }
     }
 
     /// Every [`Underline`] this text's highlight runs ask for.

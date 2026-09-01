@@ -14,7 +14,7 @@ doctest = false
 # dependency for the project — the legacy backend already shapes through it
 # (`src/platform/cross/text_system.rs`), pinned to the same version here so the
 # two agree about glyph ids, metrics, and fallback behaviour while both exist.
-cosmic-text = "0.18.2"
+cosmic-text = { version = "0.18.2", features = ["monospace_fallback"] }
 # Shaped runs become `GlyphRun`/`Glyph` patch payloads (§2), and glyph rasters
 # become atlas tile references the scene tracks for eviction (R-N §4.3). The
 # edge runs one way: `wgpui-core` names nothing here.

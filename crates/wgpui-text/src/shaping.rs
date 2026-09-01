@@ -251,6 +251,13 @@ impl Font {
         self.style = FontStyle::Italic;
         self
     }
+
+    /// Add fallback families in priority order for characters the primary
+    /// family does not cover.
+    pub fn with_fallbacks(mut self, fallbacks: impl Into<FontFallbacks>) -> Self {
+        self.fallbacks = Some(fallbacks.into());
+        self
+    }
 }
 
 /// One contiguous stretch of a line shaped with the same face and spacing.
@@ -476,6 +483,7 @@ pub struct TextShaper {
     loaded_fonts: Vec<LoadedFont>,
     font_ids_by_request: HashMap<Font, FontId>,
     font_ids_by_database_id: HashMap<(fontdb::ID, fontdb::Weight), FontId>,
+    character_fonts: HashMap<(Font, char), Option<FontId>>,
     cache: HashMap<ShapeCacheKey, CachedLine>,
     frame: u64,
     stats: ShaperStats,
@@ -525,6 +533,7 @@ impl TextShaper {
             loaded_fonts: Vec::new(),
             font_ids_by_request: HashMap::new(),
             font_ids_by_database_id: HashMap::new(),
+            character_fonts: HashMap::new(),
             cache: HashMap::new(),
             frame: 0,
             stats: ShaperStats::default(),
@@ -600,6 +609,73 @@ impl TextShaper {
         Ok(font_id)
     }
 
+    /// Resolve the first configured face that contains `character`.
+    ///
+    /// Font database fallback order is not a stable API: it can change with
+    /// installation order and platform font enumeration. The requested family
+    /// and its explicit fallback list are checked one at a time, followed by
+    /// the database enumeration as the final recovery path.
+    pub fn resolve_font_for_character(
+        &mut self,
+        request: &Font,
+        character: char,
+    ) -> Result<Option<FontId>, ShapeError> {
+        let cache_key = (request.clone(), character);
+        if let Some(font_id) = self.character_fonts.get(&cache_key) {
+            return Ok(*font_id);
+        }
+        let mut families = Vec::with_capacity(
+            1 + request
+                .fallbacks
+                .as_ref()
+                .map_or(0, |fallbacks| fallbacks.fallback_list().len()),
+        );
+        families.push(request.family.as_str().to_owned());
+        if let Some(fallbacks) = &request.fallbacks {
+            families.extend(fallbacks.fallback_list().iter().cloned());
+        }
+        let features = cosmic_text::FontFeatures::try_from(&request.features)?;
+
+        for family in families {
+            let family_name = [fontdb::Family::Name(family.as_str())];
+            let query = fontdb::Query {
+                families: &family_name,
+                weight: request.weight.into(),
+                stretch: fontdb::Stretch::Normal,
+                style: request.style.into(),
+            };
+            let Some(database_id) = self.font_system.db().query(&query) else {
+                continue;
+            };
+            let font_id = self.load_face(database_id, request.weight.into(), features.clone())?;
+            if self.font_has_character(font_id, character)? {
+                self.character_fonts.insert(cache_key, Some(font_id));
+                return Ok(Some(font_id));
+            }
+        }
+
+        let database_ids: Vec<_> = self.font_system.db().faces().map(|face| face.id).collect();
+        for database_id in database_ids {
+            let font_id = self.load_face(database_id, request.weight.into(), features.clone())?;
+            if self.font_has_character(font_id, character)? {
+                self.character_fonts.insert(cache_key, Some(font_id));
+                return Ok(Some(font_id));
+            }
+        }
+
+        self.character_fonts.insert(cache_key, None);
+        Ok(None)
+    }
+
+    fn font_has_character(&self, font_id: FontId, character: char) -> Result<bool, ShapeError> {
+        Ok(self
+            .loaded(font_id)?
+            .face
+            .unicode_codepoints()
+            .binary_search(&(character as u32))
+            .is_ok())
+    }
+
     /// The families a resolved face belongs to, for diagnostics and for the
     /// attribute list shaping builds.
     fn family_name(&self, database_id: fontdb::ID) -> Option<String> {
@@ -615,10 +691,7 @@ impl TextShaper {
         weight: fontdb::Weight,
         features: cosmic_text::FontFeatures,
     ) -> Result<FontId, ShapeError> {
-        if let Some(font_id) = self
-            .font_ids_by_database_id
-            .get(&(database_id, weight))
-        {
+        if let Some(font_id) = self.font_ids_by_database_id.get(&(database_id, weight)) {
             return Ok(*font_id);
         }
 
@@ -1083,9 +1156,7 @@ mod tests {
     #[test]
     fn different_requested_weights_do_not_alias_the_loaded_face() {
         let mut shaper = shaper();
-        let normal = shaper
-            .resolve_font(&font("Segoe UI"))
-            .expect("normal face");
+        let normal = shaper.resolve_font(&font("Segoe UI")).expect("normal face");
         let bold = shaper
             .resolve_font(&font("Segoe UI").bold())
             .expect("bold face");
@@ -1101,6 +1172,21 @@ mod tests {
         assert!(
             resolved.is_ok(),
             "a missing family must fall back to some face, as the legacy system does"
+        );
+    }
+
+    #[test]
+    fn configured_fallback_family_is_selected_before_database_fallback() {
+        let mut shaper = shaper();
+        let request =
+            font("A Font That Does Not Exist At All").with_fallbacks(vec!["Segoe UI".to_string()]);
+        let resolved = shaper
+            .resolve_font_for_character(&request, 'A')
+            .expect("fallback resolution must not fail")
+            .expect("Segoe UI must contain ASCII A");
+        assert_eq!(
+            shaper.family_name(shaper.loaded(resolved).expect("loaded fallback").face.id()),
+            Some("Segoe UI".to_string())
         );
     }
 
