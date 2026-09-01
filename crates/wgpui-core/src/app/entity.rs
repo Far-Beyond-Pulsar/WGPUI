@@ -78,18 +78,26 @@ impl<T> Entity<T> {
             app,
         )
     }
-    pub fn update<A, R>(&self, _access_context: A, access: impl FnOnce(&mut T, &mut Context<T>) -> R) -> R {
-        let result = {
+    pub fn update<A, R>(
+        &self,
+        _access_context: A,
+        access: impl FnOnce(&mut T, &mut Context<T>) -> R,
+    ) -> R {
+        let (result, notified) = {
             let mut value = self.value.borrow_mut();
             let mut context = Context::from_entity(self.clone());
-            access(
+            let result = access(
                 value
                     .as_mut()
                     .expect("an entity cannot be updated before its constructor completes"),
                 &mut context,
-            )
+            );
+            let notified = context.take_notified();
+            (result, notified)
         };
-        self.app.notify_entity(self.id);
+        if notified {
+            self.notify();
+        }
         result
     }
     pub fn update_in<R>(
@@ -97,18 +105,22 @@ impl<T> Entity<T> {
         window: &mut crate::window::Window,
         access: impl FnOnce(&mut T, &mut crate::window::Window, &mut Context<T>) -> R,
     ) -> R {
-        let result = {
+        let (result, notified) = {
             let mut value = self.value.borrow_mut();
             let mut context = Context::from_entity(self.clone());
-            access(
+            let result = access(
                 value
                     .as_mut()
                     .expect("an entity cannot be updated before its constructor completes"),
                 window,
                 &mut context,
-            )
+            );
+            let notified = context.take_notified();
+            (result, notified)
         };
-        self.app.notify_entity(self.id);
+        if notified {
+            self.notify();
+        }
         result
     }
     pub fn observe(&self, callback: impl Fn(EntityId) + 'static) -> Subscription {
@@ -177,6 +189,64 @@ impl<T> WeakEntity<T> {
             .map(|entity| entity.update_in(window, access))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn updates_notify_only_when_requested_and_coalesce_repeated_notify_calls() {
+        let app = App::create();
+        let entity = app.new_entity(0_u32);
+        let notification_count = Rc::new(Cell::new(0));
+        let notification_count_for_callback = notification_count.clone();
+        let _subscription = entity.observe(move |_| {
+            notification_count_for_callback.set(notification_count_for_callback.get() + 1);
+        });
+
+        entity.update((), |value, _context| *value += 1);
+        assert_eq!(notification_count.get(), 0);
+
+        entity.update((), |value, context| {
+            *value += 1;
+            context.notify();
+            context.notify();
+        });
+        assert_eq!(notification_count.get(), 1);
+
+        entity.update((), |value, _context| *value += 1);
+        assert_eq!(notification_count.get(), 1);
+        assert_eq!(*entity.read(&app), 3);
+    }
+
+    #[test]
+    fn update_in_has_the_same_notify_semantics() {
+        let app = App::create();
+        let entity = app.new_entity(0_u32);
+        let notification_count = Rc::new(Cell::new(0));
+        let notification_count_for_callback = notification_count.clone();
+        let _subscription = entity.observe(move |_| {
+            notification_count_for_callback.set(notification_count_for_callback.get() + 1);
+        });
+        let mut window = crate::window::Window::new();
+
+        entity.update_in(&mut window, |value, _window, _context| *value += 1);
+        assert_eq!(notification_count.get(), 0);
+
+        entity.update_in(&mut window, |value, _window, context| {
+            *value += 1;
+            context.notify();
+        });
+        assert_eq!(notification_count.get(), 1);
+
+        entity.update_in(&mut window, |value, _window, _context| *value += 1);
+        assert_eq!(notification_count.get(), 1);
+        assert_eq!(*entity.read(&app), 3);
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum EntityError {
     Dropped,

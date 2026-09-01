@@ -1,8 +1,29 @@
 use super::{App, Entity, EntityId, Subscription, Task};
-use crate::window::{BackgroundExecutor, FocusHandle, Window};
+use crate::boundary::Pixels;
 use crate::element::IntoElement;
-use std::ops::Range;
+use crate::geometry::Bounds;
+use crate::window::{BackgroundExecutor, FocusHandle, Window, WindowAppearance};
 use std::ops::Deref;
+use std::ops::Range;
+
+/// The backend hook used by [`Context`] to observe native window changes.
+///
+/// A backend returns an owned observer guard. The guard remains active until
+/// the [`Subscription`] returned by `Context` is dropped, and the backend is
+/// responsible for delivering callbacks from its native event stream.
+pub trait WindowObserverSource {
+    type Observer: 'static;
+
+    fn observe_bounds(
+        &mut self,
+        callback: Box<dyn FnMut(Bounds<Pixels>) + 'static>,
+    ) -> Self::Observer;
+
+    fn observe_appearance(
+        &mut self,
+        callback: Box<dyn FnMut(WindowAppearance) + 'static>,
+    ) -> Self::Observer;
+}
 
 pub struct Context<T> {
     entity: Entity<T>,
@@ -62,21 +83,33 @@ impl<T> Context<T> {
 
     /// Register a window-bounds observer with the active window backend.
     ///
-    /// Core does not own native window events, but it provides the same
-    /// subscription lifetime used by backend adapters.
-    pub fn observe_window_bounds<W, F>(&self, _window: &W, _callback: F) -> Subscription
+    /// The backend owns the event source; core owns the subscription lifetime.
+    pub fn observe_window_bounds<W, F>(&self, window: &mut W, callback: F) -> Subscription
     where
-        F: 'static,
+        W: WindowObserverSource,
+        F: FnMut(Bounds<Pixels>) + 'static,
     {
-        self.entity.observe(|_| {})
+        let observer = window.observe_bounds(Box::new(callback));
+        self.entity.observe(move |_| {
+            let _ = &observer;
+        })
     }
 
     /// Register a window-appearance observer with the active window backend.
-    pub fn observe_window_appearance<W, F>(&self, _window: &W, _callback: F) -> Subscription
+    /// The backend owns the event source; core owns the subscription lifetime.
+    pub fn observe_window_appearance<W, F>(&self, window: &mut W, callback: F) -> Subscription
     where
-        F: 'static,
+        W: WindowObserverSource,
+        F: FnMut(WindowAppearance) + 'static,
     {
-        self.entity.observe(|_| {})
+        let observer = window.observe_appearance(Box::new(callback));
+        self.entity.observe(move |_| {
+            let _ = &observer;
+        })
+    }
+
+    pub(crate) fn take_notified(&mut self) -> bool {
+        std::mem::take(&mut self.notified)
     }
 
     /// Create a focus handle for a control owned by this entity.
@@ -98,10 +131,7 @@ impl<T> Context<T> {
     }
 
     /// Bind a retained entity to a range-based list renderer.
-    pub fn processor<I, F>(
-        &self,
-        mut callback: F,
-    ) -> impl FnMut(Range<usize>) -> Vec<I> + 'static
+    pub fn processor<I, F>(&self, mut callback: F) -> impl FnMut(Range<usize>) -> Vec<I> + 'static
     where
         T: 'static,
         I: IntoElement + 'static,
@@ -218,8 +248,114 @@ mod tests {
         });
         subscription.detach();
 
-        entity.update((), |value, _| *value += 1);
+        entity.update((), |value, context| {
+            *value += 1;
+            context.notify();
+        });
         assert_eq!(notifications.get(), 1);
+    }
+
+    #[derive(Default)]
+    struct TestWindow {
+        bounds_observers: Vec<(
+            std::rc::Rc<std::cell::Cell<bool>>,
+            Box<dyn FnMut(crate::geometry::Bounds<crate::boundary::Pixels>)>,
+        )>,
+        appearance_observers: Vec<(
+            std::rc::Rc<std::cell::Cell<bool>>,
+            Box<dyn FnMut(crate::window::WindowAppearance)>,
+        )>,
+    }
+
+    struct TestObserver {
+        active: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl Drop for TestObserver {
+        fn drop(&mut self) {
+            self.active.set(false);
+        }
+    }
+
+    impl WindowObserverSource for TestWindow {
+        type Observer = TestObserver;
+
+        fn observe_bounds(
+            &mut self,
+            callback: Box<dyn FnMut(crate::geometry::Bounds<crate::boundary::Pixels>)>,
+        ) -> Self::Observer {
+            let active = std::rc::Rc::new(std::cell::Cell::new(true));
+            self.bounds_observers.push((active.clone(), callback));
+            TestObserver { active }
+        }
+
+        fn observe_appearance(
+            &mut self,
+            callback: Box<dyn FnMut(crate::window::WindowAppearance)>,
+        ) -> Self::Observer {
+            let active = std::rc::Rc::new(std::cell::Cell::new(true));
+            self.appearance_observers.push((active.clone(), callback));
+            TestObserver { active }
+        }
+    }
+
+    impl TestWindow {
+        fn emit_bounds(&mut self, bounds: crate::geometry::Bounds<crate::boundary::Pixels>) {
+            for (active, callback) in &mut self.bounds_observers {
+                if active.get() {
+                    callback(bounds);
+                }
+            }
+        }
+
+        fn emit_appearance(&mut self, appearance: crate::window::WindowAppearance) {
+            for (active, callback) in &mut self.appearance_observers {
+                if active.get() {
+                    callback(appearance);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn window_observers_forward_backend_events_and_stop_after_subscription_drop() {
+        let app = App::create();
+        let entity = app.new_entity(());
+        let context = Context::from_entity(entity);
+        let mut window = TestWindow::default();
+        let bounds = crate::geometry::Bounds::new(
+            crate::geometry::point(crate::boundary::Pixels(2.0), crate::boundary::Pixels(3.0)),
+            crate::geometry::size(crate::boundary::Pixels(40.0), crate::boundary::Pixels(50.0)),
+        );
+        let bounds_seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let bounds_seen_by_callback = bounds_seen.clone();
+        let bounds_subscription = context.observe_window_bounds(&mut window, move |value| {
+            bounds_seen_by_callback.borrow_mut().push(value);
+        });
+        let appearance_seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let appearance_seen_by_callback = appearance_seen.clone();
+        let appearance_subscription =
+            context.observe_window_appearance(&mut window, move |value| {
+                appearance_seen_by_callback.borrow_mut().push(value);
+            });
+
+        window.emit_bounds(bounds);
+        window.emit_appearance(crate::window::WindowAppearance::Dark);
+        assert_eq!(&*bounds_seen.borrow(), &[bounds]);
+        assert_eq!(
+            &*appearance_seen.borrow(),
+            &[crate::window::WindowAppearance::Dark]
+        );
+
+        drop(bounds_subscription);
+        drop(appearance_subscription);
+        window.emit_bounds(bounds);
+        window.emit_appearance(crate::window::WindowAppearance::Light);
+        assert_eq!(&*bounds_seen.borrow(), &[bounds]);
+        assert_eq!(
+            &*appearance_seen.borrow(),
+            &[crate::window::WindowAppearance::Dark]
+        );
     }
 
     #[test]
