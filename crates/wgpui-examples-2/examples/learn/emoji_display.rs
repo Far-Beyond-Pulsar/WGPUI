@@ -15,7 +15,7 @@ use wgpui::{
 struct EmojiDisplay;
 
 impl Render for EmojiDisplay {
-    fn render(&mut self) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .bg(rgb(0x111827))

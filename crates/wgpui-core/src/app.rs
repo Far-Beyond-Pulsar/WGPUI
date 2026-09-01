@@ -10,7 +10,8 @@ use std::sync::{
 };
 
 use crate::action::Action;
-use crate::element::{IntoElement, Render};
+#[cfg(test)]
+use crate::element::IntoElement;
 use crate::reconcile::description::Description;
 use crate::window::{KeyBinding, KeyDownEvent, Keymap, Menu, WindowOptions};
 use futures::channel::oneshot;
@@ -30,8 +31,6 @@ pub trait EntityFactory {
 
 type Observer = Rc<dyn Fn(EntityId)>;
 type ActionHandler = Rc<RefCell<dyn FnMut(&dyn Action, &mut App)>>;
-type WindowBuild = Box<dyn FnOnce(&mut crate::window::Window, &mut App) -> WindowRenderer>;
-type WindowRender = Box<dyn FnMut(&mut crate::window::Window, &mut App) -> Description>;
 type WindowClosedHandler = Rc<RefCell<dyn FnMut(&mut App, WindowId)>>;
 
 struct AppState {
@@ -49,6 +48,7 @@ struct AppState {
     next_window: u64,
     windows: HashSet<WindowId>,
     close_requested: bool,
+    hidden: bool,
     next_window_closed_handler: u64,
     window_closed_handlers: Vec<(u64, WindowClosedHandler)>,
 }
@@ -79,11 +79,11 @@ impl WindowList {
 pub struct WindowRequest {
     pub id: WindowId,
     pub options: WindowOptions,
-    pub build: WindowBuild,
+    pub build: Box<dyn FnOnce(&mut App, &mut dyn Any) -> WindowRenderer>,
 }
 
 pub struct WindowRenderer {
-    pub render: WindowRender,
+    pub render: Box<dyn FnMut(&mut App, &mut dyn Any) -> Description>,
 }
 
 /// The foreground application context. It owns entity identity and delivers
@@ -119,6 +119,7 @@ impl App {
                 next_window: 0,
                 windows: HashSet::new(),
                 close_requested: false,
+                hidden: false,
                 next_window_closed_handler: 0,
                 window_closed_handlers: Vec::new(),
             })),
@@ -160,6 +161,7 @@ impl App {
             app: self.clone(),
             entity,
             id,
+            detached: false,
         }
     }
 
@@ -174,6 +176,11 @@ impl App {
         for (_, callback) in callbacks {
             callback(entity);
         }
+    }
+
+    /// Notify observers of an entity from an application callback.
+    pub fn notify(&self, entity: EntityId) {
+        self.notify_entity(entity);
     }
 
     pub fn run_pending_tasks(&self) {
@@ -302,6 +309,21 @@ impl App {
         self.state.borrow().close_requested
     }
 
+    /// Hide the application's windows until [`Self::show`] is called.
+    pub fn hide(&mut self) {
+        self.state.borrow_mut().hidden = true;
+    }
+
+    /// Show the application's windows after a previous [`Self::hide`] call.
+    pub fn show(&mut self) {
+        self.state.borrow_mut().hidden = false;
+    }
+
+    /// Whether the application has requested that its windows be hidden.
+    pub fn is_hidden(&self) -> bool {
+        self.state.borrow().hidden
+    }
+
     pub fn windows(&self) -> WindowList {
         WindowList {
             count: self.state.borrow().windows.len(),
@@ -346,10 +368,16 @@ impl App {
         self.state.borrow_mut().windows.remove(&id);
     }
 
-    pub fn open_window<V: Render>(
+    /// Queue a window request for a renderer-owned application boundary.
+    ///
+    /// `Any` is intentional here: core records lifecycle and description
+    /// ownership without naming Winit or any concrete renderer window. The
+    /// renderer that owns the request supplies its concrete window when it
+    /// invokes these callbacks.
+    pub fn enqueue_window(
         &mut self,
         options: WindowOptions,
-        build_root_view: impl FnOnce(&mut crate::window::Window, &mut App) -> Entity<V> + 'static,
+        build: Box<dyn FnOnce(&mut App, &mut dyn Any) -> WindowRenderer>,
     ) -> Result<(), &'static str> {
         if self.quit_requested() {
             return Err("application is quitting");
@@ -361,18 +389,40 @@ impl App {
         self.state.borrow_mut().pending_windows.push(WindowRequest {
             id,
             options,
-            build: Box::new(move |window, app| {
+            build,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn open_window<V: crate::element::Render>(
+        &mut self,
+        options: WindowOptions,
+        build_root_view: impl FnOnce(&mut crate::window::Window, &mut App) -> Entity<V> + 'static,
+    ) -> Result<(), &'static str> {
+        self.enqueue_window(
+            options,
+            Box::new(move |app, window| {
+                let Some(window) = window.downcast_mut::<crate::window::Window>() else {
+                    return WindowRenderer {
+                        render: Box::new(|_, _| Description::new::<()>()),
+                    };
+                };
                 let entity = build_root_view(window, app);
                 WindowRenderer {
-                    render: Box::new(move |window, _app| {
-                        entity.update_in(window, |value, _window, _context| {
-                            value.render().into_description()
+                    render: Box::new(move |app, window| {
+                        let Some(window) = window.downcast_mut::<crate::window::Window>() else {
+                            return Description::new::<()>();
+                        };
+                        entity.update((), |value, context| {
+                            value
+                                .render(window, context)
+                                .into_description_in(window, app)
                         })
                     }),
                 }
             }),
-        });
-        Ok(())
+        )
     }
 
     pub fn reserve_window(&mut self) -> WindowId {
@@ -535,6 +585,14 @@ pub struct Subscription {
     app: App,
     entity: EntityId,
     id: u64,
+    detached: bool,
+}
+
+impl Subscription {
+    /// Keep this observer registered after the handle is dropped.
+    pub fn detach(mut self) {
+        self.detached = true;
+    }
 }
 
 pub struct WindowClosedSubscription {
@@ -574,7 +632,9 @@ impl<T> EntityFactory for Context<T> {
 }
 impl Drop for Subscription {
     fn drop(&mut self) {
-        if let Some(observers) = self.app.state.borrow_mut().observers.get_mut(&self.entity) {
+        if !self.detached
+            && let Some(observers) = self.app.state.borrow_mut().observers.get_mut(&self.entity)
+        {
             observers.retain(|(id, _)| *id != self.id);
         }
     }
@@ -583,6 +643,7 @@ impl Drop for Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::element::{IntoElement, Render};
     use crate::window::MenuItem;
     use std::cell::Cell;
     use std::future::pending;
@@ -605,7 +666,7 @@ mod tests {
             observed.set(observed.get() + 1);
         });
         for _ in 0..10_000 {
-            entity.update(|value, _context| *value += 1);
+            entity.update((), |value, _context| *value += 1);
         }
         assert_eq!(entity.entity_id(), identity);
         assert_eq!(*entity.read(&app), 10_000);
@@ -678,7 +739,7 @@ mod tests {
             Some(parent.entity_id())
         );
         assert_eq!(*child.read(&app), 7);
-        parent.update(|value, _| value.child.update(|child, _| *child += 1));
+        parent.update((), |value, _| value.child.update((), |child, _| *child += 1));
         assert_eq!(*child.read(&app), 8);
     }
 
@@ -803,7 +864,30 @@ mod tests {
     struct TestRoot;
 
     impl Render for TestRoot {
-        fn render(&mut self) -> impl IntoElement + 'static {
+        fn render(
+            &mut self,
+            _window: &mut crate::window::Window,
+            _context: &mut Context<Self>,
+        ) -> impl IntoElement + 'static {
+            Description::new::<Self>()
+        }
+    }
+
+    struct ContextTestRoot {
+        expected_entity: Option<EntityId>,
+        received_window: bool,
+        received_context: bool,
+    }
+
+    impl Render for ContextTestRoot {
+        fn render(
+            &mut self,
+            window: &mut crate::window::Window,
+            context: &mut Context<Self>,
+        ) -> impl IntoElement + 'static {
+            window.activate();
+            self.received_window = window.is_active();
+            self.received_context = self.expected_entity == Some(context.entity().entity_id());
             Description::new::<Self>()
         }
     }
@@ -821,6 +905,43 @@ mod tests {
             app.open_window(WindowOptions::default(), |_, app| app.new_entity(TestRoot)),
             Err("application is quitting")
         );
+    }
+
+    #[test]
+    fn window_entry_point_renders_with_live_window_and_context() {
+        let mut app = App::create();
+        let root = app.new_entity(ContextTestRoot {
+            expected_entity: None,
+            received_window: false,
+            received_context: false,
+        });
+        let entity_id = root.entity_id();
+        root.update((), |value, _| value.expected_entity = Some(entity_id));
+
+        app.open_window(WindowOptions::default(), {
+            let root = root.clone();
+            move |_, _| root
+        })
+        .expect("legacy window request should be accepted");
+
+        let mut requests = app.take_window_requests();
+        let request = requests.pop().expect("legacy request should be queued");
+        let mut build_window = crate::window::Window::new();
+        let mut renderer = (request.build)(
+            &mut app,
+            &mut build_window as &mut dyn std::any::Any,
+        );
+        let mut frame_window = crate::window::Window::new();
+        let description = (renderer.render)(
+            &mut app,
+            &mut frame_window as &mut dyn std::any::Any,
+        );
+
+        assert_eq!(description.type_id(), std::any::TypeId::of::<ContextTestRoot>());
+        let root = root.read(&app);
+        assert!(root.received_window);
+        assert!(root.received_context);
+        assert!(frame_window.is_active());
     }
 }
 

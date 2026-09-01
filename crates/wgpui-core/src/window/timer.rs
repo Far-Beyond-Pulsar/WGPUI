@@ -1,4 +1,38 @@
 use std::time::{Duration, Instant};
+use std::future::Future;
+
+/// A lightweight awaitable delay for foreground tasks.
+pub struct Timer;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct BackgroundExecutor;
+
+impl BackgroundExecutor {
+    pub fn timer(&self, duration: Duration) -> impl Future<Output = ()> {
+        Timer::after(duration)
+    }
+}
+
+impl Timer {
+    /// Complete after `duration` without blocking the foreground executor.
+    pub async fn after(duration: Duration) {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("wgpui-timer".to_string())
+            .spawn(move || {
+                std::thread::sleep(duration);
+                if sender.send(()).is_err() {
+                    return;
+                }
+            });
+        if spawned.is_err() {
+            return;
+        }
+        if receiver.await.is_err() {
+            return;
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TimerId(u64);
@@ -77,6 +111,7 @@ impl TimerScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     #[test]
     fn cancellation_prevents_a_due_timer_from_firing() {
         let now = Instant::now();
@@ -89,5 +124,10 @@ mod tests {
             vec![fired.id]
         );
         assert_eq!(timers.state(cancelled), Some(TimerState::Cancelled));
+    }
+
+    #[test]
+    fn awaitable_timer_completes_without_blocking_the_executor() {
+        futures::executor::block_on(Timer::after(Duration::from_millis(1)));
     }
 }

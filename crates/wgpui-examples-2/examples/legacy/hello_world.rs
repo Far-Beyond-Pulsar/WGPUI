@@ -8,7 +8,7 @@ struct HelloWorld {
 }
 
 impl Render for HelloWorld {
-    fn render(&mut self) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()

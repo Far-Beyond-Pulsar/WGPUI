@@ -7,6 +7,12 @@ pub use scroll_buffer::{ScrollAnchor, ScrollClip, ScrollbarState, TiledScrollSta
 pub use smooth_scroll::{ScrollPhysics, ScrollPhysicsMode};
 pub use crate::div::scroll_state::ScrollHandle;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScrollStrategy {
+    Top,
+    Bottom,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +78,21 @@ mod tests {
         assert!(result.propagate);
         assert_eq!(outer.scroll_wheel(&wheel(0.0, 25.0)), EventResult::HANDLED);
         assert_eq!(outer.offset().y, Pixels(-25.0));
+    }
+
+    #[test]
+    fn scroll_to_item_uses_the_realized_uniform_row_extent() {
+        let handle = ScrollHandle::new();
+        handle.set_viewport(
+            Bounds::default(),
+            size(Pixels(100.0), Pixels(2_000.0)),
+        );
+        handle.set_item_height(Pixels(20.0));
+
+        assert!(handle.scroll_to_item(40, ScrollStrategy::Top));
+        assert_eq!(handle.offset().y, Pixels(-800.0));
+        assert!(handle.scroll_to_item(0, ScrollStrategy::Top));
+        assert_eq!(handle.offset().y, Pixels::ZERO);
     }
 
     #[test]

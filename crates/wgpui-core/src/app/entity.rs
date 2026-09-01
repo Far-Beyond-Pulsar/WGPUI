@@ -78,7 +78,7 @@ impl<T> Entity<T> {
             &self.app,
         )
     }
-    pub fn update<R>(&self, access: impl FnOnce(&mut T, &mut Context<T>) -> R) -> R {
+    pub fn update<A, R>(&self, _access_context: A, access: impl FnOnce(&mut T, &mut Context<T>) -> R) -> R {
         let result = {
             let mut value = self.value.borrow_mut();
             let mut context = Context::from_entity(self.clone());
@@ -142,13 +142,14 @@ impl<T> WeakEntity<T> {
             app: self.app.clone(),
         })
     }
-    pub fn update<R>(
+    pub fn update<A, R>(
         &self,
+        _access_context: A,
         access: impl FnOnce(&mut T, &mut Context<T>) -> R,
     ) -> Result<R, EntityError> {
         self.upgrade()
             .ok_or(EntityError::Dropped)
-            .map(|entity| entity.update(access))
+            .map(|entity| entity.update((), access))
     }
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

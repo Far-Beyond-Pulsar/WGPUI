@@ -433,6 +433,12 @@ impl From<u64> for ElementId {
     }
 }
 
+impl From<usize> for ElementId {
+    fn from(value: usize) -> Self {
+        ElementId::Integer(value as u64)
+    }
+}
+
 impl From<(&str, usize)> for ElementId {
     fn from((name, index): (&str, usize)) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -467,6 +473,10 @@ pub struct Description {
     pub(crate) scroll_axes: [bool; 2],
     pub(crate) automatic_scroll: bool,
     pub(crate) emitter: Option<Box<dyn Emit>>,
+    pub(crate) deferred:
+        Option<Box<dyn FnOnce(&mut dyn std::any::Any, &mut App) -> Description>>,
+    pub(crate) deferred_core_window:
+        Option<Box<dyn FnOnce(&mut Window, &mut App) -> Description>>,
     pub(crate) layout_style: LayoutStyle,
     pub(crate) children: Vec<Description>,
     pub(crate) clip_children: bool,
@@ -523,6 +533,8 @@ impl Description {
             scroll_axes: [false, false],
             automatic_scroll: false,
             emitter: None,
+            deferred: None,
+            deferred_core_window: None,
             layout_style: LayoutStyle::default(),
             children: Vec::new(),
             clip_children: false,
@@ -536,6 +548,65 @@ impl Description {
             external_surface: None,
             active_animation: false,
         }
+    }
+
+    /// Create a description whose contents are materialized by the concrete
+    /// renderer boundary. Core stores the callback without knowing which
+    /// window implementation will consume it.
+    pub fn deferred(
+        render: impl FnOnce(&mut dyn std::any::Any, &mut App) -> Description + 'static,
+    ) -> Self {
+        let mut description = Self::new::<()>();
+        description.deferred = Some(Box::new(render));
+        description
+    }
+
+    /// Create a description whose contents are materialized with the
+    /// backend-neutral core window at the renderer boundary.
+    pub fn deferred_core_window(
+        render: impl FnOnce(&mut Window, &mut App) -> Description + 'static,
+    ) -> Self {
+        let mut description = Self::new::<()>();
+        description.deferred_core_window = Some(Box::new(render));
+        description
+    }
+
+    /// Resolve deferred nodes recursively at the concrete renderer boundary.
+    pub fn resolve_deferred(
+        mut self,
+        window: &mut dyn std::any::Any,
+        app: &mut App,
+    ) -> Description {
+        if let Some(render) = self.deferred.take() {
+            return render(window, app).resolve_deferred(window, app);
+        }
+        self.children = self
+            .children
+            .drain(..)
+            .map(|child| child.resolve_deferred(window, app))
+            .collect();
+        self
+    }
+
+    /// Resolve children that require the backend-neutral interaction window.
+    ///
+    /// This is a separate pass because a concrete renderer may need to pass
+    /// the same native window to both its own deferred callbacks and this
+    /// core callback without exposing that renderer type to `wgpui-core`.
+    pub fn resolve_deferred_core_window(
+        mut self,
+        window: &mut Window,
+        app: &mut App,
+    ) -> Description {
+        if let Some(render) = self.deferred_core_window.take() {
+            return render(window, app).resolve_deferred_core_window(window, app);
+        }
+        self.children = self
+            .children
+            .drain(..)
+            .map(|child| child.resolve_deferred_core_window(window, app))
+            .collect();
+        self
     }
 
     /// Give this element an explicit identity, so it keeps its instance across
@@ -908,6 +979,24 @@ mod tests {
         assert_eq!(ids[0], Some(&ElementId::Name(Arc::from("first"))));
         assert_eq!(ids[1], Some(&ElementId::Name(Arc::from("second"))));
         assert_eq!(description.node_count(), 3);
+    }
+
+    #[test]
+    fn deferred_description_resolves_at_the_renderer_boundary() {
+        let description = Description::deferred(|window, _app| {
+            let Some(value) = window.downcast_mut::<u32>() else {
+                return Description::new::<()>();
+            };
+            *value += 1;
+            Description::new::<Panel>()
+        });
+        let mut window = 41u32;
+        let mut app = App::create();
+
+        let resolved = description.resolve_deferred(&mut window, &mut app);
+
+        assert_eq!(window, 42);
+        assert_eq!(resolved.type_id(), TypeId::of::<Panel>());
     }
 
     #[test]

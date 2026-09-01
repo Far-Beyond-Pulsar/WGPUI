@@ -35,7 +35,7 @@ pub use inspector::{
 pub use keymap::{KeyBinding, KeyParseError, Keymap, Keystroke};
 pub use menu::{Menu, MenuItem};
 pub use scroll::ScrollRootHandle;
-pub use timer::{TimerHandle, TimerId, TimerState};
+pub use timer::{BackgroundExecutor, Timer, TimerHandle, TimerId, TimerState};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TitlebarOptions {
@@ -130,6 +130,7 @@ pub struct Window {
     timers: WindowTimers,
     close: CloseState,
     interaction_revision: u64,
+    refresh_requested: bool,
 }
 impl Default for Window {
     fn default() -> Self {
@@ -156,6 +157,7 @@ impl Window {
             timers: WindowTimers::default(),
             close: CloseState::default(),
             interaction_revision: 0,
+            refresh_requested: false,
         }
     }
     pub fn next_frame(&mut self) {
@@ -255,6 +257,23 @@ impl Window {
     }
     pub fn interaction_revision(&self) -> u64 {
         self.interaction_revision
+    }
+
+    /// Request a complete rebuild and repaint of this window.
+    pub fn refresh(&mut self) {
+        tracing::warn!(
+            "WGPUI is repainting the full window; prefer targeted entity or layer invalidation"
+        );
+        self.refresh_requested = true;
+        self.interaction_revision = self.interaction_revision.wrapping_add(1);
+    }
+
+    pub fn refresh_requested(&self) -> bool {
+        self.refresh_requested
+    }
+
+    pub fn take_refresh_request(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_requested)
     }
     pub fn hit_test(&mut self) -> &mut HitTestIndex {
         &mut self.hit_test
@@ -494,6 +513,18 @@ mod tests {
     use crate::geometry::{Rect, point, px, size};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn refresh_marks_the_window_for_a_full_rebuild() {
+        let mut window = Window::new();
+        assert!(!window.refresh_requested());
+
+        window.refresh();
+
+        assert!(window.refresh_requested());
+        assert!(window.take_refresh_request());
+        assert!(!window.refresh_requested());
+    }
 
     #[test]
     fn window_creation_bounds_resize_activation_and_close_are_stateful() {

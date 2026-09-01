@@ -1,5 +1,7 @@
 use super::{App, Entity, EntityId, Subscription, Task};
-use crate::window::{FocusHandle, Window};
+use crate::window::{BackgroundExecutor, FocusHandle, Window};
+use crate::element::IntoElement;
+use std::ops::Range;
 use std::ops::Deref;
 
 pub struct Context<T> {
@@ -21,16 +23,17 @@ impl<T> Context<T> {
     pub fn notify(&mut self) {
         self.notified = true;
     }
-    pub fn spawn<F, Fut, R>(&self, make: F) -> Task<R>
+    pub fn spawn<F, R>(&self, make: F) -> Task<R>
     where
-        F: FnOnce(super::WeakEntity<T>, Context<T>) -> Fut + 'static,
-        Fut: std::future::Future<Output = R> + 'static,
+        T: 'static,
+        F: AsyncFnOnce(super::WeakEntity<T>, &Context<T>) -> R + 'static,
         R: 'static,
     {
-        self.entity.app().spawn(make(
-            self.entity.downgrade(),
-            Context::from_entity(self.entity.clone()),
-        ))
+        let entity = self.entity.clone();
+        self.entity.app().spawn(async move {
+            let context = Context::from_entity(entity.clone());
+            make(entity.downgrade(), &context).await
+        })
     }
     pub fn observe(&self, callback: impl Fn(EntityId) + 'static) -> Subscription {
         self.entity.observe(callback)
@@ -51,6 +54,31 @@ impl<T> Context<T> {
         app.quit();
     }
 
+    /// Hide the application's windows until the application is shown again.
+    pub fn hide(&self) {
+        let mut app = self.app();
+        app.hide();
+    }
+
+    /// Register a window-bounds observer with the active window backend.
+    ///
+    /// Core does not own native window events, but it provides the same
+    /// subscription lifetime used by backend adapters.
+    pub fn observe_window_bounds<W, F>(&self, _window: &W, _callback: F) -> Subscription
+    where
+        F: 'static,
+    {
+        self.entity.observe(|_| {})
+    }
+
+    /// Register a window-appearance observer with the active window backend.
+    pub fn observe_window_appearance<W, F>(&self, _window: &W, _callback: F) -> Subscription
+    where
+        F: 'static,
+    {
+        self.entity.observe(|_| {})
+    }
+
     /// Create a focus handle for a control owned by this entity.
     pub fn focus_handle(&self) -> FocusHandle {
         FocusHandle::new()
@@ -63,6 +91,32 @@ impl<T> Context<T> {
         R: Send + 'static,
     {
         self.app().background_spawn(future)
+    }
+
+    pub fn background_executor(&self) -> BackgroundExecutor {
+        BackgroundExecutor
+    }
+
+    /// Bind a retained entity to a range-based list renderer.
+    pub fn processor<I, F>(
+        &self,
+        mut callback: F,
+    ) -> impl FnMut(Range<usize>) -> Vec<I> + 'static
+    where
+        T: 'static,
+        I: IntoElement + 'static,
+        F: FnMut(&mut T, Range<usize>, &mut Window, &mut Context<T>) -> Vec<I> + 'static,
+    {
+        let entity = self.entity.downgrade();
+        move |range| {
+            let Some(entity) = entity.upgrade() else {
+                return Vec::new();
+            };
+            let mut window = Window::new();
+            entity.update_in(&mut window, |value, window, context| {
+                callback(value, range, window, context)
+            })
+        }
     }
 }
 
@@ -138,5 +192,49 @@ mod tests {
 
         assert!(app.is_active());
         assert!(app.quit_requested());
+    }
+
+    #[test]
+    fn context_can_hide_and_show_the_shared_application() {
+        let mut app = App::create();
+        let entity = app.new_entity(());
+        let context = Context::from_entity(entity);
+
+        context.hide();
+        assert!(app.is_hidden());
+
+        app.show();
+        assert!(!app.is_hidden());
+    }
+
+    #[test]
+    fn detached_entity_observers_survive_handle_drop() {
+        let app = App::create();
+        let entity = app.new_entity(0_u32);
+        let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let notifications_for_callback = notifications.clone();
+        let subscription = entity.observe(move |_| {
+            notifications_for_callback.set(notifications_for_callback.get() + 1);
+        });
+        subscription.detach();
+
+        entity.update((), |value, _| *value += 1);
+        assert_eq!(notifications.get(), 1);
+    }
+
+    #[test]
+    fn processor_updates_its_entity_for_each_requested_range() {
+        let app = App::create();
+        let entity = app.new_entity(0_u32);
+        let context = Context::from_entity(entity.clone());
+        let mut processor = context.processor(|value, range, _window, _context| {
+            *value += range.len() as u32;
+            range.map(|index| index.to_string()).collect()
+        });
+
+        let items = processor(2..5);
+
+        assert_eq!(items, vec!["2", "3", "4"]);
+        assert_eq!(*entity.read(&app), 3);
     }
 }

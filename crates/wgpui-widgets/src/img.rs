@@ -45,6 +45,8 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Instant;
 use wgpui_core::element::Element;
@@ -56,7 +58,9 @@ use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_core::scene::atlas::{ImageRasterKey, ImageTileSource};
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 
+use crate::assets::Resource;
 use crate::image_cache::ImageCache;
+use crate::styled::IntoStylePixels;
 
 /// Identity of the thing an image is loaded from — a path, a URI, an asset
 /// handle, an in-memory buffer's registration.
@@ -244,6 +248,8 @@ pub struct ImgKey {
     pub requested_size: [f32; 2],
     /// How that box is drawn.
     pub style: ImageStyle,
+    pub size_full: bool,
+    pub max_width_full: bool,
 }
 
 impl ReconcileKey for ImgKey {
@@ -252,7 +258,10 @@ impl ReconcileKey for ImgKey {
             return Invalidation::all();
         };
         let mut axes = Invalidation::empty();
-        if previous.requested_size != self.requested_size {
+        if previous.requested_size != self.requested_size
+            || previous.size_full != self.size_full
+            || previous.max_width_full != self.max_width_full
+        {
             // Moves the Taffy leaf and repaints, exactly like a resized
             // `WgpuSurface`.
             axes |= Invalidation::LAYOUT;
@@ -375,6 +384,33 @@ struct TilePlacementOfFrame {
 /// looking at the same ones.
 pub type SharedImageEngine = Rc<RefCell<ImageEngine>>;
 
+struct PendingImageTiles;
+
+impl ImageTileSource for PendingImageTiles {
+    fn tile_for(
+        &mut self,
+        _key: ImageRasterKey,
+        _decode: &mut dyn FnMut(
+            ImageRasterKey,
+        ) -> Option<wgpui_core::scene::atlas::RasterizedImage>,
+    ) -> Option<wgpui_core::scene::atlas::ImageTile> {
+        None
+    }
+}
+
+pub(crate) fn resource_source_id(resource: &Resource) -> ImageSourceId {
+    let mut hasher = DefaultHasher::new();
+    resource.hash(&mut hasher);
+    ImageSourceId::from_raw(hasher.finish().max(1))
+}
+
+pub(crate) fn pending_engine(cache: ImageCache) -> SharedImageEngine {
+    Rc::new(RefCell::new(ImageEngine::new(
+        cache,
+        Box::new(PendingImageTiles),
+    )))
+}
+
 /// An image element's description shape.
 ///
 /// Like [`crate::wgpu_surface::WgpuSurface`], this is the shape an image
@@ -390,6 +426,7 @@ pub type SharedImageEngine = Rc<RefCell<ImageEngine>>;
 /// key is what reconciliation compares every frame.
 #[derive(Clone)]
 pub struct Img {
+    element_id: Option<wgpui_core::reconcile::description::ElementId>,
     source: ImageSourceId,
     frame_index: u32,
     load_state: ImageLoadState,
@@ -398,6 +435,8 @@ pub struct Img {
     engine: SharedImageEngine,
     started: Instant,
     automatic_frame: bool,
+    size_full: bool,
+    max_width_full: bool,
 }
 
 impl std::fmt::Debug for Img {
@@ -424,15 +463,86 @@ impl PartialEq for Img {
     }
 }
 
-/// An image showing `source`, at its first frame, ready, unsized, unstyled.
-pub fn img(source: ImageSourceId, engine: SharedImageEngine) -> Img {
+/// Construct the authoritative source-ID/engine image.
+pub fn img_with_engine(source: ImageSourceId, engine: SharedImageEngine) -> Img {
     Img::new(source, engine)
+}
+
+/// An additive resource-backed image builder.
+pub struct ImgBuilder {
+    image: Img,
+}
+
+/// Construct an image from a resource using the retained image representation.
+pub fn img(source: impl Into<Resource>) -> ImgBuilder {
+    ImgBuilder {
+        image: Img::from_resource(source.into()),
+    }
+}
+
+impl ImgBuilder {
+    pub fn size(mut self, size: impl IntoStylePixels) -> Self {
+        let size = size.into_style_pixels();
+        self.image = self.image.size(size, size);
+        self
+    }
+
+    pub fn size_8(self) -> Self {
+        self.size(32.0)
+    }
+
+    pub fn size_12(self) -> Self {
+        self.size(48.0)
+    }
+
+    pub fn size_16(self) -> Self {
+        self.size(64.0)
+    }
+
+    pub fn size_full(mut self) -> Self {
+        self.image = self.image.size_full();
+        self
+    }
+
+    pub fn h(mut self, height: impl IntoStylePixels) -> Self {
+        self.image = self.image.h(height);
+        self
+    }
+
+    pub fn w(mut self, width: impl IntoStylePixels) -> Self {
+        self.image = self.image.w(width);
+        self
+    }
+
+    pub fn max_w_full(mut self) -> Self {
+        self.image = self.image.max_w_full();
+        self
+    }
+
+    pub fn object_fit(mut self, object_fit: ObjectFit) -> Self {
+        let mut style = self.image.diff_key().style;
+        style.object_fit = object_fit;
+        self.image = self.image.style(style);
+        self
+    }
+
+    pub fn id(mut self, id: impl Into<wgpui_core::reconcile::description::ElementId>) -> Self {
+        self.image = self.image.id(id);
+        self
+    }
+}
+
+impl Element for ImgBuilder {
+    fn into_description(self) -> Description {
+        self.image.into_description()
+    }
 }
 
 impl Img {
     /// An image showing `source`, at its first frame, ready, unsized, unstyled.
     pub fn new(source: ImageSourceId, engine: SharedImageEngine) -> Self {
         Self {
+            element_id: None,
             source,
             frame_index: 0,
             load_state: ImageLoadState::Ready,
@@ -446,6 +556,8 @@ impl Img {
             engine,
             started: Instant::now(),
             automatic_frame: true,
+            size_full: false,
+            max_width_full: false,
         }
     }
 
@@ -507,12 +619,89 @@ impl Img {
     /// handled, by `patch::emit`'s own "did this element move" rule.
     pub fn size(mut self, width: f32, height: f32) -> Self {
         self.requested_size = [width, height];
+        self.size_full = false;
+        self
+    }
+
+    pub fn id(
+        mut self,
+        element_id: impl Into<wgpui_core::reconcile::description::ElementId>,
+    ) -> Self {
+        self.element_id = Some(element_id.into());
+        self
+    }
+
+    pub fn from_resource(resource: Resource) -> Self {
+        let source = resource_source_id(&resource);
+        let mut cache = ImageCache::new();
+        let bytes = match &resource {
+            Resource::Path(path) => std::fs::read(path),
+            Resource::Embedded(path) => std::fs::read(path),
+            Resource::Uri(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "URI image loading requires an application-owned loader",
+            )),
+        };
+        let load_state = match bytes {
+            Ok(bytes) if cache.insert_at(source, &bytes).is_ok() => ImageLoadState::Ready,
+            _ => ImageLoadState::Loading,
+        };
+        Self::new(
+            source,
+            pending_engine(cache),
+        )
+        .load_state(load_state)
+    }
+
+    /// Request a fixed square size using the standard spacing scale.
+    pub fn size_8(self) -> Self {
+        self.size(32.0, 32.0)
+    }
+
+    /// Request a fixed square size using the standard spacing scale.
+    pub fn size_12(self) -> Self {
+        self.size(48.0, 48.0)
+    }
+
+    /// Request a fixed square size using the standard spacing scale.
+    pub fn size_16(self) -> Self {
+        self.size(64.0, 64.0)
+    }
+
+    /// Let the image fill its parent in both axes.
+    pub fn size_full(mut self) -> Self {
+        self.size_full = true;
+        self
+    }
+
+    /// Set the height and derive the width from the decoded image ratio.
+    pub fn h(mut self, height: impl IntoStylePixels) -> Self {
+        self.requested_size = [0.0, height.into_style_pixels()];
+        self.size_full = false;
+        self
+    }
+
+    /// Set the width and derive the height from the decoded image ratio.
+    pub fn w(mut self, width: impl IntoStylePixels) -> Self {
+        self.requested_size = [width.into_style_pixels(), 0.0];
+        self.size_full = false;
+        self
+    }
+
+    /// Limit the image's width to its containing block.
+    pub fn max_w_full(mut self) -> Self {
+        self.max_width_full = true;
         self
     }
 
     /// Set how the image is drawn.
     pub fn style(mut self, style: ImageStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    pub fn tint(self, color: [f32; 4]) -> Self {
+        self.engine.borrow_mut().cache().tint(self.source, color);
         self
     }
 
@@ -524,6 +713,8 @@ impl Img {
             load_state: self.load_state,
             requested_size: self.requested_size,
             style: self.style,
+            size_full: self.size_full,
+            max_width_full: self.max_width_full,
         }
     }
 
@@ -549,8 +740,20 @@ impl Img {
     /// docs/phase-6.2-results.md on why this is *not* the same as discharging
     /// §6.2's `estimated_size` half.
     pub fn layout_size(&self) -> [f32; 2] {
+        if self.size_full {
+            return [0.0, 0.0];
+        }
         if self.requested_size != [0.0, 0.0] {
-            return self.requested_size;
+            let natural = self.natural_size();
+            return match (self.requested_size, natural) {
+                ([0.0, height], Some([width, natural_height])) if natural_height > 0 => {
+                    [height * width as f32 / natural_height as f32, height]
+                }
+                ([width, 0.0], Some([natural_width, height])) if natural_width > 0 => {
+                    [width, width * height as f32 / natural_width as f32]
+                }
+                (requested, _) => requested,
+            };
         }
         match self.natural_size() {
             Some([width, height]) => [width as f32, height as f32],
@@ -574,19 +777,34 @@ impl Img {
                 .cache
                 .get(image.source)
                 .is_some_and(|source| source.is_animated());
+        let mut layout_style = LayoutStyle {
+            size: LayoutSize {
+                width: Dimension::length(width),
+                height: Dimension::length(height),
+            },
+            flex_shrink: 0.0,
+            ..LayoutStyle::default()
+        };
+        if image.size_full {
+            layout_style.size = LayoutSize {
+                width: Dimension::percent(1.0),
+                height: Dimension::percent(1.0),
+            };
+        }
+        if image.max_width_full {
+            layout_style.max_size.width = Dimension::percent(1.0);
+        }
         let description = Description::new::<Img>()
             .diff_key(image.diff_key())
-            .style(LayoutStyle {
-                size: LayoutSize {
-                    width: Dimension::length(width),
-                    height: Dimension::length(height),
-                },
-                flex_shrink: 0.0,
-                ..LayoutStyle::default()
-            })
+            .style(layout_style)
             .emit(move |context: &EmitContext, emission: &mut Emission| {
                 image.emit_into(context, emission);
             });
+        let description = if let Some(element_id) = self.element_id.clone() {
+            description.id(element_id)
+        } else {
+            description
+        };
         if is_active_animation {
             description.active_animation()
         } else {
@@ -595,6 +813,15 @@ impl Img {
     }
 
     pub fn emit_into(&self, context: &EmitContext, emission: &mut Emission) {
+        self.emit_into_with_transform(context, emission, crate::animation::Transformation::default());
+    }
+
+    pub(crate) fn emit_into_with_transform(
+        &self,
+        context: &EmitContext,
+        emission: &mut Emission,
+        transformation: crate::animation::Transformation,
+    ) {
         if self.load_state != ImageLoadState::Ready {
             // A loading or failed image paints its replacement subtree, not
             // itself. 2.0 has no `AnyElement` replacement (§3.4 puts it with
@@ -624,9 +851,17 @@ impl Img {
             None => bounds,
         };
 
+        let transformed_size = [
+            drawn[2] * transformation.scale[0],
+            drawn[3] * transformation.scale[1],
+        ];
+        let origin = [
+            drawn[0] + (drawn[2] - transformed_size[0]) * 0.5 + transformation.translation[0],
+            drawn[1] + (drawn[3] - transformed_size[1]) * 0.5 + transformation.translation[1],
+        ];
         emission.poly_sprite(PolySprite {
-            origin: [drawn[0], drawn[1]],
-            size: [drawn[2], drawn[3]],
+            origin,
+            size: transformed_size,
             atlas_origin: placement
                 .map(|tile| tile.atlas_origin)
                 .unwrap_or([0.0, 0.0]),
@@ -1206,5 +1441,29 @@ mod tests {
             1,
             "frame indices loop through the decoded image and must not duplicate atlas tiles"
         );
+    }
+
+    #[test]
+    fn resource_builder_retains_stable_identity_and_sizing_metadata() {
+        let first = img("missing/image.png")
+            .size(wgpui_core::geometry::Pixels(24.0))
+            .id("avatar")
+            .into_description();
+        let second = img("missing/image.png")
+            .size(wgpui_core::geometry::Pixels(24.0))
+            .into_description();
+
+        assert_eq!(first.element_id(), Some(&ElementId::from("avatar")));
+        let first_key = first
+            .key()
+            .and_then(|key| key.as_any().downcast_ref::<ImgKey>())
+            .expect("resource images expose their retained image key");
+        let second_key = second
+            .key()
+            .and_then(|key| key.as_any().downcast_ref::<ImgKey>())
+            .expect("resource images expose their retained image key");
+        assert_eq!(first_key.source, second_key.source);
+        assert_eq!(first_key.requested_size, [24.0, 24.0]);
+        assert_eq!(first_key.load_state, ImageLoadState::Loading);
     }
 }

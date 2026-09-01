@@ -832,11 +832,11 @@ impl<T: Clone + Add<Output = T> + Sub<Output = T>> Sub<Point<T>> for Bounds<T> {
 }
 
 impl Bounds<Pixels> {
-    pub fn centered<C, D>(_display: Option<D>, size: Size<Pixels>, _cx: &C) -> Self {
+    pub fn centered<C>(_display: Option<()>, size: Size<Pixels>, _cx: &C) -> Self {
         Self::new(point(Pixels::ZERO, Pixels::ZERO), size)
     }
 
-    pub fn maximized<C, D>(_display: Option<D>, _cx: &C) -> Self {
+    pub fn maximized<C>(_display: Option<()>, _cx: &C) -> Self {
         Self::new(
             point(Pixels::ZERO, Pixels::ZERO),
             size(px(1024.0), px(768.0)),

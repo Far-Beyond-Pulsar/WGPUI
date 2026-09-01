@@ -14,11 +14,11 @@ pub fn derive_into_element(input: TokenStream) -> TokenStream {
         .push(parse_quote!(Self: ::wgpui::RenderOnce));
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
     quote! {
-        impl #impl_generics ::wgpui::IntoElement for #name #type_generics #where_clause {
-            type Element = ::wgpui::Component<Self>;
-
-            fn into_element(self) -> Self::Element {
-                ::wgpui::Component::new(self)
+        impl #impl_generics ::wgpui::Element for #name #type_generics #where_clause {
+            fn into_description(self) -> ::wgpui::Description {
+                ::wgpui::core::element::Element::into_description(
+                    ::wgpui::Component::new(self),
+                )
             }
         }
     }

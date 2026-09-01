@@ -65,6 +65,11 @@ use wgpui_core::reconcile::Description;
 pub struct SharedString(Arc<str>);
 
 impl SharedString {
+    /// Construct a shared string from any owned or borrowed string value.
+    pub fn new(value: impl Into<Self>) -> Self {
+        value.into()
+    }
+
     /// The text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -1097,5 +1102,14 @@ mod tests {
             resolved.is_ok(),
             "a missing family must fall back to some face, as the legacy system does"
         );
+    }
+
+    #[test]
+    fn shared_string_new_accepts_borrowed_and_owned_values() {
+        let borrowed = SharedString::new("borrowed");
+        let owned = SharedString::new(String::from("owned"));
+
+        assert_eq!(borrowed.as_str(), "borrowed");
+        assert_eq!(owned.as_str(), "owned");
     }
 }

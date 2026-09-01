@@ -8,9 +8,9 @@ pub struct FocusId(u64);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FocusHandle {
-    id: FocusId,
-    tab_index: i32,
-    tab_stop: bool,
+    pub id: FocusId,
+    pub tab_index: i32,
+    pub tab_stop: bool,
 }
 
 impl FocusHandle {

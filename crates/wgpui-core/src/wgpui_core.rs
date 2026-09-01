@@ -24,7 +24,7 @@ pub use window::{
     KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu,
     MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseButtonState, MouseClickEvent,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TextInputEvent,
-    TimerHandle, TimerId, TimerState, TitlebarOptions, WindowAppearance,
+    BackgroundExecutor, Timer, TimerHandle, TimerId, TimerState, TitlebarOptions, WindowAppearance,
     WindowBackgroundAppearance, WindowDecorations, WindowKind,
     ScrollRootHandle, WindowOptions,
 };
