@@ -68,6 +68,50 @@ type CloseHandler = Box<dyn FnMut(&mut Window) -> bool>;
 type AppInitializer = Box<dyn FnOnce(&mut App)>;
 type WindowBuildCallback = Box<dyn FnMut(&mut Window, &mut App) -> Description>;
 
+#[derive(Debug, Default)]
+struct RedrawRequestState {
+    requested: AtomicBool,
+}
+
+impl RedrawRequestState {
+    fn request(&self) -> bool {
+        !self.requested.swap(true, Ordering::AcqRel)
+    }
+
+    fn consume(&self) -> bool {
+        self.requested.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+struct RedrawRequest {
+    native: Arc<winit::window::Window>,
+    state: Arc<RedrawRequestState>,
+}
+
+impl RedrawRequest {
+    fn new(native: Arc<winit::window::Window>) -> Self {
+        Self {
+            native,
+            state: Arc::new(RedrawRequestState::default()),
+        }
+    }
+
+    fn request(&self) {
+        if self.state.request() {
+            self.native.request_redraw();
+        }
+    }
+
+    fn consume(&self) {
+        self.state.consume();
+    }
+}
+
 thread_local! {
     static CALLBACK_WINDOW: Cell<*mut Window> = const { Cell::new(std::ptr::null_mut()) };
 }
@@ -146,6 +190,8 @@ enum ImmediatePaint {
 
 pub struct Window {
     native: Arc<winit::window::Window>,
+    redraw_request: Arc<RedrawRequest>,
+    rendering: Arc<AtomicBool>,
     text_engine: SharedTextEngine,
     gpu_adapter: wgpu::Adapter,
     gpu_device: wgpu::Device,
@@ -181,6 +227,8 @@ pub struct Window {
     appearance_observers: Vec<(Arc<AtomicBool>, Box<dyn FnMut(WindowAppearance)>)>,
     observed_bounds: Option<Bounds<Pixels>>,
     observed_appearance: WindowAppearance,
+    entity_observers: Vec<wgpui_core::app::Subscription>,
+    observed_entities: std::collections::HashSet<wgpui_core::app::EntityId>,
 }
 
 #[derive(Copy, Clone)]
@@ -195,6 +243,7 @@ struct ClickState {
 #[derive(Clone)]
 pub struct WindowHandle {
     native: Arc<winit::window::Window>,
+    redraw_request: Arc<RedrawRequest>,
     close_requested: Arc<AtomicBool>,
 }
 
@@ -489,6 +538,7 @@ impl<T: Render> CoreElement for EntityView<T> {
             let Some(window) = window.downcast_mut::<Window>() else {
                 return Description::new::<Self>();
             };
+            window.observe_entity(&self.entity);
             let description = self.entity.update((), |value, context| {
                 let _scope = wgpui_core::element::enter_contextual_render_scope();
                 let element = value.render(window, context);
@@ -572,6 +622,7 @@ impl AppWindowExt for App {
                     };
                 };
                 let entity = build_root_view(window, app);
+                window.observe_entity(&entity);
                 wgpui_core::app::WindowRenderer {
                     render: Box::new(move |app, window| {
                         let Some(window) = window.downcast_mut::<Window>() else {
@@ -647,7 +698,7 @@ impl Window {
     }
 
     pub fn request_redraw(&self) {
-        self.native.request_redraw();
+        self.redraw_request.request();
     }
 
     pub fn request_animation_frame(&self) {
@@ -760,10 +811,8 @@ impl Window {
             height,
             format,
             {
-                let native = Arc::clone(&self.native);
-                Arc::new(move || {
-                    native.request_redraw();
-                })
+                let redraw_request = Arc::clone(&self.redraw_request);
+                Arc::new(move || redraw_request.request())
             },
         ))
     }
@@ -966,6 +1015,7 @@ impl Window {
     pub fn handle(&self) -> WindowHandle {
         WindowHandle {
             native: Arc::clone(&self.native),
+            redraw_request: Arc::clone(&self.redraw_request),
             close_requested: Arc::clone(&self.close_requested),
         }
     }
@@ -997,7 +1047,7 @@ impl Window {
     }
     pub fn close(&mut self) {
         self.close_requested.store(true, Ordering::Release);
-        self.native.request_redraw();
+        self.redraw_request.request();
     }
     pub fn remove_window(&mut self) {
         self.close();
@@ -1768,6 +1818,32 @@ impl Window {
     pub fn end_frame(&mut self) -> usize {
         self.state.sweep(self.state_frame)
     }
+
+    fn observe_entity<T: 'static>(&mut self, entity: &wgpui_core::app::Entity<T>) {
+        let entity_id = entity.entity_id();
+        if !self.observed_entities.insert(entity_id) {
+            return;
+        }
+        let redraw_request = Arc::clone(&self.redraw_request);
+        let rendering = Arc::clone(&self.rendering);
+        self.entity_observers.push(entity.observe(move |_| {
+            if !rendering.load(Ordering::Acquire) {
+                redraw_request.request();
+            }
+        }));
+    }
+
+    fn begin_render(&self) {
+        self.rendering.store(true, Ordering::Release);
+    }
+
+    fn end_render(&self) {
+        self.rendering.store(false, Ordering::Release);
+    }
+
+    fn consume_redraw_request(&self) {
+        self.redraw_request.consume();
+    }
 }
 
 impl WindowHandle {
@@ -1807,7 +1883,7 @@ impl WindowHandle {
         self.native.fullscreen().is_some()
     }
     pub fn request_redraw(&self) {
-        self.native.request_redraw();
+        self.redraw_request.request();
     }
     pub fn set_title(&self, title: &str) {
         self.native.set_title(title);
@@ -1855,7 +1931,7 @@ impl WindowHandle {
     }
     pub fn close(&self) {
         self.close_requested.store(true, Ordering::Release);
-        self.native.request_redraw();
+        self.redraw_request.request();
     }
     pub fn close_requested(&self) -> bool {
         self.close_requested.load(Ordering::Acquire)
@@ -2299,8 +2375,8 @@ impl Window {
         }
         let state = Arc::new(std::sync::Mutex::new(AssetState::Loading));
         let redraw = {
-            let native = Arc::clone(&self.native);
-            Arc::new(move || native.request_redraw()) as Arc<dyn Fn() + Send + Sync>
+            let redraw_request = Arc::clone(&self.redraw_request);
+            Arc::new(move || redraw_request.request()) as Arc<dyn Fn() + Send + Sync>
         };
         let asset = AssetRef { key: key.clone(), state: Arc::clone(&state) };
         entries.insert(key, asset.clone());
@@ -2522,6 +2598,7 @@ impl Handler {
         }
         let (surface, context) = WindowSurface::new(Arc::clone(&native))?;
         let surface_registry = Arc::new(SurfaceRegistry::new());
+        let redraw_request = Arc::new(RedrawRequest::new(Arc::clone(&native)));
         let (width, height) = surface.size();
         let mut resizes = ResizeDetector::new();
         resizes.seed(width, height);
@@ -2531,6 +2608,8 @@ impl Handler {
         let text_engine = frame_loop.text_engine();
         let window = Window {
             native,
+            redraw_request,
+            rendering: Arc::new(AtomicBool::new(false)),
             text_engine,
             gpu_adapter: context.adapter.clone(),
             gpu_device: context.device.clone(),
@@ -2566,6 +2645,8 @@ impl Handler {
             appearance_observers: Vec::new(),
             observed_bounds: None,
             observed_appearance: WindowAppearance::Light,
+            entity_observers: Vec::new(),
+            observed_entities: std::collections::HashSet::new(),
         };
         self.live.push(Live {
             id,
@@ -2643,6 +2724,7 @@ impl Handler {
                 .all(|(other_index, live)| other_index == index || live.frames >= limit)
         });
         let live = &mut self.live[index];
+        live.window.consume_redraw_request();
         let animation_frame_requested = live
             .window
             .animation_frame_requested
@@ -2672,6 +2754,7 @@ impl Handler {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let (width, height) = live.surface.size();
+        live.window.begin_render();
         live.window.begin_frame();
         let animation_clock = std::mem::take(&mut live.window.animation_clock);
         let (animation_clock, description) =
@@ -2689,6 +2772,7 @@ impl Handler {
             live.window.interaction_mut(),
             &mut live.app,
         );
+        live.window.end_render();
         let description = append_immediate_paints(
             description,
             std::mem::take(&mut live.window.immediate_paints),
@@ -3222,6 +3306,8 @@ fn key_name(event: &winit::event::KeyEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use wgpui_core::geometry::{point, px, size};
 
     fn spawn_accepts_a_context_async_closure<T: 'static>(
@@ -3399,6 +3485,37 @@ mod tests {
         let _element = wgpui_widgets::div::div().on_click(public_window_callback(
             |_: &wgpui_core::window::ClickEvent, _window: &mut Window, _app: &mut App| {},
         ));
+    }
+
+    #[test]
+    fn entity_notifications_schedule_one_redraw_and_stop_when_idle() {
+        let app = App::create();
+        let entity = app.new_entity(());
+        let redraw_state = Arc::new(RedrawRequestState::default());
+        let redraw_count = Rc::new(Cell::new(0));
+        let observed_state = Arc::clone(&redraw_state);
+        let observed_count = Rc::clone(&redraw_count);
+        let subscription = entity.observe(move |_| {
+            if observed_state.request() {
+                observed_count.set(observed_count.get() + 1);
+            }
+        });
+
+        app.notify(entity.entity_id());
+        app.notify(entity.entity_id());
+        app.notify(entity.entity_id());
+        assert_eq!(redraw_count.get(), 1);
+        assert!(redraw_state.is_requested());
+
+        assert!(redraw_state.consume());
+        assert!(!redraw_state.is_requested());
+        assert!(!redraw_state.consume());
+        assert_eq!(redraw_count.get(), 1);
+
+        drop(subscription);
+        app.notify(entity.entity_id());
+        assert_eq!(redraw_count.get(), 1);
+        assert!(!redraw_state.is_requested());
     }
 }
 
