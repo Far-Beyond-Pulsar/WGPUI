@@ -1,0 +1,802 @@
+[
+  {
+    "id": "APP-01",
+    "title": "[WGPUI 2.0] APP-01: Native redraw coalescing",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "APP-02",
+    "title": "[WGPUI 2.0] APP-02: Explicit notification semantics",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "APP-03",
+    "title": "[WGPUI 2.0] APP-03: Multi-window entity invalidation isolation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "APP-04",
+    "title": "[WGPUI 2.0] APP-04: Window bounds observer callbacks",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "APP-05",
+    "title": "[WGPUI 2.0] APP-05: Window appearance observer callbacks",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "APP-06",
+    "title": "[WGPUI 2.0] APP-06: Application window teardown notifications",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "APP-07",
+    "title": "[WGPUI 2.0] APP-07: Redraw scheduler observability",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "APP-08",
+    "title": "[WGPUI 2.0] APP-08: Idle no-loop invariant",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "APP-09",
+    "title": "[WGPUI 2.0] APP-09: Timer cancellation delivery",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "APP-10",
+    "title": "[WGPUI 2.0] APP-10: Animation frame invalidation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "app"
+    ]
+  },
+  {
+    "id": "ASSET-02",
+    "title": "[WGPUI 2.0] ASSET-02: Embedded AssetSource resolution",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "asset"
+    ]
+  },
+  {
+    "id": "ASSET-03",
+    "title": "[WGPUI 2.0] ASSET-03: Async native asset cache misses",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "asset"
+    ]
+  },
+  {
+    "id": "ASSET-04",
+    "title": "[WGPUI 2.0] ASSET-04: Asset request cancellation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "asset"
+    ]
+  },
+  {
+    "id": "ASSET-05",
+    "title": "[WGPUI 2.0] ASSET-05: Asset retry and backoff",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "asset"
+    ]
+  },
+  {
+    "id": "ASSET-06",
+    "title": "[WGPUI 2.0] ASSET-06: Image cache eviction",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "asset"
+    ]
+  },
+  {
+    "id": "ASSET-07",
+    "title": "[WGPUI 2.0] ASSET-07: Animated GIF advancement",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "asset"
+    ]
+  },
+  {
+    "id": "ASSET-08",
+    "title": "[WGPUI 2.0] ASSET-08: SVG lifetime and reuse",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "asset"
+    ]
+  },
+  {
+    "id": "ASSET-09",
+    "title": "[WGPUI 2.0] ASSET-09: Source ID collision handling",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "asset"
+    ]
+  },
+  {
+    "id": "DOC-01",
+    "title": "[WGPUI 2.0] DOC-01: Completion audit status",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "doc"
+    ]
+  },
+  {
+    "id": "DOC-02",
+    "title": "[WGPUI 2.0] DOC-02: Placeholder module cleanup",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "doc"
+    ]
+  },
+  {
+    "id": "DOC-03",
+    "title": "[WGPUI 2.0] DOC-03: Public API documentation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "doc"
+    ]
+  },
+  {
+    "id": "ENTITY-01",
+    "title": "[WGPUI 2.0] ENTITY-01: WeakEntity fallible update contract",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "entity"
+    ]
+  },
+  {
+    "id": "ENTITY-02",
+    "title": "[WGPUI 2.0] ENTITY-02: Nested entity update reentrancy",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "entity"
+    ]
+  },
+  {
+    "id": "ENTITY-03",
+    "title": "[WGPUI 2.0] ENTITY-03: Async entity update signatures",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "entity"
+    ]
+  },
+  {
+    "id": "ENTITY-04",
+    "title": "[WGPUI 2.0] ENTITY-04: Entity update_in window plumbing",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "entity"
+    ]
+  },
+  {
+    "id": "ENTITY-05",
+    "title": "[WGPUI 2.0] ENTITY-05: Entity observer lifetime and drop",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "entity"
+    ]
+  },
+  {
+    "id": "ENTITY-06",
+    "title": "[WGPUI 2.0] ENTITY-06: Child lowering context propagation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "entity"
+    ]
+  },
+  {
+    "id": "IMAGE-01",
+    "title": "[WGPUI 2.0] IMAGE-01: Per-instance image tint isolation",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "image"
+    ]
+  },
+  {
+    "id": "INPUT-01",
+    "title": "[WGPUI 2.0] INPUT-01: Focus traversal",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "input"
+    ]
+  },
+  {
+    "id": "INPUT-02",
+    "title": "[WGPUI 2.0] INPUT-02: Typed action dispatch",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "input"
+    ]
+  },
+  {
+    "id": "INPUT-03",
+    "title": "[WGPUI 2.0] INPUT-03: Mouse capture lifecycle",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "input"
+    ]
+  },
+  {
+    "id": "INPUT-04",
+    "title": "[WGPUI 2.0] INPUT-04: Drag payload lifecycle",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "input"
+    ]
+  },
+  {
+    "id": "INPUT-05",
+    "title": "[WGPUI 2.0] INPUT-05: IME composition",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "input"
+    ]
+  },
+  {
+    "id": "INPUT-06",
+    "title": "[WGPUI 2.0] INPUT-06: Keyboard modifier mapping",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "input"
+    ]
+  },
+  {
+    "id": "INV-01",
+    "title": "[WGPUI 2.0] INV-01: Typed entity invalidation signals",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "inv"
+    ]
+  },
+  {
+    "id": "LAYOUT-01",
+    "title": "[WGPUI 2.0] LAYOUT-01: Generic estimated-size contract",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "LAYOUT-02",
+    "title": "[WGPUI 2.0] LAYOUT-02: Regular-content GPU layout",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "LAYOUT-03",
+    "title": "[WGPUI 2.0] LAYOUT-03: CPU/GPU layout differential suite",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "LAYOUT-04",
+    "title": "[WGPUI 2.0] LAYOUT-04: Nested estimate invalidation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "LAYOUT-05",
+    "title": "[WGPUI 2.0] LAYOUT-05: Layout rounding parity",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "LAYOUT-06",
+    "title": "[WGPUI 2.0] LAYOUT-06: Layout shader limits",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "LAYOUT-07",
+    "title": "[WGPUI 2.0] LAYOUT-07: GPU layout pass fallback",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "LAYOUT-08",
+    "title": "[WGPUI 2.0] LAYOUT-08: Scroll virtualization measurement",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "LAYOUT-09",
+    "title": "[WGPUI 2.0] LAYOUT-09: Transform and clip layout semantics",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "LAYOUT-10",
+    "title": "[WGPUI 2.0] LAYOUT-10: Layout diagnostics",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "layout"
+    ]
+  },
+  {
+    "id": "OVERLAY-01",
+    "title": "[WGPUI 2.0] OVERLAY-01: Retained deferred overlays",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "overlay"
+    ]
+  },
+  {
+    "id": "OVERLAY-02",
+    "title": "[WGPUI 2.0] OVERLAY-02: Overlay focus dismissal",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "overlay"
+    ]
+  },
+  {
+    "id": "OVERLAY-03",
+    "title": "[WGPUI 2.0] OVERLAY-03: Overlay entity teardown",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "overlay"
+    ]
+  },
+  {
+    "id": "RENDER-01",
+    "title": "[WGPUI 2.0] RENDER-01: Minimal patch and upload metrics",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "render"
+    ]
+  },
+  {
+    "id": "RENDER-02",
+    "title": "[WGPUI 2.0] RENDER-02: Layer-tier occlusion",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "render"
+    ]
+  },
+  {
+    "id": "RENDER-03",
+    "title": "[WGPUI 2.0] RENDER-03: Linear sprite filtering",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "render"
+    ]
+  },
+  {
+    "id": "RENDER-04",
+    "title": "[WGPUI 2.0] RENDER-04: SVG overflow clipping",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "render"
+    ]
+  },
+  {
+    "id": "RENDER-05",
+    "title": "[WGPUI 2.0] RENDER-05: Backdrop filter completeness",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "render"
+    ]
+  },
+  {
+    "id": "RENDER-06",
+    "title": "[WGPUI 2.0] RENDER-06: Path material retained lowering",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "render"
+    ]
+  },
+  {
+    "id": "RENDER-07",
+    "title": "[WGPUI 2.0] RENDER-07: Shadow and underline shader cleanup",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "render"
+    ]
+  },
+  {
+    "id": "RENDER-08",
+    "title": "[WGPUI 2.0] RENDER-08: Render ordering invariants",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "render"
+    ]
+  },
+  {
+    "id": "TEST-01",
+    "title": "[WGPUI 2.0] TEST-01: All-example runtime harness",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "test"
+    ]
+  },
+  {
+    "id": "TEST-02",
+    "title": "[WGPUI 2.0] TEST-02: Native crash aggregation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "test"
+    ]
+  },
+  {
+    "id": "TEST-03",
+    "title": "[WGPUI 2.0] TEST-03: Screenshot golden suite",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "test"
+    ]
+  },
+  {
+    "id": "TEST-04",
+    "title": "[WGPUI 2.0] TEST-04: Property and differential tests",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "test"
+    ]
+  },
+  {
+    "id": "TEST-05",
+    "title": "[WGPUI 2.0] TEST-05: Clippy and warning cleanup",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "test"
+    ]
+  },
+  {
+    "id": "TEXT-01",
+    "title": "[WGPUI 2.0] TEXT-01: Visible shaping failure fallback",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "text"
+    ]
+  },
+  {
+    "id": "TEXT-02",
+    "title": "[WGPUI 2.0] TEXT-02: Fallback font selection",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "text"
+    ]
+  },
+  {
+    "id": "TEXT-03",
+    "title": "[WGPUI 2.0] TEXT-03: Glyph cache invalidation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "text"
+    ]
+  },
+  {
+    "id": "TEXT-04",
+    "title": "[WGPUI 2.0] TEXT-04: Multiline truncation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "text"
+    ]
+  },
+  {
+    "id": "TEXT-05",
+    "title": "[WGPUI 2.0] TEXT-05: Text input shaping",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "text"
+    ]
+  },
+  {
+    "id": "WIDGET-01",
+    "title": "[WGPUI 2.0] WIDGET-01: Retained text element",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "widget"
+    ]
+  },
+  {
+    "id": "WIDGET-02",
+    "title": "[WGPUI 2.0] WIDGET-02: Retained keyed lists",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "widget"
+    ]
+  },
+  {
+    "id": "WIDGET-03",
+    "title": "[WGPUI 2.0] WIDGET-03: Uniform list recycling",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "widget"
+    ]
+  },
+  {
+    "id": "WIDGET-04",
+    "title": "[WGPUI 2.0] WIDGET-04: Virtual list measurement",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "widget"
+    ]
+  },
+  {
+    "id": "WIDGET-05",
+    "title": "[WGPUI 2.0] WIDGET-05: Scrollbar behavior",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "widget"
+    ]
+  },
+  {
+    "id": "WIDGET-06",
+    "title": "[WGPUI 2.0] WIDGET-06: Control widget contract tests",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "widget"
+    ]
+  },
+  {
+    "id": "WINDOW-01",
+    "title": "[WGPUI 2.0] WINDOW-01: Full repaint warning escape hatch",
+    "action": "dry-run",
+    "requestedState": "closed",
+    "labels": [
+      "wgpui-2.0",
+      "window"
+    ]
+  },
+  {
+    "id": "WINDOW-02",
+    "title": "[WGPUI 2.0] WINDOW-02: Public render-time Window boundary",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "window"
+    ]
+  },
+  {
+    "id": "WINDOW-03",
+    "title": "[WGPUI 2.0] WINDOW-03: winit_window escape hatch audit",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "window"
+    ]
+  },
+  {
+    "id": "WINDOW-04",
+    "title": "[WGPUI 2.0] WINDOW-04: Interaction mutability boundary",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "window"
+    ]
+  },
+  {
+    "id": "WINDOW-05",
+    "title": "[WGPUI 2.0] WINDOW-05: Full-refresh call-site audit",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "window"
+    ]
+  },
+  {
+    "id": "WINDOW-06",
+    "title": "[WGPUI 2.0] WINDOW-06: Surface resize and loss recovery",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "window"
+    ]
+  },
+  {
+    "id": "WINDOW-07",
+    "title": "[WGPUI 2.0] WINDOW-07: Clipboard behavior parity",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "window"
+    ]
+  },
+  {
+    "id": "WINDOW-08",
+    "title": "[WGPUI 2.0] WINDOW-08: Prompt lifecycle and error propagation",
+    "action": "dry-run",
+    "requestedState": "open",
+    "labels": [
+      "wgpui-2.0",
+      "window"
+    ]
+  }
+]
