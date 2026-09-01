@@ -23,11 +23,11 @@
 //! output") only holds if a miss is recoverable.
 
 use std::collections::HashSet;
-use taffy::TaffyTree;
 pub use taffy::geometry::{Line, Size as TaffySize};
 pub use taffy::style::AvailableSpace;
 pub use taffy::style_helpers::FromFr;
 use taffy::tree::NodeId;
+use taffy::TaffyTree;
 
 /// The style a layout node is laid out with.
 ///
@@ -58,8 +58,8 @@ pub type LayoutSides<T> = taffy::geometry::Rect<T>;
 /// set a real `div()` builder needs; nothing about the policy changed.
 pub use taffy::style::{
     AlignContent, AlignItems, BoxSizing, Dimension, Display, FlexDirection, FlexWrap,
-    GridPlacement, GridTemplateComponent, LengthPercentage, LengthPercentageAuto, Overflow,
-    Position, TrackSizingFunction,
+    GridPlacement, GridTemplateComponent, JustifyContent, LengthPercentage, LengthPercentageAuto,
+    Overflow, Position, TrackSizingFunction,
 };
 
 /// The available space for a subtree with a known width and height.

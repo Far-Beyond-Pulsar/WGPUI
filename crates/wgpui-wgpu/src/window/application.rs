@@ -35,6 +35,7 @@ use wgpui_core::window::{
 use wgpui_http_client::{AppHttpClientExt, BoxedHttpClient};
 
 use crate::debug::PerformanceDebug;
+pub use crate::render::device::DeviceRequirements;
 use crate::render::draw::DrawMode;
 use crate::render::frame::RenderTarget;
 use crate::render::surface_registry::SurfaceRegistry;
@@ -2062,6 +2063,7 @@ pub struct NativeApplication<F, R> {
     build: F,
     max_frames: Option<u64>,
     http_client: Option<BoxedHttpClient>,
+    device_requirements: DeviceRequirements,
     marker: std::marker::PhantomData<fn() -> R>,
 }
 
@@ -2076,6 +2078,7 @@ where
             build,
             max_frames: None,
             http_client: None,
+            device_requirements: DeviceRequirements::retained(),
             marker: std::marker::PhantomData,
         }
     }
@@ -2088,6 +2091,12 @@ where
     /// direct form remains available under this deliberate name.
     pub fn with_window(options: WindowOptions, build: F) -> Self {
         Self::new(options, build)
+    }
+
+    /// Configure the WGPU capabilities required by this native application.
+    pub fn with_wgpu_requirements(mut self, requirements: DeviceRequirements) -> Self {
+        self.device_requirements = requirements;
+        self
     }
 
     /// Run the direct window application after initializing a shared app.
@@ -2120,6 +2129,7 @@ where
             )),
             max_frames: self.max_frames,
             initialize: Some(Box::new(initialize)),
+            device_requirements: self.device_requirements.clone(),
             live: Vec::new(),
             pending_entity_invalidations: Vec::new(),
             failure: None,
@@ -2168,6 +2178,7 @@ where
             )),
             max_frames: self.max_frames,
             initialize: None,
+            device_requirements: self.device_requirements,
             live: Vec::new(),
             pending_entity_invalidations: Vec::new(),
             failure: None,
@@ -2180,11 +2191,21 @@ where
     }
 }
 
-pub struct Application;
+pub struct Application {
+    device_requirements: DeviceRequirements,
+}
 
 impl Application {
     pub fn new() -> Self {
-        Self
+        Self {
+            device_requirements: DeviceRequirements::retained(),
+        }
+    }
+
+    /// Configure the WGPU capabilities required by this native application.
+    pub fn with_wgpu_requirements(mut self, requirements: DeviceRequirements) -> Self {
+        self.device_requirements = requirements;
+        self
     }
 
     /// Configures the client used by URI resource loading in this application.
@@ -2192,6 +2213,7 @@ impl Application {
         ConfiguredApplication {
             http_client: Some(client),
             assets: Arc::new(()),
+            device_requirements: self.device_requirements,
         }
     }
 
@@ -2205,6 +2227,7 @@ impl Application {
         ConfiguredApplication {
             http_client: None,
             assets: Arc::new(assets),
+            device_requirements: self.device_requirements,
         }
     }
 
@@ -2217,6 +2240,7 @@ impl Application {
             )),
             max_frames: None,
             initialize: Some(Box::new(initialize)),
+            device_requirements: self.device_requirements,
             app: {
                 let mut app = App::create();
                 app.set_global(AssetRegistry::default());
@@ -2238,6 +2262,15 @@ impl Application {
 pub struct ConfiguredApplication {
     http_client: Option<BoxedHttpClient>,
     assets: Arc<dyn wgpui_widgets::assets::AssetSource>,
+    device_requirements: DeviceRequirements,
+}
+
+impl ConfiguredApplication {
+    /// Configure the WGPU capabilities required by this native application.
+    pub fn with_wgpu_requirements(mut self, requirements: DeviceRequirements) -> Self {
+        self.device_requirements = requirements;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -2696,6 +2729,7 @@ impl ConfiguredApplication {
             )),
             max_frames: None,
             initialize: Some(Box::new(initialize)),
+            device_requirements: self.device_requirements,
             app,
             live: Vec::new(),
             pending_entity_invalidations: Vec::new(),
@@ -2752,6 +2786,7 @@ struct Handler {
     initial: Option<(WindowOptions, WindowBuildCallback)>,
     max_frames: Option<u64>,
     initialize: Option<AppInitializer>,
+    device_requirements: DeviceRequirements,
     live: Vec<Live>,
     pending_entity_invalidations: Vec<PendingEntityInvalidation>,
     failure: Option<ApplicationError>,
@@ -2928,7 +2963,8 @@ impl Handler {
         if options.focus {
             native.focus_window();
         }
-        let (surface, context) = WindowSurface::new(Arc::clone(&native))?;
+        let (surface, context) =
+            WindowSurface::new_with_requirements(Arc::clone(&native), &self.device_requirements)?;
         let surface_registry = Arc::new(SurfaceRegistry::new());
         let redraw_request = Arc::new(RedrawRequest::new(Arc::clone(&native)));
         let asset_redraw_subscription = self.app.global::<AssetRegistry>().map(|registry| {
@@ -3921,6 +3957,7 @@ mod tests {
             initial: None,
             max_frames: None,
             initialize: None,
+            device_requirements: DeviceRequirements::retained(),
             live: Vec::new(),
             pending_entity_invalidations: vec![
                 PendingEntityInvalidation {
@@ -3949,6 +3986,23 @@ mod tests {
         assert!(second_signals.entity_signal(first_entity).is_some());
         assert!(second_signals.entity_signal(second_entity).is_some());
         assert!(handler.pending_entity_invalidations.is_empty());
+    }
+
+    #[test]
+    fn capability_startup_errors_keep_the_adapter_diagnosis() {
+        let error = ApplicationError::from(WindowError::from(
+            crate::render::device::ContextError::Unsupported {
+                adapter: "Helio test adapter".to_string(),
+                capability: crate::render::device::CapabilityError::MissingFeatures {
+                    required: wgpu::Features::TEXTURE_BINDING_ARRAY,
+                    missing: wgpu::Features::TEXTURE_BINDING_ARRAY,
+                    available: wgpu::Features::empty(),
+                },
+            },
+        ));
+        let message = error.to_string();
+        assert!(message.contains("Helio test adapter"));
+        assert!(message.contains("TEXTURE_BINDING_ARRAY"));
     }
 }
 

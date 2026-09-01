@@ -49,7 +49,7 @@ pub mod surface;
 
 use std::sync::Arc;
 
-use crate::render::device::{ComputeContext, ContextError};
+use crate::render::device::{ComputeContext, ContextError, DeviceRequirements};
 use crate::render::pipelines::TARGET_FORMAT;
 
 /// Why a window's swapchain could not be brought up.
@@ -273,11 +273,24 @@ impl WindowSurface {
     pub fn new(
         window: Arc<winit::window::Window>,
     ) -> Result<(WindowSurface, ComputeContext), WindowError> {
+        Self::new_with_requirements(window, &DeviceRequirements::retained())
+    }
+
+    /// Create a surface and device using an integration's explicit capability
+    /// contract.
+    pub fn new_with_requirements(
+        window: Arc<winit::window::Window>,
+        requirements: &DeviceRequirements,
+    ) -> Result<(WindowSurface, ComputeContext), WindowError> {
         let instance = crate::render::device::instance();
         let surface = instance
             .create_surface(Arc::clone(&window))
             .map_err(WindowError::Surface)?;
-        let context = crate::render::device::context_for(&instance, Some(&surface))?;
+        let context = crate::render::device::context_for_with_requirements(
+            &instance,
+            Some(&surface),
+            requirements,
+        )?;
 
         let capabilities = surface.get_capabilities(&context.adapter);
         let present_mode = validate_surface_capabilities(&capabilities)?;

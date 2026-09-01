@@ -412,7 +412,49 @@ fn a_scaled_sprite_interpolates_between_texels() {
             );
         }
     }
-    assert!(saw_interpolated, "scaled sampling must interpolate at an edge");
+    assert!(
+        saw_interpolated,
+        "scaled sampling must interpolate at an edge"
+    );
+}
+
+/// Linear filtering also interpolates coverage, and a fully transparent edge
+/// remains transparent instead of writing a zero-alpha colour to the target.
+#[test]
+fn a_scaled_sprite_interpolates_translucent_and_transparent_texels() {
+    let Some(context) = context_or_report("image_sprite_scaled_alpha") else {
+        return;
+    };
+    let image = RasterizedImage {
+        size: [2, 1],
+        texels: vec![255, 255, 255, 255, 255, 255, 255, 0],
+    };
+    let (_atlas, textures, placement) = atlas_with(&context, &image, 1);
+    let scene = scene_with(&[PolySprite {
+        origin: [20.0, 20.0],
+        size: [4.0, 2.0],
+        ..natural(placement, [20.0, 20.0])
+    }]);
+    let mut renderer = FrameRenderer::new(&context.device);
+    let target = OffscreenTarget::new(&context.device, WIDTH, HEIGHT);
+    let (_, pixels) = render(
+        &context,
+        &mut renderer,
+        &target,
+        &input(
+            &scene,
+            &textures,
+            DrawMode::best_available(context.indirect),
+        ),
+    );
+
+    assert_eq!(pixel(&pixels, 20, 20), [191, 191, 191, 255]);
+    assert_eq!(pixel(&pixels, 21, 20), [64, 64, 64, 255]);
+    assert_eq!(
+        pixel(&pixels, 22, 20),
+        [0, 0, 0, 255],
+        "the transparent source edge must not paint the target"
+    );
 }
 
 /// Grayscale and opacity are applied, and a corner radius rounds the rectangle.

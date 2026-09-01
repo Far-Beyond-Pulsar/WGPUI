@@ -91,6 +91,8 @@ pub struct SvgKey {
     pub load_state: crate::img::ImageLoadState,
     pub transformation: Transformation,
     pub text_color: Option<[f32; 4]>,
+    /// Whether the rendered sprite is clipped to this element's layout box.
+    pub overflow_hidden: bool,
 }
 
 impl ReconcileKey for SvgKey {
@@ -111,6 +113,7 @@ impl ReconcileKey for SvgKey {
             || previous.style != self.style
             || previous.transformation != self.transformation
             || previous.text_color != self.text_color
+            || previous.overflow_hidden != self.overflow_hidden
         {
             axes |= Invalidation::DISPLAY;
         }
@@ -129,6 +132,7 @@ pub struct Svg {
     path: Option<SharedString>,
     transformation: Transformation,
     text_color: Option<[f32; 4]>,
+    overflow_hidden: bool,
 }
 
 /// Construct the authoritative source-ID/engine SVG.
@@ -298,6 +302,7 @@ impl Svg {
             path: None,
             transformation: Transformation::default(),
             text_color: None,
+            overflow_hidden: false,
         }
     }
 
@@ -358,11 +363,9 @@ impl Svg {
         self
     }
 
-    /// Clip the SVG to its layout bounds.
-    ///
-    /// Sprite clipping is currently supplied by the parent description, so
-    /// this builder method is a compatibility spelling with no local state.
-    pub fn overflow_hidden(self) -> Self {
+    /// Clip the SVG's rendered sprite to its layout bounds.
+    pub fn overflow_hidden(mut self) -> Self {
+        self.overflow_hidden = true;
         self
     }
 
@@ -405,6 +408,7 @@ impl Svg {
             load_state: image.load_state,
             transformation: self.transformation,
             text_color: self.text_color,
+            overflow_hidden: self.overflow_hidden,
         }
     }
 
@@ -418,7 +422,7 @@ impl Svg {
     pub fn describe(&self) -> Description {
         let [width, height] = self.image.layout_size();
         let element = self.clone();
-        Description::new::<Svg>()
+        let description = Description::new::<Svg>()
             .diff_key(self.diff_key())
             .style(LayoutStyle {
                 size: LayoutSize {
@@ -430,7 +434,12 @@ impl Svg {
             })
             .emit(move |context: &EmitContext, emission: &mut Emission| {
                 element.emit_into(context, emission);
-            })
+            });
+        if self.overflow_hidden {
+            description.clip_children()
+        } else {
+            description
+        }
     }
 
     /// Write this element's sprite into `emission`, for a caller driving
@@ -438,6 +447,9 @@ impl Svg {
     pub fn emit_into(&self, context: &EmitContext, emission: &mut Emission) {
         self.image
             .emit_into_with_transform(context, emission, self.transformation);
+        if self.overflow_hidden {
+            emission.clip_to(context.bounds);
+        }
     }
 }
 
@@ -626,6 +638,14 @@ mod tests {
             Invalidation::LAYOUT.union(Invalidation::DISPLAY),
             "a resource transition swaps the SVG fallback and image"
         );
+        assert_eq!(
+            base.clone()
+                .overflow_hidden()
+                .diff_key()
+                .compare(&base.diff_key()),
+            Invalidation::DISPLAY,
+            "changing the local clip changes only the retained paint"
+        );
 
         let other = load(&engine, DOCUMENT.as_bytes(), 1.0).expect("rasterises");
         assert_eq!(
@@ -680,5 +700,74 @@ mod tests {
             .and_then(|key| key.as_any().downcast_ref::<SvgKey>())
             .expect("SVG text sizing is retained in the SVG key");
         assert_eq!(key.requested_size, [24.0, 24.0]);
+    }
+
+    #[test]
+    fn overflow_hidden_clips_cover_and_transformed_svg_content_at_both_boundaries() {
+        use wgpui_core::scene::layer::{BoundaryId, LayerId, LayerKey};
+        use wgpui_layout::taffy_tree::LayoutRect;
+
+        let engine = engine();
+        let source = load(&engine, DOCUMENT.as_bytes(), 1.0).expect("rasterises");
+        let element = svg_with_engine(source, Rc::clone(&engine))
+            .size(20.0, 20.0)
+            .style(ImageStyle {
+                object_fit: crate::img::ObjectFit::Cover,
+                ..ImageStyle::default()
+            })
+            .with_transformation(
+                Transformation::default()
+                    .with_scaling(wgpui_core::geometry::Size::new(
+                        wgpui_core::geometry::Pixels(2.0),
+                        wgpui_core::geometry::Pixels(1.0),
+                    ))
+                    .with_translation(wgpui_core::geometry::Point::new(
+                        wgpui_core::geometry::Pixels(5.0),
+                        wgpui_core::geometry::Pixels(-5.0),
+                    )),
+            )
+            .overflow_hidden();
+        assert!(
+            element.describe().clips_children(),
+            "overflow_hidden must remain visible in the retained description"
+        );
+
+        let mut emission = Emission::new();
+        element.emit_into(
+            &EmitContext {
+                bounds: LayoutRect {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                layer: LayerId::from_key(LayerKey::untiled(BoundaryId::ROOT)),
+                boundary: BoundaryId::ROOT,
+                clip: Some(LayoutRect {
+                    x: 15.0,
+                    y: 15.0,
+                    width: 10.0,
+                    height: 10.0,
+                }),
+            },
+            &mut emission,
+        );
+        let inherited_clip = LayoutRect {
+            x: 15.0,
+            y: 15.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        emission.clip_to(inherited_clip);
+
+        let sprite = emission
+            .poly_sprites()
+            .first()
+            .copied()
+            .expect("a ready SVG emits one sprite");
+        assert_eq!(sprite.origin, [15.0, 15.0]);
+        assert_eq!(sprite.size, [10.0, 10.0]);
+        assert_eq!(sprite.atlas_origin, [15.0, 10.0]);
+        assert_eq!(sprite.atlas_size, [5.0, 10.0]);
     }
 }

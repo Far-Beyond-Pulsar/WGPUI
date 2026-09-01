@@ -1,3 +1,4 @@
+use super::ScrollbarOrientation;
 use wgpui_core::geometry::{Bounds, Pixels, Point, Rect, Size};
 use wgpui_core::scene::{EvictedTile, TileCoord, TileGrid, TileResidency};
 
@@ -44,23 +45,64 @@ pub struct ScrollbarState {
 }
 impl ScrollbarState {
     pub fn vertical(viewport: Pixels, content: Pixels, offset: Pixels) -> Self {
-        let view = viewport.value().max(0.0);
-        let total = content.value().max(view);
-        let track = Pixels(view);
-        let thumb = Pixels((view * view / total).max(12.0).min(view));
-        let progress = if total > view {
-            (-offset.value() / (total - view)).clamp(0.0, 1.0)
+        Self::for_orientation(ScrollbarOrientation::Vertical, viewport, content, offset)
+    }
+
+    pub fn horizontal(viewport: Pixels, content: Pixels, offset: Pixels) -> Self {
+        Self::for_orientation(ScrollbarOrientation::Horizontal, viewport, content, offset)
+    }
+
+    pub fn for_orientation(
+        _orientation: ScrollbarOrientation,
+        viewport: Pixels,
+        content: Pixels,
+        offset: Pixels,
+    ) -> Self {
+        Self::for_axis_with_minimum(
+            viewport,
+            content,
+            offset,
+            finite_nonnegative(viewport.value()),
+            Pixels(12.0),
+        )
+    }
+
+    pub(crate) fn for_axis_with_minimum(
+        viewport: Pixels,
+        content: Pixels,
+        offset: Pixels,
+        track_length: Pixels,
+        minimum_thumb_length: Pixels,
+    ) -> Self {
+        let view = finite_nonnegative(viewport.value());
+        let total = finite_nonnegative(content.value()).max(view);
+        let track = finite_nonnegative(track_length.value());
+        let minimum = finite_nonnegative(minimum_thumb_length.value());
+        let thumb = if total.value() > 0.0 {
+            Pixels((track.value() * view.value() / total.value())
+                .max(minimum.value())
+                .min(track.value()))
+        } else {
+            Pixels::ZERO
+        };
+        let progress = if total > view && total.value() > view.value() {
+            let offset = if offset.value().is_finite() { offset.value() } else { 0.0 };
+            (-offset / (total.value() - view.value())).clamp(0.0, 1.0)
         } else {
             0.0
         };
         Self {
-            visible: total > view,
+            visible: total > view && track.value() > 0.0,
             track_length: track,
             thumb_length: thumb,
-            thumb_offset: (track - thumb).max(Pixels::ZERO).scaled(progress),
+            thumb_offset: Pixels((track.value() - thumb.value()).max(0.0) * progress),
             progress,
         }
     }
+}
+
+fn finite_nonnegative(value: f32) -> Pixels {
+    Pixels(if value.is_finite() { value.max(0.0) } else { 0.0 })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

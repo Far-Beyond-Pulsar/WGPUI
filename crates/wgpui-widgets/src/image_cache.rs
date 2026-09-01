@@ -539,10 +539,10 @@ impl ImageCache {
     /// derived entry is materialized when [`Self::hold_at`] receives the base.
     pub fn tinted_source(&mut self, source: ImageSourceId, color: [f32; 4]) -> ImageSourceId {
         let key = (source, color.map(f32::to_bits));
-        if let Some(tinted_source) = self.tinted_sources.get(&key) {
-            if self.images.contains_key(tinted_source) || !self.images.contains_key(&source) {
-                return *tinted_source;
-            }
+        if let Some(tinted_source) = self.tinted_sources.get(&key)
+            && (self.images.contains_key(tinted_source) || !self.images.contains_key(&source))
+        {
+            return *tinted_source;
         }
 
         let tinted_source = if let Some(tinted_source) = self.tinted_sources.get(&key) {

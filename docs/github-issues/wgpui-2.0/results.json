@@ -1,0 +1,642 @@
+[
+  {
+    "id": "APP-01",
+    "title": "[WGPUI 2.0] APP-01: Native redraw coalescing",
+    "action": "created-and-closed",
+    "number": 172,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/172"
+  },
+  {
+    "id": "APP-02",
+    "title": "[WGPUI 2.0] APP-02: Explicit notification semantics",
+    "action": "created-and-closed",
+    "number": 173,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/173"
+  },
+  {
+    "id": "APP-03",
+    "title": "[WGPUI 2.0] APP-03: Multi-window entity invalidation isolation",
+    "action": "created",
+    "number": 174,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/174"
+  },
+  {
+    "id": "APP-04",
+    "title": "[WGPUI 2.0] APP-04: Window bounds observer callbacks",
+    "action": "created",
+    "number": 175,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/175"
+  },
+  {
+    "id": "APP-05",
+    "title": "[WGPUI 2.0] APP-05: Window appearance observer callbacks",
+    "action": "created",
+    "number": 176,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/176"
+  },
+  {
+    "id": "APP-06",
+    "title": "[WGPUI 2.0] APP-06: Application window teardown notifications",
+    "action": "created",
+    "number": 177,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/177"
+  },
+  {
+    "id": "APP-07",
+    "title": "[WGPUI 2.0] APP-07: Redraw scheduler observability",
+    "action": "created",
+    "number": 178,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/178"
+  },
+  {
+    "id": "APP-08",
+    "title": "[WGPUI 2.0] APP-08: Idle no-loop invariant",
+    "action": "created",
+    "number": 179,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/179"
+  },
+  {
+    "id": "APP-09",
+    "title": "[WGPUI 2.0] APP-09: Timer cancellation delivery",
+    "action": "created",
+    "number": 180,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/180"
+  },
+  {
+    "id": "APP-10",
+    "title": "[WGPUI 2.0] APP-10: Animation frame invalidation",
+    "action": "created",
+    "number": 181,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/181"
+  },
+  {
+    "id": "ASSET-02",
+    "title": "[WGPUI 2.0] ASSET-02: Embedded AssetSource resolution",
+    "action": "created-and-closed",
+    "number": 182,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/182"
+  },
+  {
+    "id": "ASSET-03",
+    "title": "[WGPUI 2.0] ASSET-03: Async native asset cache misses",
+    "action": "created-and-closed",
+    "number": 183,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/183"
+  },
+  {
+    "id": "ASSET-04",
+    "title": "[WGPUI 2.0] ASSET-04: Asset request cancellation",
+    "action": "created",
+    "number": 184,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/184"
+  },
+  {
+    "id": "ASSET-05",
+    "title": "[WGPUI 2.0] ASSET-05: Asset retry and backoff",
+    "action": "created",
+    "number": 185,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/185"
+  },
+  {
+    "id": "ASSET-06",
+    "title": "[WGPUI 2.0] ASSET-06: Image cache eviction",
+    "action": "created",
+    "number": 186,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/186"
+  },
+  {
+    "id": "ASSET-07",
+    "title": "[WGPUI 2.0] ASSET-07: Animated GIF advancement",
+    "action": "created",
+    "number": 187,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/187"
+  },
+  {
+    "id": "ASSET-08",
+    "title": "[WGPUI 2.0] ASSET-08: SVG lifetime and reuse",
+    "action": "created",
+    "number": 188,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/188"
+  },
+  {
+    "id": "ASSET-09",
+    "title": "[WGPUI 2.0] ASSET-09: Source ID collision handling",
+    "action": "created",
+    "number": 189,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/189"
+  },
+  {
+    "id": "DOC-01",
+    "title": "[WGPUI 2.0] DOC-01: Completion audit status",
+    "action": "created",
+    "number": 190,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/190"
+  },
+  {
+    "id": "DOC-02",
+    "title": "[WGPUI 2.0] DOC-02: Placeholder module cleanup",
+    "action": "created",
+    "number": 191,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/191"
+  },
+  {
+    "id": "DOC-03",
+    "title": "[WGPUI 2.0] DOC-03: Public API documentation",
+    "action": "created",
+    "number": 192,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/192"
+  },
+  {
+    "id": "ENTITY-01",
+    "title": "[WGPUI 2.0] ENTITY-01: WeakEntity fallible update contract",
+    "action": "created",
+    "number": 193,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/193"
+  },
+  {
+    "id": "ENTITY-02",
+    "title": "[WGPUI 2.0] ENTITY-02: Nested entity update reentrancy",
+    "action": "created",
+    "number": 194,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/194"
+  },
+  {
+    "id": "ENTITY-03",
+    "title": "[WGPUI 2.0] ENTITY-03: Async entity update signatures",
+    "action": "created",
+    "number": 195,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/195"
+  },
+  {
+    "id": "ENTITY-04",
+    "title": "[WGPUI 2.0] ENTITY-04: Entity update_in window plumbing",
+    "action": "created",
+    "number": 196,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/196"
+  },
+  {
+    "id": "ENTITY-05",
+    "title": "[WGPUI 2.0] ENTITY-05: Entity observer lifetime and drop",
+    "action": "created",
+    "number": 197,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/197"
+  },
+  {
+    "id": "ENTITY-06",
+    "title": "[WGPUI 2.0] ENTITY-06: Child lowering context propagation",
+    "action": "created",
+    "number": 198,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/198"
+  },
+  {
+    "id": "IMAGE-01",
+    "title": "[WGPUI 2.0] IMAGE-01: Per-instance image tint isolation",
+    "action": "created-and-closed",
+    "number": 199,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/199"
+  },
+  {
+    "id": "INPUT-01",
+    "title": "[WGPUI 2.0] INPUT-01: Focus traversal",
+    "action": "created",
+    "number": 200,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/200"
+  },
+  {
+    "id": "INPUT-02",
+    "title": "[WGPUI 2.0] INPUT-02: Typed action dispatch",
+    "action": "created",
+    "number": 201,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/201"
+  },
+  {
+    "id": "INPUT-03",
+    "title": "[WGPUI 2.0] INPUT-03: Mouse capture lifecycle",
+    "action": "created",
+    "number": 202,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/202"
+  },
+  {
+    "id": "INPUT-04",
+    "title": "[WGPUI 2.0] INPUT-04: Drag payload lifecycle",
+    "action": "created",
+    "number": 203,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/203"
+  },
+  {
+    "id": "INPUT-05",
+    "title": "[WGPUI 2.0] INPUT-05: IME composition",
+    "action": "created",
+    "number": 204,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/204"
+  },
+  {
+    "id": "INPUT-06",
+    "title": "[WGPUI 2.0] INPUT-06: Keyboard modifier mapping",
+    "action": "created",
+    "number": 205,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/205"
+  },
+  {
+    "id": "INV-01",
+    "title": "[WGPUI 2.0] INV-01: Typed entity invalidation signals",
+    "action": "created-and-closed",
+    "number": 206,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/206"
+  },
+  {
+    "id": "LAYOUT-01",
+    "title": "[WGPUI 2.0] LAYOUT-01: Generic estimated-size contract",
+    "action": "created-and-closed",
+    "number": 207,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/207"
+  },
+  {
+    "id": "LAYOUT-02",
+    "title": "[WGPUI 2.0] LAYOUT-02: Regular-content GPU layout",
+    "action": "created",
+    "number": 208,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/208"
+  },
+  {
+    "id": "LAYOUT-03",
+    "title": "[WGPUI 2.0] LAYOUT-03: CPU/GPU layout differential suite",
+    "action": "created",
+    "number": 209,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/209"
+  },
+  {
+    "id": "LAYOUT-04",
+    "title": "[WGPUI 2.0] LAYOUT-04: Nested estimate invalidation",
+    "action": "created",
+    "number": 210,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/210"
+  },
+  {
+    "id": "LAYOUT-05",
+    "title": "[WGPUI 2.0] LAYOUT-05: Layout rounding parity",
+    "action": "created",
+    "number": 211,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/211"
+  },
+  {
+    "id": "LAYOUT-06",
+    "title": "[WGPUI 2.0] LAYOUT-06: Layout shader limits",
+    "action": "created",
+    "number": 212,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/212"
+  },
+  {
+    "id": "LAYOUT-07",
+    "title": "[WGPUI 2.0] LAYOUT-07: GPU layout pass fallback",
+    "action": "created",
+    "number": 213,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/213"
+  },
+  {
+    "id": "LAYOUT-08",
+    "title": "[WGPUI 2.0] LAYOUT-08: Scroll virtualization measurement",
+    "action": "created",
+    "number": 214,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/214"
+  },
+  {
+    "id": "LAYOUT-09",
+    "title": "[WGPUI 2.0] LAYOUT-09: Transform and clip layout semantics",
+    "action": "created",
+    "number": 215,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/215"
+  },
+  {
+    "id": "LAYOUT-10",
+    "title": "[WGPUI 2.0] LAYOUT-10: Layout diagnostics",
+    "action": "created",
+    "number": 216,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/216"
+  },
+  {
+    "id": "OVERLAY-01",
+    "title": "[WGPUI 2.0] OVERLAY-01: Retained deferred overlays",
+    "action": "created-and-closed",
+    "number": 217,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/217"
+  },
+  {
+    "id": "OVERLAY-02",
+    "title": "[WGPUI 2.0] OVERLAY-02: Overlay focus dismissal",
+    "action": "created",
+    "number": 218,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/218"
+  },
+  {
+    "id": "OVERLAY-03",
+    "title": "[WGPUI 2.0] OVERLAY-03: Overlay entity teardown",
+    "action": "created",
+    "number": 219,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/219"
+  },
+  {
+    "id": "RENDER-01",
+    "title": "[WGPUI 2.0] RENDER-01: Minimal patch and upload metrics",
+    "action": "created",
+    "number": 220,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/220"
+  },
+  {
+    "id": "RENDER-02",
+    "title": "[WGPUI 2.0] RENDER-02: Layer-tier occlusion",
+    "action": "created",
+    "number": 221,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/221"
+  },
+  {
+    "id": "RENDER-03",
+    "title": "[WGPUI 2.0] RENDER-03: Linear sprite filtering",
+    "action": "created",
+    "number": 222,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/222"
+  },
+  {
+    "id": "RENDER-04",
+    "title": "[WGPUI 2.0] RENDER-04: SVG overflow clipping",
+    "action": "created",
+    "number": 223,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/223"
+  },
+  {
+    "id": "RENDER-05",
+    "title": "[WGPUI 2.0] RENDER-05: Backdrop filter completeness",
+    "action": "created",
+    "number": 224,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/224"
+  },
+  {
+    "id": "RENDER-06",
+    "title": "[WGPUI 2.0] RENDER-06: Path material retained lowering",
+    "action": "created",
+    "number": 225,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/225"
+  },
+  {
+    "id": "RENDER-07",
+    "title": "[WGPUI 2.0] RENDER-07: Shadow and underline shader cleanup",
+    "action": "created",
+    "number": 226,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/226"
+  },
+  {
+    "id": "RENDER-08",
+    "title": "[WGPUI 2.0] RENDER-08: Render ordering invariants",
+    "action": "created",
+    "number": 227,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/227"
+  },
+  {
+    "id": "TEST-01",
+    "title": "[WGPUI 2.0] TEST-01: All-example runtime harness",
+    "action": "created",
+    "number": 228,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/228"
+  },
+  {
+    "id": "TEST-02",
+    "title": "[WGPUI 2.0] TEST-02: Native crash aggregation",
+    "action": "created",
+    "number": 229,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/229"
+  },
+  {
+    "id": "TEST-03",
+    "title": "[WGPUI 2.0] TEST-03: Screenshot golden suite",
+    "action": "created",
+    "number": 230,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/230"
+  },
+  {
+    "id": "TEST-04",
+    "title": "[WGPUI 2.0] TEST-04: Property and differential tests",
+    "action": "created",
+    "number": 231,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/231"
+  },
+  {
+    "id": "TEST-05",
+    "title": "[WGPUI 2.0] TEST-05: Clippy and warning cleanup",
+    "action": "created",
+    "number": 232,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/232"
+  },
+  {
+    "id": "TEXT-01",
+    "title": "[WGPUI 2.0] TEXT-01: Visible shaping failure fallback",
+    "action": "created-and-closed",
+    "number": 233,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/233"
+  },
+  {
+    "id": "TEXT-02",
+    "title": "[WGPUI 2.0] TEXT-02: Fallback font selection",
+    "action": "created",
+    "number": 234,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/234"
+  },
+  {
+    "id": "TEXT-03",
+    "title": "[WGPUI 2.0] TEXT-03: Glyph cache invalidation",
+    "action": "created",
+    "number": 235,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/235"
+  },
+  {
+    "id": "TEXT-04",
+    "title": "[WGPUI 2.0] TEXT-04: Multiline truncation",
+    "action": "created",
+    "number": 236,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/236"
+  },
+  {
+    "id": "TEXT-05",
+    "title": "[WGPUI 2.0] TEXT-05: Text input shaping",
+    "action": "created",
+    "number": 237,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/237"
+  },
+  {
+    "id": "WIDGET-01",
+    "title": "[WGPUI 2.0] WIDGET-01: Retained text element",
+    "action": "created-and-closed",
+    "number": 238,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/238"
+  },
+  {
+    "id": "WIDGET-02",
+    "title": "[WGPUI 2.0] WIDGET-02: Retained keyed lists",
+    "action": "created-and-closed",
+    "number": 239,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/239"
+  },
+  {
+    "id": "WIDGET-03",
+    "title": "[WGPUI 2.0] WIDGET-03: Uniform list recycling",
+    "action": "created",
+    "number": 240,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/240"
+  },
+  {
+    "id": "WIDGET-04",
+    "title": "[WGPUI 2.0] WIDGET-04: Virtual list measurement",
+    "action": "created",
+    "number": 241,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/241"
+  },
+  {
+    "id": "WIDGET-05",
+    "title": "[WGPUI 2.0] WIDGET-05: Scrollbar behavior",
+    "action": "created",
+    "number": 242,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/242"
+  },
+  {
+    "id": "WIDGET-06",
+    "title": "[WGPUI 2.0] WIDGET-06: Control widget contract tests",
+    "action": "created",
+    "number": 243,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/243"
+  },
+  {
+    "id": "WINDOW-01",
+    "title": "[WGPUI 2.0] WINDOW-01: Full repaint warning escape hatch",
+    "action": "created-and-closed",
+    "number": 244,
+    "state": "CLOSED",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/244"
+  },
+  {
+    "id": "WINDOW-02",
+    "title": "[WGPUI 2.0] WINDOW-02: Public render-time Window boundary",
+    "action": "created",
+    "number": 245,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/245"
+  },
+  {
+    "id": "WINDOW-03",
+    "title": "[WGPUI 2.0] WINDOW-03: winit_window escape hatch audit",
+    "action": "created",
+    "number": 246,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/246"
+  },
+  {
+    "id": "WINDOW-04",
+    "title": "[WGPUI 2.0] WINDOW-04: Interaction mutability boundary",
+    "action": "created",
+    "number": 247,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/247"
+  },
+  {
+    "id": "WINDOW-05",
+    "title": "[WGPUI 2.0] WINDOW-05: Full-refresh call-site audit",
+    "action": "created",
+    "number": 248,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/248"
+  },
+  {
+    "id": "WINDOW-06",
+    "title": "[WGPUI 2.0] WINDOW-06: Surface resize and loss recovery",
+    "action": "created",
+    "number": 249,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/249"
+  },
+  {
+    "id": "WINDOW-07",
+    "title": "[WGPUI 2.0] WINDOW-07: Clipboard behavior parity",
+    "action": "created",
+    "number": 250,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/250"
+  },
+  {
+    "id": "WINDOW-08",
+    "title": "[WGPUI 2.0] WINDOW-08: Prompt lifecycle and error propagation",
+    "action": "created",
+    "number": 251,
+    "state": "OPEN",
+    "url": "https://github.com/Far-Beyond-Pulsar/WGPUI/issues/251"
+  }
+]

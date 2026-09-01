@@ -18,6 +18,9 @@ struct ScrollState {
     revision: u64,
     item_height: Option<Pixels>,
     item_count: Option<usize>,
+    scrollbar_drag_axis: Option<usize>,
+    scrollbar_drag_pointer: Pixels,
+    scrollbar_drag_offset: Pixels,
 }
 
 /// A cloneable handle for reading and changing a scroll container's retained
@@ -64,6 +67,37 @@ impl ScrollHandle {
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) fn begin_scrollbar_drag(
+        &self,
+        axis: usize,
+        pointer: Pixels,
+        offset: Pixels,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        if state.scrollbar_drag_axis.is_some() {
+            return false;
+        }
+        state.scrollbar_drag_axis = Some(axis);
+        state.scrollbar_drag_pointer = pointer;
+        state.scrollbar_drag_offset = offset;
+        true
+    }
+
+    pub(crate) fn scrollbar_drag(&self, axis: usize) -> Option<(Pixels, Pixels)> {
+        let state = self.state.borrow();
+        (state.scrollbar_drag_axis == Some(axis))
+            .then_some((state.scrollbar_drag_pointer, state.scrollbar_drag_offset))
+    }
+
+    pub(crate) fn end_scrollbar_drag(&self, axis: usize) -> bool {
+        let mut state = self.state.borrow_mut();
+        if state.scrollbar_drag_axis != Some(axis) {
+            return false;
+        }
+        state.scrollbar_drag_axis = None;
+        true
     }
 
     /// Copy-only state for the native inspector. The handle itself stays

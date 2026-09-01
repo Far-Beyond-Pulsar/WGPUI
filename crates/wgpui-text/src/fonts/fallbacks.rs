@@ -21,3 +21,9 @@ impl FontFallbacks {
         FontFallbacks(Arc::new(fonts))
     }
 }
+
+impl From<Vec<String>> for FontFallbacks {
+    fn from(fonts: Vec<String>) -> Self {
+        Self::from_fonts(fonts)
+    }
+}

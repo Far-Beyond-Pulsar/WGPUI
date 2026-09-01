@@ -100,6 +100,7 @@ pub struct Div {
     interaction: events::InteractionState,
     focus_handle: Option<wgpui_core::window::FocusHandle>,
     scroll_handle: Option<scroll_state::ScrollHandle>,
+    scrollbar_orientations: [bool; 2],
     hover_style: Option<Box<DivStyle>>,
     active_style: Option<Box<DivStyle>>,
     focus_style: Option<Box<DivStyle>>,
@@ -125,6 +126,7 @@ pub fn div() -> Div {
         interaction: events::InteractionState::new(),
         focus_handle: None,
         scroll_handle: None,
+        scrollbar_orientations: [false, false],
         hover_style: None,
         active_style: None,
         focus_style: None,
@@ -456,7 +458,20 @@ impl Div {
 
     pub fn track_scroll(mut self, handle: &scroll_state::ScrollHandle) -> Self {
         self.scroll_handle = Some(handle.clone());
+        self.scrollbar_orientations = [true, true];
         self.boundary = true;
+        self
+    }
+
+    /// Add the scrollbar for one axis to a tracked div.
+    pub fn scrollbar(mut self, orientation: crate::scroll::ScrollbarOrientation) -> Self {
+        self.scrollbar_orientations[orientation.axis()] = true;
+        self
+    }
+
+    /// Add both scrollbars to a tracked div.
+    pub fn scrollbars(mut self) -> Self {
+        self.scrollbar_orientations = [true, true];
         self
     }
 
@@ -570,7 +585,7 @@ impl Div {
         let Div {
             element_id,
             style,
-            children,
+            mut children,
             mut boundary,
             boundary_policy,
             uncached,
@@ -584,6 +599,7 @@ impl Div {
             focus_visible_style,
             group_name: _,
             group_hover_style,
+            scrollbar_orientations,
             mut interaction,
             ..
         } = self;
@@ -658,6 +674,61 @@ impl Div {
             .as_ref()
             .map(|handle| [handle.offset().x.value(), handle.offset().y.value()])
             .unwrap_or(scroll_offset);
+
+        if let Some(handle) = scroll_handle.as_ref() {
+            for orientation in [
+                crate::scroll::ScrollbarOrientation::Vertical,
+                crate::scroll::ScrollbarOrientation::Horizontal,
+            ] {
+                if !scrollbar_orientations[orientation.axis()] {
+                    continue;
+                }
+                let scrollbar = crate::scroll::Scrollbar::new(handle, orientation);
+                let viewport = handle.viewport();
+                let track_size = match orientation {
+                    crate::scroll::ScrollbarOrientation::Vertical => {
+                        wgpui_core::geometry::Size::pixels(
+                            scrollbar.thickness().value(),
+                            viewport.size.height.value(),
+                        )
+                    }
+                    crate::scroll::ScrollbarOrientation::Horizontal => {
+                        wgpui_core::geometry::Size::pixels(
+                            viewport.size.width.value(),
+                            scrollbar.thickness().value(),
+                        )
+                    }
+                };
+                scrollbar.set_track_bounds(wgpui_core::geometry::Bounds::new(
+                    wgpui_core::geometry::Point::default(),
+                    track_size,
+                ));
+                if !scrollbar.state().visible {
+                    continue;
+                }
+                let controller = scrollbar.clone();
+                interaction.on_mouse_move(move |event, _, _| {
+                    if controller.is_dragging() {
+                        controller.update_drag(event.position);
+                        wgpui_core::window::EventResult::HANDLED
+                    } else {
+                        wgpui_core::window::EventResult::IGNORED
+                    }
+                });
+                let controller = scrollbar.clone();
+                interaction.on_mouse_up(
+                    wgpui_core::window::MouseButton::Left,
+                    move |_, _, _| {
+                        if controller.end_drag() {
+                            wgpui_core::window::EventResult::HANDLED
+                        } else {
+                            wgpui_core::window::EventResult::IGNORED
+                        }
+                    },
+                );
+                children.push(scrollbar.description());
+            }
+        }
         let mut description = Description::new::<Div>()
             .diff_key(key)
             .style(layout_style)

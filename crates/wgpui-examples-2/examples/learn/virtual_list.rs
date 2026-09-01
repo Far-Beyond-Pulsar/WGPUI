@@ -75,9 +75,9 @@ impl Render for VirtualListExample {
                     .child("Scroll to top")
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, window, _cx| {
+                        cx.listener(|this, _, _window, cx| {
                             this.controller.scroll_to_item(0);
-                            window.refresh();
+                            cx.notify();
                         }),
                     ),
             )
@@ -100,9 +100,9 @@ impl Render for VirtualListExample {
                     .child("Scroll to bottom")
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, window, _cx| {
+                        cx.listener(|this, _, _window, cx| {
                             this.controller.scroll_to_item(199);
-                            window.refresh();
+                            cx.notify();
                         }),
                     ),
             )
