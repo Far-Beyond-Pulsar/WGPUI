@@ -42,12 +42,12 @@ use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 
-use crate::assets::{AssetRegistry, Resource};
+use crate::animation::Transformation;
+use crate::assets::{AssetRegistry, AssetState, Resource};
 use crate::image_cache::{ImageCache, ImageDecodeError, decode_svg_at};
 use crate::img::{
     ImageSourceId, ImageStyle, Img, SharedImageEngine, pending_engine, resource_source_id,
 };
-use crate::animation::Transformation;
 use wgpui_text::shaping::SharedString;
 
 /// Rasterise SVG bytes into `engine`'s cache and return the source that holds
@@ -75,10 +75,9 @@ pub fn load(
 ///
 /// §6.2's standing rule — "every first-party element type ships with `diff_key`
 /// implemented" — applied to an element added after the rule was written, which
-/// is what the rule is for. It is [`crate::img::ImgKey`] minus the two fields an
-/// SVG cannot have: there is no animation frame in a rasterised document, and
-/// there is no load state because [`load`] is synchronous and either produced a
-/// source or returned an error.
+/// is what the rule is for. It is [`crate::img::ImgKey`] minus the animation
+/// frame, while retaining load state because resource-backed SVGs resolve
+/// asynchronously.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SvgKey {
     /// Which rasterised document is displayed.
@@ -87,6 +86,8 @@ pub struct SvgKey {
     pub requested_size: [f32; 2],
     /// How that box is drawn.
     pub style: ImageStyle,
+    /// Whether the document, loading placeholder, or failure fallback paints.
+    pub load_state: crate::img::ImageLoadState,
     pub transformation: Transformation,
     pub text_color: Option<[f32; 4]>,
 }
@@ -98,6 +99,10 @@ impl ReconcileKey for SvgKey {
         };
         let mut axes = Invalidation::empty();
         if previous.requested_size != self.requested_size {
+            axes |= Invalidation::LAYOUT;
+            axes |= Invalidation::DISPLAY;
+        }
+        if previous.load_state != self.load_state {
             axes |= Invalidation::LAYOUT;
             axes |= Invalidation::DISPLAY;
         }
@@ -132,7 +137,9 @@ pub fn svg_with_engine(source: ImageSourceId, engine: SharedImageEngine) -> Svg 
 
 /// Construct an asset-backed SVG builder.
 pub fn svg() -> SvgBuilder {
-    SvgBuilder { svg: Svg::pending() }
+    SvgBuilder {
+        svg: Svg::pending(),
+    }
 }
 
 pub struct SvgBuilder {
@@ -224,19 +231,48 @@ impl Element for SvgBuilder {
             return self.svg.into_description();
         };
         let Some(registry) = app.global::<AssetRegistry>() else {
-            return self.svg.load_state(crate::img::ImageLoadState::Failed).into_description();
+            return self
+                .svg
+                .load_state(crate::img::ImageLoadState::Failed)
+                .into_description();
         };
         let resource = Resource::from(path);
-        match registry.load_cached(resource.clone()) {
-            Ok(image) => {
-                let source = resource_source_id(&resource);
-                self.svg.image = self.svg.image.set_decoded(source, image);
-                if let Some(text_color) = self.svg.text_color {
-                    self.svg.image = self.svg.image.tint(text_color);
+        let request = registry.load_async(resource.clone(), app);
+        let state = registry.state(&resource);
+        request.detach();
+        match state {
+            Some(AssetState::Ready) => match registry.cached(&resource) {
+                Some(image) => {
+                    let source = resource_source_id(&resource);
+                    self.svg.image = self.svg.image.set_decoded(source, image);
+                    if let Some(text_color) = self.svg.text_color {
+                        self.svg.image = self.svg.image.tint(text_color);
+                    }
                 }
+                None => {
+                    self.svg.image = self
+                        .svg
+                        .image
+                        .load_state(crate::img::ImageLoadState::Failed);
+                }
+            },
+            Some(AssetState::Loading) => {
+                self.svg.image = self
+                    .svg
+                    .image
+                    .load_state(crate::img::ImageLoadState::Loading);
             }
-            Err(_) => {
-                self.svg.image = self.svg.image.load_state(crate::img::ImageLoadState::Failed);
+            Some(AssetState::Failed(_)) | None => {
+                self.svg.image = self
+                    .svg
+                    .image
+                    .load_state(crate::img::ImageLoadState::Failed);
+            }
+            Some(AssetState::Cancelled) => {
+                self.svg.image = self
+                    .svg
+                    .image
+                    .load_state(crate::img::ImageLoadState::Cancelled);
             }
         }
         self.svg.into_description()
@@ -245,31 +281,16 @@ impl Element for SvgBuilder {
 
 impl Svg {
     fn pending() -> Self {
-        Self::new(ImageSourceId::from_raw(1), pending_engine(ImageCache::new()))
+        Self::new(
+            ImageSourceId::from_raw(1),
+            pending_engine(ImageCache::new()),
+        )
     }
 
     pub fn from_resource(resource: Resource) -> Self {
         let source = resource_source_id(&resource);
-        let mut cache = ImageCache::new();
-        let bytes = match &resource {
-            Resource::Path(path) => std::fs::read(path),
-            Resource::Embedded(path) => std::fs::read(path),
-            Resource::Uri(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "URI SVG loading requires an application-owned loader",
-            )),
-        };
-        let load_state = match bytes {
-            Ok(bytes) => match decode_svg_at(&bytes, 1.0) {
-                Ok(document) => match cache.hold_at(source, document) {
-                    Ok(_) => crate::img::ImageLoadState::Ready,
-                    Err(_) => crate::img::ImageLoadState::Loading,
-                },
-                Err(_) => crate::img::ImageLoadState::Loading,
-            },
-            Err(_) => crate::img::ImageLoadState::Loading,
-        };
-        Self::new(source, pending_engine(cache)).load_state(load_state)
+        Self::new(source, pending_engine(ImageCache::new()))
+            .load_state(crate::img::ImageLoadState::Loading)
     }
 
     /// An SVG showing the document [`load`] put at `source`.
@@ -383,6 +404,7 @@ impl Svg {
             source: image.source,
             requested_size: image.requested_size,
             style: image.style,
+            load_state: image.load_state,
             transformation: self.transformation,
             text_color: self.text_color,
         }
@@ -563,6 +585,14 @@ mod tests {
                 .diff_key()
                 .compare(&base.diff_key()),
             Invalidation::DISPLAY
+        );
+        assert_eq!(
+            base.clone()
+                .load_state(crate::img::ImageLoadState::Loading)
+                .diff_key()
+                .compare(&base.diff_key()),
+            Invalidation::LAYOUT.union(Invalidation::DISPLAY),
+            "a resource transition swaps the SVG fallback and image"
         );
 
         let other = load(&engine, DOCUMENT.as_bytes(), 1.0).expect("rasterises");

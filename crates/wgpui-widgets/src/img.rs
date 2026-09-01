@@ -58,7 +58,7 @@ use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_core::scene::atlas::{ImageRasterKey, ImageTileSource};
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 
-use crate::assets::{AssetRegistry, Resource};
+use crate::assets::{AssetRegistry, AssetState, Resource};
 use crate::image_cache::ImageCache;
 use crate::styled::IntoStylePixels;
 
@@ -101,6 +101,8 @@ pub enum ImageLoadState {
     Loading,
     /// Loading failed; a fallback subtree paints instead.
     Failed,
+    /// Loading was cancelled; the fallback subtree remains active.
+    Cancelled,
 }
 
 /// How an image's own aspect ratio is reconciled with the box it was given.
@@ -468,23 +470,28 @@ pub fn img_with_engine(source: ImageSourceId, engine: SharedImageEngine) -> Img 
     Img::new(source, engine)
 }
 
+pub type ImageInputResolver =
+    Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>;
+
 /// An additive resource-backed image builder.
 pub struct ImgBuilder {
     image: Img,
     resource: Option<Resource>,
-    resolver: Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>,
+    resolver: Option<ImageInputResolver>,
 }
 
 pub trait IntoImageInput: 'static {
-    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>);
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>);
 }
 
 impl IntoImageInput for Resource {
-    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { (Some(self), None) }
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
+        (Some(self), None)
+    }
 }
 
 impl IntoImageInput for PathBuf {
-    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) {
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
         Resource::from(self).into_image_input()
     }
 }
@@ -493,16 +500,28 @@ impl<F> IntoImageInput for F
 where
     F: FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource + 'static,
 {
-    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { (None, Some(Box::new(self))) }
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
+        (None, Some(Box::new(self)))
+    }
 }
 
-impl IntoImageInput for String { fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { Resource::from(self).into_image_input() } }
-impl IntoImageInput for &'static str { fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { Resource::from(self).into_image_input() } }
+impl IntoImageInput for String {
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
+        Resource::from(self).into_image_input()
+    }
+}
+impl IntoImageInput for &'static str {
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
+        Resource::from(self).into_image_input()
+    }
+}
 
 /// Construct an image from a resource using the retained image representation.
 pub fn img(source: impl IntoImageInput) -> ImgBuilder {
     let (resource, resolver) = source.into_image_input();
-    let initial_resource = resource.clone().unwrap_or_else(|| Resource::Embedded("pending-image".into()));
+    let initial_resource = resource
+        .clone()
+        .unwrap_or_else(|| Resource::Embedded("pending-image".into()));
     ImgBuilder {
         image: Img::from_resource(initial_resource),
         resource,
@@ -511,11 +530,18 @@ pub fn img(source: impl IntoImageInput) -> ImgBuilder {
 }
 
 impl ImgBuilder {
-    pub fn from_decoded(source: ImageSourceId, image: std::sync::Arc<crate::assets::RenderImage>) -> Self {
+    pub fn from_decoded(
+        source: ImageSourceId,
+        image: std::sync::Arc<crate::assets::RenderImage>,
+    ) -> Self {
         let mut cache = ImageCache::new();
         let load_state = cache.hold_at(source, (*image).clone()).is_ok();
         Self {
-            image: Img::new(source, pending_engine(cache)).load_state(if load_state { ImageLoadState::Ready } else { ImageLoadState::Failed }),
+            image: Img::new(source, pending_engine(cache)).load_state(if load_state {
+                ImageLoadState::Ready
+            } else {
+                ImageLoadState::Failed
+            }),
             resource: None,
             resolver: None,
         }
@@ -586,16 +612,50 @@ impl Element for ImgBuilder {
             (None, Some(resolver)) => resolver(_window, &mut app.clone()),
             (None, None) => return self.image.into_description(),
         };
-        let Some(registry) = app.global::<AssetRegistry>() else { return self.image.into_description(); };
-        match registry.load_cached(resource.clone()) {
-            Ok(image) => {
-                let source = resource_source_id(&resource);
-                let load_state = if self.image.engine.borrow_mut().cache().hold_at(source, (*image).clone()).is_ok() {
-                    ImageLoadState::Ready
-                } else { ImageLoadState::Failed };
-                self.image.load_state(load_state).into_description()
-            }
-            Err(_) => self.image.load_state(ImageLoadState::Failed).into_description(),
+        let Some(registry) = app.global::<AssetRegistry>() else {
+            return self
+                .image
+                .load_state(ImageLoadState::Failed)
+                .into_description();
+        };
+        let request = registry.load_async(resource.clone(), app);
+        let state = registry.state(&resource);
+        request.detach();
+        match state {
+            Some(AssetState::Ready) => match registry.cached(&resource) {
+                Some(image) => {
+                    let source = resource_source_id(&resource);
+                    let load_state = if self
+                        .image
+                        .engine
+                        .borrow_mut()
+                        .cache()
+                        .hold_at(source, (*image).clone())
+                        .is_ok()
+                    {
+                        ImageLoadState::Ready
+                    } else {
+                        ImageLoadState::Failed
+                    };
+                    self.image.load_state(load_state).into_description()
+                }
+                None => self
+                    .image
+                    .load_state(ImageLoadState::Failed)
+                    .into_description(),
+            },
+            Some(AssetState::Loading) => self
+                .image
+                .load_state(ImageLoadState::Loading)
+                .into_description(),
+            Some(AssetState::Failed(_)) | None => self
+                .image
+                .load_state(ImageLoadState::Failed)
+                .into_description(),
+            Some(AssetState::Cancelled) => self
+                .image
+                .load_state(ImageLoadState::Cancelled)
+                .into_description(),
         }
     }
 }
@@ -714,24 +774,7 @@ impl Img {
 
     pub fn from_resource(resource: Resource) -> Self {
         let source = resource_source_id(&resource);
-        let mut cache = ImageCache::new();
-        let bytes = match &resource {
-            Resource::Path(path) => std::fs::read(path),
-            Resource::Embedded(path) => std::fs::read(path),
-            Resource::Uri(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "URI image loading requires an application-owned loader",
-            )),
-        };
-        let load_state = match bytes {
-            Ok(bytes) if cache.insert_at(source, &bytes).is_ok() => ImageLoadState::Ready,
-            _ => ImageLoadState::Loading,
-        };
-        Self::new(
-            source,
-            pending_engine(cache),
-        )
-        .load_state(load_state)
+        Self::new(source, pending_engine(ImageCache::new())).load_state(ImageLoadState::Loading)
     }
 
     /// Request a fixed square size using the standard spacing scale.
@@ -894,7 +937,11 @@ impl Img {
     }
 
     pub fn emit_into(&self, context: &EmitContext, emission: &mut Emission) {
-        self.emit_into_with_transform(context, emission, crate::animation::Transformation::default());
+        self.emit_into_with_transform(
+            context,
+            emission,
+            crate::animation::Transformation::default(),
+        );
     }
 
     pub(crate) fn emit_into_with_transform(
