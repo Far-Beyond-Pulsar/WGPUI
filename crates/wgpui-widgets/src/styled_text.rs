@@ -47,15 +47,13 @@ use std::sync::Arc;
 use wgpui_core::element::Element;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::patch::emit::{Emission, EmitContext};
-use wgpui_core::patch::primitive::Underline;
+use wgpui_core::patch::primitive::{Quad, Underline};
 use wgpui_core::reconcile::description::Description;
 use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 pub use wgpui_text::engine::{SharedTextEngine, TextEngine};
 use wgpui_text::patch::RunPlacement;
-use wgpui_text::shaping::{
-    Font, FontRun, FontStyle, FontWeight, ShapeError, SharedString,
-};
+use wgpui_text::shaping::{Font, FontRun, FontStyle, FontWeight, ShapeError, SharedString};
 
 /// The text properties that decide shaping, plus the one that does not.
 ///
@@ -383,11 +381,19 @@ impl StyledText {
 
     fn emit_into(&self, context: &EmitContext, emission: &mut Emission) {
         let mut engine = self.engine.borrow_mut();
-        let Ok(font_id) = engine.shaper().resolve_font(&self.style.font) else {
-            // No face at all: the text draws nothing this frame rather than
-            // taking the frame down. `resolve_font` already falls back to any
-            // available face, so reaching here means the font database is empty.
-            return;
+        let font_id = match engine.shaper().resolve_font(&self.style.font) {
+            Ok(font_id) => font_id,
+            Err(error) => {
+                report_shape_error(
+                    &self.text,
+                    &self.style,
+                    self.highlights.len(),
+                    "resolve_font",
+                    &error,
+                );
+                emit_shape_error_fallback(context, emission);
+                return;
+            }
         };
         let runs = self.font_runs(font_id);
         let placement = RunPlacement {
@@ -398,12 +404,14 @@ impl StyledText {
         let line = match engine.shape_line(&self.text, self.style.font_size, &runs) {
             Ok(line) => line,
             Err(error) => {
-                // Shaping refused this line — a run-length mismatch or an
-                // unissued font id, both of which are bugs in the caller rather
-                // than conditions to recover from. Reported rather than
-                // swallowed, and the element emits nothing rather than emitting
-                // garbage.
-                log_shape_error(&error);
+                report_shape_error(
+                    &self.text,
+                    &self.style,
+                    self.highlights.len(),
+                    "shape_line",
+                    &error,
+                );
+                emit_shape_error_fallback(context, emission);
                 return;
             }
         };
@@ -615,19 +623,52 @@ fn push_band(bands: &mut Vec<DecorationBand>, band: DecorationBand) {
     bands.push(band);
 }
 
-/// Where a shaping failure goes.
+/// Report a failure at the infallible `Emit` boundary with stable fields that
+/// can be collected by the application's stderr/tracing bridge.
+fn report_shape_error(
+    text: &SharedString,
+    style: &TextStyle,
+    highlight_count: usize,
+    stage: &str,
+    error: &ShapeError,
+) {
+    eprintln!(
+        "target=wgpui_widgets::styled_text level=ERROR event=shape_error \
+         stage={stage:?} family={:?} text={:?} text_len={} highlight_count={} \
+         font_size={} error={error}",
+        style.font.family.as_str(),
+        text.as_str(),
+        text.len(),
+        highlight_count,
+        style.font_size,
+    );
+}
+
+/// Make a failed text materialization visible without inventing glyph data.
 ///
-/// `wgpui-widgets` has no logging dependency and §3.4 does not give it one, so
-/// this is the single place that decides what happens to an error that cannot
-/// be propagated (an `Emit` returns nothing by design — it is called from a walk
-/// that has already committed to a frame). Kept as a named function so the
-/// decision is one line to change when the crate does take a logger, rather than
-/// an `eprintln!` scattered through the module.
-fn log_shape_error(error: &ShapeError) {
-    #[cfg(test)]
-    panic!("shaping failed during emission: {error}");
-    #[cfg(not(test))]
-    let _unreported = error;
+/// `Emit` has no error channel, so this quad is the only recoverable fallback
+/// that does not alter the shared shaping/raster pipeline or claim that text
+/// was rendered. The minimum size keeps the failure visible even for a zero-
+/// sized test/layout rectangle.
+fn emit_shape_error_fallback(context: &EmitContext, emission: &mut Emission) {
+    let width = if context.bounds.width.is_finite() && context.bounds.width > 0.0 {
+        context.bounds.width
+    } else {
+        1.0
+    };
+    let height = if context.bounds.height.is_finite() && context.bounds.height > 0.0 {
+        context.bounds.height
+    } else {
+        1.0
+    };
+    emission.quad(Quad {
+        origin: [context.bounds.x, context.bounds.y],
+        size: [width, height],
+        background: [1.0, 0.0, 0.0, 0.15],
+        border_color: [1.0, 0.0, 0.0, 1.0],
+        border_widths: [1.0; 4],
+        ..Quad::ZERO
+    });
 }
 
 impl Element for StyledText {
@@ -648,7 +689,8 @@ mod tests {
     use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
     use wgpui_core::scene::atlas::{GlyphRasterKey, GlyphTile, GlyphTileSource};
     use wgpui_layout::taffy_tree::LayoutTree;
-    use wgpui_text::shaping::{font, ShapedLine, TextShaper};
+    use wgpui_text::fonts::features::FontFeatures;
+    use wgpui_text::shaping::{ShapedLine, TextShaper, font};
 
     /// A tile source that hands out one tile per distinct raster key.
     ///
@@ -951,6 +993,54 @@ mod tests {
             Some(NodeOutcome::Reused)
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_shaping_failure_emits_a_visible_fallback_without_glyph_tiles() {
+        let engine = engine();
+        let element = StyledText::new(
+            "broken text",
+            TextStyle {
+                font: Font {
+                    family: "Segoe UI".into(),
+                    features: FontFeatures::from_pairs(vec![("bad".into(), 1)]),
+                    ..Font::default()
+                },
+                ..style()
+            },
+            engine,
+        )
+        .size(200.0, 20.0);
+        let mut emission = Emission::new();
+
+        element.emit_into(&context(), &mut emission);
+
+        assert!(
+            emission.glyph_runs().is_empty(),
+            "a failed shape must not pretend that any glyphs rendered"
+        );
+        assert_eq!(emission.quads().len(), 1);
+        assert_eq!(emission.quads()[0].origin, ORIGIN);
+        assert_eq!(emission.quads()[0].size, [200.0, 20.0]);
+        assert_eq!(emission.quads()[0].background, [1.0, 0.0, 0.0, 0.15]);
+        assert_eq!(emission.quads()[0].border_color, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(emission.quads()[0].border_widths, [1.0; 4]);
+    }
+
+    #[test]
+    fn successful_shaping_still_emits_glyphs_without_a_fallback_quad() {
+        let engine = engine();
+        let element = text(&engine, "unchanged");
+        let mut emission = Emission::new();
+
+        element.emit_into(&context(), &mut emission);
+
+        assert!(emission.quads().is_empty());
+        assert_eq!(emission.glyph_runs().len(), 1);
+        assert_eq!(
+            emission.glyph_runs()[0].glyphs.len(),
+            element.text.as_str().chars().count()
+        );
     }
 
     // ---- Phase 6.6: underline and strikethrough emission -------------------
