@@ -5,6 +5,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Cargo writes warnings to stderr even when the check succeeds. PowerShell 7
+# otherwise promotes that native stderr stream to a terminating error here.
+$PSNativeCommandUseErrorActionPreference = $false
 $manifest = Join-Path $PSScriptRoot "..\crates\wgpui-examples-2\Cargo.toml"
 $exampleRoot = Join-Path $PSScriptRoot "..\crates\wgpui-examples-2\examples"
 $logDirectory = if ($OutputDirectory) { $OutputDirectory } else { Join-Path $PSScriptRoot "..\target\examples-2-compile" }
@@ -23,8 +26,22 @@ $entries = @(
 $passed = 0
 $failed = 0
 foreach ($entry in $entries) {
-    $output = & cargo @cargoArgs --example $entry.Name 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) {
+    $stdoutFile = [System.IO.Path]::GetTempFileName()
+    $stderrFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $savedErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & cargo @cargoArgs --example $entry.Name 1> $stdoutFile 2> $stderrFile
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $savedErrorActionPreference
+        $output = [System.IO.File]::ReadAllText($stdoutFile) + [System.IO.File]::ReadAllText($stderrFile)
+    } finally {
+        if ($savedErrorActionPreference) {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
+        Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+    if ($exitCode -eq 0) {
         $passed++
         Write-Output ("PASS|{0}|{1}|compile-only" -f $entry.Name, $entry.Path)
     } else {
