@@ -14,8 +14,9 @@ mod example_prelude;
 
 use example_prelude::init_example;
 use wgpui::{
-    App, Application, Bounds, Colors, Context, FontStyle, FontWeight, Hsla, Render, StyledText,
-    TextOverflow, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, size,
+    App, Application, Bounds, Colors, Context, FontStyle, FontWeight, Hsla, HighlightStyle, Render,
+    SharedTextEngine, StyledText, TextOverflow, TextStyle, Window, WindowBounds, WindowOptions,
+    div, font, prelude::*, px, relative, size,
 };
 
 // Text Styling Examples
@@ -331,7 +332,7 @@ fn text_overflow_example(colors: &Colors) -> impl IntoElement {
 
 // Styled Text Examples
 
-fn styled_text_example(colors: &Colors) -> impl IntoElement {
+fn styled_text_example(colors: &Colors, engine: SharedTextEngine) -> impl IntoElement {
     let text = colors.text;
     let text_muted = colors.text_muted;
 
@@ -346,11 +347,23 @@ fn styled_text_example(colors: &Colors) -> impl IntoElement {
                 .child("StyledText with inline highlights"),
         )
         .child(div().text_lg().text_color(text).child(
-            StyledText::new("Bold Italic Normal Semibold").with_highlights([
-                (0..4, FontWeight::BOLD.into()),
-                (5..11, FontStyle::Italic.into()),
-                (19..27, FontWeight::SEMIBOLD.into()),
-            ]),
+            StyledText::new(
+                "Bold Italic Normal Semibold",
+                TextStyle {
+                    font: font("Segoe UI"),
+                    font_size: 18.0,
+                    line_height: 24.0,
+                    color: colors.text.into(),
+                },
+                engine,
+            )
+            .with_highlights(
+                std::sync::Arc::from(vec![
+                    (0..4, HighlightStyle::from(FontWeight::BOLD)),
+                    (5..11, HighlightStyle::from(FontStyle::Italic)),
+                    (19..27, HighlightStyle::from(FontWeight::SEMIBOLD)),
+                ]),
+            ),
         ))
 }
 
@@ -588,7 +601,7 @@ impl Render for TextExample {
                     .child(section(
                         &colors,
                         "Styled Text",
-                        styled_text_example(&colors),
+                        styled_text_example(&colors, window.text_engine()),
                     ))
                     .child(section(
                         &colors,
@@ -642,5 +655,5 @@ fn main() {
         .expect("Failed to open window");
 
         init_example(cx, "Text");
-    });
+    }).expect("Failed to run application");
 }

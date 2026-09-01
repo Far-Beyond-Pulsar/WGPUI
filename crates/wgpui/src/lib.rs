@@ -94,8 +94,9 @@ pub use wgpui_layout::taffy_tree::{
 };
 pub use wgpui_macros::IntoElement;
 pub use wgpui_text::patch::{RunPlacement, glyph_runs};
+pub use wgpui_text::engine::{SharedTextEngine, SharedTextShaper, TextEngine};
 pub use wgpui_text::shaping::{
-    Font, FontId, FontRun, FontStyle, FontWeight, SharedString, TextMeasurement, TextShaper,
+    font, Font, FontId, FontRun, FontStyle, FontWeight, SharedString, TextMeasurement, TextShaper,
 };
 pub use wgpui_widgets::animation::{
     Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline, Transformation,
@@ -285,8 +286,7 @@ pub use wgpui_widgets::styled::{
     TextOverflow,
 };
 pub use wgpui_widgets::styled_text::{
-    Highlight, HighlightStyle, StrikethroughStyle, StyledText, TextEngine, TextStyle,
-    UnderlineStyle,
+    Highlight, HighlightStyle, StrikethroughStyle, StyledText, TextStyle, UnderlineStyle,
 };
 pub use wgpui_widgets::svg::{
     svg, svg_with_engine, load as load_svg, Svg, SvgBuilder, SvgKey,

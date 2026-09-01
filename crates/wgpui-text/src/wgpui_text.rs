@@ -15,6 +15,7 @@
 //! a texture, and that copy is the only part of the path that needs one.
 
 pub mod fonts;
+pub mod engine;
 pub mod line;
 pub mod line_layout;
 pub mod line_wrapper;
@@ -30,3 +31,5 @@ pub mod shaping;
 /// feature at Phase 8's cutover, and not worth a feature flag before then, when
 /// nothing ships this crate at all.
 pub mod test_fonts;
+
+pub use engine::{SharedTextEngine, SharedTextShaper, TextEngine};

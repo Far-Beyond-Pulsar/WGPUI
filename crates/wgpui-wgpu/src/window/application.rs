@@ -43,6 +43,7 @@ use crate::window::frame_loop::{FrameLoop, InteractionRegistration, LoopInput};
 use crate::window::resize_detector::ResizeDetector;
 use crate::window::surface::WgpuSurfaceHandle;
 use crate::window::{Acquired, WindowError, WindowSurface};
+use wgpui_text::engine::SharedTextEngine;
 use wgpui_widgets::assets::Resource;
 use wgpui_widgets::assets::{Asset, AssetRegistry, ImageCacheError, RenderImage};
 use wgpui_widgets::img::ImgBuilder;
@@ -145,6 +146,7 @@ enum ImmediatePaint {
 
 pub struct Window {
     native: Arc<winit::window::Window>,
+    text_engine: SharedTextEngine,
     gpu_adapter: wgpu::Adapter,
     gpu_device: wgpu::Device,
     gpu_queue: wgpu::Queue,
@@ -638,6 +640,12 @@ impl Window {
     pub fn scale_factor(&self) -> f64 {
         self.scale_factor
     }
+
+    /// Access the renderer-backed text engine for this window.
+    pub fn text_engine(&self) -> SharedTextEngine {
+        self.text_engine.clone()
+    }
+
     pub fn request_redraw(&self) {
         self.native.request_redraw();
     }
@@ -2518,8 +2526,12 @@ impl Handler {
         let mut resizes = ResizeDetector::new();
         resizes.seed(width, height);
         let mode = DrawMode::best_available(context.indirect);
+        let mut frame_loop = FrameLoop::new(&context.device);
+        frame_loop.set_surface_registry(Arc::clone(&surface_registry));
+        let text_engine = frame_loop.text_engine();
         let window = Window {
             native,
+            text_engine,
             gpu_adapter: context.adapter.clone(),
             gpu_device: context.device.clone(),
             gpu_queue: context.queue.clone(),
@@ -2555,8 +2567,6 @@ impl Handler {
             observed_bounds: None,
             observed_appearance: WindowAppearance::Light,
         };
-        let mut frame_loop = FrameLoop::new(&context.device);
-        frame_loop.set_surface_registry(surface_registry);
         self.live.push(Live {
             id,
             frame_loop,

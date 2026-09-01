@@ -42,11 +42,15 @@
 //! needs a device.
 
 use std::collections::HashMap;
+use std::cell::RefCell;
+use std::rc::Rc;
 use wgpui_core::patch::primitive::AtlasTileId;
 use wgpui_core::scene::atlas::{
     AtlasEviction, AtlasKey, AtlasKind, GlyphRasterKey, ImageRasterKey, ImageTile, ImageTileSource,
     RasterizedGlyph, RasterizedImage,
 };
+use wgpui_text::engine::SharedTextShaper;
+use wgpui_text::raster::GlyphRasterizer;
 #[cfg(feature = "devtools")]
 use wgpui_devtools::{AtlasPackingSnapshot, AtlasPageRecord, AtlasPlacementRecord, SnapshotLimits};
 
@@ -897,6 +901,53 @@ where
                 self.atlas.get_or_insert_raster(key, &raster).ok()?
             }
         };
+        Some(wgpui_core::scene::atlas::GlyphTile {
+            tile: placement.tile,
+            atlas_origin: placement.origin,
+            atlas_size: placement.size,
+            bearing: placement.bearing,
+        })
+    }
+}
+
+/// A real glyph source shared by rich text elements and the frame loop.
+pub struct SharedAtlasTileSource {
+    atlas: Rc<RefCell<GlyphAtlas>>,
+    shaper: SharedTextShaper,
+    rasterizer: Rc<RefCell<GlyphRasterizer>>,
+}
+
+impl SharedAtlasTileSource {
+    pub fn new(
+        atlas: Rc<RefCell<GlyphAtlas>>,
+        shaper: SharedTextShaper,
+        rasterizer: Rc<RefCell<GlyphRasterizer>>,
+    ) -> Self {
+        Self { atlas, shaper, rasterizer }
+    }
+}
+
+impl wgpui_core::scene::atlas::GlyphTileSource for SharedAtlasTileSource {
+    fn tile_for(&mut self, key: GlyphRasterKey) -> Option<wgpui_core::scene::atlas::GlyphTile> {
+        if let Some(placement) = self.atlas.borrow().get(key) {
+            self.atlas.borrow_mut().stats.cache_hits += 1;
+            return Some(wgpui_core::scene::atlas::GlyphTile {
+                tile: placement.tile,
+                atlas_origin: placement.origin,
+                atlas_size: placement.size,
+                bearing: placement.bearing,
+            });
+        }
+        let raster = {
+            let mut rasterizer = self.rasterizer.borrow_mut();
+            let mut shaper = self.shaper.borrow_mut();
+            rasterizer.rasterize(&mut shaper, key).ok()?
+        };
+        let placement = self
+            .atlas
+            .borrow_mut()
+            .get_or_insert_raster(key, &raster)
+            .ok()?;
         Some(wgpui_core::scene::atlas::GlyphTile {
             tile: placement.tile,
             atlas_origin: placement.origin,
