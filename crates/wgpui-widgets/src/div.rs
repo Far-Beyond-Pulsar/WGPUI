@@ -481,6 +481,12 @@ impl Div {
         self
     }
 
+    /// Transform this builder while retaining its concrete type for fluent
+    /// conditional construction.
+    pub fn map<R>(self, transform: impl FnOnce(Self) -> R) -> R {
+        transform(self)
+    }
+
     /// Append one child.
     pub fn child(mut self, child: impl IntoDescription) -> Self {
         self.children.push(child.into_description());
