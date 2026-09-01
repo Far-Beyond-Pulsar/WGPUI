@@ -35,6 +35,8 @@ type WindowClosedHandler = Rc<RefCell<dyn FnMut(&mut App, WindowId)>>;
 
 struct AppState {
     observers: HashMap<EntityId, Vec<(u64, Observer)>>,
+    entity_invalidations: Vec<EntityId>,
+    queued_entity_invalidations: HashSet<EntityId>,
     next_observer: u64,
     next_entity: u64,
     globals: HashMap<TypeId, Rc<dyn Any>>,
@@ -106,6 +108,8 @@ impl App {
         Self {
             state: Rc::new(RefCell::new(AppState {
                 observers: HashMap::new(),
+                entity_invalidations: Vec::new(),
+                queued_entity_invalidations: HashSet::new(),
                 next_observer: 0,
             next_entity: 0,
             globals: HashMap::new(),
@@ -166,6 +170,12 @@ impl App {
     }
 
     pub(crate) fn notify_entity(&self, entity: EntityId) {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.queued_entity_invalidations.insert(entity) {
+                state.entity_invalidations.push(entity);
+            }
+        }
         let callbacks = self
             .state
             .borrow()
@@ -181,6 +191,25 @@ impl App {
     /// Notify observers of an entity from an application callback.
     pub fn notify(&self, entity: EntityId) {
         self.notify_entity(entity);
+    }
+
+    /// Drain entity changes raised since the last native frame consumed them.
+    ///
+    /// Entity IDs are coalesced without changing their first-seen order. The
+    /// queue is application-owned so cloned app handles and every native
+    /// window observe the same notification stream.
+    pub fn drain_entity_invalidations(&self) -> Vec<EntityId> {
+        let mut state = self.state.borrow_mut();
+        state.queued_entity_invalidations.clear();
+        std::mem::take(&mut state.entity_invalidations)
+    }
+
+    /// Whether `entity` has a queued change awaiting native consumption.
+    pub fn has_pending_entity_invalidation(&self, entity: EntityId) -> bool {
+        self.state
+            .borrow()
+            .queued_entity_invalidations
+            .contains(&entity)
     }
 
     pub fn run_pending_tasks(&self) {
@@ -670,11 +699,53 @@ mod tests {
             observed.set(observed.get() + 1);
         });
         for _ in 0..10_000 {
-            entity.update((), |value, _context| *value += 1);
+            entity.update((), |value, context| {
+                *value += 1;
+                context.notify();
+            });
         }
         assert_eq!(entity.entity_id(), identity);
         assert_eq!(*entity.read(&app), 10_000);
         assert_eq!(notifications.get(), 10_000);
+        assert_eq!(app.drain_entity_invalidations(), vec![identity]);
+    }
+
+    #[test]
+    fn entity_invalidations_coalesce_in_first_seen_order_and_drain_once() {
+        let app = App::create();
+        let first = app.new_entity(()).entity_id();
+        let second = app.new_entity(()).entity_id();
+
+        app.notify(first);
+        app.notify(second);
+        app.notify(first);
+
+        assert_eq!(app.drain_entity_invalidations(), vec![first, second]);
+        assert!(app.drain_entity_invalidations().is_empty());
+
+        app.notify(first);
+        assert!(app.has_pending_entity_invalidation(first));
+        assert!(!app.has_pending_entity_invalidation(second));
+    }
+
+    #[test]
+    fn draining_entity_invalidations_does_not_change_observer_drop_semantics() {
+        let app = App::create();
+        let entity = app.new_entity(());
+        let notifications = Rc::new(Cell::new(0));
+        let observed_notifications = notifications.clone();
+        let subscription = entity.observe(move |_| {
+            observed_notifications.set(observed_notifications.get() + 1);
+        });
+
+        app.notify(entity.entity_id());
+        assert_eq!(notifications.get(), 1);
+        assert_eq!(app.drain_entity_invalidations(), vec![entity.entity_id()]);
+
+        drop(subscription);
+        app.notify(entity.entity_id());
+        assert_eq!(notifications.get(), 1);
+        assert_eq!(app.drain_entity_invalidations(), vec![entity.entity_id()]);
     }
 
     #[test]

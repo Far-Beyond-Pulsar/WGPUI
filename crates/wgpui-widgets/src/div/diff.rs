@@ -27,6 +27,7 @@ use crate::div::interactivity::style::{DivStyle, classify_style_change};
 use std::any::Any;
 use wgpui_core::invalidation::axes::Invalidation;
 use wgpui_core::reconcile::diff_key::ReconcileKey;
+use wgpui_layout::IntrinsicSize;
 
 /// The fingerprint a `div()` presents to ambient reconciliation.
 #[derive(Clone, Debug, PartialEq)]
@@ -39,7 +40,7 @@ pub struct DivDiffKey {
     /// Taffy child list, and the reconciler needs `LAYOUT` raised for that even
     /// when every surviving child is individually clean.
     child_count: usize,
-    estimated_size: Option<[f32; 2]>,
+    estimated_size: Option<IntrinsicSize>,
 }
 
 impl DivDiffKey {
@@ -53,6 +54,36 @@ impl DivDiffKey {
         child_count: usize,
         estimated_size: Option<[f32; 2]>,
     ) -> DivDiffKey {
+        Self::with_intrinsic_estimate(
+            style,
+            child_count,
+            estimated_size.map(IntrinsicSize::from),
+        )
+    }
+
+    pub fn with_intrinsic_estimate(
+        style: DivStyle,
+        child_count: usize,
+        estimated_size: Option<IntrinsicSize>,
+    ) -> DivDiffKey {
+        let estimated_size = estimated_size
+            .and_then(IntrinsicSize::validated)
+            .filter(|_| {
+                style.layout.size.width == wgpui_layout::Dimension::auto()
+                    || style.layout.size.height == wgpui_layout::Dimension::auto()
+            })
+            .map(|estimate| IntrinsicSize::new(
+                if style.layout.size.width == wgpui_layout::Dimension::auto() {
+                    estimate.width
+                } else {
+                    0.0
+                },
+                if style.layout.size.height == wgpui_layout::Dimension::auto() {
+                    estimate.height
+                } else {
+                    0.0
+                },
+            ));
         DivDiffKey {
             style,
             child_count,
@@ -134,6 +165,40 @@ mod tests {
         let current = DivDiffKey::with_estimate(style(), 0, Some([80.0, 20.0]));
         assert_eq!(current.compare(&previous), Invalidation::LAYOUT);
         assert_eq!(previous.compare(&previous), Invalidation::empty());
+    }
+
+    #[test]
+    fn invalid_estimates_do_not_make_a_div_perpetually_dirty() {
+        let previous = DivDiffKey::with_intrinsic_estimate(
+            style(),
+            0,
+            Some(IntrinsicSize::new(f32::NAN, 20.0)),
+        );
+        let current = DivDiffKey::with_intrinsic_estimate(
+            style(),
+            0,
+            Some(IntrinsicSize::new(f32::NAN, 20.0)),
+        );
+        assert_eq!(current.compare(&previous), Invalidation::empty());
+    }
+
+    #[test]
+    fn an_estimate_change_is_inert_when_authored_dimensions_are_explicit() {
+        let mut fixed_style = style();
+        fixed_style.layout.size.width = wgpui_layout::Dimension::length(100.0);
+        fixed_style.layout.size.height = wgpui_layout::Dimension::length(50.0);
+
+        let previous = DivDiffKey::with_intrinsic_estimate(
+            fixed_style.clone(),
+            0,
+            Some(IntrinsicSize::new(40.0, 20.0)),
+        );
+        let current = DivDiffKey::with_intrinsic_estimate(
+            fixed_style,
+            0,
+            Some(IntrinsicSize::new(80.0, 30.0)),
+        );
+        assert_eq!(current.compare(&previous), Invalidation::empty());
     }
 
     #[test]

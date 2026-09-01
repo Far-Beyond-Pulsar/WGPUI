@@ -58,7 +58,7 @@ use wgpui_core::reconcile::diff_key::ReconcileKey;
 use wgpui_core::scene::atlas::{ImageRasterKey, ImageTileSource};
 use wgpui_layout::taffy_tree::{Dimension, LayoutSize, LayoutStyle};
 
-use crate::assets::{AssetRegistry, Resource};
+use crate::assets::{AssetRegistry, AssetState, Resource};
 use crate::image_cache::ImageCache;
 use crate::styled::IntoStylePixels;
 
@@ -101,6 +101,8 @@ pub enum ImageLoadState {
     Loading,
     /// Loading failed; a fallback subtree paints instead.
     Failed,
+    /// Loading was cancelled; the fallback subtree remains active.
+    Cancelled,
 }
 
 /// How an image's own aspect ratio is reconciled with the box it was given.
@@ -428,6 +430,8 @@ pub(crate) fn pending_engine(cache: ImageCache) -> SharedImageEngine {
 pub struct Img {
     element_id: Option<wgpui_core::reconcile::description::ElementId>,
     source: ImageSourceId,
+    render_source: ImageSourceId,
+    tint: Option<[f32; 4]>,
     frame_index: u32,
     load_state: ImageLoadState,
     requested_size: [f32; 2],
@@ -468,23 +472,28 @@ pub fn img_with_engine(source: ImageSourceId, engine: SharedImageEngine) -> Img 
     Img::new(source, engine)
 }
 
+pub type ImageInputResolver =
+    Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>;
+
 /// An additive resource-backed image builder.
 pub struct ImgBuilder {
     image: Img,
     resource: Option<Resource>,
-    resolver: Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>,
+    resolver: Option<ImageInputResolver>,
 }
 
 pub trait IntoImageInput: 'static {
-    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>);
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>);
 }
 
 impl IntoImageInput for Resource {
-    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { (Some(self), None) }
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
+        (Some(self), None)
+    }
 }
 
 impl IntoImageInput for PathBuf {
-    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) {
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
         Resource::from(self).into_image_input()
     }
 }
@@ -493,16 +502,28 @@ impl<F> IntoImageInput for F
 where
     F: FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource + 'static,
 {
-    fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { (None, Some(Box::new(self))) }
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
+        (None, Some(Box::new(self)))
+    }
 }
 
-impl IntoImageInput for String { fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { Resource::from(self).into_image_input() } }
-impl IntoImageInput for &'static str { fn into_image_input(self) -> (Option<Resource>, Option<Box<dyn FnOnce(&mut wgpui_core::window::Window, &mut wgpui_core::App) -> Resource>>) { Resource::from(self).into_image_input() } }
+impl IntoImageInput for String {
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
+        Resource::from(self).into_image_input()
+    }
+}
+impl IntoImageInput for &'static str {
+    fn into_image_input(self) -> (Option<Resource>, Option<ImageInputResolver>) {
+        Resource::from(self).into_image_input()
+    }
+}
 
 /// Construct an image from a resource using the retained image representation.
 pub fn img(source: impl IntoImageInput) -> ImgBuilder {
     let (resource, resolver) = source.into_image_input();
-    let initial_resource = resource.clone().unwrap_or_else(|| Resource::Embedded("pending-image".into()));
+    let initial_resource = resource
+        .clone()
+        .unwrap_or_else(|| Resource::Embedded("pending-image".into()));
     ImgBuilder {
         image: Img::from_resource(initial_resource),
         resource,
@@ -511,14 +532,48 @@ pub fn img(source: impl IntoImageInput) -> ImgBuilder {
 }
 
 impl ImgBuilder {
-    pub fn from_decoded(source: ImageSourceId, image: std::sync::Arc<crate::assets::RenderImage>) -> Self {
+    pub fn from_decoded(
+        source: ImageSourceId,
+        image: std::sync::Arc<crate::assets::RenderImage>,
+    ) -> Self {
         let mut cache = ImageCache::new();
         let load_state = cache.hold_at(source, (*image).clone()).is_ok();
         Self {
-            image: Img::new(source, pending_engine(cache)).load_state(if load_state { ImageLoadState::Ready } else { ImageLoadState::Failed }),
+            image: Img::new(source, pending_engine(cache)).load_state(if load_state {
+                ImageLoadState::Ready
+            } else {
+                ImageLoadState::Failed
+            }),
             resource: None,
             resolver: None,
         }
+    }
+
+    /// Attach a decoded image to this builder while preserving its style and
+    /// retained element identity.
+    pub fn with_decoded(
+        mut self,
+        source: ImageSourceId,
+        image: std::sync::Arc<crate::assets::RenderImage>,
+    ) -> Self {
+        self.image = self.image.set_decoded(source, image);
+        self.resource = None;
+        self.resolver = None;
+        self
+    }
+
+    /// Set the resource resolved by an outer compatibility builder.
+    pub fn with_resource(mut self, resource: Resource) -> Self {
+        self.image.source = resource_source_id(&resource);
+        self.image.render_source = self.image.source;
+        self.resource = Some(resource);
+        self.resolver = None;
+        self
+    }
+
+    pub fn with_load_state(mut self, load_state: ImageLoadState) -> Self {
+        self.image = self.image.load_state(load_state);
+        self
     }
     pub fn size(mut self, size: impl IntoStylePixels) -> Self {
         let size = size.into_style_pixels();
@@ -586,16 +641,38 @@ impl Element for ImgBuilder {
             (None, Some(resolver)) => resolver(_window, &mut app.clone()),
             (None, None) => return self.image.into_description(),
         };
-        let Some(registry) = app.global::<AssetRegistry>() else { return self.image.into_description(); };
-        match registry.load_cached(resource.clone()) {
-            Ok(image) => {
-                let source = resource_source_id(&resource);
-                let load_state = if self.image.engine.borrow_mut().cache().hold_at(source, (*image).clone()).is_ok() {
-                    ImageLoadState::Ready
-                } else { ImageLoadState::Failed };
-                self.image.load_state(load_state).into_description()
-            }
-            Err(_) => self.image.load_state(ImageLoadState::Failed).into_description(),
+        let Some(registry) = app.global::<AssetRegistry>() else {
+            return self
+                .image
+                .load_state(ImageLoadState::Failed)
+                .into_description();
+        };
+        let request = registry.load_async(resource.clone(), app);
+        let state = registry.state(&resource);
+        request.detach();
+        match state {
+            Some(AssetState::Ready) => match registry.cached(&resource) {
+                Some(image) => {
+                    let source = resource_source_id(&resource);
+                    self.image.set_decoded(source, image).into_description()
+                }
+                None => self
+                    .image
+                    .load_state(ImageLoadState::Failed)
+                    .into_description(),
+            },
+            Some(AssetState::Loading) => self
+                .image
+                .load_state(ImageLoadState::Loading)
+                .into_description(),
+            Some(AssetState::Failed(_)) | None => self
+                .image
+                .load_state(ImageLoadState::Failed)
+                .into_description(),
+            Some(AssetState::Cancelled) => self
+                .image
+                .load_state(ImageLoadState::Cancelled)
+                .into_description(),
         }
     }
 }
@@ -613,6 +690,15 @@ impl Img {
             .hold_at(source, (*image).clone())
             .is_ok();
         self.source = source;
+        self.render_source = self
+            .tint
+            .map(|color| {
+                self.engine
+                    .borrow_mut()
+                    .cache()
+                    .tinted_source(source, color)
+            })
+            .unwrap_or(source);
         self.load_state(if loaded {
             ImageLoadState::Ready
         } else {
@@ -625,6 +711,8 @@ impl Img {
         Self {
             element_id: None,
             source,
+            render_source: source,
+            tint: None,
             frame_index: 0,
             load_state: ImageLoadState::Ready,
             requested_size: [0.0, 0.0],
@@ -714,24 +802,7 @@ impl Img {
 
     pub fn from_resource(resource: Resource) -> Self {
         let source = resource_source_id(&resource);
-        let mut cache = ImageCache::new();
-        let bytes = match &resource {
-            Resource::Path(path) => std::fs::read(path),
-            Resource::Embedded(path) => std::fs::read(path),
-            Resource::Uri(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "URI image loading requires an application-owned loader",
-            )),
-        };
-        let load_state = match bytes {
-            Ok(bytes) if cache.insert_at(source, &bytes).is_ok() => ImageLoadState::Ready,
-            _ => ImageLoadState::Loading,
-        };
-        Self::new(
-            source,
-            pending_engine(cache),
-        )
-        .load_state(load_state)
+        Self::new(source, pending_engine(ImageCache::new())).load_state(ImageLoadState::Loading)
     }
 
     /// Request a fixed square size using the standard spacing scale.
@@ -781,15 +852,20 @@ impl Img {
         self
     }
 
-    pub fn tint(self, color: [f32; 4]) -> Self {
-        self.engine.borrow_mut().cache().tint(self.source, color);
+    pub fn tint(mut self, color: [f32; 4]) -> Self {
+        self.tint = Some(color);
+        self.render_source = self
+            .engine
+            .borrow_mut()
+            .cache()
+            .tinted_source(self.source, color);
         self
     }
 
     /// This image's fingerprint.
     pub fn diff_key(&self) -> ImgKey {
         ImgKey {
-            source: self.source,
+            source: self.render_source,
             frame_index: self.frame_index,
             load_state: self.load_state,
             requested_size: self.requested_size,
@@ -894,7 +970,11 @@ impl Img {
     }
 
     pub fn emit_into(&self, context: &EmitContext, emission: &mut Emission) {
-        self.emit_into_with_transform(context, emission, crate::animation::Transformation::default());
+        self.emit_into_with_transform(
+            context,
+            emission,
+            crate::animation::Transformation::default(),
+        );
     }
 
     pub(crate) fn emit_into_with_transform(
@@ -915,7 +995,7 @@ impl Img {
         let placement = self
             .engine
             .borrow_mut()
-            .tile_for(self.source, self.frame_index);
+            .tile_for(self.render_source, self.frame_index);
         let natural = self.natural_size();
         let bounds = [
             context.bounds.x,
@@ -1487,6 +1567,104 @@ mod tests {
             "and exactly one of them paid for a decode — forty avatars sharing \
              one source is the case this cache exists for, and a claim about \
              work *not* happening is only checkable by counting it when it does"
+        );
+    }
+
+    #[test]
+    fn instances_with_different_tints_keep_distinct_immutable_sources() {
+        let (engine, source, counters) = engine_counting(1, 1);
+        let original = engine
+            .borrow()
+            .cache
+            .get(source)
+            .expect("the helper holds its source")
+            .clone();
+        let red = sized(&engine, source).tint([1.0, 0.0, 0.0, 0.5]);
+        let green = sized(&engine, source).tint([0.0, 1.0, 0.0, 1.0]);
+        let red_again = sized(&engine, source).tint([1.0, 0.0, 0.0, 0.5]);
+
+        assert_ne!(red.diff_key().source, green.diff_key().source);
+        assert_eq!(red.diff_key().source, red_again.diff_key().source);
+        assert_eq!(
+            red.diff_key().compare(&green.diff_key()),
+            Invalidation::DISPLAY
+        );
+        assert_eq!(
+            red.diff_key().compare(&red_again.diff_key()),
+            Invalidation::empty()
+        );
+        assert_eq!(
+            engine.borrow().cache.get(source),
+            Some(&original),
+            "tinting an instance never changes the shared base frame"
+        );
+        assert_eq!(
+            engine
+                .borrow()
+                .cache
+                .frame(red.diff_key().source, 0)
+                .map(|frame| frame.texels.as_slice()),
+            Some([255, 0, 0, 64].as_slice())
+        );
+        assert!(emitted(&red, [0.0, 0.0, 1.0, 1.0]).is_some());
+        assert!(emitted(&red_again, [0.0, 0.0, 1.0, 1.0]).is_some());
+        assert!(emitted(&green, [0.0, 0.0, 1.0, 1.0]).is_some());
+        assert_eq!(
+            counters.decodes.get(),
+            2,
+            "one atlas entry per distinct tint"
+        );
+    }
+
+    #[test]
+    fn a_tinted_animation_reuses_one_source_across_frames_and_preserves_delays() {
+        let (engine, source, counters) = animated_engine();
+        let first = Img::new(source, Rc::clone(&engine))
+            .frame_index(0)
+            .tint([0.8, 0.2, 0.1, 1.0]);
+        let second = Img::new(source, Rc::clone(&engine))
+            .frame_index(1)
+            .tint([0.8, 0.2, 0.1, 1.0]);
+
+        assert_eq!(first.diff_key().source, second.diff_key().source);
+        assert!(emitted(&first, [0.0, 0.0, 16.0, 16.0]).is_some());
+        assert!(emitted(&first, [0.0, 0.0, 16.0, 16.0]).is_some());
+        assert!(emitted(&second, [0.0, 0.0, 16.0, 16.0]).is_some());
+        assert_eq!(
+            counters.decodes.get(),
+            2,
+            "each animation frame is resident once"
+        );
+
+        let cache = engine.borrow();
+        let image = cache
+            .cache
+            .get(first.diff_key().source)
+            .expect("the tinted animation source is materialized");
+        assert_eq!(image.frame_count(), 2);
+        assert_eq!(
+            image.frames()[0].delay,
+            std::time::Duration::from_millis(10)
+        );
+        assert_eq!(
+            image.frames()[1].delay,
+            std::time::Duration::from_millis(10)
+        );
+        assert_eq!(
+            image.frames()[0].texels,
+            [204, 51, 26, 0]
+                .into_iter()
+                .cycle()
+                .take(16 * 16 * 4)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            image.frames()[1].texels,
+            [204, 51, 26, 1]
+                .into_iter()
+                .cycle()
+                .take(16 * 16 * 4)
+                .collect::<Vec<_>>()
         );
     }
 

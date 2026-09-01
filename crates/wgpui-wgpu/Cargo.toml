@@ -61,6 +61,7 @@ raw-window-handle = "0.6.2"
 windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
+anyhow = "1"
 # `tests/legacy_image_differential.rs` drives Phase 6.2's gate end to end: a real
 # file on disk, decoded by `wgpui-widgets`, drawn by this crate, compared against
 # the legacy decoder's own bytes. That needs all three in one test binary.

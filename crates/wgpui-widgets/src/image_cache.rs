@@ -88,6 +88,24 @@ impl DecodedFrame {
             texels: self.texels.clone(),
         }
     }
+
+    fn tinted(&self, color: [f32; 4]) -> Self {
+        let [red, green, blue, alpha] =
+            color.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8);
+        let mut texels = self.texels.clone();
+        for texel in texels.chunks_exact_mut(4) {
+            let source_alpha = f32::from(texel[3]) / 255.0;
+            texel[0] = red;
+            texel[1] = green;
+            texel[2] = blue;
+            texel[3] = (source_alpha * f32::from(alpha) / 255.0 * 255.0).round() as u8;
+        }
+        Self {
+            size: self.size,
+            texels,
+            delay: self.delay,
+        }
+    }
 }
 
 /// A decoded image: one frame for a still, many for an animation.
@@ -197,6 +215,16 @@ impl DecodedImage {
             .first()
             .map(|frame| frame.size)
             .unwrap_or([0, 0])
+    }
+
+    fn tinted(&self, color: [f32; 4]) -> Self {
+        Self {
+            frames: self
+                .frames
+                .iter()
+                .map(|frame| frame.tinted(color))
+                .collect(),
+        }
     }
 }
 
@@ -438,6 +466,7 @@ fn decode_svg(bytes: &[u8], scale_factor: f32) -> Result<Vec<DecodedFrame>, Imag
 #[derive(Debug, Default)]
 pub struct ImageCache {
     images: HashMap<ImageSourceId, DecodedImage>,
+    tinted_sources: HashMap<(ImageSourceId, [u32; 4]), ImageSourceId>,
     next_source: u64,
 }
 
@@ -484,6 +513,16 @@ impl ImageCache {
     ) -> Result<ImageSourceId, ImageDecodeError> {
         self.next_source = self.next_source.max(source.as_raw());
         self.images.insert(source, image);
+        let pending_tints = self
+            .tinted_sources
+            .iter()
+            .filter_map(|((base_source, color_bits), tinted_source)| {
+                (*base_source == source).then_some((*color_bits, *tinted_source))
+            })
+            .collect::<Vec<_>>();
+        for (color_bits, tinted_source) in pending_tints {
+            self.materialize_tinted_source(source, color_bits, tinted_source);
+        }
         Ok(source)
     }
 
@@ -492,21 +531,54 @@ impl ImageCache {
         self.images.get(&source)
     }
 
-    /// Apply an RGBA tint to every frame while preserving decoded alpha.
-    pub fn tint(&mut self, source: ImageSourceId, color: [f32; 4]) -> bool {
-        let Some(image) = self.images.get_mut(&source) else {
-            return false;
-        };
-        for frame in &mut image.frames {
-            for texel in frame.texels.chunks_exact_mut(4) {
-                let alpha = f32::from(texel[3]) / 255.0;
-                texel[0] = (color[0].clamp(0.0, 1.0) * 255.0).round() as u8;
-                texel[1] = (color[1].clamp(0.0, 1.0) * 255.0).round() as u8;
-                texel[2] = (color[2].clamp(0.0, 1.0) * 255.0).round() as u8;
-                texel[3] = (alpha * color[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+    /// Return the immutable derived source for an RGBA tint.
+    ///
+    /// The base source is never changed. Derived sources share one cache entry
+    /// for the same source and exact colour, including all animation frames and
+    /// their delays. A source may be registered before its pixels arrive; the
+    /// derived entry is materialized when [`Self::hold_at`] receives the base.
+    pub fn tinted_source(&mut self, source: ImageSourceId, color: [f32; 4]) -> ImageSourceId {
+        let key = (source, color.map(f32::to_bits));
+        if let Some(tinted_source) = self.tinted_sources.get(&key) {
+            if self.images.contains_key(tinted_source) || !self.images.contains_key(&source) {
+                return *tinted_source;
             }
         }
-        true
+
+        let tinted_source = if let Some(tinted_source) = self.tinted_sources.get(&key) {
+            *tinted_source
+        } else {
+            self.next_source = self.next_source.max(source.as_raw());
+            self.next_source = self.next_source.saturating_add(1);
+            let tinted_source = ImageSourceId::from_raw(self.next_source);
+            self.tinted_sources.insert(key, tinted_source);
+            tinted_source
+        };
+        self.materialize_tinted_source(source, key.1, tinted_source);
+        tinted_source
+    }
+
+    fn materialize_tinted_source(
+        &mut self,
+        source: ImageSourceId,
+        color_bits: [u32; 4],
+        tinted_source: ImageSourceId,
+    ) {
+        if self.images.contains_key(&tinted_source) {
+            return;
+        }
+        let Some(image) = self.images.get(&source).cloned() else {
+            return;
+        };
+        let color = color_bits.map(f32::from_bits);
+        self.images.insert(tinted_source, image.tinted(color));
+    }
+
+    /// The old cache-wide tint operation cannot express which element should
+    /// receive the result. It is retained as an explicit unsupported operation;
+    /// use [`Self::tinted_source`] through [`crate::img::Img::tint`] instead.
+    pub fn tint(&mut self, _source: ImageSourceId, _color: [f32; 4]) -> bool {
+        false
     }
 
     /// One frame of one source.
@@ -546,7 +618,22 @@ impl ImageCache {
     /// cache that reached into the atlas would be a second eviction mechanism
     /// with its own chance of missing a subscriber.
     pub fn remove(&mut self, source: ImageSourceId) -> bool {
-        self.images.remove(&source).is_some()
+        let removed = self.images.remove(&source).is_some();
+        if removed {
+            let derived_sources = self
+                .tinted_sources
+                .iter()
+                .filter_map(|((base_source, _), tinted_source)| {
+                    (*base_source == source).then_some(*tinted_source)
+                })
+                .collect::<Vec<_>>();
+            for tinted_source in derived_sources {
+                self.images.remove(&tinted_source);
+            }
+            self.tinted_sources
+                .retain(|(base_source, _), _| *base_source != source);
+        }
+        removed
     }
 }
 
@@ -722,6 +809,82 @@ mod tests {
             cache.raster(ImageRasterKey { source: 999, ..key }),
             None,
             "a source the cache does not hold is `None`, not a panic"
+        );
+    }
+
+    #[test]
+    fn tints_reuse_derived_sources_without_changing_the_base_or_each_other() {
+        let base = DecodedImage::from_frames(vec![DecodedFrame {
+            size: [2, 1],
+            texels: vec![10, 20, 30, 128, 40, 50, 60, 255],
+            delay: Duration::from_millis(25),
+        }])
+        .expect("one frame");
+        let original = base.clone();
+        let mut cache = ImageCache::new();
+        let source = cache.hold(base).expect("holding a decoded image");
+
+        let red = cache.tinted_source(source, [1.0, 0.0, 0.5, 0.5]);
+        let red_again = cache.tinted_source(source, [1.0, 0.0, 0.5, 0.5]);
+        let green = cache.tinted_source(source, [0.0, 1.0, 0.0, 1.0]);
+
+        assert_eq!(
+            red, red_again,
+            "the same source and colour share one result"
+        );
+        assert_ne!(
+            red, green,
+            "different colours need different atlas identities"
+        );
+        assert_eq!(
+            cache.get(source),
+            Some(&original),
+            "the base remains immutable"
+        );
+        assert_eq!(
+            cache.frame(red, 0).map(|frame| frame.texels.as_slice()),
+            Some([255, 0, 128, 64, 255, 0, 128, 128].as_slice())
+        );
+        assert_eq!(
+            cache.frame(green, 0).map(|frame| frame.texels.as_slice()),
+            Some([0, 255, 0, 128, 0, 255, 0, 255].as_slice())
+        );
+        assert_eq!(cache.frame(red, 1), cache.frame(red, 0));
+        assert_eq!(cache.get(red).map(DecodedImage::frame_count), Some(1));
+        assert_eq!(
+            cache
+                .get(red)
+                .and_then(|image| image.frame(0))
+                .map(|frame| frame.delay),
+            Some(Duration::from_millis(25))
+        );
+    }
+
+    #[test]
+    fn a_tint_requested_before_decode_is_materialized_when_the_source_arrives() {
+        let mut cache = ImageCache::new();
+        let source = ImageSourceId::from_raw(1);
+        let tinted = cache.tinted_source(source, [0.2, 0.4, 0.6, 1.0]);
+
+        assert!(
+            cache.get(tinted).is_none(),
+            "there are no pixels to derive yet"
+        );
+        cache
+            .hold_at(
+                source,
+                DecodedImage::from_frames(vec![DecodedFrame {
+                    size: [1, 1],
+                    texels: vec![9, 8, 7, 255],
+                    delay: Duration::ZERO,
+                }])
+                .expect("one frame"),
+            )
+            .expect("holding a decoded image");
+
+        assert_eq!(
+            cache.frame(tinted, 0).map(|frame| frame.texels.as_slice()),
+            Some([51, 102, 153, 255].as_slice())
         );
     }
 

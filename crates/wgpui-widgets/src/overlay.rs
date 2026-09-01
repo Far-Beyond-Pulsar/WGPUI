@@ -5,3 +5,6 @@
 
 pub mod anchored;
 pub mod deferred;
+
+pub use anchored::{Anchor, AnchorHandle, AnchoredPosition, track_anchor};
+pub use deferred::{DeferredOverlay, OverlayHandle, OverlayLayer};

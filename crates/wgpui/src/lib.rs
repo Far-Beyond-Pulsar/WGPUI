@@ -5,16 +5,16 @@
 //! frozen compatibility crate or the reference implementation under `old/`.
 
 pub use wgpui_core as core;
+pub use wgpui_http_client as http_client;
 pub use wgpui_layout as layout;
 pub use wgpui_text as text;
 pub use wgpui_wgpu as gpu;
 pub use wgpui_widgets as widgets;
-pub use wgpui_http_client as http_client;
 
 pub use wgpui_http_client::{
-    AppHttpClientExt, AsyncBody, BoxedHttpClient, Builder, FollowRedirects, HttpBody,
-    HttpClient, HttpClientService, HttpClientWithProxy, HttpClientWithUrl, HttpRequestExt, Inner,
-    Method, NullHttpClient, RedirectPolicy, Request, Response, Result, StatusCode, Uri, Url,
+    AppHttpClientExt, AsyncBody, BoxedHttpClient, Builder, FollowRedirects, HttpBody, HttpClient,
+    HttpClientService, HttpClientWithProxy, HttpClientWithUrl, HttpRequestExt, Inner, Method,
+    NullHttpClient, RedirectPolicy, Request, Response, Result, StatusCode, Uri, Url,
 };
 
 pub use wgpui_core::actions;
@@ -26,6 +26,7 @@ pub use wgpui_core::color::{
     pattern_slash, radial_gradient, red, rgb, rgba, solid_background, transparent_black,
     transparent_white, white, yellow,
 };
+pub use wgpui_core::damage::{DamagePlan, DamageReason, DamageRecord};
 pub use wgpui_core::geometry;
 pub use wgpui_core::geometry::Rect;
 pub use wgpui_core::geometry::{
@@ -40,63 +41,61 @@ pub use wgpui_core::patch::primitive::{
     Shadow, ShadowClip, Underline,
 };
 pub use wgpui_core::reconcile;
-pub use wgpui_core::reconcile::description::{
-    RawText, RawTextKey, TextDecoration, TextOptions,
-};
+pub use wgpui_core::reconcile::description::{RawText, RawTextKey, TextDecoration, TextOptions};
 pub use wgpui_core::reconcile::{Description, ElementId, FramePlan, ReconcileKey, Reconciler};
-pub use wgpui_core::reconcile::{StateKey, StateScope};
-pub use wgpui_layout::taffy_tree::{LayoutNodeId as LayoutId, LayoutStyle as Style};
-pub use wgpui_text::shaping::ShapedLine;
 pub use wgpui_core::reconcile::{
     RetainedElementSnapshot, RetainedFrameSnapshot, RetainedWalk, RetainedWalkNode, TileOwnership,
 };
-pub use wgpui_core::damage::{DamagePlan, DamageReason, DamageRecord};
+pub use wgpui_core::reconcile::{StateKey, StateScope};
 pub use wgpui_core::scene;
 pub use wgpui_core::window::{
     AnimationClock, AnimationScheduler, DispatchTree, FocusManager, Keymap, WindowTimers,
 };
 pub use wgpui_core::{
-    Action, App, BackgroundExecutor, ClipboardItem, ClickEvent, CloseState, Context, DispatchNodeId, DragData, DragHoverEvent,
-    DropEvent, Entity, EntityError, EntityFactory, EntityId, EventResult, FocusEvent, FocusHandle,
-    FocusId, FocusTransition, Focusable, HitTestIndex, Hitbox, HitboxId, ImeEvent,
-    InputEvent, KeyBinding, KeyDownEvent, KeyParseError, KeyUpEvent, KeyboardButton,
-    KeyboardClickEvent, Keystroke, Menu, MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseButtonState,
-    MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Subscription, TextInputEvent,
-    Task, TaskError, Timer, TimerHandle, TimerId, TimerState, WeakEntity, WindowClosedSubscription,
-    TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowDecorations, WindowId,
-    WindowKind, WindowList,
+    Action, App, BackgroundExecutor, ClickEvent, ClipboardItem, CloseState, Context,
+    DispatchNodeId, DragData, DragHoverEvent, DropEvent, Entity, EntityError, EntityFactory,
+    EntityId, EventResult, FocusEvent, FocusHandle, FocusId, FocusTransition, Focusable,
+    HitTestIndex, Hitbox, HitboxId, ImeEvent, InputEvent, KeyBinding, KeyDownEvent, KeyParseError,
+    KeyUpEvent, KeyboardButton, KeyboardClickEvent, Keystroke, Menu, MenuItem, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Subscription, Task, TaskError, TextInputEvent,
+    Timer, TimerHandle, TimerId, TimerState, TitlebarOptions, WeakEntity, WindowAppearance,
+    WindowBackgroundAppearance, WindowClosedSubscription, WindowDecorations, WindowId, WindowKind,
+    WindowList,
 };
+pub use wgpui_layout::taffy_tree::{LayoutNodeId as LayoutId, LayoutStyle as Style};
+pub use wgpui_text::shaping::ShapedLine;
 
 /// Compatibility spelling used by the restored examples.
 pub type AppContext = App;
-pub use wgpui_core::{
-    Element, Stateful,
-};
+pub use wgpui_core::element::IntoElement;
+pub use wgpui_core::{Element, Stateful};
 pub use wgpui_wgpu::window::application::{
     AppWindowExt, Component, Render, RenderOnce, render_description,
 };
-pub use wgpui_core::element::IntoElement;
 
 pub trait IntoAnyElement {
     fn into_any_element(self) -> Description;
 }
 
 impl<T: IntoElement> IntoAnyElement for T {
-    fn into_any_element(self) -> Description { self.into_description() }
+    fn into_any_element(self) -> Description {
+        self.into_description()
+    }
 }
-pub use wgpui_layout::{
-    AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
-    LayoutTree, Measure,
-};
 pub use wgpui_layout::taffy_tree::{
     AlignContent, AlignItems, BoxSizing, FlexWrap, GridPlacement, GridTemplateComponent,
     LengthPercentage, LengthPercentageAuto, Overflow, Position, TrackSizingFunction,
 };
+pub use wgpui_layout::{
+    AvailableSpace, Dimension, Display, FlexDirection, IntrinsicSize, LayoutSize, LayoutStyle,
+    LayoutTree, Measure,
+};
 pub use wgpui_macros::IntoElement;
-pub use wgpui_text::patch::{RunPlacement, glyph_runs};
 pub use wgpui_text::engine::{SharedTextEngine, SharedTextShaper, TextEngine};
+pub use wgpui_text::patch::{RunPlacement, glyph_runs};
 pub use wgpui_text::shaping::{
-    font, Font, FontId, FontRun, FontStyle, FontWeight, SharedString, TextMeasurement, TextShaper,
+    Font, FontId, FontRun, FontStyle, FontWeight, SharedString, TextMeasurement, TextShaper, font,
 };
 pub use wgpui_widgets::animation::{
     Animation, AnimationElement, AnimationExt, AnimationSample, AnimationTimeline, Transformation,
@@ -115,17 +114,21 @@ pub use wgpui_widgets::image_cache::{
     DecodedFrame, DecodedImage, ImageCache, ImageDecodeError, decode, decode_async, decode_svg_at,
 };
 pub use wgpui_widgets::img::{
-    img_with_engine, ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img,
-    ImgBuilder, ObjectFit, SharedImageEngine,
+    ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img, ImgBuilder, ObjectFit,
+    SharedImageEngine, img_with_engine,
 };
 pub use wgpui_widgets::list;
+pub use wgpui_widgets::list::h_list::{
+    HList, HListArguments, HListState, HorizontalItemTransform, h_list,
+};
 pub use wgpui_widgets::list::uniform_list::{
     UniformItemTransform, UniformList, UniformListState, uniform_list,
 };
 pub use wgpui_widgets::list::virtual_list::{
-    VirtualItemTransform, VirtualList, VirtualListScrollController, VirtualListState, vlist,
-    virtual_list,
+    VirtualItemTransform, VirtualList, VirtualListScrollController, VirtualListState, virtual_list,
+    vlist,
 };
+pub use wgpui_widgets::list::{List, ListState, list};
 pub use wgpui_widgets::scroll::{ScrollHandle, ScrollPhysics, ScrollPhysicsMode, ScrollStrategy};
 pub type UniformListScrollHandle = ScrollHandle;
 
@@ -281,6 +284,16 @@ pub mod render_stats {
     }
 }
 
+pub use wgpui_widgets::animation::pulsating_between;
+pub use wgpui_widgets::assets::{
+    Asset, AssetLoadError, AssetLogger, AssetRegistry, AssetSource, ImageAssetLoader,
+    ImageCacheError, ImageSource, ImgResourceLoader, LOADING_DELAY, RenderImage, Resource,
+    SharedUri,
+};
+pub use wgpui_widgets::overlay::{
+    Anchor, AnchorHandle, AnchoredPosition, DeferredOverlay, OverlayHandle, OverlayLayer,
+    track_anchor,
+};
 pub use wgpui_widgets::styled::{
     IntoStyleBackground, IntoStyleColor, IntoStyleDimension, IntoStylePixels, Styled, TextAlign,
     TextOverflow,
@@ -288,27 +301,21 @@ pub use wgpui_widgets::styled::{
 pub use wgpui_widgets::styled_text::{
     Highlight, HighlightStyle, StrikethroughStyle, StyledText, TextStyle, UnderlineStyle,
 };
-pub use wgpui_widgets::svg::{
-    svg, svg_with_engine, load as load_svg, Svg, SvgBuilder, SvgKey,
-};
+pub use wgpui_widgets::svg::{Svg, SvgBuilder, SvgKey, load as load_svg, svg, svg_with_engine};
+pub use wgpui_widgets::text::{Text, TextArguments, text, text_with_style};
 pub use wgpui_widgets::wgpu_surface::{SurfaceId, SurfaceStyle, WgpuSurface, WgpuSurfaceKey};
-pub use wgpui_widgets::assets::{
-    Asset, AssetLoadError, AssetLogger, AssetRegistry, AssetSource, ImageAssetLoader, ImageCacheError,
-    ImageSource, ImgResourceLoader, LOADING_DELAY, RenderImage, Resource, SharedUri,
-};
-pub use wgpui_widgets::animation::pulsating_between;
 
 pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
+pub use wgpui_wgpu::window::WindowError;
 pub use wgpui_wgpu::window::application::{
-    entity_view, public_listener, public_value_listener, public_window_callback, img, AppAssetExt,
-    AssetRef, Application, ApplicationError, ClipboardError, ConfiguredApplication, Decorations,
-    Display as NativeDisplay, DisplayId, EntityView, FrameReport, IntoLegacyImageSource,
-    LegacyImageSource, LegacyImgBuilder, NativeApplication, PromptButton, PromptError, PromptLevel,
-    ResizeEdge, TilingState, Window, WindowHandle, WindowObserver, WindowOptions,
-    WindowServiceError,
+    AppAssetExt, Application, ApplicationError, AssetRef, ClipboardError, ConfiguredApplication,
+    Decorations, Display as NativeDisplay, DisplayId, EntityView, FrameReport,
+    IntoLegacyImageSource, LegacyImageSource, LegacyImgBuilder, NativeApplication, PromptButton,
+    PromptError, PromptLevel, ResizeEdge, TilingState, Window, WindowHandle, WindowObserver,
+    WindowOptions, WindowServiceError, entity_view, img, public_listener, public_value_listener,
+    public_window_callback,
 };
 pub use wgpui_wgpu::window::surface::{SurfaceResizeError, WgpuSurfaceHandle};
-pub use wgpui_wgpu::window::WindowError;
 
 /// Lower a native WGPU surface handle into a retained surface element.
 pub fn wgpu_surface(handle: WgpuSurfaceHandle) -> WgpuSurface {
@@ -317,9 +324,10 @@ pub fn wgpu_surface(handle: WgpuSurfaceHandle) -> WgpuSurface {
 
 pub mod prelude {
     pub use crate::{
-        App, AppWindowExt, Application, Component, Context, Description, Div, Element,
-        Entity, EntityFactory, IntoAnyElement, IntoElement, Render, RenderOnce, Stateful,
-        StatefulDiv, Styled, UniformList, VirtualList, WeakEntity, Window, WindowOptions, div,
-        uniform_list, virtual_list,
+        Anchor, AnchorHandle, AnchoredPosition, App, AppWindowExt, Application, Component, Context,
+        DeferredOverlay, Description, Div, Element, Entity, EntityFactory, HList, IntoAnyElement,
+        IntoElement, List, OverlayHandle, OverlayLayer, Render, RenderOnce, Stateful, StatefulDiv,
+        Styled, Text, UniformList, VirtualList, WeakEntity, Window, WindowOptions, div, h_list,
+        list, text, track_anchor, uniform_list, virtual_list,
     };
 }

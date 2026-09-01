@@ -5,10 +5,11 @@
 //! the decision to use the configured native HTTP client for URI resources.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::AsyncReadExt;
@@ -17,6 +18,13 @@ use wgpui_http_client::{AppHttpClientExt, AsyncBody, BoxedHttpClient, StatusCode
 use wgpui_text::shaping::SharedString;
 
 use crate::image_cache::{DecodedImage, ImageDecodeError, decode_async};
+
+type RedrawCallback = Arc<dyn Fn() + Send + Sync>;
+struct RedrawCallbackEntry {
+    resource: Option<Resource>,
+    callback: RedrawCallback,
+}
+type RedrawCallbacks = Arc<Mutex<HashMap<u64, RedrawCallbackEntry>>>;
 
 /// A typed, cancellable application asset operation.
 pub trait Asset: 'static {
@@ -48,6 +56,8 @@ pub type RenderImage = DecodedImage;
 #[derive(Debug)]
 pub enum ImageCacheError {
     Load(AssetLoadError),
+    Loading,
+    Failed(String),
     Cancelled(TaskError),
     Other(anyhow::Error),
 }
@@ -56,6 +66,8 @@ impl std::fmt::Display for ImageCacheError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Load(error) => error.fmt(formatter),
+            Self::Loading => formatter.write_str("asset is still loading"),
+            Self::Failed(error) => write!(formatter, "asset load failed: {error}"),
             Self::Cancelled(error) => error.fmt(formatter),
             Self::Other(error) => error.fmt(formatter),
         }
@@ -64,10 +76,14 @@ impl std::fmt::Display for ImageCacheError {
 
 impl std::error::Error for ImageCacheError {}
 impl From<AssetLoadError> for ImageCacheError {
-    fn from(error: AssetLoadError) -> Self { Self::Load(error) }
+    fn from(error: AssetLoadError) -> Self {
+        Self::Load(error)
+    }
 }
 impl From<anyhow::Error> for ImageCacheError {
-    fn from(error: anyhow::Error) -> Self { Self::Other(error) }
+    fn from(error: anyhow::Error) -> Self {
+        Self::Other(error)
+    }
 }
 
 /// Delay used by legacy image loading examples before a loading replacement is shown.
@@ -76,46 +92,389 @@ pub const LOADING_DELAY: std::time::Duration = std::time::Duration::from_millis(
 /// Application-owned source and decoded-image registry.
 pub struct AssetRegistry {
     source: Arc<dyn AssetSource>,
-    entries: Mutex<HashMap<Resource, RegistryEntry>>,
+    entries: Arc<Mutex<HashMap<Resource, RegistryEntry>>>,
+    redraw_callbacks: RedrawCallbacks,
+    next_callback: AtomicU64,
 }
 
 #[derive(Clone)]
 struct RegistryEntry {
     generation: u64,
-    image: Arc<RenderImage>,
+    state: AssetState,
+    image: Option<Arc<RenderImage>>,
+}
+
+/// The observable state of a registry entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssetState {
+    Loading,
+    Ready,
+    Failed(String),
+    Cancelled,
+}
+
+/// A subscription used by a renderer to request a targeted redraw when an
+/// asset changes state.
+pub struct AssetRedrawSubscription {
+    callbacks: RedrawCallbacks,
+    id: u64,
+}
+
+/// A cancellable registry-owned load.
+pub struct AssetRequest {
+    registry: Arc<Mutex<HashMap<Resource, RegistryEntry>>>,
+    redraw_callbacks: RedrawCallbacks,
+    resource: Resource,
+    generation: u64,
+    task: Option<wgpui_core::Task<()>>,
+    detached: bool,
 }
 
 impl AssetRegistry {
     pub fn new(source: Arc<dyn AssetSource>) -> Self {
-        Self { source, entries: Mutex::new(HashMap::new()) }
+        Self {
+            source,
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            redraw_callbacks: Arc::new(Mutex::new(HashMap::new())),
+            next_callback: AtomicU64::new(0),
+        }
     }
 
-    pub fn source(&self) -> &Arc<dyn AssetSource> { &self.source }
+    pub fn source(&self) -> &Arc<dyn AssetSource> {
+        &self.source
+    }
 
     pub fn invalidate(&self, resource: &Resource) -> bool {
-        self.entries.lock().map(|mut entries| entries.remove(resource).is_some()).unwrap_or(false)
+        let removed = match self.entries.lock() {
+            Ok(mut entries) => entries.remove(resource).is_some(),
+            Err(poisoned) => poisoned.into_inner().remove(resource).is_some(),
+        };
+        if removed {
+            self.notify_redraw(Some(resource));
+        }
+        removed
     }
 
     pub fn cached(&self, resource: &Resource) -> Option<Arc<RenderImage>> {
-        self.entries.lock().ok()?.get(resource).map(|entry| Arc::clone(&entry.image))
+        match self.entries.lock() {
+            Ok(entries) => entries.get(resource).and_then(|entry| entry.image.clone()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .get(resource)
+                .and_then(|entry| entry.image.clone()),
+        }
     }
 
+    /// Return the current state without doing any I/O or decoding.
+    pub fn state(&self, resource: &Resource) -> Option<AssetState> {
+        match self.entries.lock() {
+            Ok(entries) => entries.get(resource).map(|entry| entry.state.clone()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .get(resource)
+                .map(|entry| entry.state.clone()),
+        }
+    }
+
+    /// Return a cached image. A miss is reported as a stateful error; this
+    /// method never starts work and never blocks the caller.
     pub fn load_cached(&self, resource: Resource) -> Result<Arc<RenderImage>, ImageCacheError> {
-        if let Some(image) = self.cached(&resource) { return Ok(image); }
-        let image = futures::executor::block_on(ImageAssetLoader::load_with_client(
-            resource.clone(),
-            Arc::new(wgpui_http_client::NullHttpClient),
-            Arc::clone(&self.source),
-        ))?;
-        let image = Arc::new(image);
-        self.entries.lock().map_err(|_| anyhow::anyhow!("asset registry lock poisoned"))?
-            .insert(resource, RegistryEntry { generation: 0, image: Arc::clone(&image) });
-        Ok(image)
+        let entry = match self.entries.lock() {
+            Ok(entries) => entries.get(&resource).cloned(),
+            Err(poisoned) => poisoned.into_inner().get(&resource).cloned(),
+        };
+        match entry {
+            Some(RegistryEntry {
+                state: AssetState::Ready,
+                image: Some(image),
+                ..
+            }) => Ok(image),
+            Some(RegistryEntry {
+                state: AssetState::Loading,
+                ..
+            })
+            | None => Err(ImageCacheError::Loading),
+            Some(RegistryEntry {
+                state: AssetState::Failed(error),
+                ..
+            }) => Err(ImageCacheError::Failed(error)),
+            Some(RegistryEntry {
+                state: AssetState::Cancelled,
+                ..
+            }) => Err(ImageCacheError::Cancelled(TaskError::Cancelled)),
+            Some(RegistryEntry {
+                state: AssetState::Ready,
+                image: None,
+                ..
+            }) => Err(ImageCacheError::Other(anyhow::anyhow!(
+                "ready asset has no decoded image"
+            ))),
+        }
+    }
+
+    /// Start a deduplicated load using the application's configured HTTP
+    /// client. The returned handle can cancel work that is still pending.
+    pub fn load(&self, resource: Resource, app: &App) -> AssetRequest {
+        self.load_async(resource, app)
+    }
+
+    /// Start a deduplicated background load without doing any work on the
+    /// render thread.
+    pub fn load_async(&self, resource: Resource, app: &App) -> AssetRequest {
+        let (generation, should_start) = match self.entries.lock() {
+            Ok(mut entries) => match entries.get(&resource) {
+                Some(entry) => (entry.generation, false),
+                None => {
+                    entries.insert(
+                        resource.clone(),
+                        RegistryEntry {
+                            generation: 1,
+                            state: AssetState::Loading,
+                            image: None,
+                        },
+                    );
+                    (1, true)
+                }
+            },
+            Err(poisoned) => {
+                let mut entries = poisoned.into_inner();
+                let generation = entries
+                    .get(&resource)
+                    .map_or(1, |entry| entry.generation.wrapping_add(1).max(1));
+                entries.insert(
+                    resource.clone(),
+                    RegistryEntry {
+                        generation,
+                        state: AssetState::Loading,
+                        image: None,
+                    },
+                );
+                (generation, true)
+            }
+        };
+
+        if should_start {
+            let entries = Arc::clone(&self.entries);
+            let source = Arc::clone(&self.source);
+            let redraw_callbacks = Arc::clone(&self.redraw_callbacks);
+            let client = configured_asset_http_client(app);
+            let load_resource = resource.clone();
+            let task = app.background_spawn(async move {
+                let result = ImageAssetLoader::load_with_optional_client(
+                    load_resource.clone(),
+                    client,
+                    source,
+                )
+                .await
+                .map(Arc::new);
+                let mut notify = false;
+                match entries.lock() {
+                    Ok(mut entries) => {
+                        if let Some(entry) = entries.get_mut(&load_resource)
+                            && entry.generation == generation
+                            && entry.state == AssetState::Loading
+                        {
+                            notify = true;
+                            match result {
+                                Ok(image) => {
+                                    entry.image = Some(image);
+                                    entry.state = AssetState::Ready;
+                                }
+                                Err(error) => {
+                                    entry.image = None;
+                                    entry.state = AssetState::Failed(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                    Err(poisoned) => {
+                        let mut entries = poisoned.into_inner();
+                        if let Some(entry) = entries.get_mut(&load_resource)
+                            && entry.generation == generation
+                            && entry.state == AssetState::Loading
+                        {
+                            notify = true;
+                            match result {
+                                Ok(image) => {
+                                    entry.image = Some(image);
+                                    entry.state = AssetState::Ready;
+                                }
+                                Err(error) => {
+                                    entry.image = None;
+                                    entry.state = AssetState::Failed(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                if notify {
+                    notify_callbacks(&redraw_callbacks, Some(&load_resource));
+                }
+            });
+            return AssetRequest {
+                registry: Arc::clone(&self.entries),
+                redraw_callbacks: Arc::clone(&self.redraw_callbacks),
+                resource,
+                generation,
+                task: Some(task),
+                detached: false,
+            };
+        }
+
+        AssetRequest {
+            registry: Arc::clone(&self.entries),
+            redraw_callbacks: Arc::clone(&self.redraw_callbacks),
+            resource,
+            generation,
+            task: None,
+            detached: false,
+        }
+    }
+
+    /// Register a renderer callback for targeted redraw invalidation.
+    pub fn subscribe_redraw(
+        &self,
+        callback: impl Fn() + Send + Sync + 'static,
+    ) -> AssetRedrawSubscription {
+        self.subscribe_redraw_for(None, callback)
+    }
+
+    /// Register a renderer callback for one resource's state transitions.
+    pub fn subscribe_redraw_for(
+        &self,
+        resource: Option<&Resource>,
+        callback: impl Fn() + Send + Sync + 'static,
+    ) -> AssetRedrawSubscription {
+        let id = self
+            .next_callback
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let entry = RedrawCallbackEntry {
+            resource: resource.cloned(),
+            callback: Arc::new(callback),
+        };
+        match self.redraw_callbacks.lock() {
+            Ok(mut callbacks) => {
+                callbacks.insert(id, entry);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().insert(id, entry);
+            }
+        }
+        AssetRedrawSubscription {
+            callbacks: Arc::clone(&self.redraw_callbacks),
+            id,
+        }
+    }
+
+    fn notify_redraw(&self, resource: Option<&Resource>) {
+        notify_callbacks(&self.redraw_callbacks, resource);
     }
 }
 
+impl AssetRequest {
+    pub fn state(&self) -> Option<AssetState> {
+        match self.registry.lock() {
+            Ok(entries) => entries.get(&self.resource).map(|entry| entry.state.clone()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .get(&self.resource)
+                .map(|entry| entry.state.clone()),
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        let cancelled = match self.registry.lock() {
+            Ok(mut entries) => {
+                let Some(entry) = entries.get_mut(&self.resource) else {
+                    return;
+                };
+                if entry.generation != self.generation || entry.state != AssetState::Loading {
+                    return;
+                }
+                entry.state = AssetState::Cancelled;
+                true
+            }
+            Err(poisoned) => {
+                let mut entries = poisoned.into_inner();
+                let Some(entry) = entries.get_mut(&self.resource) else {
+                    return;
+                };
+                if entry.generation != self.generation || entry.state != AssetState::Loading {
+                    return;
+                }
+                entry.state = AssetState::Cancelled;
+                true
+            }
+        };
+        if cancelled {
+            if let Some(task) = self.task.as_mut() {
+                task.cancel();
+            }
+            notify_callbacks(&self.redraw_callbacks, Some(&self.resource));
+        }
+    }
+
+    /// Let the registry-owned operation finish after this handle is dropped.
+    pub fn detach(mut self) {
+        self.detached = true;
+        if let Some(task) = self.task.take() {
+            task.detach();
+        }
+    }
+}
+
+impl Drop for AssetRedrawSubscription {
+    fn drop(&mut self) {
+        match self.callbacks.lock() {
+            Ok(mut callbacks) => {
+                callbacks.remove(&self.id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(&self.id);
+            }
+        }
+    }
+}
+
+impl Drop for AssetRequest {
+    fn drop(&mut self) {
+        if self.task.is_some() && !self.detached && self.state() == Some(AssetState::Loading) {
+            self.cancel();
+        }
+    }
+}
+
+fn notify_callbacks(callbacks: &RedrawCallbacks, resource: Option<&Resource>) {
+    let callbacks = match callbacks.lock() {
+        Ok(callbacks) => callbacks
+            .values()
+            .filter(|entry| callback_matches(entry, resource))
+            .map(|entry| Arc::clone(&entry.callback))
+            .collect::<Vec<_>>(),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .values()
+            .filter(|entry| callback_matches(entry, resource))
+            .map(|entry| Arc::clone(&entry.callback))
+            .collect::<Vec<_>>(),
+    };
+    for callback in callbacks {
+        callback();
+    }
+}
+
+fn callback_matches(entry: &RedrawCallbackEntry, resource: Option<&Resource>) -> bool {
+    entry
+        .resource
+        .as_ref()
+        .is_none_or(|registered| resource.is_some_and(|current| registered == current))
+}
+
 impl Default for AssetRegistry {
-    fn default() -> Self { Self::new(Arc::new(())) }
+    fn default() -> Self {
+        Self::new(Arc::new(()))
+    }
 }
 
 /// A source of embedded assets supplied by an application.
@@ -187,6 +546,7 @@ impl From<SharedString> for Resource {
 #[derive(Debug)]
 pub enum AssetLoadError {
     Http(anyhow::Error),
+    MissingHttpClient,
     Io(std::io::Error),
     Embedded(anyhow::Error),
     BadStatus {
@@ -201,6 +561,9 @@ impl std::fmt::Display for AssetLoadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Http(error) => write!(formatter, "HTTP request failed: {error}"),
+            Self::MissingHttpClient => {
+                formatter.write_str("no HTTP client is configured for URI asset loading")
+            }
             Self::Io(error) => write!(formatter, "asset I/O failed: {error}"),
             Self::Embedded(error) => write!(formatter, "embedded asset failed: {error}"),
             Self::BadStatus { uri, status, body } => {
@@ -223,13 +586,20 @@ impl Asset for ImageAssetLoader {
     type Source = Resource;
     type Output = Result<Arc<RenderImage>, ImageCacheError>;
 
-    fn load(source: Self::Source, app: &mut App) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
-        let client = app.http_client();
-        let assets: Arc<dyn AssetSource> = app.global::<AssetRegistry>()
-            .map_or_else(|| Arc::new(()) as Arc<dyn AssetSource>, |registry| registry.source().clone());
+    fn load(
+        source: Self::Source,
+        app: &mut App,
+    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+        let client = configured_asset_http_client(app);
+        let assets: Arc<dyn AssetSource> = app.global::<AssetRegistry>().map_or_else(
+            || Arc::new(()) as Arc<dyn AssetSource>,
+            |registry| registry.source().clone(),
+        );
         async move {
             let bytes = ImageAssetLoader::load_bytes(source, client, assets).await?;
-            Ok(Arc::new(decode_async(bytes).await.map_err(AssetLoadError::Decode)?))
+            Ok(Arc::new(
+                decode_async(bytes).await.map_err(AssetLoadError::Decode)?,
+            ))
         }
     }
 }
@@ -238,7 +608,10 @@ pub struct ImgResourceLoader;
 impl Asset for ImgResourceLoader {
     type Source = Resource;
     type Output = Result<Arc<RenderImage>, ImageCacheError>;
-    fn load(source: Self::Source, app: &mut App) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+    fn load(
+        source: Self::Source,
+        app: &mut App,
+    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
         <ImageAssetLoader as Asset>::load(source, app)
     }
 }
@@ -250,11 +623,14 @@ impl ImageAssetLoader {
         app: &App,
         asset_source: Arc<dyn AssetSource>,
     ) -> impl std::future::Future<Output = Result<Arc<RenderImage>, ImageCacheError>> {
-        let client = app.http_client();
+        let client = configured_asset_http_client(app);
         let source = source.into();
         let task = app.background_spawn(async move {
             let bytes = Self::load_bytes(source, client, asset_source).await?;
-            decode_async(bytes).await.map_err(AssetLoadError::Decode).map(Arc::new)
+            decode_async(bytes)
+                .await
+                .map_err(AssetLoadError::Decode)
+                .map(Arc::new)
         });
         async move {
             let result = task.await.map_err(ImageCacheError::Cancelled)?;
@@ -271,18 +647,30 @@ impl ImageAssetLoader {
         client: BoxedHttpClient,
         asset_source: Arc<dyn AssetSource>,
     ) -> Result<DecodedImage, AssetLoadError> {
+        let bytes = Self::load_bytes(source.into(), Some(client), asset_source).await?;
+        decode_async(bytes).await.map_err(AssetLoadError::Decode)
+    }
+
+    async fn load_with_optional_client(
+        source: impl Into<Resource>,
+        client: Option<BoxedHttpClient>,
+        asset_source: Arc<dyn AssetSource>,
+    ) -> Result<DecodedImage, AssetLoadError> {
         let bytes = Self::load_bytes(source.into(), client, asset_source).await?;
         decode_async(bytes).await.map_err(AssetLoadError::Decode)
     }
 
     async fn load_bytes(
         source: Resource,
-        client: BoxedHttpClient,
+        client: Option<BoxedHttpClient>,
         asset_source: Arc<dyn AssetSource>,
     ) -> Result<Vec<u8>, AssetLoadError> {
         match source {
             Resource::Path(path) => std::fs::read(path).map_err(AssetLoadError::Io),
             Resource::Uri(uri) => {
+                let Some(client) = client else {
+                    return Err(AssetLoadError::MissingHttpClient);
+                };
                 let mut response = client
                     .get(&uri, AsyncBody::empty(), true)
                     .await
@@ -317,6 +705,11 @@ impl ImageAssetLoader {
     }
 }
 
+fn configured_asset_http_client(app: &App) -> Option<BoxedHttpClient> {
+    app.configured_http_client()
+        .filter(|client| client.type_name() != "NullHttpClient")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,19 +722,63 @@ mod tests {
         fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'_, [u8]>>> {
             Ok((path == "icon.svg").then_some(Cow::Borrowed(br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="4" height="2" fill="red"/></svg>"#)))
         }
-        fn list(&self, _path: &str) -> anyhow::Result<Vec<SharedString>> { Ok(Vec::new()) }
+        fn list(&self, _path: &str) -> anyhow::Result<Vec<SharedString>> {
+            Ok(Vec::new())
+        }
     }
 
     #[test]
     fn registry_decodes_caches_and_invalidates_application_assets() {
         let registry = AssetRegistry::new(Arc::new(MemoryAssets));
         let resource = Resource::Embedded("icon.svg".into());
+        let app = App::create();
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Ready);
         let first = registry.load_cached(resource.clone()).expect("asset loads");
         let second = registry.load_cached(resource.clone()).expect("cache hit");
         assert!(Arc::ptr_eq(&first, &second));
         assert!(registry.invalidate(&resource));
         assert!(registry.cached(&resource).is_none());
-        assert!(registry.load_cached(Resource::Embedded("missing.svg".into())).is_err());
+        let missing = Resource::Embedded("missing.svg".into());
+        registry.load_async(missing.clone(), &app).detach();
+        wait_for_state(&registry, &missing, AssetState::Failed(String::new()));
+        assert!(matches!(
+            registry.load_cached(missing),
+            Err(ImageCacheError::Failed(_))
+        ));
+    }
+
+    fn wait_for_state(registry: &AssetRegistry, resource: &Resource, expected: AssetState) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(state) = registry.state(resource)
+                && (state == expected
+                    || matches!(
+                        (&state, &expected),
+                        (AssetState::Failed(_), AssetState::Failed(_))
+                    ))
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "asset did not reach {expected:?}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn uri_failure_without_a_configured_client_is_retained_as_a_failure_state() {
+        let registry = AssetRegistry::new(Arc::new(()));
+        let app = App::create();
+        let resource = Resource::Uri("https://example.test/image.png".into());
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Failed(String::new()));
+        let Some(AssetState::Failed(error)) = registry.state(&resource) else {
+            panic!("URI request did not retain its failure state");
+        };
+        assert!(error.contains("no HTTP client is configured"));
     }
 
     struct FakeClient {
@@ -394,6 +831,260 @@ mod tests {
                 assert_eq!(body, "not found");
             }
             other => panic!("expected status error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_uses_the_configured_client_for_uri_resources() {
+        let client: BoxedHttpClient = Arc::new(FakeClient {
+            response: Mutex::new(Some(Ok(Response::builder()
+                .status(200)
+                .body(AsyncBody::from(br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2"/></svg>"#.to_vec()))
+                .expect("response")))),
+        });
+        let mut app = App::create();
+        app.set_http_client(client);
+        let registry = AssetRegistry::new(Arc::new(()));
+        let resource = Resource::Uri("https://example.test/image.svg".into());
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Ready);
+        assert!(registry.cached(&resource).is_some());
+    }
+
+    #[test]
+    fn registry_notifies_redraw_subscribers_after_a_state_transition() {
+        let redraws = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = AssetRegistry::new(Arc::new(MemoryAssets));
+        let subscription_counter = Arc::clone(&redraws);
+        let _subscription = registry.subscribe_redraw(move || {
+            subscription_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let app = App::create();
+        let resource = Resource::Embedded("icon.svg".into());
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Ready);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while redraws.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "redraw callback was not called"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(redraws.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn registry_only_notifies_a_resource_scoped_subscriber_for_that_resource() {
+        let redraws = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = AssetRegistry::new(Arc::new(MemoryAssets));
+        let resource = Resource::Embedded("icon.svg".into());
+        let unrelated = Resource::Embedded("other.svg".into());
+        let redraw_counter = Arc::clone(&redraws);
+        let _subscription = registry.subscribe_redraw_for(Some(&resource), move || {
+            redraw_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let app = App::create();
+
+        registry.load_async(unrelated.clone(), &app).detach();
+        wait_for_state(&registry, &unrelated, AssetState::Failed(String::new()));
+        assert_eq!(redraws.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Ready);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while redraws.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resource-scoped redraw callback was not called"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(redraws.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dropping_a_redraw_subscription_stops_late_asset_notifications() {
+        let redraws = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = AssetRegistry::new(Arc::new(MemoryAssets));
+        let resource = Resource::Embedded("icon.svg".into());
+        let redraw_counter = Arc::clone(&redraws);
+        let subscription = registry.subscribe_redraw_for(Some(&resource), move || {
+            redraw_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        drop(subscription);
+
+        let app = App::create();
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Ready);
+        std::thread::yield_now();
+        assert_eq!(redraws.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn duplicate_registry_requests_share_one_configured_http_request() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client: BoxedHttpClient = Arc::new(CountingClient {
+            requests: Arc::clone(&requests),
+        });
+        let mut app = App::create();
+        app.set_http_client(client);
+        let registry = AssetRegistry::new(Arc::new(()));
+        let resource = Resource::Uri("https://example.test/image.svg".into());
+        registry.load_async(resource.clone(), &app).detach();
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Ready);
+
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_explicit_null_http_client_is_not_used_for_asset_resolution() {
+        let mut app = App::create();
+        app.set_http_client(Arc::new(wgpui_http_client::NullHttpClient));
+        let registry = AssetRegistry::new(Arc::new(()));
+        let resource = Resource::Uri("https://example.test/image.svg".into());
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Failed(String::new()));
+        let Some(AssetState::Failed(error)) = registry.state(&resource) else {
+            panic!("URI request did not retain its failure state");
+        };
+        assert!(error.contains("no HTTP client is configured"));
+    }
+
+    #[test]
+    fn uncached_access_does_not_block_and_reports_loading() {
+        let registry = AssetRegistry::new(Arc::new(MemoryAssets));
+        let resource = Resource::Embedded("icon.svg".into());
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            registry.load_cached(resource),
+            Err(ImageCacheError::Loading)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_pending_request_can_be_cancelled_without_committing_a_late_result() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client: BoxedHttpClient = Arc::new(PendingClient {
+            dropped: Arc::clone(&dropped),
+            started: Arc::clone(&started),
+        });
+        let mut app = App::create();
+        app.set_http_client(client);
+        let registry = AssetRegistry::new(Arc::new(()));
+        let resource = Resource::Uri("https://example.test/pending".into());
+        let mut request = registry.load_async(resource.clone(), &app);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending request did not start"
+            );
+            std::thread::yield_now();
+        }
+        let observer = registry.load_async(resource.clone(), &app);
+        drop(observer);
+        assert_eq!(registry.state(&resource), Some(AssetState::Loading));
+        request.cancel();
+        assert_eq!(request.state(), Some(AssetState::Cancelled));
+        drop(request);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending request was not cancelled"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(registry.state(&resource), Some(AssetState::Cancelled));
+    }
+
+    struct PendingClient {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct CountingClient {
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HttpClient for CountingClient {
+        fn type_name(&self) -> &'static str {
+            "CountingClient"
+        }
+
+        fn user_agent(&self) -> Option<&wgpui_http_client::http_client::http::HeaderValue> {
+            None
+        }
+
+        fn send(
+            &self,
+            _request: Request<AsyncBody>,
+        ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(
+                        br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2"/></svg>"#.to_vec(),
+                    ))
+                    .expect("response"))
+            })
+        }
+
+        fn proxy(&self) -> Option<&wgpui_http_client::Url> {
+            None
+        }
+    }
+
+    impl HttpClient for PendingClient {
+        fn type_name(&self) -> &'static str {
+            "PendingClient"
+        }
+
+        fn user_agent(&self) -> Option<&wgpui_http_client::http_client::http::HeaderValue> {
+            None
+        }
+
+        fn send(
+            &self,
+            _request: Request<AsyncBody>,
+        ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(PendingResponse {
+                dropped: Arc::clone(&self.dropped),
+            })
+        }
+
+        fn proxy(&self) -> Option<&wgpui_http_client::Url> {
+            None
+        }
+    }
+
+    struct PendingResponse {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::future::Future for PendingResponse {
+        type Output = anyhow::Result<Response<AsyncBody>>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingResponse {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
