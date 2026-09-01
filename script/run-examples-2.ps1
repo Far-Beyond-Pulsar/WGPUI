@@ -283,7 +283,7 @@ $textLines.Add(("SUMMARY|total={0}|exited={1}|crashed={2}|launch-failed={3}|rust
 foreach ($record in $finalRecords | Sort-Object name) {
     $textLines.Add(("{0}|status={1}|exit={2}|pid={3}|rust-backtrace={4}|native-exception={5}" -f `
         $record.name, $record.status, $record.exit_code, $record.pid, $record.rust_backtrace, $record.native_exception))
-    foreach ($line in @($record.diagnostics.panic + $record.diagnostics.errors + $record.diagnostics.native_exception)) {
+    foreach ($line in @($record.diagnostics.panic + $record.diagnostics.errors + $record.diagnostics.native_exception | Select-Object -Unique)) {
         if ($line) {
             $textLines.Add(("DETAIL|{0}|{1}" -f $record.name, $line.Trim()))
         }
