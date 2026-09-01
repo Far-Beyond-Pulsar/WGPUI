@@ -1,9 +1,9 @@
 use std::{ops::Range, rc::Rc, time::Duration};
 
 use wgpui::{
-    App, Application, Bounds, Context, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    Render, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, canvas,
-    div, point, prelude::*, px, rgb, size, uniform_list,
+    App, Application, Bounds, Context, MouseButton, MouseMoveEvent, Pixels, Point, Render,
+    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, point,
+    prelude::*, px, rgb, size, uniform_list,
 };
 
 const TOTAL_ITEMS: usize = 10000;
@@ -273,21 +273,15 @@ impl DataTable {
     }
 
     fn table_bounds(&self) -> Bounds<Pixels> {
-        self.scroll_handle.0.borrow().base_handle.bounds()
+        self.scroll_handle.bounds()
     }
 
     fn scroll_top(&self) -> Pixels {
-        self.scroll_handle.0.borrow().base_handle.offset().y
+        self.scroll_handle.offset().y
     }
 
     fn scroll_height(&self) -> Pixels {
-        self.scroll_handle
-            .0
-            .borrow()
-            .last_item_size
-            .unwrap_or_default()
-            .contents
-            .height
+        self.scroll_handle.content_size().height
     }
 
     fn render_scrollbar(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -304,7 +298,7 @@ impl DataTable {
             (table_height - SCROLLBAR_THUMB_HEIGHT - px(4.)).max(px(4.)),
         );
         let entity = cx.entity();
-        let scroll_handle = self.scroll_handle.0.borrow().base_handle.clone();
+        let scroll_handle = self.scroll_handle.clone();
 
         div()
             .id("scrollbar")
@@ -316,58 +310,43 @@ impl DataTable {
             .bg(rgb(0xC0C0C0))
             .hover(|this| this.bg(rgb(0xA0A0A0)))
             .rounded_lg()
-            .child(
-                canvas(
-                    |_, _, _| (),
-                    move |thumb_bounds, _, window, _| {
-                        window.on_mouse_event({
-                            let entity = entity.clone();
-                            move |ev: &MouseDownEvent, _, _, cx| {
-                                if !thumb_bounds.contains(&ev.position) {
-                                    return;
-                                }
-
-                                entity.update(cx, |this, _| {
-                                    this.drag_position = Some(
-                                        ev.position - thumb_bounds.origin - table_bounds.origin,
-                                    );
-                                })
-                            }
-                        });
-                        window.on_mouse_event({
-                            let entity = entity.clone();
-                            move |_: &MouseUpEvent, _, _, cx| {
-                                entity.update(cx, |this, _| {
-                                    this.drag_position = None;
-                                })
-                            }
-                        });
-
-                        window.on_mouse_event(move |ev: &MouseMoveEvent, _, _, cx| {
-                            if !ev.dragging() {
-                                return;
-                            }
-
-                            let Some(drag_pos) = entity.read(cx).drag_position else {
-                                return;
-                            };
-
-                            let inside_offset = drag_pos.y;
-                            let percentage = ((ev.position.y - table_bounds.origin.y
-                                + inside_offset)
-                                / (table_bounds.size.height))
-                                .clamp(0., 1.);
-
-                            let offset_y = ((scroll_height - table_bounds.size.height)
-                                * percentage)
-                                .clamp(px(0.), scroll_height - SCROLLBAR_THUMB_HEIGHT);
-                            scroll_handle.set_offset(point(px(0.), -offset_y));
-                            cx.notify(entity.entity_id());
+            .on_mouse_down(MouseButton::Left, {
+                let entity = entity.clone();
+                move |event, _, cx| {
+                    if let wgpui::InputEvent::MouseDown(mouse_down) = event {
+                        let pointer = point(mouse_down.position[0], mouse_down.position[1]);
+                        entity.update(cx, |this, _| {
+                            this.drag_position = Some(pointer - table_bounds.origin);
                         })
-                    },
-                )
-                .size_full(),
-            )
+                    }
+                }
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let entity = entity.clone();
+                move |_, _, cx| {
+                    entity.update(cx, |this, _| {
+                        this.drag_position = None;
+                    })
+                }
+            })
+            .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
+                if !event.dragging() {
+                    return;
+                }
+
+                let Some(drag_pos) = entity.read(cx).drag_position else {
+                    return;
+                };
+
+                let percentage = ((event.position[1] - table_bounds.origin.y + drag_pos.y)
+                    / table_bounds.size.height)
+                    .clamp(0., 1.);
+
+                let offset_y = ((scroll_height - table_bounds.size.height) * percentage)
+                    .clamp(px(0.), scroll_height - SCROLLBAR_THUMB_HEIGHT);
+                scroll_handle.set_offset(point(px(0.), -offset_y));
+                cx.notify(entity.entity_id());
+            })
     }
 }
 
