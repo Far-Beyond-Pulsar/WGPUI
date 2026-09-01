@@ -670,7 +670,10 @@ mod tests {
             observed.set(observed.get() + 1);
         });
         for _ in 0..10_000 {
-            entity.update((), |value, _context| *value += 1);
+            entity.update((), |value, context| {
+                *value += 1;
+                context.notify();
+            });
         }
         assert_eq!(entity.entity_id(), identity);
         assert_eq!(*entity.read(&app), 10_000);
