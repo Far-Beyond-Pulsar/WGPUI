@@ -62,9 +62,9 @@ impl Render for SmoothScrollingExample {
                     .child("Scroll to top")
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, window, _cx| {
+                        cx.listener(|this, _, _window, cx| {
                             this.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
-                            window.refresh();
+                            cx.notify();
                         }),
                     ),
             )
@@ -87,10 +87,10 @@ impl Render for SmoothScrollingExample {
                     .child("Scroll to bottom")
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, window, _cx| {
+                        cx.listener(|this, _, _window, cx| {
                             this.scroll_handle
                                 .scroll_to_item(199, ScrollStrategy::Bottom);
-                            window.refresh();
+                            cx.notify();
                         }),
                     ),
             )
