@@ -23,11 +23,10 @@ use wgpui_core::reconcile::plan::FrameStats;
 use wgpui_core::reconcile::{ElementStateStore, StateKey, StateScope};
 pub use wgpui_core::window::WindowOptions;
 use wgpui_core::window::{
-    AnimationClock, ClipboardItem, DragData, FocusEvent, FocusHandle, FocusId, ImeEvent, InputEvent,
-    KeyDownEvent,
-    KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton as CoreMouseButton,
-    MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent,
-    TextInputEvent,
+    AnimationClock, ClipboardItem, DragData, FocusEvent, FocusHandle, FocusId, ImeEvent,
+    InputEvent, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
+    MouseButton as CoreMouseButton, MouseButtonState, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ScrollWheelEvent, TextInputEvent,
 };
 use wgpui_core::window::{TimerHandle, TimerState};
 use wgpui_core::window::{
@@ -50,6 +49,7 @@ use wgpui_widgets::assets::{
     ImageCacheError, RenderImage,
 };
 use wgpui_widgets::img::ImgBuilder;
+use wgpui_widgets::overlay::{AnchorHandle, OverlayHandle, OverlayLayer};
 use wgpui_widgets::styled::Styled;
 
 fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
@@ -130,18 +130,19 @@ thread_local! {
 /// The adapter is only valid while the callback is dispatched by a live WGPU
 /// window. Keeping this conversion here avoids making either core or widgets
 /// depend on the concrete backend window.
-pub fn public_window_callback<E, F>(mut callback: F) -> impl FnMut(
-    &E,
-    &mut wgpui_core::window::Window,
-    &mut App,
-) + 'static
+pub fn public_window_callback<E, F>(
+    mut callback: F,
+) -> impl FnMut(&E, &mut wgpui_core::window::Window, &mut App) + 'static
 where
     F: FnMut(&E, &mut Window, &mut App) + 'static,
 {
     move |event, _core_window, app| {
         CALLBACK_WINDOW.with(|slot| {
             let pointer = slot.get();
-            assert!(!pointer.is_null(), "public window callback outside WGPU dispatch");
+            assert!(
+                !pointer.is_null(),
+                "public window callback outside WGPU dispatch"
+            );
             // SAFETY: the dispatch guard installs the pointer from the
             // currently borrowed Window and restores it before returning.
             unsafe { callback(event, &mut *pointer, app) };
@@ -180,7 +181,10 @@ pub fn public_value_listener<T: 'static, E: 'static>(
     move |event, core_window, _app| {
         CALLBACK_WINDOW.with(|slot| {
             let pointer = slot.get();
-            assert!(!pointer.is_null(), "public value listener outside WGPU dispatch");
+            assert!(
+                !pointer.is_null(),
+                "public value listener outside WGPU dispatch"
+            );
             let Some(entity) = entity.upgrade() else {
                 return;
             };
@@ -478,7 +482,9 @@ pub struct PromptButton {
 
 impl PromptButton {
     pub fn new(label: impl Into<String>) -> Self {
-        Self { label: label.into() }
+        Self {
+            label: label.into(),
+        }
     }
 
     pub fn ok(label: impl Into<String>) -> Self {
@@ -507,7 +513,10 @@ impl std::fmt::Display for PromptError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedButtonCount(count) => {
-                write!(formatter, "native prompt supports one or two buttons, got {count}")
+                write!(
+                    formatter,
+                    "native prompt supports one or two buttons, got {count}"
+                )
             }
             Self::UnsupportedButtonLabels => {
                 formatter.write_str("native prompt cannot display custom button labels")
@@ -647,8 +656,7 @@ impl AppWindowExt for App {
                         };
                         let lower = entity.update((), |value, context| {
                             let element = {
-                                let _scope =
-                                    wgpui_core::element::enter_contextual_render_scope();
+                                let _scope = wgpui_core::element::enter_contextual_render_scope();
                                 value.render(window, context)
                             };
                             Box::new(move |window: &mut Window, app: &mut App| {
@@ -657,7 +665,8 @@ impl AppWindowExt for App {
                                     window.interaction_mut(),
                                     app,
                                 )
-                            }) as Box<dyn FnOnce(&mut Window, &mut App) -> Description>
+                            })
+                                as Box<dyn FnOnce(&mut Window, &mut App) -> Description>
                         });
                         lower(window, app)
                     }),
@@ -722,7 +731,8 @@ impl Window {
         // The redraw is delivered by Winit on a later event-loop turn. The
         // flag makes repeated requests coalesce and keeps this request alive
         // until that redraw is consumed.
-        self.animation_frame_requested.store(true, Ordering::Release);
+        self.animation_frame_requested
+            .store(true, Ordering::Release);
         self.request_redraw();
     }
 
@@ -743,7 +753,9 @@ impl Window {
     }
 
     pub fn refresh(&mut self) {
-        tracing::warn!("full repaint forced by Window::refresh; targeted invalidation should generally be preferred");
+        tracing::warn!(
+            "full repaint forced by Window::refresh; targeted invalidation should generally be preferred"
+        );
         self.interaction.refresh();
         self.request_redraw();
     }
@@ -1037,7 +1049,9 @@ impl Window {
         }
     }
     pub fn current_monitor(&self) -> Option<DisplayId> {
-        self.native.current_monitor().map(|monitor| display_id(&monitor))
+        self.native
+            .current_monitor()
+            .map(|monitor| display_id(&monitor))
     }
 
     pub fn mouse_position(&self) -> Point<Pixels> {
@@ -1057,10 +1071,11 @@ impl Window {
     }
 
     pub fn show_window_menu(&self, position: [Pixels; 2]) {
-        self.native.show_window_menu(winit::dpi::LogicalPosition::new(
-            position[0].value().max(0.0) as u32,
-            position[1].value().max(0.0) as u32,
-        ));
+        self.native
+            .show_window_menu(winit::dpi::LogicalPosition::new(
+                position[0].value().max(0.0) as u32,
+                position[1].value().max(0.0) as u32,
+            ));
     }
     pub fn close(&mut self) {
         self.close_requested.store(true, Ordering::Release);
@@ -1097,6 +1112,31 @@ impl Window {
     /// descriptions and dispatching input.
     pub fn interaction_mut(&mut self) -> &mut wgpui_core::window::Window {
         &mut self.interaction
+    }
+
+    /// Lower an overlay layer against this window's current client viewport.
+    ///
+    /// The layer remains an ordinary retained description subtree. This
+    /// helper only supplies the concrete WGPU viewport and keeps redraw
+    /// ownership at the native boundary.
+    pub fn overlay_layer(&self, layer: OverlayLayer) -> Description {
+        let bounds = self.bounds();
+        let viewport = Rect::from_origin_size(
+            [0.0, 0.0],
+            [bounds.size.width.value(), bounds.size.height.value()],
+        );
+        CoreElement::into_description(layer.viewport(viewport))
+    }
+
+    /// Connect an overlay controller to this window's coalesced redraw queue.
+    pub fn bind_overlay_handle(&self, handle: &OverlayHandle) {
+        let window = self.handle();
+        handle.invalidate_with(move || window.request_redraw());
+    }
+
+    pub fn bind_anchor_handle(&self, handle: &AnchorHandle) {
+        let window = self.handle();
+        handle.invalidate_with(move || window.request_redraw());
     }
 
     pub fn focus<A>(&mut self, handle: &FocusHandle, _cx: A) -> bool {
@@ -1311,10 +1351,12 @@ impl Window {
                     else {
                         continue;
                     };
-                    let consumed = scroll_root.handle.scroll_by(wgpui_core::geometry::Point::new(
-                        Pixels(remaining[0]),
-                        Pixels(remaining[1]),
-                    ));
+                    let consumed = scroll_root
+                        .handle
+                        .scroll_by(wgpui_core::geometry::Point::new(
+                            Pixels(remaining[0]),
+                            Pixels(remaining[1]),
+                        ));
                     remaining[0] -= consumed.x.value();
                     remaining[1] -= consumed.y.value();
                     handled |= consumed.x != Pixels::ZERO || consumed.y != Pixels::ZERO;
@@ -1385,7 +1427,10 @@ impl Window {
         let mut current = Some(index);
         let mut result = wgpui_core::window::EventResult::IGNORED;
         while let Some(index) = current {
-            let parent = self.interactions.get(index).and_then(|registration| registration.parent);
+            let parent = self
+                .interactions
+                .get(index)
+                .and_then(|registration| registration.parent);
             let current_result = self.dispatch_interaction_result(index, event, app);
             if current_result.handled {
                 result.handled = true;
@@ -1531,7 +1576,8 @@ impl Window {
                 app,
             );
         }
-        self.native.set_ime_allowed(self.interaction.focused().is_some());
+        self.native
+            .set_ime_allowed(self.interaction.focused().is_some());
         handled
     }
     fn mark_interaction_dirty_for(&mut self, index: usize) {
@@ -1705,13 +1751,16 @@ impl Window {
     }
     fn focused_interaction(&self) -> Option<usize> {
         let focused = self.interaction.focused()?;
-        self.interactions
-            .iter()
-            .position(|registration| registration.focus.is_some_and(|focus| focus.id() == focused))
+        self.interactions.iter().position(|registration| {
+            registration
+                .focus
+                .is_some_and(|focus| focus.id() == focused)
+        })
     }
     pub fn handle_window_focus(&mut self, focused: bool, app: &mut App) -> bool {
         if focused {
-            self.native.set_ime_allowed(self.interaction.focused().is_some());
+            self.native
+                .set_ime_allowed(self.interaction.focused().is_some());
             return false;
         }
         let mut handled = self.clear_hover_with_app(app);
@@ -2140,13 +2189,19 @@ impl Application {
 
     /// Configures the client used by URI resource loading in this application.
     pub fn with_http_client(self, client: BoxedHttpClient) -> ConfiguredApplication {
-        ConfiguredApplication { http_client: Some(client), assets: Arc::new(()) }
+        ConfiguredApplication {
+            http_client: Some(client),
+            assets: Arc::new(()),
+        }
     }
 
     /// Retain the application-builder shape used by asset-backed examples.
     /// Asset resolution is owned by the widget layer; the native lifecycle
     /// does not need to inspect the source while constructing the event loop.
-    pub fn with_assets<T: wgpui_widgets::assets::AssetSource>(self, assets: T) -> ConfiguredApplication {
+    pub fn with_assets<T: wgpui_widgets::assets::AssetSource>(
+        self,
+        assets: T,
+    ) -> ConfiguredApplication {
         ConfiguredApplication {
             http_client: None,
             assets: Arc::new(assets),
@@ -2232,7 +2287,9 @@ pub struct LegacyImgBuilder {
     loading: Option<Box<dyn Fn() -> Description>>,
     border: bool,
     border_color: Option<wgpui_core::color::Hsla>,
-    click_handler: Option<Box<dyn FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut App)>>,
+    click_handler: Option<
+        Box<dyn FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut App)>,
+    >,
 }
 
 pub trait IntoLegacyImageSource: 'static {
@@ -2240,22 +2297,32 @@ pub trait IntoLegacyImageSource: 'static {
 }
 
 impl IntoLegacyImageSource for Resource {
-    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self) }
+    fn into_legacy_source(self) -> LegacyImageSource {
+        LegacyImageSource::Resource(self)
+    }
 }
 impl IntoLegacyImageSource for std::path::PathBuf {
-    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self.into()) }
+    fn into_legacy_source(self) -> LegacyImageSource {
+        LegacyImageSource::Resource(self.into())
+    }
 }
 impl IntoLegacyImageSource for String {
-    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self.into()) }
+    fn into_legacy_source(self) -> LegacyImageSource {
+        LegacyImageSource::Resource(self.into())
+    }
 }
 impl IntoLegacyImageSource for &'static str {
-    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self.into()) }
+    fn into_legacy_source(self) -> LegacyImageSource {
+        LegacyImageSource::Resource(self.into())
+    }
 }
 impl<F> IntoLegacyImageSource for F
 where
     F: FnOnce(&mut Window, &mut App) -> AssetRef + 'static,
 {
-    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Deferred(Box::new(self)) }
+    fn into_legacy_source(self) -> LegacyImageSource {
+        LegacyImageSource::Deferred(Box::new(self))
+    }
 }
 
 pub fn img(source: impl IntoLegacyImageSource) -> LegacyImgBuilder {
@@ -2272,31 +2339,125 @@ pub fn img(source: impl IntoLegacyImageSource) -> LegacyImgBuilder {
 
 impl LegacyImgBuilder {
     pub fn id(mut self, id: impl Into<wgpui_core::reconcile::description::ElementId>) -> Self {
-        self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).id(id)); self
-    }
-    pub fn size(mut self, size: impl wgpui_widgets::styled::IntoStylePixels) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).size(size)); self }
-    pub fn size_12(self) -> Self { self.size(48.0) }
-    pub fn size_8(self) -> Self { self.size(32.0) }
-    pub fn size_16(self) -> Self { self.size(64.0) }
-    pub fn size_full(mut self) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).size_full()); self }
-    pub fn h(mut self, height: impl wgpui_widgets::styled::IntoStylePixels) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).h(height)); self }
-    pub fn w(mut self, width: impl wgpui_widgets::styled::IntoStylePixels) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).w(width)); self }
-    pub fn max_w_full(mut self) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).max_w_full()); self }
-    pub fn object_fit(mut self, object_fit: wgpui_widgets::img::ObjectFit) -> Self {
-        self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).object_fit(object_fit));
+        self.image = Some(
+            self.image
+                .take()
+                .unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into())))
+                .id(id),
+        );
         self
     }
-    pub fn border_1(mut self) -> Self { self.border = true; self }
-    pub fn border_color(mut self, color: impl Into<wgpui_core::color::Hsla>) -> Self { self.border_color = Some(color.into()); self }
+    pub fn size(mut self, size: impl wgpui_widgets::styled::IntoStylePixels) -> Self {
+        self.image = Some(
+            self.image
+                .take()
+                .unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into())))
+                .size(size),
+        );
+        self
+    }
+    pub fn size_12(self) -> Self {
+        self.size(48.0)
+    }
+    pub fn size_8(self) -> Self {
+        self.size(32.0)
+    }
+    pub fn size_16(self) -> Self {
+        self.size(64.0)
+    }
+    pub fn size_full(mut self) -> Self {
+        self.image = Some(
+            self.image
+                .take()
+                .unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into())))
+                .size_full(),
+        );
+        self
+    }
+    pub fn h(mut self, height: impl wgpui_widgets::styled::IntoStylePixels) -> Self {
+        self.image = Some(
+            self.image
+                .take()
+                .unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into())))
+                .h(height),
+        );
+        self
+    }
+    pub fn w(mut self, width: impl wgpui_widgets::styled::IntoStylePixels) -> Self {
+        self.image = Some(
+            self.image
+                .take()
+                .unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into())))
+                .w(width),
+        );
+        self
+    }
+    pub fn max_w_full(mut self) -> Self {
+        self.image = Some(
+            self.image
+                .take()
+                .unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into())))
+                .max_w_full(),
+        );
+        self
+    }
+    pub fn object_fit(mut self, object_fit: wgpui_widgets::img::ObjectFit) -> Self {
+        self.image = Some(
+            self.image
+                .take()
+                .unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into())))
+                .object_fit(object_fit),
+        );
+        self
+    }
+    pub fn border_1(mut self) -> Self {
+        self.border = true;
+        self
+    }
+    pub fn border_color(mut self, color: impl Into<wgpui_core::color::Hsla>) -> Self {
+        self.border_color = Some(color.into());
+        self
+    }
     pub fn on_click<F>(mut self, handler: F) -> Self
-    where F: FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut App) + 'static { self.click_handler = Some(Box::new(handler)); self }
-    pub fn with_fallback<F>(mut self, fallback: F) -> Self where F: Fn() -> Description + 'static { self.fallback = Some(Box::new(fallback)); self }
-    pub fn with_loading<F>(mut self, loading: F) -> Self where F: Fn() -> Description + 'static { self.loading = Some(Box::new(loading)); self }
+    where
+        F: FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut App)
+            + 'static,
+    {
+        self.click_handler = Some(Box::new(handler));
+        self
+    }
+    pub fn with_fallback<F>(mut self, fallback: F) -> Self
+    where
+        F: Fn() -> Description + 'static,
+    {
+        self.fallback = Some(Box::new(fallback));
+        self
+    }
+    pub fn with_loading<F>(mut self, loading: F) -> Self
+    where
+        F: Fn() -> Description + 'static,
+    {
+        self.loading = Some(Box::new(loading));
+        self
+    }
 }
 
 impl CoreElement for LegacyImgBuilder {
-    fn into_description(self) -> Description { Description::deferred(move |window, app| { let Some(window) = window.downcast_mut::<Window>() else { return Description::new::<Self>(); }; self.resolve(window, app) }) }
-    fn into_description_in(self, _window: &mut wgpui_core::window::Window, _app: &App) -> Description { wgpui_core::Element::into_description(self) }
+    fn into_description(self) -> Description {
+        Description::deferred(move |window, app| {
+            let Some(window) = window.downcast_mut::<Window>() else {
+                return Description::new::<Self>();
+            };
+            self.resolve(window, app)
+        })
+    }
+    fn into_description_in(
+        self,
+        _window: &mut wgpui_core::window::Window,
+        _app: &App,
+    ) -> Description {
+        wgpui_core::Element::into_description(self)
+    }
 }
 
 impl LegacyImgBuilder {
@@ -2321,6 +2482,7 @@ impl LegacyImgBuilder {
         };
         let description = match state {
             AssetState::Ready(image_data) => {
+<<<<<<< HEAD
                 let source = wgpui_widgets::img::ImageSourceId::from_raw(crate::window::application::asset_source_id(&asset.key));
                 let image = match image {
                     Some(image) => image.with_decoded(source, image_data),
@@ -2360,7 +2522,15 @@ impl LegacyImgBuilder {
         } else {
             description
         };
-        if let Some(mut handler) = click_handler { wgpui_core::Element::into_description(wgpui_widgets::div::div().on_click(move |event, window, app| handler(event, window, app)).child(description)) } else { description }
+        if let Some(mut handler) = click_handler {
+            wgpui_core::Element::into_description(
+                wgpui_widgets::div::div()
+                    .on_click(move |event, window, app| handler(event, window, app))
+                    .child(description),
+            )
+        } else {
+            description
+        }
     }
 }
 
@@ -2394,7 +2564,9 @@ fn resolve_resource_asset(resource: Resource, app: &App) -> AssetRef {
 
 fn asset_source_id(key: &str) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new(); key.hash(&mut hasher); hasher.finish().max(1)
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish().max(1)
 }
 
 pub trait AssetImageOutput: Send + 'static {
@@ -2402,13 +2574,17 @@ pub trait AssetImageOutput: Send + 'static {
 }
 
 impl AssetImageOutput for Result<Arc<RenderImage>, ImageCacheError> {
-    fn into_image_result(self) -> Result<Arc<RenderImage>, ImageCacheError> { self }
+    fn into_image_result(self) -> Result<Arc<RenderImage>, ImageCacheError> {
+        self
+    }
 }
 
 struct AssetRequests(std::sync::Mutex<std::collections::HashMap<String, AssetRef>>);
 
 impl Default for AssetRequests {
-    fn default() -> Self { Self(std::sync::Mutex::new(std::collections::HashMap::new())) }
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
 }
 
 pub trait AppAssetExt {
@@ -2422,17 +2598,17 @@ impl AppAssetExt for App {
         source.hash(&mut hasher);
         if let Some(requests) = self.global::<AssetRequests>() {
             let key = format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish());
-            requests.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&key);
+            requests
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
         }
     }
 }
 
 impl Window {
-    pub fn use_asset<A>(
-        &mut self,
-        source: &A::Source,
-        app: &mut App,
-    ) -> AssetRef
+    pub fn use_asset<A>(&mut self, source: &A::Source, app: &mut App) -> AssetRef
     where
         A: Asset,
         A::Output: AssetImageOutput,
@@ -2452,7 +2628,10 @@ impl Window {
                 ))),
             };
         };
-        let mut entries = requests.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries = requests
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(asset) = entries.get(&key) {
             return asset.clone();
         }
@@ -2461,7 +2640,10 @@ impl Window {
             let redraw_request = Arc::clone(&self.redraw_request);
             Arc::new(move || redraw_request.request()) as Arc<dyn Fn() + Send + Sync>
         };
-        let asset = AssetRef { key: key.clone(), state: Arc::clone(&state) };
+        let asset = AssetRef {
+            key: key.clone(),
+            state: Arc::clone(&state),
+        };
         entries.insert(key, asset.clone());
         let mut asset_app = app.clone();
         let future = A::load(source.clone(), &mut asset_app);
@@ -2490,7 +2672,11 @@ impl Window {
         source.hash(&mut hasher);
         if let Some(requests) = app.global::<AssetRequests>() {
             let key = format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish());
-            requests.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&key);
+            requests
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
         }
     }
 }
@@ -2586,18 +2772,16 @@ fn append_immediate_paints(
     paints: impl IntoIterator<Item = ImmediatePaint>,
 ) -> Description {
     for paint in paints {
-        description = description.child(
-            Description::new::<ImmediatePaint>().emit(
-                move |_context: &EmitContext, emission: &mut Emission| match &paint {
-                    ImmediatePaint::Quad(quad) => {
-                        emission.quad(quad.clone());
-                    }
-                    ImmediatePaint::Path(path) => {
-                        emission.path(path.clone());
-                    }
-                },
-            ),
-        );
+        description = description.child(Description::new::<ImmediatePaint>().emit(
+            move |_context: &EmitContext, emission: &mut Emission| match &paint {
+                ImmediatePaint::Quad(quad) => {
+                    emission.quad(quad.clone());
+                }
+                ImmediatePaint::Path(path) => {
+                    emission.path(path.clone());
+                }
+            },
+        ));
     }
     description
 }
@@ -2610,11 +2794,13 @@ impl Handler {
 
     fn collect_entity_invalidations(&mut self) {
         let live_window_ids = self.live.iter().map(|live| live.id).collect::<Vec<_>>();
-        self.pending_entity_invalidations.iter_mut().for_each(|pending| {
-            pending
-                .windows
-                .retain(|window| live_window_ids.contains(window));
-        });
+        self.pending_entity_invalidations
+            .iter_mut()
+            .for_each(|pending| {
+                pending
+                    .windows
+                    .retain(|window| live_window_ids.contains(window));
+            });
         self.pending_entity_invalidations
             .retain(|pending| !pending.windows.is_empty());
         for entity in self.app.drain_entity_invalidations() {
@@ -2675,19 +2861,29 @@ impl Handler {
             .map(|decorations| decorations == WindowDecorations::Server)
             .unwrap_or(options.titlebar.is_some());
         if options.window_decorations == Some(WindowDecorations::Client) {
-            log::warn!("client window decorations are lowered as a borderless Winit window; WGPUI does not provide native client chrome");
+            log::warn!(
+                "client window decorations are lowered as a borderless Winit window; WGPUI does not provide native client chrome"
+            );
         }
         if !options.is_movable {
-            log::warn!("non-movable windows are not supported by the cross-platform Winit boundary; the request is not applied");
+            log::warn!(
+                "non-movable windows are not supported by the cross-platform Winit boundary; the request is not applied"
+            );
         }
         if options.app_id.is_some() {
-            log::warn!("WindowOptions::app_id is not supported by the cross-platform Winit boundary; the request is not applied");
+            log::warn!(
+                "WindowOptions::app_id is not supported by the cross-platform Winit boundary; the request is not applied"
+            );
         }
         if options.tabbing_identifier.is_some() {
-            log::warn!("WindowOptions::tabbing_identifier is not supported by the cross-platform Winit boundary; the request is not applied");
+            log::warn!(
+                "WindowOptions::tabbing_identifier is not supported by the cross-platform Winit boundary; the request is not applied"
+            );
         }
         if options.display_id.is_some() {
-            log::warn!("WindowOptions::display_id is not supported by the cross-platform Winit boundary; the request is not applied");
+            log::warn!(
+                "WindowOptions::display_id is not supported by the cross-platform Winit boundary; the request is not applied"
+            );
         }
         let attributes = winit::window::Window::default_attributes()
             .with_title(title)
@@ -2914,15 +3110,11 @@ impl Handler {
             });
         live.window.animation_clock = animation_clock;
         let description = description.resolve_deferred(&mut live.window, &mut live.app);
-        let description = description.resolve_deferred_core_window(
-            live.window.interaction_mut(),
-            &mut live.app,
-        );
+        let description =
+            description.resolve_deferred_core_window(live.window.interaction_mut(), &mut live.app);
         let description = description.resolve_deferred(&mut live.window, &mut live.app);
-        let description = description.resolve_deferred_core_window(
-            live.window.interaction_mut(),
-            &mut live.app,
-        );
+        let description =
+            description.resolve_deferred_core_window(live.window.interaction_mut(), &mut live.app);
         live.window.end_render();
         let redraw_after_render = live.window.has_pending_entity_invalidations(&live.app);
         let description = append_immediate_paints(
@@ -3314,12 +3506,10 @@ impl winit::application::ApplicationHandler for Handler {
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => [x * 16.0, y * 16.0],
-                    winit::event::MouseScrollDelta::PixelDelta(point) => {
-                        [
-                            point.x as f32 / live.window.scale_factor as f32,
-                            point.y as f32 / live.window.scale_factor as f32,
-                        ]
-                    }
+                    winit::event::MouseScrollDelta::PixelDelta(point) => [
+                        point.x as f32 / live.window.scale_factor as f32,
+                        point.y as f32 / live.window.scale_factor as f32,
+                    ],
                 };
                 let event = InputEvent::Scroll(ScrollWheelEvent {
                     position: live.window.cursor_position(),
@@ -3332,7 +3522,10 @@ impl winit::application::ApplicationHandler for Handler {
             }
             winit::event::WindowEvent::Ime(ime) => {
                 let event = ime_event(ime);
-                if live.window.handle_input_with_app(InputEvent::Ime(event), &mut live.app) {
+                if live
+                    .window
+                    .handle_input_with_app(InputEvent::Ime(event), &mut live.app)
+                {
                     live.window.request_redraw();
                 }
             }
@@ -3571,14 +3764,8 @@ mod tests {
 
     #[test]
     fn decoration_state_reports_the_native_decoration_mode() {
-        assert_eq!(
-            window_decorations_for(true),
-            WindowDecorations::Server
-        );
-        assert_eq!(
-            window_decorations_for(false),
-            WindowDecorations::Client
-        );
+        assert_eq!(window_decorations_for(true), WindowDecorations::Server);
+        assert_eq!(window_decorations_for(false), WindowDecorations::Client);
     }
 
     #[test]
@@ -3587,10 +3774,7 @@ mod tests {
             resize_direction(ResizeEdge::BottomRight),
             winit::window::ResizeDirection::SouthEast
         );
-        assert_eq!(
-            validate_prompt_buttons(&[PromptButton::ok("OK")]),
-            Ok(())
-        );
+        assert_eq!(validate_prompt_buttons(&[PromptButton::ok("OK")]), Ok(()));
         assert_eq!(
             validate_prompt_buttons(&[PromptButton::ok("OK"), PromptButton::cancel("Cancel")]),
             Ok(())
@@ -3624,16 +3808,16 @@ mod tests {
             ],
             [1.0; 4],
         );
-        let description = append_immediate_paints(
-            Description::new::<()>(),
-            [ImmediatePaint::Path(path)],
-        );
+        let description =
+            append_immediate_paints(Description::new::<()>(), [ImmediatePaint::Path(path)]);
 
         assert_eq!(description.child_descriptions().len(), 1);
-        assert!(description
-            .child_descriptions()
-            .first()
-            .is_some_and(Description::emits));
+        assert!(
+            description
+                .child_descriptions()
+                .first()
+                .is_some_and(Description::emits)
+        );
     }
 
     #[test]
@@ -3782,8 +3966,8 @@ fn native_prompt(
     {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING,
-            MB_OK, MB_YESNO, MessageBoxW,
+            IDOK, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+            MB_YESNO, MessageBoxW,
         };
 
         let flags = match (buttons.len(), level) {
@@ -3798,8 +3982,14 @@ fn native_prompt(
             _ => return Err(PromptError::UnsupportedButtonCount(buttons.len())),
         };
         let caption = detail.unwrap_or("WGPUI");
-        let message = message.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
-        let caption = caption.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let message = message
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let caption = caption
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
         let window_handle = window
             .native
             .window_handle()
@@ -3812,12 +4002,12 @@ fn native_prompt(
                 ));
             }
         };
-        let result = unsafe {
-            MessageBoxW(hwnd, message.as_ptr(), caption.as_ptr(), flags)
-        };
+        let result = unsafe { MessageBoxW(hwnd, message.as_ptr(), caption.as_ptr(), flags) };
         return match result {
             IDOK | IDYES => Ok(0),
-            0 => Err(PromptError::Native("MessageBoxW returned no result".to_string())),
+            0 => Err(PromptError::Native(
+                "MessageBoxW returned no result".to_string(),
+            )),
             _ => Ok(1),
         };
     }
