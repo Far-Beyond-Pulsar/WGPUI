@@ -929,7 +929,8 @@ impl SharedAtlasTileSource {
 
 impl wgpui_core::scene::atlas::GlyphTileSource for SharedAtlasTileSource {
     fn tile_for(&mut self, key: GlyphRasterKey) -> Option<wgpui_core::scene::atlas::GlyphTile> {
-        if let Some(placement) = self.atlas.borrow().get(key) {
+        let cached_placement = { self.atlas.borrow().get(key) };
+        if let Some(placement) = cached_placement {
             self.atlas.borrow_mut().stats.cache_hits += 1;
             return Some(wgpui_core::scene::atlas::GlyphTile {
                 tile: placement.tile,
@@ -1783,6 +1784,41 @@ mod tests {
             "a re-entrant borrow is a bug in the caller's frame structure, and a \
              blank sprite reports it better than a panic inside a paint walk"
         );
+    }
+
+    #[test]
+    fn a_shared_glyph_atlas_releases_a_cache_hit_before_updating_stats() {
+        use wgpui_core::scene::atlas::GlyphTileSource;
+
+        let key = key(1);
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(GlyphAtlas::new(64)));
+        let expected = shared
+            .borrow_mut()
+            .get_or_insert(key, raster(8, 12))
+            .expect("allocate the resident glyph");
+        let shaper = std::rc::Rc::new(std::cell::RefCell::new(
+            wgpui_text::shaping::TextShaper::new(),
+        ));
+        let rasterizer = std::rc::Rc::new(std::cell::RefCell::new(
+            wgpui_text::raster::GlyphRasterizer::new(),
+        ));
+        let mut source = SharedAtlasTileSource::new(
+            std::rc::Rc::clone(&shared),
+            shaper,
+            rasterizer,
+        );
+
+        for _ in 0..1024 {
+            let tile = source
+                .tile_for(key)
+                .expect("a resident glyph should answer every cache hit");
+            assert_eq!(tile.tile, expected.tile);
+            assert_eq!(tile.atlas_origin, expected.origin);
+            assert_eq!(tile.atlas_size, expected.size);
+            assert_eq!(tile.bearing, expected.bearing);
+        }
+
+        assert_eq!(shared.borrow().stats().cache_hits, 1024);
     }
 
     #[test]
