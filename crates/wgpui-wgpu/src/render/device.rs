@@ -244,7 +244,7 @@ pub fn headless_compute_context() -> Result<ComputeContext, ContextError> {
 /// than two copies that could drift.
 pub fn instance() -> wgpu::Instance {
     wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+        backends: wgpu::Backends::VULKAN | wgpu::Backends::DX12 | wgpu::Backends::METAL,
         flags: wgpu::InstanceFlags::default(),
         backend_options: wgpu::BackendOptions::default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),

@@ -35,6 +35,7 @@ wgpu = { version = "30", default-features = false, features = [
     "dx12",
     "vulkan",
     "wgsl",
+    "metal"
 ] }
 
 pollster = "0.4.0"
