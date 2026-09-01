@@ -20,7 +20,11 @@ use wgpui_text::shaping::SharedString;
 use crate::image_cache::{DecodedImage, ImageDecodeError, decode_async};
 
 type RedrawCallback = Arc<dyn Fn() + Send + Sync>;
-type RedrawCallbacks = Arc<Mutex<HashMap<u64, RedrawCallback>>>;
+struct RedrawCallbackEntry {
+    resource: Option<Resource>,
+    callback: RedrawCallback,
+}
+type RedrawCallbacks = Arc<Mutex<HashMap<u64, RedrawCallbackEntry>>>;
 
 /// A typed, cancellable application asset operation.
 pub trait Asset: 'static {
@@ -146,7 +150,7 @@ impl AssetRegistry {
             Err(poisoned) => poisoned.into_inner().remove(resource).is_some(),
         };
         if removed {
-            self.notify_redraw();
+            self.notify_redraw(Some(resource));
         }
         removed
     }
@@ -253,7 +257,7 @@ impl AssetRegistry {
             let entries = Arc::clone(&self.entries);
             let source = Arc::clone(&self.source);
             let redraw_callbacks = Arc::clone(&self.redraw_callbacks);
-            let client = app.configured_http_client();
+            let client = configured_asset_http_client(app);
             let load_resource = resource.clone();
             let task = app.background_spawn(async move {
                 let result = ImageAssetLoader::load_with_optional_client(
@@ -304,15 +308,7 @@ impl AssetRegistry {
                     }
                 }
                 if notify {
-                    let callbacks = match redraw_callbacks.lock() {
-                        Ok(callbacks) => callbacks.values().cloned().collect::<Vec<_>>(),
-                        Err(poisoned) => {
-                            poisoned.into_inner().values().cloned().collect::<Vec<_>>()
-                        }
-                    };
-                    for callback in callbacks {
-                        callback();
-                    }
+                    notify_callbacks(&redraw_callbacks, Some(&load_resource));
                 }
             });
             return AssetRequest {
@@ -340,16 +336,29 @@ impl AssetRegistry {
         &self,
         callback: impl Fn() + Send + Sync + 'static,
     ) -> AssetRedrawSubscription {
+        self.subscribe_redraw_for(None, callback)
+    }
+
+    /// Register a renderer callback for one resource's state transitions.
+    pub fn subscribe_redraw_for(
+        &self,
+        resource: Option<&Resource>,
+        callback: impl Fn() + Send + Sync + 'static,
+    ) -> AssetRedrawSubscription {
         let id = self
             .next_callback
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
+        let entry = RedrawCallbackEntry {
+            resource: resource.cloned(),
+            callback: Arc::new(callback),
+        };
         match self.redraw_callbacks.lock() {
             Ok(mut callbacks) => {
-                callbacks.insert(id, Arc::new(callback));
+                callbacks.insert(id, entry);
             }
             Err(poisoned) => {
-                poisoned.into_inner().insert(id, Arc::new(callback));
+                poisoned.into_inner().insert(id, entry);
             }
         }
         AssetRedrawSubscription {
@@ -358,14 +367,8 @@ impl AssetRegistry {
         }
     }
 
-    fn notify_redraw(&self) {
-        let callbacks = match self.redraw_callbacks.lock() {
-            Ok(callbacks) => callbacks.values().cloned().collect::<Vec<_>>(),
-            Err(poisoned) => poisoned.into_inner().values().cloned().collect::<Vec<_>>(),
-        };
-        for callback in callbacks {
-            callback();
-        }
+    fn notify_redraw(&self, resource: Option<&Resource>) {
+        notify_callbacks(&self.redraw_callbacks, resource);
     }
 }
 
@@ -408,7 +411,7 @@ impl AssetRequest {
             if let Some(task) = self.task.as_mut() {
                 task.cancel();
             }
-            notify_callbacks(&self.redraw_callbacks);
+            notify_callbacks(&self.redraw_callbacks, Some(&self.resource));
         }
     }
 
@@ -442,14 +445,30 @@ impl Drop for AssetRequest {
     }
 }
 
-fn notify_callbacks(callbacks: &RedrawCallbacks) {
+fn notify_callbacks(callbacks: &RedrawCallbacks, resource: Option<&Resource>) {
     let callbacks = match callbacks.lock() {
-        Ok(callbacks) => callbacks.values().cloned().collect::<Vec<_>>(),
-        Err(poisoned) => poisoned.into_inner().values().cloned().collect::<Vec<_>>(),
+        Ok(callbacks) => callbacks
+            .values()
+            .filter(|entry| callback_matches(entry, resource))
+            .map(|entry| Arc::clone(&entry.callback))
+            .collect::<Vec<_>>(),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .values()
+            .filter(|entry| callback_matches(entry, resource))
+            .map(|entry| Arc::clone(&entry.callback))
+            .collect::<Vec<_>>(),
     };
     for callback in callbacks {
         callback();
     }
+}
+
+fn callback_matches(entry: &RedrawCallbackEntry, resource: Option<&Resource>) -> bool {
+    entry
+        .resource
+        .as_ref()
+        .is_none_or(|registered| resource.is_some_and(|current| registered == current))
 }
 
 impl Default for AssetRegistry {
@@ -571,7 +590,7 @@ impl Asset for ImageAssetLoader {
         source: Self::Source,
         app: &mut App,
     ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
-        let client = app.configured_http_client();
+        let client = configured_asset_http_client(app);
         let assets: Arc<dyn AssetSource> = app.global::<AssetRegistry>().map_or_else(
             || Arc::new(()) as Arc<dyn AssetSource>,
             |registry| registry.source().clone(),
@@ -604,7 +623,7 @@ impl ImageAssetLoader {
         app: &App,
         asset_source: Arc<dyn AssetSource>,
     ) -> impl std::future::Future<Output = Result<Arc<RenderImage>, ImageCacheError>> {
-        let client = app.configured_http_client();
+        let client = configured_asset_http_client(app);
         let source = source.into();
         let task = app.background_spawn(async move {
             let bytes = Self::load_bytes(source, client, asset_source).await?;
@@ -684,6 +703,11 @@ impl ImageAssetLoader {
                 }),
         }
     }
+}
+
+fn configured_asset_http_client(app: &App) -> Option<BoxedHttpClient> {
+    app.configured_http_client()
+        .filter(|client| client.type_name() != "NullHttpClient")
 }
 
 #[cfg(test)]
@@ -851,6 +875,84 @@ mod tests {
     }
 
     #[test]
+    fn registry_only_notifies_a_resource_scoped_subscriber_for_that_resource() {
+        let redraws = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = AssetRegistry::new(Arc::new(MemoryAssets));
+        let resource = Resource::Embedded("icon.svg".into());
+        let unrelated = Resource::Embedded("other.svg".into());
+        let redraw_counter = Arc::clone(&redraws);
+        let _subscription = registry.subscribe_redraw_for(Some(&resource), move || {
+            redraw_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let app = App::create();
+
+        registry.load_async(unrelated.clone(), &app).detach();
+        wait_for_state(&registry, &unrelated, AssetState::Failed(String::new()));
+        assert_eq!(redraws.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Ready);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while redraws.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resource-scoped redraw callback was not called"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(redraws.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dropping_a_redraw_subscription_stops_late_asset_notifications() {
+        let redraws = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = AssetRegistry::new(Arc::new(MemoryAssets));
+        let resource = Resource::Embedded("icon.svg".into());
+        let redraw_counter = Arc::clone(&redraws);
+        let subscription = registry.subscribe_redraw_for(Some(&resource), move || {
+            redraw_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        drop(subscription);
+
+        let app = App::create();
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Ready);
+        std::thread::yield_now();
+        assert_eq!(redraws.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn duplicate_registry_requests_share_one_configured_http_request() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client: BoxedHttpClient = Arc::new(CountingClient {
+            requests: Arc::clone(&requests),
+        });
+        let mut app = App::create();
+        app.set_http_client(client);
+        let registry = AssetRegistry::new(Arc::new(()));
+        let resource = Resource::Uri("https://example.test/image.svg".into());
+        registry.load_async(resource.clone(), &app).detach();
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Ready);
+
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_explicit_null_http_client_is_not_used_for_asset_resolution() {
+        let mut app = App::create();
+        app.set_http_client(Arc::new(wgpui_http_client::NullHttpClient));
+        let registry = AssetRegistry::new(Arc::new(()));
+        let resource = Resource::Uri("https://example.test/image.svg".into());
+        registry.load_async(resource.clone(), &app).detach();
+        wait_for_state(&registry, &resource, AssetState::Failed(String::new()));
+        let Some(AssetState::Failed(error)) = registry.state(&resource) else {
+            panic!("URI request did not retain its failure state");
+        };
+        assert!(error.contains("no HTTP client is configured"));
+    }
+
+    #[test]
     fn uncached_access_does_not_block_and_reports_loading() {
         let registry = AssetRegistry::new(Arc::new(MemoryAssets));
         let resource = Resource::Embedded("icon.svg".into());
@@ -903,6 +1005,40 @@ mod tests {
     struct PendingClient {
         dropped: Arc<std::sync::atomic::AtomicBool>,
         started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct CountingClient {
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HttpClient for CountingClient {
+        fn type_name(&self) -> &'static str {
+            "CountingClient"
+        }
+
+        fn user_agent(&self) -> Option<&wgpui_http_client::http_client::http::HeaderValue> {
+            None
+        }
+
+        fn send(
+            &self,
+            _request: Request<AsyncBody>,
+        ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(
+                        br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2"/></svg>"#.to_vec(),
+                    ))
+                    .expect("response"))
+            })
+        }
+
+        fn proxy(&self) -> Option<&wgpui_http_client::Url> {
+            None
+        }
     }
 
     impl HttpClient for PendingClient {

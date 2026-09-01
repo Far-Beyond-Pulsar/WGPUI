@@ -548,6 +548,33 @@ impl ImgBuilder {
             resolver: None,
         }
     }
+
+    /// Attach a decoded image to this builder while preserving its style and
+    /// retained element identity.
+    pub fn with_decoded(
+        mut self,
+        source: ImageSourceId,
+        image: std::sync::Arc<crate::assets::RenderImage>,
+    ) -> Self {
+        self.image = self.image.set_decoded(source, image);
+        self.resource = None;
+        self.resolver = None;
+        self
+    }
+
+    /// Set the resource resolved by an outer compatibility builder.
+    pub fn with_resource(mut self, resource: Resource) -> Self {
+        self.image.source = resource_source_id(&resource);
+        self.image.render_source = self.image.source;
+        self.resource = Some(resource);
+        self.resolver = None;
+        self
+    }
+
+    pub fn with_load_state(mut self, load_state: ImageLoadState) -> Self {
+        self.image = self.image.load_state(load_state);
+        self
+    }
     pub fn size(mut self, size: impl IntoStylePixels) -> Self {
         let size = size.into_style_pixels();
         self.image = self.image.size(size, size);
@@ -627,19 +654,7 @@ impl Element for ImgBuilder {
             Some(AssetState::Ready) => match registry.cached(&resource) {
                 Some(image) => {
                     let source = resource_source_id(&resource);
-                    let load_state = if self
-                        .image
-                        .engine
-                        .borrow_mut()
-                        .cache()
-                        .hold_at(source, (*image).clone())
-                        .is_ok()
-                    {
-                        ImageLoadState::Ready
-                    } else {
-                        ImageLoadState::Failed
-                    };
-                    self.image.load_state(load_state).into_description()
+                    self.image.set_decoded(source, image).into_description()
                 }
                 None => self
                     .image

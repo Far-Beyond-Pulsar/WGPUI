@@ -45,7 +45,10 @@ use crate::window::surface::WgpuSurfaceHandle;
 use crate::window::{Acquired, WindowError, WindowSurface};
 use wgpui_text::engine::SharedTextEngine;
 use wgpui_widgets::assets::Resource;
-use wgpui_widgets::assets::{Asset, AssetRegistry, ImageCacheError, RenderImage};
+use wgpui_widgets::assets::{
+    Asset, AssetRedrawSubscription, AssetRegistry, AssetState as RegistryAssetState,
+    ImageCacheError, RenderImage,
+};
 use wgpui_widgets::img::ImgBuilder;
 use wgpui_widgets::styled::Styled;
 
@@ -91,6 +94,7 @@ impl RedrawRequestState {
 struct RedrawRequest {
     native: Arc<winit::window::Window>,
     state: Arc<RedrawRequestState>,
+    active: Arc<AtomicBool>,
 }
 
 impl RedrawRequest {
@@ -98,17 +102,22 @@ impl RedrawRequest {
         Self {
             native,
             state: Arc::new(RedrawRequestState::default()),
+            active: Arc::new(AtomicBool::new(true)),
         }
     }
 
     fn request(&self) {
-        if self.state.request() {
+        if self.active.load(Ordering::Acquire) && self.state.request() {
             self.native.request_redraw();
         }
     }
 
     fn consume(&self) {
         self.state.consume();
+    }
+
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -191,6 +200,7 @@ enum ImmediatePaint {
 pub struct Window {
     native: Arc<winit::window::Window>,
     redraw_request: Arc<RedrawRequest>,
+    asset_redraw_subscription: Option<AssetRedrawSubscription>,
     rendering: Arc<AtomicBool>,
     text_engine: SharedTextEngine,
     gpu_adapter: wgpu::Adapter,
@@ -229,6 +239,13 @@ pub struct Window {
     observed_appearance: WindowAppearance,
     entity_observers: Vec<wgpui_core::app::Subscription>,
     observed_entities: std::collections::HashSet<wgpui_core::app::EntityId>,
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        self.redraw_request.deactivate();
+        self.asset_redraw_subscription.take();
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -2038,9 +2055,9 @@ where
         let mut app = App::create();
         if let Some(client) = self.http_client {
             app.set_http_client(client);
-        } else {
-            app.install_default_http_client();
         }
+        app.set_global(AssetRegistry::default());
+        app.set_global(AssetRequests::default());
         let mut handler = Handler {
             initial: Some((
                 self.options,
@@ -2086,9 +2103,9 @@ where
         let mut app = App::create();
         if let Some(client) = self.http_client {
             app.set_http_client(client);
-        } else {
-            app.install_default_http_client();
         }
+        app.set_global(AssetRegistry::default());
+        app.set_global(AssetRequests::default());
         let mut handler = Handler {
             initial: Some((
                 self.options,
@@ -2147,7 +2164,7 @@ impl Application {
             initialize: Some(Box::new(initialize)),
             app: {
                 let mut app = App::create();
-                app.set_global(AssetRegistry::new(Arc::new(())));
+                app.set_global(AssetRegistry::default());
                 app.set_global(AssetRequests::default());
                 app
             },
@@ -2285,16 +2302,18 @@ impl CoreElement for LegacyImgBuilder {
 impl LegacyImgBuilder {
     fn resolve(self, window: &mut Window, app: &mut App) -> Description {
         let Self { source, image, fallback, loading, border, border_color, click_handler } = self;
-        let asset = match source {
+        let (asset, resource) = match source {
             LegacyImageSource::Resource(resource) => {
-                let key = format!("resource:{resource:?}");
-                let state = match app.global::<AssetRegistry>().and_then(|registry| registry.load_cached(resource).ok()) {
-                    Some(image) => AssetState::Ready(image),
-                    None => AssetState::Failed("asset could not be resolved".into()),
-                };
-                AssetRef { key, state: Arc::new(std::sync::Mutex::new(state)) }
+                let asset = resolve_resource_asset(resource.clone(), app);
+                (asset, Some(resource))
             }
-            LegacyImageSource::Deferred(resolve) => resolve(window, app),
+            LegacyImageSource::Deferred(resolve) => (resolve(window, app), None),
+        };
+        let image = match resource.as_ref() {
+            Some(resource) => image
+                .map(|image| image.with_resource(resource.clone()))
+                .or_else(|| Some(wgpui_widgets::img::img(resource.clone()))),
+            None => image,
         };
         let state = match asset.state.lock() {
             Ok(state) => state.clone(),
@@ -2303,11 +2322,34 @@ impl LegacyImgBuilder {
         let description = match state {
             AssetState::Ready(image_data) => {
                 let source = wgpui_widgets::img::ImageSourceId::from_raw(crate::window::application::asset_source_id(&asset.key));
-                let image = image.unwrap_or_else(|| ImgBuilder::from_decoded(source, image_data));
+                let image = match image {
+                    Some(image) => image.with_decoded(source, image_data),
+                    None => ImgBuilder::from_decoded(source, image_data),
+                };
                 wgpui_core::Element::into_description(image)
             }
-            AssetState::Loading => loading.map_or_else(|| Description::new::<()>(), |render| render()),
-            AssetState::Failed(_) => fallback.map_or_else(|| Description::new::<()>(), |render| render()),
+            AssetState::Loading => loading.map_or_else(
+                || {
+                    image.map_or_else(
+                        || Description::new::<()>(),
+                        wgpui_core::Element::into_description,
+                    )
+                },
+                |render| render(),
+            ),
+            AssetState::Failed(_) => fallback.map_or_else(
+                || {
+                    image.map_or_else(
+                        || Description::new::<()>(),
+                        |image| {
+                            wgpui_core::Element::into_description(
+                                image.with_load_state(wgpui_widgets::img::ImageLoadState::Failed),
+                            )
+                        },
+                    )
+                },
+                |render| render(),
+            ),
         };
         let description = if border {
             let mut container = wgpui_widgets::div::div().border_1();
@@ -2319,6 +2361,34 @@ impl LegacyImgBuilder {
             description
         };
         if let Some(mut handler) = click_handler { wgpui_core::Element::into_description(wgpui_widgets::div::div().on_click(move |event, window, app| handler(event, window, app)).child(description)) } else { description }
+    }
+}
+
+fn resolve_resource_asset(resource: Resource, app: &App) -> AssetRef {
+    let key = format!("resource:{resource:?}");
+    let state = app
+        .global::<AssetRegistry>()
+        .map(|registry| {
+            let request = registry.load_async(resource.clone(), app);
+            let state = registry.state(&resource);
+            request.detach();
+            match state {
+                Some(RegistryAssetState::Ready) => registry
+                    .cached(&resource)
+                    .map(AssetState::Ready)
+                    .unwrap_or_else(|| AssetState::Failed("ready asset has no image".into())),
+                Some(RegistryAssetState::Loading) => AssetState::Loading,
+                Some(RegistryAssetState::Failed(error)) => AssetState::Failed(error),
+                Some(RegistryAssetState::Cancelled) => {
+                    AssetState::Failed("asset load was cancelled".into())
+                }
+                None => AssetState::Failed("asset request was not registered".into()),
+            }
+        })
+        .unwrap_or_else(|| AssetState::Failed("asset registry is unavailable".into()));
+    AssetRef {
+        key,
+        state: Arc::new(std::sync::Mutex::new(state)),
     }
 }
 
@@ -2431,8 +2501,6 @@ impl ConfiguredApplication {
         let mut app = App::create();
         if let Some(client) = self.http_client {
             app.set_http_client(client);
-        } else {
-            app.install_default_http_client();
         }
         app.set_global(AssetRegistry::new(self.assets));
         app.set_global(AssetRequests::default());
@@ -2668,6 +2736,10 @@ impl Handler {
         let (surface, context) = WindowSurface::new(Arc::clone(&native))?;
         let surface_registry = Arc::new(SurfaceRegistry::new());
         let redraw_request = Arc::new(RedrawRequest::new(Arc::clone(&native)));
+        let asset_redraw_subscription = self.app.global::<AssetRegistry>().map(|registry| {
+            let redraw_request = Arc::clone(&redraw_request);
+            registry.subscribe_redraw(move || redraw_request.request())
+        });
         let (width, height) = surface.size();
         let mut resizes = ResizeDetector::new();
         resizes.seed(width, height);
@@ -2678,6 +2750,7 @@ impl Handler {
         let window = Window {
             native,
             redraw_request,
+            asset_redraw_subscription,
             rendering: Arc::new(AtomicBool::new(false)),
             text_engine,
             gpu_adapter: context.adapter.clone(),
@@ -3388,6 +3461,7 @@ fn key_name(event: &winit::event::KeyEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use std::cell::Cell;
     use std::rc::Rc;
     use wgpui_core::geometry::{point, px, size};
@@ -3567,6 +3641,59 @@ mod tests {
         let _element = wgpui_widgets::div::div().on_click(public_window_callback(
             |_: &wgpui_core::window::ClickEvent, _window: &mut Window, _app: &mut App| {},
         ));
+    }
+
+    struct BoundaryAssets;
+
+    impl wgpui_widgets::assets::AssetSource for BoundaryAssets {
+        fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'_, [u8]>>> {
+            Ok((path == "icon.svg").then_some(Cow::Borrowed(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="4" height="2"/></svg>"#,
+            )))
+        }
+
+        fn list(&self, _path: &str) -> anyhow::Result<Vec<wgpui_text::shaping::SharedString>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn native_resource_resolution_starts_the_shared_async_registry_load() {
+        let mut app = App::create();
+        app.set_global(AssetRegistry::new(Arc::new(BoundaryAssets)));
+        let resource = Resource::Embedded("icon.svg".into());
+
+        let loading = resolve_resource_asset(resource.clone(), &app);
+        assert!(loading.is_loading());
+        let registry = app
+            .global::<AssetRegistry>()
+            .expect("native application installs an asset registry");
+        wait_for_registry_state(&registry, &resource, RegistryAssetState::Ready);
+
+        let ready = resolve_resource_asset(resource, &app);
+        assert!(!ready.is_loading());
+        assert!(ready.error().is_none());
+    }
+
+    fn wait_for_registry_state(
+        registry: &AssetRegistry,
+        resource: &Resource,
+        expected: RegistryAssetState,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(state) = registry.state(resource)
+                && (state == expected
+                    || matches!(
+                        (&state, &expected),
+                        (RegistryAssetState::Failed(_), RegistryAssetState::Failed(_))
+                    ))
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "native asset did not reach {expected:?}");
+            std::thread::yield_now();
+        }
     }
 
     #[test]
