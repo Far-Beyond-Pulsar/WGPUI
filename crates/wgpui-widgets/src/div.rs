@@ -58,6 +58,7 @@ use wgpui_core::boundary::BoundaryPolicy;
 use wgpui_core::element::Element;
 use wgpui_core::patch::emit::{Emission, EmitContext};
 use wgpui_core::reconcile::description::{Description, ElementId, TextDecoration, TextOptions};
+use wgpui_layout::{EstimatedSize, IntrinsicSize, resolve_element_style};
 
 /// Anything that can become one node of a description tree.
 ///
@@ -95,7 +96,7 @@ pub struct Div {
     boundary_policy: Option<BoundaryPolicy>,
     uncached: bool,
     scroll_offset: [f32; 2],
-    estimated_size: Option<[f32; 2]>,
+    estimated_size: Option<IntrinsicSize>,
     interaction: events::InteractionState,
     focus_handle: Option<wgpui_core::window::FocusHandle>,
     scroll_handle: Option<scroll_state::ScrollHandle>,
@@ -522,15 +523,27 @@ impl Div {
 
     /// Supply a cheap intrinsic estimate for unresolved dimensions. The
     /// estimate is used only for dimensions that remain `auto`; explicit
-    /// author sizing always wins. Keeping it on the description makes the
-    /// fallback deterministic and avoids invoking a content measurer twice.
-    pub fn estimated_size(mut self, size: [f32; 2]) -> Self {
-        self.estimated_size = Some([size[0].max(0.0), size[1].max(0.0)]);
+    /// author sizing always wins. Invalid estimates use exact layout.
+    pub fn estimated_size(mut self, size: impl Into<IntrinsicSize>) -> Self {
+        self.estimated_size = Some(size.into());
         self
     }
 
-    pub fn intrinsic_size(&self) -> Option<[f32; 2]> {
+    /// Remove the intrinsic estimate and restore exact layout for unresolved
+    /// dimensions.
+    pub fn clear_estimated_size(mut self) -> Self {
+        self.estimated_size = None;
+        self
+    }
+
+    /// The estimate supplied to this builder, before layout validation.
+    pub fn estimated_size_value(&self) -> Option<IntrinsicSize> {
         self.estimated_size
+    }
+
+    /// Compatibility view of the estimate using the original array shape.
+    pub fn intrinsic_size(&self) -> Option<[f32; 2]> {
+        self.estimated_size.map(|size| [size.width, size.height])
     }
 
     /// This `div`'s resolved style, for tests and for an inspector.
@@ -545,7 +558,11 @@ impl Div {
 
     /// This frame's fingerprint.
     pub fn diff_key(&self) -> DivDiffKey {
-        DivDiffKey::with_estimate(self.style.clone(), self.children.len(), self.estimated_size)
+        DivDiffKey::with_intrinsic_estimate(
+            self.style.clone(),
+            self.children.len(),
+            self.estimated_size,
+        )
     }
 
     /// The per-frame description of this `div` and its subtree.
@@ -588,16 +605,9 @@ impl Div {
         } else {
             style
         };
-        let key = DivDiffKey::with_estimate(style.clone(), children.len(), estimated_size);
-        let mut layout_style = style.layout.clone();
-        if let Some([width, height]) = estimated_size {
-            if layout_style.size.width == wgpui_layout::taffy_tree::Dimension::auto() {
-                layout_style.size.width = wgpui_layout::taffy_tree::Dimension::length(width);
-            }
-            if layout_style.size.height == wgpui_layout::taffy_tree::Dimension::auto() {
-                layout_style.size.height = wgpui_layout::taffy_tree::Dimension::length(height);
-            }
-        }
+        let estimate = estimated_size.and_then(IntrinsicSize::validated);
+        let key = DivDiffKey::with_intrinsic_estimate(style.clone(), children.len(), estimate);
+        let layout_style = resolve_element_style(style.layout.clone(), &estimated_size);
         let paint = style;
         let text_options = TextOptions {
             size: paint.text_size,
@@ -667,7 +677,7 @@ impl Div {
         }
 
         if let Some(handle) = scroll_handle.as_ref() {
-            let content = estimated_size;
+            let content = estimate;
             let handle = handle.clone();
             description =
                 description.on_layout_with_content_changed(move |bounds, content_bounds| {
@@ -684,8 +694,8 @@ impl Div {
                     );
                     let content = content.map_or(measured_content, |size| {
                         wgpui_core::geometry::Size::pixels(
-                            measured_content.width.value().max(size[0]),
-                            measured_content.height.value().max(size[1]),
+                            measured_content.width.value().max(size.width),
+                            measured_content.height.value().max(size.height),
                         )
                     });
                     handle.set_viewport(viewport, content)
@@ -723,6 +733,12 @@ impl Div {
 
     pub fn into_any_element(self) -> Description {
         self.describe()
+    }
+}
+
+impl EstimatedSize for Div {
+    fn estimated_size(&self) -> Option<IntrinsicSize> {
+        self.estimated_size
     }
 }
 
@@ -898,7 +914,8 @@ mod tests {
     use wgpui_core::reconcile::reconciler::{ReconcileError, Reconciler};
     use wgpui_core::scene::Scene;
     use wgpui_core::scene::layer::{BoundaryId, LayerId, LayerKey};
-    use wgpui_layout::taffy_tree::{LayoutTree, definite};
+    use wgpui_layout::taffy_tree::{LayoutNodeId, LayoutTree, definite};
+    use wgpui_layout::{EstimatedSize, IntrinsicSize};
 
     const VIEWPORT: [f32; 2] = [400.0, 300.0];
 
@@ -943,6 +960,7 @@ mod tests {
         Reconcile(ReconcileError),
         Emit(EmitError),
         Patch(wgpui_core::patch::PatchError),
+        Layout(wgpui_layout::LayoutError),
     }
 
     impl From<ReconcileError> for FrameError {
@@ -958,6 +976,11 @@ mod tests {
     impl From<wgpui_core::patch::PatchError> for FrameError {
         fn from(error: wgpui_core::patch::PatchError) -> Self {
             FrameError::Patch(error)
+        }
+    }
+    impl From<wgpui_layout::LayoutError> for FrameError {
+        fn from(error: wgpui_layout::LayoutError) -> Self {
+            FrameError::Layout(error)
         }
     }
 
@@ -1001,6 +1024,11 @@ mod tests {
                     .iter()
                     .map(|node| (node.address, node.outcome))
                     .collect(),
+                layout_nodes: plan
+                    .nodes()
+                    .iter()
+                    .map(|node| (node.address, node.layout_node))
+                    .collect(),
                 emitted: emission.stats.nodes_emitted,
                 updated: emission.stats.records_updated,
                 inserted: emission.stats.records_inserted,
@@ -1012,6 +1040,7 @@ mod tests {
 
     struct Frame {
         outcomes: Vec<(InstanceKey, NodeOutcome)>,
+        layout_nodes: Vec<(InstanceKey, LayoutNodeId)>,
         emitted: usize,
         updated: usize,
         inserted: usize,
@@ -1026,6 +1055,14 @@ mod tests {
                 .iter()
                 .find(|(key, _)| *key == address)
                 .map(|(_, outcome)| *outcome)
+        }
+
+        fn layout_node_at(&self, path: &[ElementId]) -> Option<LayoutNodeId> {
+            let address = InstanceKey::from_path(path);
+            self.layout_nodes
+                .iter()
+                .find(|(key, _)| *key == address)
+                .map(|(_, node)| *node)
         }
     }
 
@@ -1052,6 +1089,105 @@ mod tests {
             .border_color([1.0, 1.0, 1.0, 1.0])
             .border_1()
             .rounded_md()
+    }
+
+    #[test]
+    fn estimated_size_uses_intrinsic_size_and_keeps_array_compatibility() {
+        let estimate = IntrinsicSize::new(48.0, 24.0);
+        let div_with_estimate = div().estimated_size(estimate);
+        assert_eq!(div_with_estimate.estimated_size_value(), Some(estimate));
+        assert_eq!(div_with_estimate.intrinsic_size(), Some([48.0, 24.0]));
+        assert_eq!(
+            EstimatedSize::estimated_size(&div_with_estimate),
+            Some(estimate)
+        );
+
+        let description = div_with_estimate.describe();
+        assert_eq!(
+            description.layout_style().size.width,
+            wgpui_layout::taffy_tree::Dimension::length(48.0)
+        );
+        assert_eq!(
+            description.layout_style().size.height,
+            wgpui_layout::taffy_tree::Dimension::length(24.0)
+        );
+    }
+
+    #[test]
+    fn absent_and_invalid_estimates_preserve_the_exact_layout_style() {
+        let exact = div().describe();
+        let absent = div().clear_estimated_size().describe();
+        let invalid = div()
+            .estimated_size(IntrinsicSize::new(f32::NAN, -1.0))
+            .describe();
+
+        assert_eq!(absent.layout_style(), exact.layout_style());
+        assert_eq!(invalid.layout_style(), exact.layout_style());
+        assert_eq!(
+            invalid
+                .key()
+                .expect("invalid div key")
+                .compare(exact.key().expect("exact div key")),
+            wgpui_core::invalidation::axes::Invalidation::empty()
+        );
+    }
+
+    #[test]
+    fn nested_divs_lower_their_estimates_independently() {
+        let description = div()
+            .estimated_size([120.0, 80.0])
+            .child(div().estimated_size(IntrinsicSize::new(40.0, 20.0)))
+            .describe();
+
+        assert_eq!(
+            description.layout_style().size,
+            wgpui_layout::taffy_tree::TaffySize {
+                width: wgpui_layout::taffy_tree::Dimension::length(120.0),
+                height: wgpui_layout::taffy_tree::Dimension::length(80.0),
+            }
+        );
+        assert_eq!(
+            description.child_descriptions()[0].layout_style().size,
+            wgpui_layout::taffy_tree::TaffySize {
+                width: wgpui_layout::taffy_tree::Dimension::length(40.0),
+                height: wgpui_layout::taffy_tree::Dimension::length(20.0),
+            }
+        );
+    }
+
+    #[test]
+    fn changing_and_removing_an_estimate_reuses_the_retained_layout_node() -> Result<(), FrameError>
+    {
+        let mut window = Window::new();
+        let first = window.draw(div().estimated_size([40.0, 20.0]))?;
+        let root_path = [ElementId::Slot(0)];
+        let node = first
+            .layout_node_at(&root_path)
+            .expect("root layout node");
+
+        let changed = window.draw(div().estimated_size([80.0, 30.0]))?;
+        assert_eq!(changed.layout_node_at(&root_path), Some(node));
+        assert_eq!(changed.layout_created, 0);
+        assert_eq!(changed.layout_reused, 1);
+        assert_eq!(
+            changed.outcome_at(&root_path),
+            Some(NodeOutcome::Rebuilt(
+                wgpui_core::reconcile::plan::RebuildReason::KeyChanged,
+            ))
+        );
+        assert_eq!(
+            window.layout.style_of(node)?.size.width,
+            wgpui_layout::taffy_tree::Dimension::length(80.0)
+        );
+
+        let removed = window.draw(div().clear_estimated_size())?;
+        assert_eq!(removed.layout_node_at(&root_path), Some(node));
+        assert_eq!(removed.layout_reused, 1);
+        assert_eq!(
+            window.layout.style_of(node)?.size.width,
+            wgpui_layout::taffy_tree::Dimension::auto()
+        );
+        Ok(())
     }
 
     #[test]

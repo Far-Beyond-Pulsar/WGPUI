@@ -39,6 +39,12 @@ impl IntrinsicSize {
     }
 }
 
+impl From<[f32; 2]> for IntrinsicSize {
+    fn from([width, height]: [f32; 2]) -> Self {
+        Self::new(width, height)
+    }
+}
+
 /// A measurement callback is intentionally pure: it can run during Taffy's
 /// CPU layout pass without touching the scene or GPU.
 pub trait Measure {
