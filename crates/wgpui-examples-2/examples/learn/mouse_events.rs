@@ -99,7 +99,7 @@ impl Render for MouseEventsExample {
                             } else {
                                 "TARGET"
                             })
-                            .on_hover(cx.listener(|this, &h, _, _| {
+                            .on_hover(wgpui::public_value_listener(cx, |this, h, _, _| {
                                 this.hovered = h;
                             }))
                             .on_mouse_enter(move |_, cx| {
@@ -108,7 +108,7 @@ impl Render for MouseEventsExample {
                             .on_mouse_leave(move |_, cx| {
                                 let _ = mo.update(cx, |this, _| this.mouse_inside = false);
                             })
-                            .on_drag_hover::<DragPayload>(move |&h, _, cx| {
+                            .on_drag_hover::<DragPayload, _>(move |h, _, cx| {
                                 if h {
                                     let _ = de.update(cx, |this, _| this.drag_hovered = true);
                                 } else {

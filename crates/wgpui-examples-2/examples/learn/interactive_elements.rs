@@ -14,7 +14,7 @@ use example_prelude::init_example;
 use wgpui::{
     App, Application, Bounds, ClickEvent, Colors, Context, Entity, Half, Hsla, IntoElement,
     MouseButton, MouseMoveEvent, Pixels, Point, Render, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, size,
+    point, prelude::*, px, size,
 };
 
 // ============================================================================
@@ -188,7 +188,7 @@ impl Render for HoverDemo {
                         "Hover Over Me"
                     })
                     // on_hover callback receives a bool: true when mouse enters, false when it leaves
-                    .on_hover(cx.listener(|this, &hovered, _window, cx| {
+                    .on_hover(wgpui::public_value_listener(cx, |this, hovered, _window, cx| {
                         this.is_hovered = hovered;
                         if hovered {
                             this.hover_count += 1;
@@ -306,7 +306,7 @@ impl Render for MouseEventsDemo {
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                        this.mouse_position = Some(event.position);
+                        this.mouse_position = Some(point(event.position[0], event.position[1]));
                         cx.notify();
                     })),
             )
@@ -442,7 +442,7 @@ impl Render for DragDropDemo {
                             .child(format!("Item {}", index + 1))
                             // on_drag takes: drag data, and a closure that creates the drag preview
                             .on_drag(drag_data, |data: &DragData, position, _, cx| {
-                                cx.new(|_| data.with_position(position))
+                                cx.new(|_| data.with_position(point(position[0], position[1])))
                             })
                     })),
             )
@@ -541,10 +541,10 @@ impl Render for InteractiveElementsExample {
                             .grid()
                             .grid_cols(2)
                             .gap_4()
-                            .child(self.click_demo.clone())
-                            .child(self.hover_demo.clone())
-                            .child(self.mouse_events_demo.clone())
-                            .child(self.drag_drop_demo.clone()),
+                            .child(wgpui::entity_view(self.click_demo.clone()))
+                            .child(wgpui::entity_view(self.hover_demo.clone()))
+                            .child(wgpui::entity_view(self.mouse_events_demo.clone()))
+                            .child(wgpui::entity_view(self.drag_drop_demo.clone())),
                     ),
             )
     }

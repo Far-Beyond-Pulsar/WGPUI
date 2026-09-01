@@ -1,6 +1,6 @@
 use wgpui::{
     App, Application, Bounds, Context, Div, ElementId, FocusHandle, KeyBinding, SharedString,
-    Stateful, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 
 actions!(example, [Tab, TabPrev]);
@@ -48,7 +48,7 @@ impl Render for Example {
             this.border_3().border_color(wgpui::blue())
         }
 
-        fn button(id: impl Into<ElementId>) -> Stateful<Div> {
+        fn button(id: impl Into<ElementId>) -> Div {
             div()
                 .id(id)
                 .h_10()
@@ -67,8 +67,8 @@ impl Render for Example {
         div()
             .id("app")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(Self::on_tab))
-            .on_action(cx.listener(Self::on_tab_prev))
+            .on_action(wgpui::public_listener(cx, Self::on_tab))
+            .on_action(wgpui::public_listener(cx, Self::on_tab_prev))
             .size_full()
             .flex()
             .flex_col()
@@ -94,7 +94,8 @@ impl Render for Example {
                             .border_1()
                             .border_color(wgpui::black())
                             .when(
-                                item_handle.tab_stop && item_handle.is_focused(window),
+                                item_handle.tab_stop
+                                    && window.interaction_mut().is_focused(&item_handle),
                                 tab_stop_style,
                             )
                             .map(|this| match item_handle.tab_stop {
@@ -115,7 +116,7 @@ impl Render for Example {
                         button("el1")
                             .tab_index(4)
                             .child("Button 1")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(wgpui::public_listener(cx, |this, _, _, cx| {
                                 this.message = "You have clicked Button 1.".into();
                                 cx.notify();
                             })),
@@ -124,7 +125,7 @@ impl Render for Example {
                         button("el2")
                             .tab_index(5)
                             .child("Button 2")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(wgpui::public_listener(cx, |this, _, _, cx| {
                                 this.message = "You have clicked Button 2.".into();
                                 cx.notify();
                             })),

@@ -115,6 +115,28 @@ pub fn public_listener<T: 'static, E: ?Sized>(
     }
 }
 
+/// Adapt an entity listener whose event is passed by value, such as the
+/// boolean delivered by hover transitions.
+pub fn public_value_listener<T: 'static, E: 'static>(
+    context: &wgpui_core::app::Context<T>,
+    mut callback: impl FnMut(&mut T, E, &mut Window, &mut wgpui_core::app::Context<T>) + 'static,
+) -> impl FnMut(E, &mut wgpui_core::window::Window, &mut App) + 'static {
+    let entity = context.entity().downgrade();
+    move |event, core_window, _app| {
+        CALLBACK_WINDOW.with(|slot| {
+            let pointer = slot.get();
+            assert!(!pointer.is_null(), "public value listener outside WGPU dispatch");
+            let Some(entity) = entity.upgrade() else {
+                return;
+            };
+            // SAFETY: see `public_window_callback`.
+            entity.update_in(core_window, |value, _window, context| unsafe {
+                callback(value, event, &mut *pointer, context);
+            });
+        });
+    }
+}
+
 enum ImmediatePaint {
     Quad(Quad),
     Path(Path),
