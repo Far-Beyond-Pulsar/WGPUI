@@ -1833,6 +1833,16 @@ impl Window {
         }));
     }
 
+    fn observes_entity(&self, entity: wgpui_core::app::EntityId) -> bool {
+        self.observed_entities.contains(&entity)
+    }
+
+    fn has_pending_entity_invalidations(&self, app: &App) -> bool {
+        self.observed_entities
+            .iter()
+            .any(|entity| app.has_pending_entity_invalidation(*entity))
+    }
+
     fn begin_render(&self) {
         self.rendering.store(true, Ordering::Release);
     }
@@ -2045,6 +2055,7 @@ where
             max_frames: self.max_frames,
             initialize: Some(Box::new(initialize)),
             live: Vec::new(),
+            pending_entity_invalidations: Vec::new(),
             failure: None,
             app,
         };
@@ -2092,6 +2103,7 @@ where
             max_frames: self.max_frames,
             initialize: None,
             live: Vec::new(),
+            pending_entity_invalidations: Vec::new(),
             failure: None,
             app,
         };
@@ -2140,6 +2152,7 @@ impl Application {
                 app
             },
             live: Vec::new(),
+            pending_entity_invalidations: Vec::new(),
             failure: None,
         };
         event_loop
@@ -2432,6 +2445,7 @@ impl ConfiguredApplication {
             initialize: Some(Box::new(initialize)),
             app,
             live: Vec::new(),
+            pending_entity_invalidations: Vec::new(),
             failure: None,
         };
         event_loop
@@ -2476,11 +2490,17 @@ struct Live {
     build: WindowBuildCallback,
 }
 
+struct PendingEntityInvalidation {
+    entity: wgpui_core::app::EntityId,
+    windows: Vec<wgpui_core::app::WindowId>,
+}
+
 struct Handler {
     initial: Option<(WindowOptions, WindowBuildCallback)>,
     max_frames: Option<u64>,
     initialize: Option<AppInitializer>,
     live: Vec<Live>,
+    pending_entity_invalidations: Vec<PendingEntityInvalidation>,
     failure: Option<ApplicationError>,
     app: App,
 }
@@ -2518,6 +2538,55 @@ impl Handler {
     fn fail(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, error: ApplicationError) {
         self.failure = Some(error);
         event_loop.exit();
+    }
+
+    fn collect_entity_invalidations(&mut self) {
+        let live_window_ids = self.live.iter().map(|live| live.id).collect::<Vec<_>>();
+        self.pending_entity_invalidations.iter_mut().for_each(|pending| {
+            pending
+                .windows
+                .retain(|window| live_window_ids.contains(window));
+        });
+        self.pending_entity_invalidations
+            .retain(|pending| !pending.windows.is_empty());
+        for entity in self.app.drain_entity_invalidations() {
+            let windows = self
+                .live
+                .iter()
+                .filter(|live| live.window.observes_entity(entity))
+                .map(|live| live.id)
+                .collect::<Vec<_>>();
+            if windows.is_empty() {
+                continue;
+            }
+            if let Some(pending) = self
+                .pending_entity_invalidations
+                .iter_mut()
+                .find(|pending| pending.entity == entity)
+            {
+                for window in windows {
+                    if !pending.windows.contains(&window) {
+                        pending.windows.push(window);
+                    }
+                }
+            } else {
+                self.pending_entity_invalidations
+                    .push(PendingEntityInvalidation { entity, windows });
+            }
+        }
+    }
+
+    fn take_entity_signals(&mut self, window: wgpui_core::app::WindowId) -> FrameSignals {
+        let mut signals = FrameSignals::new();
+        for pending in &mut self.pending_entity_invalidations {
+            if let Some(position) = pending.windows.iter().position(|id| *id == window) {
+                pending.windows.remove(position);
+                signals.entity_changed(pending.entity);
+            }
+        }
+        self.pending_entity_invalidations
+            .retain(|pending| !pending.windows.is_empty());
+        signals
     }
 
     fn create_window(
@@ -2717,39 +2786,48 @@ impl Handler {
             return;
         };
         self.app.run_pending_tasks();
+        self.collect_entity_invalidations();
         let all_other_windows_reached_limit = self.max_frames.is_some_and(|limit| {
             self.live
                 .iter()
                 .enumerate()
                 .all(|(other_index, live)| other_index == index || live.frames >= limit)
         });
-        let live = &mut self.live[index];
-        live.window.consume_redraw_request();
-        let animation_frame_requested = live
-            .window
-            .animation_frame_requested
-            .swap(false, Ordering::AcqRel);
-        let due_timer_count = live.window.take_due_timers(Instant::now()).len();
-        if due_timer_count > 0 {
-            log::debug!("window timer deadline reached: {due_timer_count} timer(s)");
-        }
-        if let Some((width, height)) = live.resizes.take_pending() {
-            live.surface.resize(&live.context.device, width, height);
-        }
-        let texture = match live.surface.acquire(&live.context.device) {
-            Acquired::Frame(texture) => texture,
-            Acquired::Skipped(_) => {
-                live.window.request_redraw();
-                return;
+        let (texture, animation_frame_requested) = {
+            let live = &mut self.live[index];
+            live.window.consume_redraw_request();
+            let animation_frame_requested = live
+                .window
+                .animation_frame_requested
+                .swap(false, Ordering::AcqRel);
+            let due_timer_count = live.window.take_due_timers(Instant::now()).len();
+            if due_timer_count > 0 {
+                log::debug!("window timer deadline reached: {due_timer_count} timer(s)");
             }
-            Acquired::Lost => {
-                self.fail(
-                    event_loop,
-                    ApplicationError::Render("surface image was lost after recovery".to_string()),
-                );
-                return;
+            if let Some((width, height)) = live.resizes.take_pending() {
+                live.surface.resize(&live.context.device, width, height);
             }
+            let texture = match live.surface.acquire(&live.context.device) {
+                Acquired::Frame(texture) => texture,
+                Acquired::Skipped(_) => {
+                    live.window.request_redraw();
+                    return;
+                }
+                Acquired::Lost => {
+                    self.fail(
+                        event_loop,
+                        ApplicationError::Render(
+                            "surface image was lost after recovery".to_string(),
+                        ),
+                    );
+                    return;
+                }
+            };
+            (texture, animation_frame_requested)
         };
+        let core_window_id = self.live[index].id;
+        let signals = self.take_entity_signals(core_window_id);
+        let live = &mut self.live[index];
         let view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -2773,6 +2851,7 @@ impl Handler {
             &mut live.app,
         );
         live.window.end_render();
+        let redraw_after_render = live.window.has_pending_entity_invalidations(&live.app);
         let description = append_immediate_paints(
             description,
             std::mem::take(&mut live.window.immediate_paints),
@@ -2788,7 +2867,6 @@ impl Handler {
             clear: wgpu::Color::BLACK,
             source: Some(&texture.texture),
         };
-        let signals = FrameSignals::new();
         let result = live.frame_loop.draw(
             &live.context.device,
             &live.context.queue,
@@ -2832,7 +2910,11 @@ impl Handler {
                     && all_other_windows_reached_limit
                 {
                     event_loop.exit();
-                } else if animation_frame_requested || self.max_frames.is_some() || frame.needs_redraw {
+                } else if redraw_after_render
+                    || animation_frame_requested
+                    || self.max_frames.is_some()
+                    || frame.needs_redraw
+                {
                     live.window.request_redraw();
                 }
             }
@@ -3516,6 +3598,47 @@ mod tests {
         app.notify(entity.entity_id());
         assert_eq!(redraw_count.get(), 1);
         assert!(!redraw_state.is_requested());
+    }
+
+    #[test]
+    fn entity_signals_are_broadcast_once_per_relevant_window() {
+        let mut app = App::create();
+        let first_entity = app.new_entity(()).entity_id();
+        let second_entity = app.new_entity(()).entity_id();
+        let first_window = app.reserve_window();
+        let second_window = app.reserve_window();
+        let mut handler = Handler {
+            initial: None,
+            max_frames: None,
+            initialize: None,
+            live: Vec::new(),
+            pending_entity_invalidations: vec![
+                PendingEntityInvalidation {
+                    entity: first_entity,
+                    windows: vec![first_window, second_window],
+                },
+                PendingEntityInvalidation {
+                    entity: second_entity,
+                    windows: vec![second_window],
+                },
+            ],
+            failure: None,
+            app: app.clone(),
+        };
+
+        let mut first_signals = handler.take_entity_signals(first_window);
+        assert_eq!(first_signals.requests().len(), 1);
+        assert!(first_signals.entity_signal(first_entity).is_some());
+        assert!(first_signals.entity_signal(second_entity).is_none());
+        assert!(first_signals.consume_entity_signal(first_entity).is_some());
+        assert!(first_signals.entity_signal(first_entity).is_none());
+        assert!(handler.take_entity_signals(first_window).is_empty());
+
+        let second_signals = handler.take_entity_signals(second_window);
+        assert_eq!(second_signals.requests().len(), 2);
+        assert!(second_signals.entity_signal(first_entity).is_some());
+        assert!(second_signals.entity_signal(second_entity).is_some());
+        assert!(handler.pending_entity_invalidations.is_empty());
     }
 }
 
