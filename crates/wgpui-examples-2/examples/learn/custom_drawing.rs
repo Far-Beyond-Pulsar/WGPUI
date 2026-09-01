@@ -8,10 +8,13 @@
 //! 4. Interactive drawing - Responding to mouse events
 
 use wgpui::{
-    App, Application, Bounds, Colors, Context, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Path, PathBuilder, Pixels, Point, Render, Rgba, Window, WindowBounds,
-    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
+    App, Application, Bounds, Colors, Context, Hsla, InputEvent, MouseButton, MouseMoveEvent,
+    MouseUpEvent, PathBuilder, Pixels, Point, Rgba, Window, WindowBounds, WindowOptions, canvas,
+    div, point, prelude::*, px, rgb, size,
 };
+use wgpui::core::element::Render as CoreRender;
+use wgpui::core::window::Window as CoreWindow;
+use wgpui::gpu::window::application::Render as WgpuRender;
 
 #[path = "../prelude.rs"]
 mod example_prelude;
@@ -27,37 +30,35 @@ fn basic_shapes_canvas(colors: &Colors) -> impl IntoElement {
     let success = colors.success;
     let accent = colors.accent;
 
-    canvas(
-        move |_bounds, _window, _cx| {},
-        move |bounds, _prepaint_state, window, _cx| {
+    canvas(move |context, emission| {
+            let bounds = context.bounds();
             // Draw a filled rectangle
-            window.paint_quad(fill(
+            emission.quad(context.fill(
                 Bounds {
-                    origin: point(bounds.origin.x + px(10.), bounds.origin.y + px(10.)),
+                    origin: point(px(bounds.x + 10.), px(bounds.y + 10.)),
                     size: size(px(60.), px(40.)),
                 },
                 error,
             ));
 
             // Draw another rectangle
-            window.paint_quad(fill(
+            emission.quad(context.fill(
                 Bounds {
-                    origin: point(bounds.origin.x + px(80.), bounds.origin.y + px(10.)),
+                    origin: point(px(bounds.x + 80.), px(bounds.y + 10.)),
                     size: size(px(60.), px(40.)),
                 },
                 success,
             ));
 
             // Draw a third rectangle
-            window.paint_quad(fill(
+            emission.quad(context.fill(
                 Bounds {
-                    origin: point(bounds.origin.x + px(150.), bounds.origin.y + px(10.)),
+                    origin: point(px(bounds.x + 150.), px(bounds.y + 10.)),
                     size: size(px(60.), px(40.)),
                 },
                 accent,
             ));
-        },
-    )
+        })
     .size_full()
 }
 
@@ -69,7 +70,7 @@ fn basic_shapes_canvas(colors: &Colors) -> impl IntoElement {
 // - curve_to: Draw a bezier curve
 // - close: Close the current subpath
 
-fn create_star(center: Point<Pixels>, outer_radius: f32, inner_radius: f32) -> Path<Pixels> {
+fn create_star(center: Point<Pixels>, outer_radius: f32, inner_radius: f32) -> wgpui::Path {
     let mut builder = PathBuilder::fill();
     let points = 5;
 
@@ -96,7 +97,7 @@ fn create_star(center: Point<Pixels>, outer_radius: f32, inner_radius: f32) -> P
     builder.build().unwrap()
 }
 
-fn create_triangle(p1: Point<Pixels>, p2: Point<Pixels>, p3: Point<Pixels>) -> Path<Pixels> {
+fn create_triangle(p1: Point<Pixels>, p2: Point<Pixels>, p3: Point<Pixels>) -> wgpui::Path {
     let mut builder = PathBuilder::fill();
     builder.move_to(p1);
     builder.line_to(p2);
@@ -109,27 +110,26 @@ fn custom_paths_canvas(colors: &Colors) -> impl IntoElement {
     let warning = colors.warning;
     let accent = colors.accent;
 
-    canvas(
-        move |_bounds, _window, _cx| {},
-        move |bounds, _, window, _cx| {
-            let center_y = bounds.origin.y + bounds.size.height / 2.0;
+    canvas(move |context, emission| {
+            let bounds = context.bounds();
+            let center_y = px(bounds.y + bounds.height / 2.0);
 
             // Draw a star
-            let star_center = point(bounds.origin.x + px(50.), center_y);
+            let star_center = point(px(bounds.x + 50.), center_y);
             let star = create_star(star_center, 30., 15.);
-            window.paint_path(star, warning);
+            emission.path(context.path(star, warning));
 
             // Draw a triangle
-            let tri_base_x = bounds.origin.x + px(120.);
+            let tri_base_x = px(bounds.x + 120.);
             let triangle = create_triangle(
                 point(tri_base_x + px(30.), center_y - px(25.)),
                 point(tri_base_x, center_y + px(25.)),
                 point(tri_base_x + px(60.), center_y + px(25.)),
             );
-            window.paint_path(triangle, rgb(0x8b5cf6)); // Purple
+            emission.path(context.path(triangle, rgb(0x8b5cf6))); // Purple
 
             // Draw a custom shape (arrow)
-            let arrow_x = bounds.origin.x + px(200.);
+            let arrow_x = px(bounds.x + 200.);
             let mut arrow_builder = PathBuilder::fill();
             arrow_builder.move_to(point(arrow_x, center_y));
             arrow_builder.line_to(point(arrow_x + px(20.), center_y - px(20.)));
@@ -140,9 +140,8 @@ fn custom_paths_canvas(colors: &Colors) -> impl IntoElement {
             arrow_builder.line_to(point(arrow_x + px(20.), center_y + px(20.)));
             arrow_builder.close();
             let arrow = arrow_builder.build().unwrap();
-            window.paint_path(arrow, accent);
-        },
-    )
+            emission.path(context.path(arrow, accent));
+        })
     .size_full()
 }
 
@@ -190,13 +189,15 @@ impl DrawingCanvas {
 
     fn on_mouse_down(
         &mut self,
-        event: &MouseDownEvent,
-        _window: &mut Window,
+        event: &InputEvent,
+        _window: &mut CoreWindow,
         cx: &mut Context<Self>,
     ) {
-        if event.button == MouseButton::Left {
+        if let InputEvent::MouseDown(event) = event
+            && event.button == MouseButton::Left
+        {
             self.is_drawing = true;
-            self.current_line = vec![event.position];
+            self.current_line = vec![point(event.position[0], event.position[1])];
             cx.notify();
         }
     }
@@ -204,16 +205,17 @@ impl DrawingCanvas {
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        _window: &mut Window,
+        _window: &mut CoreWindow,
         cx: &mut Context<Self>,
     ) {
         if self.is_drawing {
-            self.current_line.push(event.position);
+            self.current_line
+                .push(point(event.position[0], event.position[1]));
             cx.notify();
         }
     }
 
-    fn on_mouse_up(&mut self, _event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _event: &MouseUpEvent, window: &mut CoreWindow, cx: &mut Context<Self>) {
         if self.is_drawing && self.current_line.len() > 1 {
             self.lines.push(std::mem::take(&mut self.current_line));
             let colors = Colors::for_appearance(window);
@@ -231,10 +233,11 @@ impl DrawingCanvas {
         cx.notify();
     }
 
-    fn draw_line(window: &mut Window, points: &[Point<Pixels>], color: Rgba) {
+    fn draw_line(points: &[Point<Pixels>]) -> Vec<wgpui::Path> {
         if points.len() < 2 {
-            return;
+            return Vec::new();
         }
+        let mut paths = Vec::new();
 
         for pair in points.windows(2) {
             let start = pair[0];
@@ -263,14 +266,15 @@ impl DrawingCanvas {
             builder.close();
 
             if let Ok(path) = builder.build() {
-                window.paint_path(path, color);
+                paths.push(path);
             }
         }
+        paths
     }
 }
 
-impl Render for DrawingCanvas {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl CoreRender for DrawingCanvas {
+    fn render(&mut self, window: &mut CoreWindow, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::for_appearance(window);
         let lines = self.lines.clone();
         let current_line = self.current_line.clone();
@@ -303,18 +307,20 @@ impl Render for DrawingCanvas {
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .child(
                         canvas(
-                            move |_, _, _| {},
-                            move |_bounds, _, window, _cx| {
+                            move |context, emission| {
                                 for (i, line) in lines.iter().enumerate() {
                                     let color = palette[i % palette.len()];
-                                    DrawingCanvas::draw_line(window, line, color);
+                                    for path in DrawingCanvas::draw_line(line) {
+                                        emission.path(context.path(path, color));
+                                    }
                                 }
 
                                 if !current_line.is_empty() {
-                                    DrawingCanvas::draw_line(window, &current_line, current_color);
+                                    for path in DrawingCanvas::draw_line(&current_line) {
+                                        emission.path(context.path(path, current_color));
+                                    }
                                 }
-                            },
-                        )
+                            })
                         .size_full(),
                     ),
             )
@@ -362,7 +368,7 @@ impl CustomDrawingExample {
     }
 }
 
-impl Render for CustomDrawingExample {
+impl WgpuRender for CustomDrawingExample {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::for_appearance(window);
 
@@ -475,5 +481,5 @@ fn main() {
         .expect("Failed to open window");
 
         example_prelude::init_example(cx, "Custom Drawing");
-    });
+    }).expect("Failed to run application");
 }
