@@ -33,7 +33,10 @@ pub trait Asset: 'static {
 pub struct AssetLogger<A>(PhantomData<A>);
 
 impl<A: Asset> AssetLogger<A> {
-    pub fn load(source: A::Source, app: &mut App) -> impl std::future::Future<Output = A::Output> {
+    pub fn load(
+        source: A::Source,
+        app: &mut App,
+    ) -> impl std::future::Future<Output = A::Output> + Send + 'static {
         A::load(source, app)
     }
 }

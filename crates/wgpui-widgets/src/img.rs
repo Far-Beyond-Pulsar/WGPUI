@@ -511,6 +511,15 @@ pub fn img(source: impl IntoImageInput) -> ImgBuilder {
 }
 
 impl ImgBuilder {
+    pub fn from_decoded(source: ImageSourceId, image: std::sync::Arc<crate::assets::RenderImage>) -> Self {
+        let mut cache = ImageCache::new();
+        let load_state = cache.hold_at(source, (*image).clone()).is_ok();
+        Self {
+            image: Img::new(source, pending_engine(cache)).load_state(if load_state { ImageLoadState::Ready } else { ImageLoadState::Failed }),
+            resource: None,
+            resolver: None,
+        }
+    }
     pub fn size(mut self, size: impl IntoStylePixels) -> Self {
         let size = size.into_style_pixels();
         self.image = self.image.size(size, size);
@@ -592,6 +601,25 @@ impl Element for ImgBuilder {
 }
 
 impl Img {
+    pub(crate) fn set_decoded(
+        mut self,
+        source: ImageSourceId,
+        image: std::sync::Arc<crate::assets::RenderImage>,
+    ) -> Self {
+        let loaded = self
+            .engine
+            .borrow_mut()
+            .cache()
+            .hold_at(source, (*image).clone())
+            .is_ok();
+        self.source = source;
+        self.load_state(if loaded {
+            ImageLoadState::Ready
+        } else {
+            ImageLoadState::Failed
+        })
+    }
+
     /// An image showing `source`, at its first frame, ready, unsized, unstyled.
     pub fn new(source: ImageSourceId, engine: SharedImageEngine) -> Self {
         Self {

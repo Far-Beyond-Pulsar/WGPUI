@@ -8,8 +8,8 @@ pub struct Timer;
 pub struct BackgroundExecutor;
 
 impl BackgroundExecutor {
-    pub fn timer(&self, duration: Duration) -> impl Future<Output = ()> {
-        Timer::after(duration)
+    pub fn timer(&self, duration: Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        Box::pin(Timer::after(duration))
     }
 }
 

@@ -113,7 +113,7 @@ pub use wgpui_widgets::image_cache::{
     DecodedFrame, DecodedImage, ImageCache, ImageDecodeError, decode, decode_async, decode_svg_at,
 };
 pub use wgpui_widgets::img::{
-    img, img_with_engine, ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img,
+    img_with_engine, ImageEngine, ImageLoadState, ImageSourceId, ImageStyle, Img,
     ImgBuilder, ObjectFit, SharedImageEngine,
 };
 pub use wgpui_widgets::list;
@@ -299,8 +299,10 @@ pub use wgpui_widgets::animation::pulsating_between;
 
 pub use wgpui_wgpu::debug::{PerformanceDebug, TileRefreshFlash};
 pub use wgpui_wgpu::window::application::{
-    entity_view, public_listener, public_window_callback, Application, ApplicationError,
-    ClipboardError, ConfiguredApplication, DisplayId, EntityView, FrameReport, NativeApplication,
+    entity_view, public_listener, public_value_listener, public_window_callback, img, AppAssetExt,
+    AssetRef, Application, ApplicationError, ClipboardError, ConfiguredApplication, DisplayId,
+    EntityView, FrameReport, IntoLegacyImageSource, LegacyImageSource, LegacyImgBuilder,
+    NativeApplication,
     Window, WindowHandle, WindowOptions,
 };
 pub use wgpui_wgpu::window::surface::{SurfaceResizeError, WgpuSurfaceHandle};

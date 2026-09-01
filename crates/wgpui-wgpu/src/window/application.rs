@@ -33,7 +33,6 @@ use wgpui_core::window::{
     WindowAppearance, WindowBackgroundAppearance, WindowDecorations, WindowKind,
 };
 use wgpui_http_client::{AppHttpClientExt, BoxedHttpClient};
-use wgpui_widgets::assets::AssetRegistry;
 
 use crate::debug::PerformanceDebug;
 use crate::render::draw::DrawMode;
@@ -44,6 +43,9 @@ use crate::window::resize_detector::ResizeDetector;
 use crate::window::surface::WgpuSurfaceHandle;
 use crate::window::{Acquired, WindowError, WindowSurface};
 use wgpui_widgets::assets::Resource;
+use wgpui_widgets::assets::{Asset, AssetRegistry, ImageCacheError, RenderImage};
+use wgpui_widgets::img::ImgBuilder;
+use wgpui_widgets::styled::Styled;
 
 fn initial_bounds(options: &WindowOptions) -> Bounds<Pixels> {
     let fallback = size(Pixels(options.width as f32), Pixels(options.height as f32));
@@ -1688,6 +1690,7 @@ impl Application {
             app: {
                 let mut app = App::create();
                 app.set_global(AssetRegistry::new(Arc::new(())));
+                app.set_global(AssetRequests::default());
                 app
             },
             live: Vec::new(),
@@ -1706,18 +1709,258 @@ pub struct ConfiguredApplication {
     assets: Arc<dyn wgpui_widgets::assets::AssetSource>,
 }
 
-impl Window {
-    pub fn use_asset<A: wgpui_widgets::assets::Asset>(
-        &mut self,
-        source: &A::Source,
-        _app: &mut App,
-    ) -> Resource {
+#[derive(Clone)]
+pub struct AssetRef {
+    key: String,
+    state: Arc<std::sync::Mutex<AssetState>>,
+}
+
+#[derive(Clone)]
+enum AssetState {
+    Loading,
+    Ready(Arc<RenderImage>),
+    Failed(String),
+}
+
+impl AssetRef {
+    pub fn is_loading(&self) -> bool {
+        match self.state.lock() {
+            Ok(state) => matches!(*state, AssetState::Loading),
+            Err(poisoned) => matches!(*poisoned.into_inner(), AssetState::Loading),
+        }
+    }
+
+    pub fn error(&self) -> Option<String> {
+        match self.state.lock() {
+            Ok(state) => match &*state {
+                AssetState::Failed(error) => Some(error.clone()),
+                _ => None,
+            },
+            Err(poisoned) => match &*poisoned.into_inner() {
+                AssetState::Failed(error) => Some(error.clone()),
+                _ => None,
+            },
+        }
+    }
+}
+
+pub enum LegacyImageSource {
+    Resource(Resource),
+    Deferred(Box<dyn FnOnce(&mut Window, &mut App) -> AssetRef>),
+}
+
+pub struct LegacyImgBuilder {
+    source: LegacyImageSource,
+    image: Option<ImgBuilder>,
+    fallback: Option<Box<dyn Fn() -> Description>>,
+    loading: Option<Box<dyn Fn() -> Description>>,
+    border: bool,
+    border_color: Option<wgpui_core::color::Hsla>,
+    click_handler: Option<Box<dyn FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut App)>>,
+}
+
+pub trait IntoLegacyImageSource: 'static {
+    fn into_legacy_source(self) -> LegacyImageSource;
+}
+
+impl IntoLegacyImageSource for Resource {
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self) }
+}
+impl IntoLegacyImageSource for std::path::PathBuf {
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self.into()) }
+}
+impl IntoLegacyImageSource for String {
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self.into()) }
+}
+impl IntoLegacyImageSource for &'static str {
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Resource(self.into()) }
+}
+impl<F> IntoLegacyImageSource for F
+where
+    F: FnOnce(&mut Window, &mut App) -> AssetRef + 'static,
+{
+    fn into_legacy_source(self) -> LegacyImageSource { LegacyImageSource::Deferred(Box::new(self)) }
+}
+
+pub fn img(source: impl IntoLegacyImageSource) -> LegacyImgBuilder {
+    LegacyImgBuilder {
+        source: source.into_legacy_source(),
+        image: None,
+        fallback: None,
+        loading: None,
+        border: false,
+        border_color: None,
+        click_handler: None,
+    }
+}
+
+impl LegacyImgBuilder {
+    pub fn id(mut self, id: impl Into<wgpui_core::reconcile::description::ElementId>) -> Self {
+        self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).id(id)); self
+    }
+    pub fn size(mut self, size: impl wgpui_widgets::styled::IntoStylePixels) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).size(size)); self }
+    pub fn size_12(self) -> Self { self.size(48.0) }
+    pub fn size_8(self) -> Self { self.size(32.0) }
+    pub fn size_16(self) -> Self { self.size(64.0) }
+    pub fn size_full(mut self) -> Self { self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).size_full()); self }
+    pub fn object_fit(mut self, object_fit: wgpui_widgets::img::ObjectFit) -> Self {
+        self.image = Some(self.image.take().unwrap_or_else(|| wgpui_widgets::img::img(Resource::Embedded("pending".into()))).object_fit(object_fit));
+        self
+    }
+    pub fn border_1(mut self) -> Self { self.border = true; self }
+    pub fn border_color(mut self, color: impl Into<wgpui_core::color::Hsla>) -> Self { self.border_color = Some(color.into()); self }
+    pub fn on_click<F>(mut self, handler: F) -> Self
+    where F: FnMut(&wgpui_core::window::ClickEvent, &mut wgpui_core::window::Window, &mut App) + 'static { self.click_handler = Some(Box::new(handler)); self }
+    pub fn with_fallback<F>(mut self, fallback: F) -> Self where F: Fn() -> Description + 'static { self.fallback = Some(Box::new(fallback)); self }
+    pub fn with_loading<F>(mut self, loading: F) -> Self where F: Fn() -> Description + 'static { self.loading = Some(Box::new(loading)); self }
+}
+
+impl CoreElement for LegacyImgBuilder {
+    fn into_description(self) -> Description { Description::deferred(move |window, app| { let Some(window) = window.downcast_mut::<Window>() else { return Description::new::<Self>(); }; self.resolve(window, app) }) }
+    fn into_description_in(self, _window: &mut wgpui_core::window::Window, _app: &App) -> Description { wgpui_core::Element::into_description(self) }
+}
+
+impl LegacyImgBuilder {
+    fn resolve(self, window: &mut Window, app: &mut App) -> Description {
+        let Self { source, image, fallback, loading, border, border_color, click_handler } = self;
+        let asset = match source {
+            LegacyImageSource::Resource(resource) => {
+                let key = format!("resource:{resource:?}");
+                let state = match app.global::<AssetRegistry>().and_then(|registry| registry.load_cached(resource).ok()) {
+                    Some(image) => AssetState::Ready(image),
+                    None => AssetState::Failed("asset could not be resolved".into()),
+                };
+                AssetRef { key, state: Arc::new(std::sync::Mutex::new(state)) }
+            }
+            LegacyImageSource::Deferred(resolve) => resolve(window, app),
+        };
+        let state = match asset.state.lock() {
+            Ok(state) => state.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let description = match state {
+            AssetState::Ready(image_data) => {
+                let source = wgpui_widgets::img::ImageSourceId::from_raw(crate::window::application::asset_source_id(&asset.key));
+                let image = image.unwrap_or_else(|| ImgBuilder::from_decoded(source, image_data));
+                wgpui_core::Element::into_description(image)
+            }
+            AssetState::Loading => loading.map_or_else(|| Description::new::<()>(), |render| render()),
+            AssetState::Failed(_) => fallback.map_or_else(|| Description::new::<()>(), |render| render()),
+        };
+        let description = if border {
+            let mut container = wgpui_widgets::div::div().border_1();
+            if let Some(color) = border_color {
+                container = container.border_color(color);
+            }
+            wgpui_core::Element::into_description(container.child(description))
+        } else {
+            description
+        };
+        if let Some(mut handler) = click_handler { wgpui_core::Element::into_description(wgpui_widgets::div::div().on_click(move |event, window, app| handler(event, window, app)).child(description)) } else { description }
+    }
+}
+
+fn asset_source_id(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new(); key.hash(&mut hasher); hasher.finish().max(1)
+}
+
+pub trait AssetImageOutput: Send + 'static {
+    fn into_image_result(self) -> Result<Arc<RenderImage>, ImageCacheError>;
+}
+
+impl AssetImageOutput for Result<Arc<RenderImage>, ImageCacheError> {
+    fn into_image_result(self) -> Result<Arc<RenderImage>, ImageCacheError> { self }
+}
+
+struct AssetRequests(std::sync::Mutex<std::collections::HashMap<String, AssetRef>>);
+
+impl Default for AssetRequests {
+    fn default() -> Self { Self(std::sync::Mutex::new(std::collections::HashMap::new())) }
+}
+
+pub trait AppAssetExt {
+    fn remove_asset<A: Asset>(&mut self, source: &A::Source);
+}
+
+impl AppAssetExt for App {
+    fn remove_asset<A: Asset>(&mut self, source: &A::Source) {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         source.hash(&mut hasher);
-        Resource::Embedded(format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish()))
+        if let Some(requests) = self.global::<AssetRequests>() {
+            let key = format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish());
+            requests.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&key);
+        }
+    }
+}
+
+impl Window {
+    pub fn use_asset<A>(
+        &mut self,
+        source: &A::Source,
+        app: &mut App,
+    ) -> AssetRef
+    where
+        A: Asset,
+        A::Output: AssetImageOutput,
+    {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        let key = format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish());
+        if app.global::<AssetRequests>().is_none() {
+            app.set_global(AssetRequests::default());
+        }
+        let Some(requests) = app.global::<AssetRequests>() else {
+            return AssetRef {
+                key,
+                state: Arc::new(std::sync::Mutex::new(AssetState::Failed(
+                    "asset request registry is unavailable".into(),
+                ))),
+            };
+        };
+        let mut entries = requests.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(asset) = entries.get(&key) {
+            return asset.clone();
+        }
+        let state = Arc::new(std::sync::Mutex::new(AssetState::Loading));
+        let redraw = {
+            let native = Arc::clone(&self.native);
+            Arc::new(move || native.request_redraw()) as Arc<dyn Fn() + Send + Sync>
+        };
+        let asset = AssetRef { key: key.clone(), state: Arc::clone(&state) };
+        entries.insert(key, asset.clone());
+        let mut asset_app = app.clone();
+        let future = A::load(source.clone(), &mut asset_app);
+        let task = app.background_spawn(async move {
+            let result = future.await.into_image_result();
+            let new_state = match result {
+                Ok(image) => AssetState::Ready(image),
+                Err(error) => AssetState::Failed(error.to_string()),
+            };
+            match state.lock() {
+                Ok(mut state) => *state = new_state,
+                Err(poisoned) => {
+                    let mut state = poisoned.into_inner();
+                    *state = new_state;
+                }
+            }
+            redraw();
+        });
+        task.detach();
+        asset
     }
 
+    pub fn remove_asset<A: Asset>(&mut self, source: &A::Source, app: &mut App) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        if let Some(requests) = app.global::<AssetRequests>() {
+            let key = format!("asset:{}:{}", std::any::type_name::<A>(), hasher.finish());
+            requests.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&key);
+        }
+    }
 }
 
 impl ConfiguredApplication {
@@ -1730,6 +1973,7 @@ impl ConfiguredApplication {
             app.install_default_http_client();
         }
         app.set_global(AssetRegistry::new(self.assets));
+        app.set_global(AssetRequests::default());
         let mut handler = Handler {
             initial: Some((
                 WindowOptions::default(),
