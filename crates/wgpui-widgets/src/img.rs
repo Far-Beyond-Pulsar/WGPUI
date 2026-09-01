@@ -505,9 +505,6 @@ pub fn img(source: impl IntoImageInput) -> ImgBuilder {
 }
 
 impl ImgBuilder {
-    pub fn border_1(self) -> Self { self }
-    pub fn with_fallback<F>(self, _fallback: F) -> Self where F: Fn() -> wgpui_core::reconcile::description::Description + 'static { self }
-    pub fn with_loading<F>(self, _loading: F) -> Self where F: Fn() -> wgpui_core::reconcile::description::Description + 'static { self }
     pub fn size(mut self, size: impl IntoStylePixels) -> Self {
         let size = size.into_style_pixels();
         self.image = self.image.size(size, size);
