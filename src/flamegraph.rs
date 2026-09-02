@@ -195,6 +195,16 @@ pub(crate) fn hash_global_element_id(id: &crate::GlobalElementId) -> u64 {
 pub struct ThreadKey(u64);
 
 impl ThreadKey {
+    /// Construct a thread key from an embedding profiler's stable thread id.
+    pub fn from_raw(raw: u64) -> Self {
+        ThreadKey(raw)
+    }
+
+    /// Return the raw value used by an embedding profiler.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
     fn current() -> Self {
         let mut hasher = DefaultHasher::new();
         std::thread::current().id().hash(&mut hasher);
@@ -479,7 +489,11 @@ pub struct FrameCounters {
 #[derive(Debug)]
 pub struct Capture {
     anchor: Instant,
+    /// Unix-nanosecond timestamp corresponding to `anchor`.
+    anchor_unix_ns: u64,
     frames: VecDeque<FrameCapture>,
+    /// Interned labels used by imported dynamic spans.
+    span_names: Vec<String>,
     /// Frame-count ring-buffer bound this capture was configured with.
     pub max_frames: usize,
     // Always `false` on a `Capture` returned by `CaptureHandle::stop` today
@@ -512,6 +526,15 @@ impl Capture {
     /// Number of frames currently held.
     pub fn frame_count(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Resolve a span label, including labels imported from an external
+    /// instrumentation stream.
+    pub fn span_name(&self, name: SpanName) -> Option<&str> {
+        match name {
+            SpanName::Static(name) => Some(name),
+            SpanName::Interned(index) => self.span_names.get(index as usize).map(String::as_str),
+        }
     }
 
     /// Approximate heap bytes retained by this stopped capture's own frames
@@ -615,19 +638,14 @@ impl Capture {
 
     /// Write this capture out in WGPUI's versioned binary trace format:
     /// an 8-byte magic, a `u32` format version, a fixed `bytemuck::Pod` header,
-    /// then a sequence of independently length-prefixed, bincode-encoded
+    /// a length-prefixed UTF-8 table for imported dynamic span names, then a
+    /// sequence of independently length-prefixed, bincode-encoded
     /// [`FrameCapture`] chunks (not one big `Vec<FrameCapture>` blob), so the
     /// format is streaming-friendly from day one. There is no public reader
-    /// this round; a future viewer defines its own.
+    /// this round; a future viewer can resolve `SpanName::Interned` through
+    /// the table before decoding the frame chunks.
     pub fn export_trace(&self, writer: &mut impl Write) -> anyhow::Result<()> {
-        let anchor_system_time = SystemTime::now()
-            .checked_sub(self.anchor.elapsed())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let anchor_unix_nanos = anchor_system_time
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
+        let anchor_unix_nanos = self.anchor_unix_ns;
 
         let calibration = gpu_calibration();
         let header = TraceHeader {
@@ -638,12 +656,20 @@ impl Capture {
             cpu_clock_source: CPU_CLOCK_SOURCE_STD_INSTANT,
             gpu_ns_per_tick: calibration.ns_per_tick,
             gpu_calibrated: calibration.calibrated as u32,
-            reserved: [0; 16],
+            span_name_count: self.span_names.len().min(u32::MAX as usize) as u32,
+            reserved: [0; 12],
         };
 
         writer.write_all(&TRACE_MAGIC)?;
         writer.write_all(&TRACE_FORMAT_VERSION.to_le_bytes())?;
         writer.write_all(bytemuck::bytes_of(&header))?;
+
+        for name in self.span_names.iter().take(header.span_name_count as usize) {
+            let length = u32::try_from(name.len())
+                .map_err(|_| anyhow::anyhow!("span name too large to encode"))?;
+            writer.write_all(&length.to_le_bytes())?;
+            writer.write_all(name.as_bytes())?;
+        }
 
         for frame in &self.frames {
             let encoded = bincode::serde::encode_to_vec(frame, bincode::config::standard())
@@ -659,12 +685,14 @@ impl Capture {
 }
 
 const TRACE_MAGIC: [u8; 8] = *b"WGPUIFLG";
-const TRACE_FORMAT_VERSION: u32 = 2;
+const TRACE_FORMAT_VERSION: u32 = 3;
 const CPU_CLOCK_SOURCE_STD_INSTANT: u32 = 0;
 
 /// Fixed-size POD trace header. Field order is chosen so that no implicit
-/// padding is inserted (three `u64`s, then four `u32`-sized fields, then a
-/// byte array), which `bytemuck::Pod`'s derive requires.
+/// padding is inserted (three `u64`s, then five `u32`-sized fields, then a
+/// byte array), which `bytemuck::Pod`'s derive requires. Version 3 adds
+/// `span_name_count` so imported dynamic labels survive export instead of
+/// displaying as opaque numeric intern IDs in an out-of-process viewer.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct TraceHeader {
@@ -675,7 +703,8 @@ struct TraceHeader {
     cpu_clock_source: u32,
     gpu_ns_per_tick: f32,
     gpu_calibrated: u32,
-    reserved: [u8; 16],
+    span_name_count: u32,
+    reserved: [u8; 12],
 }
 
 /// Error returned by [`start_capture`] when a capture session is already active.
@@ -719,7 +748,9 @@ impl CaptureHandle {
 
         Capture {
             anchor: self.state.anchor,
+            anchor_unix_ns: self.state.anchor_unix_ns,
             frames: self.state.finished_frames.lock().clone(),
+            span_names: self.state.span_names.lock().names.clone(),
             max_frames: self.state.max_frames,
             enabled: AtomicBool::new(false),
             full_draw_frame_count: self.state.full_draw_frames.load(Ordering::Relaxed),
@@ -882,6 +913,7 @@ struct OpenFrame {
 
 struct CaptureState {
     anchor: Instant,
+    anchor_unix_ns: u64,
     max_frames: usize,
     capture_gpu: bool,
     next_frame_index: AtomicU64,
@@ -906,6 +938,9 @@ struct CaptureState {
     /// bounded so an application that is captured while occluded cannot grow
     /// profiler memory without limit.
     pending_diagnostics: parking_lot::Mutex<Vec<DiagnosticEvent>>,
+    /// Session-local string table for dynamic labels imported from external
+    /// profilers. Repeated names are stored once.
+    span_names: parking_lot::Mutex<SpanNameTable>,
     /// Session-wide (not ring-buffer-windowed) frame-pacing counters. See
     /// `record_frame_pacing` and `Capture::full_draw_frame_count`.
     full_draw_frames: AtomicU64,
@@ -914,11 +949,69 @@ struct CaptureState {
 
 const MAX_DIAGNOSTICS_PER_FRAME: usize = 4096;
 const MAX_PENDING_DIAGNOSTICS: usize = 8192;
+const MAX_PENDING_BACKGROUND_SPANS: usize = 131_072;
+
+#[derive(Default)]
+struct SpanNameTable {
+    names: Vec<String>,
+    indices: HashMap<String, u32>,
+}
+
+impl SpanNameTable {
+    fn intern(&mut self, name: &str) -> u32 {
+        if let Some(index) = self.indices.get(name) {
+            return *index;
+        }
+
+        let index = self.names.len().min(u32::MAX as usize) as u32;
+        let owned = name.to_owned();
+        self.indices.insert(owned.clone(), index);
+        self.names.push(owned);
+        index
+    }
+}
+
+/// Import one completed span from an embedding profiler that uses an absolute
+/// Unix-nanosecond clock. The span is interned and attached to the retained
+/// frame whose time window it overlaps. If that frame has not closed yet, it
+/// is queued for normal background-span bucketing.
+///
+/// The disabled path is a single atomic load. The caller should pass the
+/// profiler's original start timestamp rather than the time at which this
+/// function is called; collector polling may be delayed by several frames.
+pub fn record_external_span(
+    name: &str,
+    start_unix_ns: u64,
+    duration_ns: u64,
+    depth: u32,
+    thread_id: u64,
+) {
+    if !capture_enabled() {
+        return;
+    }
+
+    let Some(state) = ACTIVE_CAPTURE.lock().as_ref().cloned() else {
+        return;
+    };
+    let start_ns = start_unix_ns.saturating_sub(state.anchor_unix_ns);
+    let span = CpuSpan {
+        name: state.intern_span_name(name),
+        category: SpanCategory::UserDefined,
+        depth: depth.min(u16::MAX as u32) as u16,
+        start_ns,
+        duration_ns: duration_ns.min(u32::MAX as u64) as u32,
+        thread_id: ThreadKey::from_raw(thread_id),
+        element: None,
+    };
+    state.attach_external_span(span);
+}
 
 impl CaptureState {
     fn new(options: CaptureOptions) -> Self {
+        let anchor = Instant::now();
         Self {
-            anchor: Instant::now(),
+            anchor,
+            anchor_unix_ns: unix_time_ns(),
             max_frames: options.max_frames.max(1),
             capture_gpu: options.capture_gpu,
             next_frame_index: AtomicU64::new(0),
@@ -927,6 +1020,7 @@ impl CaptureState {
             finished_frames: parking_lot::Mutex::new(VecDeque::new()),
             pending_background_spans: parking_lot::Mutex::new(Vec::new()),
             pending_diagnostics: parking_lot::Mutex::new(Vec::new()),
+            span_names: parking_lot::Mutex::new(SpanNameTable::default()),
             full_draw_frames: AtomicU64::new(0),
             fast_path_frames: AtomicU64::new(0),
         }
@@ -1002,6 +1096,40 @@ impl CaptureState {
             self.close_frame(frame_index);
         }
     }
+
+    fn intern_span_name(&self, name: &str) -> SpanName {
+        SpanName::Interned(self.span_names.lock().intern(name))
+    }
+
+    fn attach_external_span(&self, span: CpuSpan) {
+        // External events are often drained after their originating frame has
+        // already closed. Attach to the retained frame first so polling delay
+        // does not misattribute or strand the event.
+        {
+            let span_end = span.start_ns.saturating_add(span.duration_ns as u64);
+            let mut finished = self.finished_frames.lock();
+            if let Some(frame) = finished.iter_mut().find(|frame| {
+                span.start_ns < frame.frame_end_ns && span_end > frame.frame_start_ns
+            }) {
+                frame.background_spans.push(span);
+                return;
+            }
+        }
+
+        let mut pending = self.pending_background_spans.lock();
+        if pending.len() >= MAX_PENDING_BACKGROUND_SPANS {
+            pending.remove(0);
+        }
+        pending.push(span);
+    }
+}
+
+fn unix_time_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 struct PendingSpan {
@@ -2260,7 +2388,7 @@ mod tests {
         counters: FrameCounters,
     }
 
-    fn read_trace(bytes: &[u8]) -> anyhow::Result<(TraceHeader, Vec<DecodedFrameCapture>)> {
+    fn read_trace(bytes: &[u8]) -> anyhow::Result<(TraceHeader, Vec<String>, Vec<DecodedFrameCapture>)> {
         anyhow::ensure!(
             bytes.len() >= TRACE_MAGIC.len() + 4 + core::mem::size_of::<TraceHeader>(),
             "trace too short"
@@ -2278,6 +2406,17 @@ mod tests {
         let header: TraceHeader = bytemuck::pod_read_unaligned(header_bytes);
 
         let mut offset = 12 + header_size;
+        let mut span_names = Vec::with_capacity(header.span_name_count as usize);
+        for _ in 0..header.span_name_count {
+            anyhow::ensure!(bytes.len() >= offset + 4, "truncated span-name length prefix");
+            let length = u32::from_le_bytes(bytes[offset..offset + 4].try_into()?) as usize;
+            offset += 4;
+            anyhow::ensure!(bytes.len() >= offset + length, "truncated span-name body");
+            let name = std::str::from_utf8(&bytes[offset..offset + length])?.to_owned();
+            offset += length;
+            span_names.push(name);
+        }
+
         let mut frames = Vec::with_capacity(header.frame_count as usize);
         for _ in 0..header.frame_count {
             anyhow::ensure!(bytes.len() >= offset + 4, "truncated frame length prefix");
@@ -2291,7 +2430,7 @@ mod tests {
             frames.push(frame);
         }
 
-        Ok((header, frames))
+        Ok((header, span_names, frames))
     }
 
     fn decode(span: &CpuSpan) -> DecodedCpuSpan {
@@ -2457,8 +2596,9 @@ mod tests {
         let mut buffer = Vec::new();
         capture.export_trace(&mut buffer).expect("export_trace should succeed");
 
-        let (header, frames) = read_trace(&buffer).expect("round trip decode should succeed");
+        let (header, span_names, frames) = read_trace(&buffer).expect("round trip decode should succeed");
         assert_eq!(header.frame_count, 3);
+        assert!(span_names.is_empty(), "static labels do not need the export table");
         assert_eq!(frames.len(), 3);
         let expected: Vec<DecodedFrameCapture> = capture.frames().map(decode_frame).collect();
         assert_eq!(frames, expected);
@@ -2522,6 +2662,41 @@ mod tests {
             capture_engine_memory_usage(),
             recorder_count * (THREAD_SPAN_BUDGET_BYTES as u64)
         );
+    }
+
+    #[test]
+    fn external_spans_are_attached_and_export_their_name_table() {
+        let handle = start_capture(CaptureOptions {
+            max_frames: 4,
+            capture_gpu: false,
+        })
+        .expect("no other capture should be active in this test process at this point");
+
+        let frame_index = open_frame_cpu_side(7);
+        let start_unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos() as u64;
+        record_external_span("engine::resize", start_unix_ns, 1_000_000, 2, 99);
+        close_frame_cpu_side(frame_index);
+
+        let capture = handle.stop();
+        let frame = capture.frames().next().expect("external span frame retained");
+        let span = frame
+            .background_spans
+            .iter()
+            .find(|span| span.name == SpanName::Interned(0))
+            .expect("external span attached to the frame");
+        assert_eq!(span.thread_id.raw(), 99);
+        assert_eq!(capture.span_name(span.name), Some("engine::resize"));
+
+        let mut buffer = Vec::new();
+        capture.export_trace(&mut buffer).expect("export should succeed");
+        let (header, span_names, frames) = read_trace(&buffer).expect("trace should decode");
+        assert_eq!(header.span_name_count, 1);
+        assert_eq!(span_names, vec!["engine::resize"]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].background_spans[0].name, DecodedSpanName::Interned(0));
     }
 
     #[test]
