@@ -63,6 +63,83 @@ pub enum SpanCategory {
     UserDefined,
 }
 
+/// A low-overhead diagnostic event emitted by the UI framework while a
+/// flamegraph capture is active.
+///
+/// Unlike a CPU span, a diagnostic event is not intended to describe a call
+/// stack. It records facts that explain *why* a frame did work: resize
+/// notifications, refresh/invalidation traffic, surface reconfiguration and
+/// other lifecycle transitions. The four numeric payload fields are
+/// intentionally generic so call sites never need to allocate a string while
+/// recording an event. Their meaning is documented by each [`DiagnosticKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiagnosticKind {
+    /// A native window resize notification. `a`/`b` are physical width and
+    /// height, `c` is the scale factor as `f32::to_bits`.
+    ResizeEvent,
+    /// The complete WGPUI resize handler. `a`/`b` are physical width and
+    /// height, `c` is the scale factor as `f32::to_bits`.
+    ResizeHandling,
+    /// `Window::bounds_changed` and the refresh it schedules. `a`/`b` are
+    /// logical viewport width and height as `f32::to_bits`.
+    BoundsChanged,
+    /// A call to `Window::refresh`. `a` is the resulting invalidation state.
+    RefreshRequested,
+    /// A surface/swapchain reconfiguration. `a`/`b` are physical width and
+    /// height.
+    SurfaceReconfigured,
+    /// A drawable-size update, including replacement of size-dependent GPU
+    /// textures. `a`/`b` are physical width and height.
+    DrawableResized,
+    /// A frame completed with a full compositor draw. `a` is the CPU span
+    /// count and `b` is the diagnostic count for the frame.
+    FramePresented,
+    /// A frame completed through the framebuffer-only fast path.
+    FastFramePresented,
+    /// A generic UI refresh/invalidation fact supplied by an embedding app.
+    User,
+}
+
+impl DiagnosticKind {
+    /// Stable human-readable label used by the profiler viewer and exports.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ResizeEvent => "Resize event",
+            Self::ResizeHandling => "Resize handling",
+            Self::BoundsChanged => "Bounds changed",
+            Self::RefreshRequested => "Refresh requested",
+            Self::SurfaceReconfigured => "Surface reconfigured",
+            Self::DrawableResized => "Drawable resized",
+            Self::FramePresented => "Frame presented",
+            Self::FastFramePresented => "Fast frame presented",
+            Self::User => "User diagnostic",
+        }
+    }
+}
+
+/// One point-in-time or timed diagnostic observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticEvent {
+    /// Kind of lifecycle/fact event.
+    pub kind: DiagnosticKind,
+    /// Timestamp relative to the active capture's anchor.
+    pub timestamp_ns: u64,
+    /// Duration for timed events, or zero for an instant event.
+    pub duration_ns: u64,
+    /// Window that produced the event. Zero means no window was available.
+    pub window_id: u64,
+    /// Numeric payload; interpretation depends on [`DiagnosticKind`].
+    pub a: u64,
+    /// Numeric payload; interpretation depends on [`DiagnosticKind`].
+    pub b: u64,
+    /// Numeric payload; interpretation depends on [`DiagnosticKind`].
+    pub c: u64,
+    /// Numeric payload; interpretation depends on [`DiagnosticKind`].
+    pub d: u64,
+    /// Thread that emitted the event.
+    pub thread_id: ThreadKey,
+}
+
 /// The name of a span. This round only produces `Static`; `Interned` exists so
 /// that a future dynamic-name mechanism (e.g. per-entity type names built at
 /// runtime) does not require a trace-format break.
@@ -101,7 +178,7 @@ pub(crate) fn hash_global_element_id(id: &crate::GlobalElementId) -> u64 {
 
 /// A hashed, serde-friendly stand-in for `std::thread::ThreadId`, which does
 /// not implement `Serialize`/`Deserialize` itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ThreadKey(u64);
 
 impl ThreadKey {
@@ -199,6 +276,11 @@ pub struct FrameCapture {
     /// Spans recorded on other threads whose `start_ns` fell within this
     /// frame's window.
     pub background_spans: Vec<CpuSpan>,
+    /// Structured UI lifecycle observations associated with this frame.
+    /// These are separate from CPU spans so the viewer can show resize,
+    /// refresh and invalidation traffic without pretending those facts are
+    /// nested function calls.
+    pub diagnostics: Vec<DiagnosticEvent>,
     /// GPU spans, attached asynchronously after query readback. May be empty
     /// even for an otherwise-complete frame; check `gpu_spans_finalized`.
     pub gpu_spans: Vec<GpuSpan>,
@@ -564,7 +646,7 @@ impl Capture {
 }
 
 const TRACE_MAGIC: [u8; 8] = *b"WGPUIFLG";
-const TRACE_FORMAT_VERSION: u32 = 1;
+const TRACE_FORMAT_VERSION: u32 = 2;
 const CPU_CLOCK_SOURCE_STD_INSTANT: u32 = 0;
 
 /// Fixed-size POD trace header. Field order is chosen so that no implicit
@@ -806,11 +888,19 @@ struct CaptureState {
     /// Background-thread spans drained but not yet claimed by a frame window.
     /// Partitioned into a frame's `background_spans` at `close_frame` time.
     pending_background_spans: parking_lot::Mutex<Vec<CpuSpan>>,
+    /// Diagnostics recorded between frame boundaries, usually native window
+    /// events that arrive immediately before the next draw. This queue is
+    /// bounded so an application that is captured while occluded cannot grow
+    /// profiler memory without limit.
+    pending_diagnostics: parking_lot::Mutex<Vec<DiagnosticEvent>>,
     /// Session-wide (not ring-buffer-windowed) frame-pacing counters. See
     /// `record_frame_pacing` and `Capture::full_draw_frame_count`.
     full_draw_frames: AtomicU64,
     fast_path_frames: AtomicU64,
 }
+
+const MAX_DIAGNOSTICS_PER_FRAME: usize = 4096;
+const MAX_PENDING_DIAGNOSTICS: usize = 8192;
 
 impl CaptureState {
     fn new(options: CaptureOptions) -> Self {
@@ -823,6 +913,7 @@ impl CaptureState {
             open_frames: parking_lot::Mutex::new(HashMap::new()),
             finished_frames: parking_lot::Mutex::new(VecDeque::new()),
             pending_background_spans: parking_lot::Mutex::new(Vec::new()),
+            pending_diagnostics: parking_lot::Mutex::new(Vec::new()),
             full_draw_frames: AtomicU64::new(0),
             fast_path_frames: AtomicU64::new(0),
         }
@@ -862,12 +953,19 @@ impl CaptureState {
             *pending = remaining;
             in_window
         };
+        let diagnostics = {
+            let mut pending = self.pending_diagnostics.lock();
+            let mut diagnostics = std::mem::take(&mut *pending);
+            diagnostics.truncate(MAX_DIAGNOSTICS_PER_FRAME);
+            diagnostics
+        };
 
         let frame = FrameCapture {
             frame_index,
             window_id: open_frame.window_id,
             cpu_spans,
             background_spans,
+            diagnostics,
             gpu_spans: Vec::new(),
             gpu_spans_finalized: !self.capture_gpu,
             gpu_spans_truncated: false,
@@ -1058,6 +1156,130 @@ pub fn enter_span(name: SpanName, category: SpanCategory, element: Option<Elemen
     });
 
     SpanGuard { handle: Some(()) }
+}
+
+/// Record an instant diagnostic event for the current capture.
+///
+/// The disabled path is a single atomic load. When capture is active this
+/// appends a fixed-size value to a bounded queue; there are no strings,
+/// formatting operations, or database writes on the render/event thread.
+pub fn record_diagnostic(kind: DiagnosticKind, window_id: u64, a: u64, b: u64, c: u64, d: u64) {
+    if !capture_enabled() {
+        return;
+    }
+
+    let Some(state) = ACTIVE_CAPTURE.lock().as_ref().cloned() else {
+        return;
+    };
+    let event = DiagnosticEvent {
+        kind,
+        timestamp_ns: state.now_ns(),
+        duration_ns: 0,
+        window_id,
+        a,
+        b,
+        c,
+        d,
+        thread_id: ThreadKey::current(),
+    };
+    let mut pending = state.pending_diagnostics.lock();
+    if pending.len() >= MAX_PENDING_DIAGNOSTICS {
+        pending.remove(0);
+    }
+    pending.push(event);
+}
+
+/// A timed diagnostic event. Dropping the guard records the elapsed duration
+/// against the active capture, if it is still running.
+pub struct DiagnosticGuard {
+    kind: DiagnosticKind,
+    window_id: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+    start: Instant,
+    start_ns: u64,
+    active: bool,
+}
+
+impl Drop for DiagnosticGuard {
+    fn drop(&mut self) {
+        if !self.active || !capture_enabled() {
+            return;
+        }
+        let Some(state) = ACTIVE_CAPTURE.lock().as_ref().cloned() else {
+            return;
+        };
+        let duration_ns = self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let event = DiagnosticEvent {
+            kind: self.kind,
+            timestamp_ns: self.start_ns,
+            duration_ns,
+            window_id: self.window_id,
+            a: self.a,
+            b: self.b,
+            c: self.c,
+            d: self.d,
+            thread_id: ThreadKey::current(),
+        };
+        let mut pending = state.pending_diagnostics.lock();
+        if pending.len() >= MAX_PENDING_DIAGNOSTICS {
+            pending.remove(0);
+        }
+        pending.push(event);
+    }
+}
+
+/// Start a timed diagnostic event. The returned guard is intentionally cheap
+/// when capture is disabled, matching [`enter_span`].
+pub fn record_diagnostic_scope(
+    kind: DiagnosticKind,
+    window_id: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+) -> DiagnosticGuard {
+    if !capture_enabled() {
+        return DiagnosticGuard {
+            kind,
+            window_id,
+            a,
+            b,
+            c,
+            d,
+            start: Instant::now(),
+            start_ns: 0,
+            active: false,
+        };
+    }
+
+    let Some(state) = ACTIVE_CAPTURE.lock().as_ref().cloned() else {
+        return DiagnosticGuard {
+            kind,
+            window_id,
+            a,
+            b,
+            c,
+            d,
+            start: Instant::now(),
+            start_ns: 0,
+            active: false,
+        };
+    };
+    let start = Instant::now();
+    DiagnosticGuard {
+        kind,
+        window_id,
+        a,
+        b,
+        c,
+        d,
+        start,
+        start_ns: state.now_ns(),
+        active: true,
+    }
 }
 
 /// Open a CPU span with a category of [`SpanCategory::UserDefined`] and no
@@ -1659,8 +1881,9 @@ pub(crate) fn capture_engine_memory_usage() -> u64 {
 fn frame_capture_memory_usage(frame: &FrameCapture) -> u64 {
     let cpu_span_bytes = ((frame.cpu_spans.len() + frame.background_spans.len()) as u64)
         * (core::mem::size_of::<CpuSpan>() as u64);
+    let diagnostic_bytes = (frame.diagnostics.len() as u64) * (core::mem::size_of::<DiagnosticEvent>() as u64);
     let gpu_span_bytes = (frame.gpu_spans.len() as u64) * (core::mem::size_of::<GpuSpan>() as u64);
-    core::mem::size_of::<FrameCapture>() as u64 + cpu_span_bytes + gpu_span_bytes
+    core::mem::size_of::<FrameCapture>() as u64 + cpu_span_bytes + diagnostic_bytes + gpu_span_bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -2010,6 +2233,7 @@ mod tests {
         window_id: u64,
         cpu_spans: Vec<DecodedCpuSpan>,
         background_spans: Vec<DecodedCpuSpan>,
+        diagnostics: Vec<DiagnosticEvent>,
         gpu_spans: Vec<DecodedGpuSpan>,
         gpu_spans_finalized: bool,
         gpu_spans_truncated: bool,
@@ -2097,6 +2321,7 @@ mod tests {
             window_id: frame.window_id,
             cpu_spans: frame.cpu_spans.iter().map(decode).collect(),
             background_spans: frame.background_spans.iter().map(decode).collect(),
+            diagnostics: frame.diagnostics.clone(),
             gpu_spans: Vec::new(),
             gpu_spans_finalized: frame.gpu_spans_finalized,
             gpu_spans_truncated: frame.gpu_spans_truncated,
@@ -2250,6 +2475,7 @@ mod tests {
                 core::mem::size_of::<FrameCapture>() as u64
                     + ((frame.cpu_spans.len() + frame.background_spans.len()) as u64)
                         * (core::mem::size_of::<CpuSpan>() as u64)
+                    + (frame.diagnostics.len() as u64) * (core::mem::size_of::<DiagnosticEvent>() as u64)
                     + (frame.gpu_spans.len() as u64) * (core::mem::size_of::<GpuSpan>() as u64)
             })
             .sum();
@@ -2283,6 +2509,37 @@ mod tests {
             capture_engine_memory_usage(),
             recorder_count * (THREAD_SPAN_BUDGET_BYTES as u64)
         );
+    }
+
+    #[test]
+    fn diagnostic_events_are_attached_to_the_next_frame() {
+        let handle = start_capture(CaptureOptions {
+            max_frames: 4,
+            capture_gpu: false,
+        })
+        .expect("no other capture should be active in this test process at this point");
+
+        record_diagnostic(DiagnosticKind::ResizeEvent, 7, 1920, 1080, 1.25f32.to_bits() as u64, 0);
+        let frame_index = open_frame_cpu_side(7);
+        {
+            let _resize = record_diagnostic_scope(
+                DiagnosticKind::ResizeHandling,
+                7,
+                1920,
+                1080,
+                1.25f32.to_bits() as u64,
+                0,
+            );
+        }
+        close_frame_cpu_side(frame_index);
+
+        let capture = handle.stop();
+        let frame = capture.frames().next().expect("frame should be captured");
+        assert_eq!(frame.diagnostics.len(), 2);
+        assert_eq!(frame.diagnostics[0].kind, DiagnosticKind::ResizeEvent);
+        assert_eq!(frame.diagnostics[1].kind, DiagnosticKind::ResizeHandling);
+        assert_eq!(frame.diagnostics[0].a, 1920);
+        assert!(frame.diagnostics[1].duration_ns <= u64::MAX);
     }
 
     #[test]

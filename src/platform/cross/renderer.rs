@@ -1737,6 +1737,15 @@ impl WgpuRenderer {
     ///
     /// All `Surface::configure` calls in this renderer must go through here.
     fn reconfigure_surface(&self) {
+        #[cfg(feature = "flamegraph")]
+        let _reconfigure_diagnostic = crate::record_diagnostic_scope(
+            crate::DiagnosticKind::SurfaceReconfigured,
+            0,
+            self.surface_configuration.width as u64,
+            self.surface_configuration.height as u64,
+            0,
+            0,
+        );
         let _exclusive = self.context.gpu_submit_lock.write();
         self.surface
             .configure(&self.context.device, &self.surface_configuration);
@@ -3165,6 +3174,15 @@ impl WgpuRenderer {
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
+        #[cfg(feature = "flamegraph")]
+        let _resize_diagnostic = crate::record_diagnostic_scope(
+            crate::DiagnosticKind::DrawableResized,
+            0,
+            size.width.0.max(0) as u64,
+            size.height.0.max(0) as u64,
+            0,
+            0,
+        );
         self.surface_configuration.width = size.width.0 as u32;
         self.surface_configuration.height = size.height.0 as u32;
         self.reconfigure_surface();

@@ -1317,6 +1317,25 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     return;
                 }
 
+                #[cfg(feature = "flamegraph")]
+                let _resize_diagnostic = crate::record_diagnostic_scope(
+                    crate::DiagnosticKind::ResizeHandling,
+                    window_id.into(),
+                    physical_size.width as u64,
+                    physical_size.height as u64,
+                    window.scale_factor().to_bits() as u64,
+                    0,
+                );
+                #[cfg(feature = "flamegraph")]
+                crate::record_diagnostic(
+                    crate::DiagnosticKind::ResizeEvent,
+                    window_id.into(),
+                    physical_size.width as u64,
+                    physical_size.height as u64,
+                    window.scale_factor().to_bits() as u64,
+                    0,
+                );
+
                 window.0.state.resize_detector.on_resize_event();
                 window.window().request_redraw();
                 let scale_factor = window.scale_factor();

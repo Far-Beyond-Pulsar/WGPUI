@@ -2155,6 +2155,15 @@ impl Window {
     /// from prepaint or paint is deferred to the end of the frame rather than
     /// silently dropped.
     pub fn refresh(&mut self) {
+        #[cfg(feature = "flamegraph")]
+        crate::record_diagnostic(
+            crate::DiagnosticKind::RefreshRequested,
+            self.handle.id.as_u64(),
+            1,
+            0,
+            0,
+            0,
+        );
         self.invalidator.invalidate_window(Invalidation::all());
     }
 
@@ -2589,6 +2598,15 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
+        #[cfg(feature = "flamegraph")]
+        let _bounds_diagnostic = crate::record_diagnostic_scope(
+            crate::DiagnosticKind::BoundsChanged,
+            self.handle.id.as_u64(),
+            self.viewport_size.width.0.to_bits() as u64,
+            self.viewport_size.height.0.to_bits() as u64,
+            self.scale_factor.to_bits() as u64,
+            0,
+        );
         let previous_viewport_size = self.viewport_size;
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
@@ -3136,6 +3154,16 @@ impl Window {
         self.needs_present.set(false);
         profiling::finish_frame!();
 
+        #[cfg(feature = "flamegraph")]
+        crate::record_diagnostic(
+            crate::DiagnosticKind::FramePresented,
+            self.handle.id.as_u64(),
+            0,
+            0,
+            0,
+            0,
+        );
+
         // GPU spans for this frame are left open (attached asynchronously via
         // `attach_gpu_spans` after query readback); only the CPU/background
         // sides are finalized here.
@@ -3156,6 +3184,16 @@ impl Window {
         self.platform_window.present_framebuffer_only();
         self.needs_present.set(false);
         profiling::finish_frame!();
+
+        #[cfg(feature = "flamegraph")]
+        crate::record_diagnostic(
+            crate::DiagnosticKind::FastFramePresented,
+            self.handle.id.as_u64(),
+            0,
+            0,
+            0,
+            0,
+        );
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
