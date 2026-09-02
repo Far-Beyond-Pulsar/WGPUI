@@ -96,6 +96,16 @@ pub enum DiagnosticKind {
     FramePresented,
     /// A frame completed through the framebuffer-only fast path.
     FastFramePresented,
+    /// An engine-owned render frame. `a` is the engine frame number and
+    /// `b`/`c` are the physical width and height.
+    EngineFrame,
+    /// The Helio renderer observed a viewport resize. `a`/`b` are the
+    /// physical width and height, `c` is the SceneDB render revision and `d`
+    /// is the engine frame number.
+    EngineResize,
+    /// SceneDB-to-Helio synchronization ran. `a` is the SceneDB render
+    /// revision and `b` is the engine frame number.
+    EngineSceneSync,
     /// A generic UI refresh/invalidation fact supplied by an embedding app.
     User,
 }
@@ -112,6 +122,9 @@ impl DiagnosticKind {
             Self::DrawableResized => "Drawable resized",
             Self::FramePresented => "Frame presented",
             Self::FastFramePresented => "Fast frame presented",
+            Self::EngineFrame => "Engine frame",
+            Self::EngineResize => "Engine resize",
+            Self::EngineSceneSync => "Engine scene sync",
             Self::User => "User diagnostic",
         }
     }
