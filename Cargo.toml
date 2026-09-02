@@ -28,6 +28,8 @@ test-support = [
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
 flamegraph = ["dep:bincode"]
+# Compatibility feature forwarded by Pulsar-Native's profile-tracy feature.
+profile-tracy = ["profiling/profile-with-tracy"]
 
 [lib]
 name = "gpui"
