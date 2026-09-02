@@ -9,6 +9,6 @@ members = [
     "crates/wgpui",
     "crates/wgpui-devtools",
     "crates/wgpui-examples-2",
-    "crates/wgpui-compat-macros",
     "crates/wgpui-macros",
 ]
+exclude = ["crates/wgpui-compat"]

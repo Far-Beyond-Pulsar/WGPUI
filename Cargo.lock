@@ -5563,15 +5563,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wgpui-compat-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "wgpui-core"
 version = "0.1.0"
 dependencies = [

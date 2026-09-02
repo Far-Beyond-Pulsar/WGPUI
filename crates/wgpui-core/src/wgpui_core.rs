@@ -25,7 +25,7 @@ pub use window::{
     MenuItem, Modifiers, ModifiersChangedEvent, MouseButton, MouseButtonState, MouseClickEvent,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, TextInputEvent,
     BackgroundExecutor, Timer, TimerHandle, TimerId, TimerState, TitlebarOptions, WindowAppearance,
-    WindowBackgroundAppearance, WindowDecorations, WindowKind,
+    WindowBackgroundAppearance, WindowDecorations, WindowIcon, WindowIconError, WindowKind,
     ScrollRootHandle, WindowOptions,
 };
 pub mod boundary;

@@ -2926,6 +2926,20 @@ impl Handler {
             .with_decorations(decorations)
             .with_enabled_buttons(enabled_window_buttons(resizable, options.is_minimizable))
             .with_window_level(window_level(&options.kind));
+        let attributes = if let Some(icon) = options.app_icon.as_ref() {
+            let decoded = image::load_from_memory(icon.png_bytes())
+                .map_err(|error| ApplicationError::CreateWindow(error.to_string()))?
+                .into_rgba8();
+            let icon = winit::window::Icon::from_rgba(
+                decoded.as_raw().clone(),
+                decoded.width(),
+                decoded.height(),
+            )
+            .map_err(|error| ApplicationError::CreateWindow(error.to_string()))?;
+            attributes.with_window_icon(Some(icon))
+        } else {
+            attributes
+        };
         let attributes = apply_titlebar_attributes(attributes, options.titlebar.as_ref());
         let attributes = apply_background_attributes(attributes, options.window_background);
         let bounds = initial_bounds(&options);

@@ -60,7 +60,8 @@ pub use wgpui_core::{
     ModifiersChangedEvent, MouseButton, MouseButtonState, MouseClickEvent, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ScrollWheelEvent, Subscription, Task, TaskError, TextInputEvent,
     Timer, TimerHandle, TimerId, TimerState, TitlebarOptions, WeakEntity, WindowAppearance,
-    WindowBackgroundAppearance, WindowClosedSubscription, WindowDecorations, WindowId, WindowKind,
+    WindowBackgroundAppearance, WindowClosedSubscription, WindowDecorations, WindowIcon,
+    WindowIconError, WindowId, WindowKind,
     WindowList,
 };
 pub use wgpui_layout::taffy_tree::{LayoutNodeId as LayoutId, LayoutStyle as Style};

@@ -15,6 +15,7 @@ pub mod timer;
 use crate::action::Action;
 use crate::geometry::{Bounds, Pixels, Size, point};
 use crate::reconcile::{ElementStateStore, StateKey, StateScope};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use animation::{AnimationClock, AnimationScheduler, WindowTimers};
@@ -75,6 +76,41 @@ pub enum WindowDecorations {
     Client,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowIcon {
+    png_bytes: Arc<[u8]>,
+}
+
+impl WindowIcon {
+    pub fn from_png_bytes(bytes: &[u8]) -> Result<Self, WindowIconError> {
+        if bytes.is_empty() {
+            return Err(WindowIconError::Empty);
+        }
+        Ok(Self {
+            png_bytes: Arc::from(bytes),
+        })
+    }
+
+    pub fn png_bytes(&self) -> &[u8] {
+        &self.png_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowIconError {
+    Empty,
+}
+
+impl std::fmt::Display for WindowIconError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("window icon data is empty"),
+        }
+    }
+}
+
+impl std::error::Error for WindowIconError {}
+
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
     pub title: String,
@@ -90,6 +126,7 @@ pub struct WindowOptions {
     pub is_minimizable: bool,
     pub window_background: WindowBackgroundAppearance,
     pub window_min_size: Option<Size<Pixels>>,
+    pub app_icon: Option<WindowIcon>,
     pub window_decorations: Option<WindowDecorations>,
     pub display_id: Option<u64>,
     pub is_movable: bool,
@@ -113,6 +150,7 @@ impl Default for WindowOptions {
             is_minimizable: true,
             window_background: WindowBackgroundAppearance::Opaque,
             window_min_size: None,
+            app_icon: None,
             window_decorations: None,
             display_id: None,
             is_movable: true,

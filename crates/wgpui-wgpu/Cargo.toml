@@ -38,6 +38,7 @@ wgpu = { version = "30", default-features = false, features = [
     "wgsl",
     "metal"
 ] }
+image = { version = "0.25.1", default-features = false, features = ["png"] }
 
 pollster = "0.4.0"
 # The bin-packing allocator behind `render/atlas.rs`, at the same version the
