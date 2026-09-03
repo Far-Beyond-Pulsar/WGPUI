@@ -30,6 +30,7 @@ mod flamegraph_ui_capture;
 mod flamegraph_replay;
 mod geometry;
 mod global;
+mod hud;
 mod input;
 mod inspector;
 mod instance;
@@ -109,7 +110,20 @@ pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
 pub use instance::{InstanceKey, ReconcileKey};
-pub use layer::{LayerId, LayerKey, LayerPolicy, LayerTransform};
+pub use layer::{
+    evict_after_frames_override, is_force_rasterize_all, is_layer_debug_enabled,
+    rasterize_above_override, set_evict_after_frames_override, set_force_rasterize_all,
+    set_layer_debug_enabled, set_rasterize_above_override, LayerId, LayerKey, LayerPolicy,
+    LayerTransform,
+};
+pub use occlusion::{
+    is_occlusion_disabled, is_occlusion_visualizer_enabled, set_occlusion_disabled,
+    set_occlusion_visualizer_enabled,
+};
+pub use hud::{
+    is_hud_enabled, is_layer_fps_enabled, is_slow_frame_flash_enabled, set_hud_enabled,
+    set_layer_fps_enabled, set_slow_frame_flash_enabled,
+};
 pub use path_builder::*;
 pub use platform::*;
 pub use platform::cross::render_context::WgpuOptions;

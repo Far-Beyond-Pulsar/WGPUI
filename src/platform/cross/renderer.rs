@@ -7,13 +7,16 @@ use wgpu::CurrentSurfaceTexture;
 
 use crate::{
     AtlasTextureId, AtlasTile, BackdropFilter, DevicePixels, FilterBoundary, GpuSpecs,
-    GradientStop, LinearColorStop, MonochromeSprite, Pixels, PlatformAtlas, PrimitiveBatch, Quad,
-    ScaledPixels, Scene, TransformationMatrix, color, geometry,
+    GradientStop, LinearColorStop, MonochromeSprite, Pixels, PlatformAtlas, PolychromeSprite,
+    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, TransformationMatrix, Underline, color,
+    geometry,
+    layer::LayerId,
     platform::cross::{
         atlas::WgpuAtlas,
         render_context::{WgpuContext, ensure_buffer_size},
         surface_registry::SurfaceId,
     },
+    scene::{LayerRasterizeJob, PaintSurface, Primitive, SurfaceContent},
 };
 
 const fn map_attributes<const N: usize>(
@@ -1504,6 +1507,16 @@ pub struct WgpuRenderer {
     group_textures: Vec<wgpu::Texture>,
     group_views: Vec<wgpu::TextureView>,
 
+    // Persistent textures backing rasterized `.layer()` subtrees
+    // (`WGPUI_LAYERS_RASTERIZE=1`, docs/retained-layers.md §3.3/Phase 11),
+    // registered in `self.context.surface_registry` under their own
+    // `SurfaceId`. This map is the only place that `LayerId -> SurfaceId`
+    // association lives — `Scene`/`Layer` address these purely by `LayerId`
+    // (see `SurfaceContent::Layer`'s doc comment) — so it is also what
+    // `process_layer_rasterize_evictions` consults to free a texture whose
+    // layer died.
+    layer_surfaces: HashMap<crate::layer::LayerId, SurfaceId>,
+
     // Bounds cache for fast surface blitting without compositor
     surface_bounds_cache: Arc<Mutex<HashMap<SurfaceId, SurfaceBoundsEntry>>>,
 
@@ -1696,6 +1709,7 @@ impl WgpuRenderer {
             pipelines,
             rendering_parameters: RenderingParameters::from_env(),
             surface_bind_groups: Mutex::new(HashMap::new()),
+            layer_surfaces: HashMap::new(),
             persistent_framebuffer: Some(persistent_framebuffer),
             persistent_framebuffer_view: Some(persistent_framebuffer_view),
             backdrop_blur_texture: Some(backdrop_blur_texture),
@@ -1751,8 +1765,500 @@ impl WgpuRenderer {
             .configure(&self.context.device, &self.surface_configuration);
     }
 
+    // ---- Phase 11: rasterized `.layer()` textures ---------------------
+    // (`WGPUI_LAYERS_RASTERIZE=1`, docs/retained-layers.md §3.3). See
+    // `Scene::rasterize_requests`/`rasterize_evictions` and
+    // `Window::flatten_for_rasterize` for the producer side.
+
+    /// Render every queued [`LayerRasterizeJob`] into its own persistent
+    /// texture (creating or resizing it first), then free any evicted
+    /// layer's texture. Called once, at the very top of `draw`, before any
+    /// of the main frame's own buffer writes.
+    ///
+    /// Order matters and is why this is a separate pass rather than folded
+    /// into the main one: each job here gets its own command buffer and its
+    /// own immediate `queue.submit`, strictly *before* the main frame builds
+    /// its encoder. `Queue::write_buffer`'s copy is ordered by call sequence
+    /// on the queue, not by where the corresponding pass got *encoded* in a
+    /// not-yet-submitted command buffer — so interleaving these jobs' writes
+    /// with the main pass's shared per-frame buffers ahead of one deferred
+    /// `submit()` would race (a later write landing before an earlier pass
+    /// reads it, or vice versa, depending on driver scheduling). Giving each
+    /// job (and, implicitly, the main frame after them) its own
+    /// write-then-submit pair makes the ordering exactly what the call
+    /// sequence says, at the cost of one extra `queue.submit` per job — rare
+    /// in practice, since a job is only queued when a layer crosses
+    /// `rasterize_above` on a frame it re-renders, not on every clean
+    /// composite of it.
+    fn process_layer_rasterize_requests(&mut self, requests: &[LayerRasterizeJob]) {
+        for job in requests {
+            let width = job.bounds.size.width.0.max(1.0).ceil() as u32;
+            let height = job.bounds.size.height.0.max(1.0).ceil() as u32;
+
+            let surface_id = match self.layer_surfaces.get(&job.id).copied() {
+                Some(existing) => {
+                    if self.context.surface_registry.size(existing) != Some((width, height)) {
+                        self.context
+                            .surface_registry
+                            .resize(&self.context.device, existing, width, height);
+                    }
+                    existing
+                }
+                None => {
+                    let created = self.context.surface_registry.create(
+                        &self.context.device,
+                        width,
+                        height,
+                        self.surface_configuration.format,
+                    );
+                    self.layer_surfaces.insert(job.id, created);
+                    created
+                }
+            };
+
+            let Some(view) = self.context.surface_registry.back_view(surface_id) else {
+                // Just created or resized above; should always exist. Never
+                // panic on what is, worst case, one stale-looking panel.
+                log::error!("layer rasterize: no back view for surface {surface_id:?}");
+                continue;
+            };
+
+            self.render_primitives_to_texture(&job.primitives, &view, width, height);
+            // Single-threaded producer/consumer: this call is the "produce"
+            // half, and the very next composite that reads `front_view` is
+            // the "consume" half — no concurrent renderer to race, so the
+            // unsynchronized swap (used elsewhere only for the deprecated,
+            // non-GPU-synced path) is exactly right here, not a shortcut.
+            self.context
+                .surface_registry
+                .swap_rendering_ready_no_sync(surface_id);
+        }
+    }
+
+    /// Free the persistent texture of every layer evicted this frame.
+    fn process_layer_rasterize_evictions(&mut self, evictions: &[LayerId]) {
+        for id in evictions {
+            if let Some(surface_id) = self.layer_surfaces.remove(id) {
+                self.context.surface_registry.remove(surface_id);
+            }
+        }
+    }
+
+    /// Render `primitives` — already flattened and translated into the
+    /// target's own zero origin by `Window::flatten_for_rasterize` /
+    /// `record_layer` — into `view`, sized `width x height`.
+    ///
+    /// A self-contained render pass with its own globals uniform (sized to
+    /// this texture, not the window) and its own per-kind buffers, entirely
+    /// independent of the shared per-frame buffers the main pass uses —
+    /// see [`Self::process_layer_rasterize_requests`] for why that
+    /// independence, and this function's own `queue.submit` at the end,
+    /// are load-bearing rather than incidental.
+    fn render_primitives_to_texture(
+        &mut self,
+        primitives: &[Primitive],
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        enum Run {
+            Quads(Vec<Quad>),
+            Shadows(Vec<Shadow>),
+            Underlines(Vec<Underline>),
+            Mono(AtlasTextureId, Vec<MonochromeSprite>),
+            Poly(AtlasTextureId, Vec<PolychromeSprite>),
+            Surface(PaintSurface),
+        }
+
+        // Bucket into contiguous same-kind (same-texture, for sprites) runs.
+        // `primitives` arrives in the paint order `Layer.items` recorded it
+        // in, so grouping preserves correctness without re-sorting.
+        let mut runs: Vec<Run> = Vec::new();
+        for primitive in primitives {
+            match primitive {
+                Primitive::Quad(q) => match runs.last_mut() {
+                    Some(Run::Quads(v)) => v.push(*q),
+                    _ => runs.push(Run::Quads(vec![*q])),
+                },
+                Primitive::Shadow(s) => match runs.last_mut() {
+                    Some(Run::Shadows(v)) => v.push(*s),
+                    _ => runs.push(Run::Shadows(vec![*s])),
+                },
+                Primitive::Underline(u) => match runs.last_mut() {
+                    Some(Run::Underlines(v)) => v.push(*u),
+                    _ => runs.push(Run::Underlines(vec![*u])),
+                },
+                Primitive::MonochromeSprite(sp) => {
+                    let extends = matches!(runs.last(), Some(Run::Mono(tex, _)) if *tex == sp.tile.texture_id);
+                    if extends {
+                        if let Some(Run::Mono(_, v)) = runs.last_mut() {
+                            v.push(*sp);
+                        }
+                    } else {
+                        runs.push(Run::Mono(sp.tile.texture_id, vec![*sp]));
+                    }
+                }
+                Primitive::PolychromeSprite(sp) => {
+                    let extends = matches!(runs.last(), Some(Run::Poly(tex, _)) if *tex == sp.tile.texture_id);
+                    if extends {
+                        if let Some(Run::Poly(_, v)) = runs.last_mut() {
+                            v.push(*sp);
+                        }
+                    } else {
+                        runs.push(Run::Poly(sp.tile.texture_id, vec![*sp]));
+                    }
+                }
+                Primitive::Surface(s) => runs.push(Run::Surface(s.clone())),
+                Primitive::Path(_) | Primitive::BackdropFilter(_) | Primitive::FilterBoundary(_) => {
+                    // `Window::flatten_for_rasterize` rejects every job
+                    // containing one of these before it ever reaches here.
+                    debug_assert!(
+                        false,
+                        "layer rasterize received a primitive kind flatten_for_rasterize should have rejected"
+                    );
+                    log::error!("layer rasterize: dropping an unsupported primitive kind");
+                }
+            }
+        }
+
+        if runs.is_empty() {
+            return;
+        }
+
+        let device = &self.context.device;
+
+        let globals = GlobalParams {
+            viewport_size: [width as f32, height as f32],
+            premultimated_alpha: match self.surface_configuration.alpha_mode {
+                wgpu::CompositeAlphaMode::PreMultiplied => 1,
+                _ => 0,
+            },
+            pad: 0,
+        };
+        let globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("layer_rasterize_globals_buffer"),
+            contents: bytemuck::bytes_of(&globals),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        // Every pipeline's group 0 is built from the same
+        // `globals_bind_group_layout` (see `WgpuPipelines::new`), so any of
+        // them yields a compatible layout to bind this job-local buffer
+        // against — `quads_pipeline` is arbitrary among them.
+        let globals_layout = self.pipelines.quads_pipeline.get_bind_group_layout(0);
+        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("layer_rasterize_globals_bind_group"),
+            layout: &globals_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &globals_buffer,
+                    offset: 0,
+                    size: None,
+                }),
+            }],
+        });
+
+        let mut command_encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("layer_rasterize"),
+            });
+
+        // Kept alive until the pass below finishes encoding; every bind
+        // group created inside it borrows one of these.
+        let mut kind_buffers: Vec<wgpu::Buffer> = Vec::new();
+        let mut kind_bind_groups: Vec<wgpu::BindGroup> = Vec::new();
+        let mut surface_views: Vec<wgpu::TextureView> = Vec::new();
+
+        {
+            let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("layer_rasterize"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    resolve_target: None,
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            for run in &runs {
+                match run {
+                    Run::Quads(quads) => {
+                        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("layer_rasterize_quads_buffer"),
+                            contents: bytemuck::cast_slice(quads),
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+                        });
+                        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("layer_rasterize_quads_bind_group"),
+                            layout: &self.pipelines.quads_bind_group_layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &buffer,
+                                    offset: 0,
+                                    size: None,
+                                }),
+                            }],
+                        });
+                        pass.set_pipeline(&self.pipelines.quads_pipeline);
+                        pass.set_bind_group(0, &globals_bind_group, &[]);
+                        pass.set_bind_group(1, &bind_group, &[]);
+                        pass.draw(0..4, 0..quads.len() as u32);
+                        kind_buffers.push(buffer);
+                        kind_bind_groups.push(bind_group);
+                    }
+                    Run::Shadows(shadows) => {
+                        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("layer_rasterize_shadows_buffer"),
+                            contents: bytemuck::cast_slice(shadows),
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+                        });
+                        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("layer_rasterize_shadows_bind_group"),
+                            layout: &self.pipelines.shadows_bind_group_layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &buffer,
+                                    offset: 0,
+                                    size: None,
+                                }),
+                            }],
+                        });
+                        pass.set_pipeline(&self.pipelines.shadows_pipeline);
+                        pass.set_bind_group(0, &globals_bind_group, &[]);
+                        pass.set_bind_group(1, &bind_group, &[]);
+                        pass.draw(0..4, 0..shadows.len() as u32);
+                        kind_buffers.push(buffer);
+                        kind_bind_groups.push(bind_group);
+                    }
+                    Run::Underlines(underlines) => {
+                        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("layer_rasterize_underlines_buffer"),
+                            contents: bytemuck::cast_slice(underlines),
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+                        });
+                        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("layer_rasterize_underlines_bind_group"),
+                            layout: &self.pipelines.underlines_bind_group_layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &buffer,
+                                    offset: 0,
+                                    size: None,
+                                }),
+                            }],
+                        });
+                        pass.set_pipeline(&self.pipelines.underlines_pipeline);
+                        pass.set_bind_group(0, &globals_bind_group, &[]);
+                        pass.set_bind_group(1, &bind_group, &[]);
+                        pass.draw(0..4, 0..underlines.len() as u32);
+                        kind_buffers.push(buffer);
+                        kind_bind_groups.push(bind_group);
+                    }
+                    Run::Mono(texture_id, sprites) => {
+                        let tex_info = self.atlas.get_texture_info(*texture_id);
+                        let texture_bind_group =
+                            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("layer_rasterize_mono_texture_bind_group"),
+                                layout: &self.pipelines.sprites_bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            &tex_info.raw_view,
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::Sampler(
+                                            &self.atlas_sampler,
+                                        ),
+                                    },
+                                ],
+                            });
+                        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("layer_rasterize_mono_sprites_buffer"),
+                            contents: bytemuck::cast_slice(sprites),
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+                        });
+                        let sprites_bind_group =
+                            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("layer_rasterize_mono_sprites_bind_group"),
+                                layout: &self.pipelines.mono_sprites_bind_group_layout,
+                                entries: &[wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: &buffer,
+                                        offset: 0,
+                                        size: None,
+                                    }),
+                                }],
+                            });
+                        pass.set_pipeline(&self.pipelines.mono_sprites_pipeline);
+                        pass.set_bind_group(0, &globals_bind_group, &[]);
+                        pass.set_bind_group(1, &self.pipelines.color_adjustments_bind_group, &[]);
+                        pass.set_bind_group(2, &texture_bind_group, &[]);
+                        pass.set_bind_group(3, &sprites_bind_group, &[]);
+                        pass.draw(0..4, 0..sprites.len() as u32);
+                        kind_buffers.push(buffer);
+                        kind_bind_groups.push(texture_bind_group);
+                        kind_bind_groups.push(sprites_bind_group);
+                    }
+                    Run::Poly(texture_id, sprites) => {
+                        let tex_info = self.atlas.get_texture_info(*texture_id);
+                        let texture_bind_group =
+                            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("layer_rasterize_poly_texture_bind_group"),
+                                layout: &self.pipelines.sprites_bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            &tex_info.raw_view,
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::Sampler(
+                                            &self.atlas_sampler,
+                                        ),
+                                    },
+                                ],
+                            });
+                        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("layer_rasterize_poly_sprites_buffer"),
+                            contents: bytemuck::cast_slice(sprites),
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+                        });
+                        let sprites_bind_group =
+                            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("layer_rasterize_poly_sprites_bind_group"),
+                                layout: &self.pipelines.poly_sprites_bind_group_layout,
+                                entries: &[wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: &buffer,
+                                        offset: 0,
+                                        size: None,
+                                    }),
+                                }],
+                            });
+                        pass.set_pipeline(&self.pipelines.poly_sprites_pipeline);
+                        pass.set_bind_group(0, &globals_bind_group, &[]);
+                        pass.set_bind_group(1, &texture_bind_group, &[]);
+                        pass.set_bind_group(2, &sprites_bind_group, &[]);
+                        pass.draw(0..4, 0..sprites.len() as u32);
+                        kind_buffers.push(buffer);
+                        kind_bind_groups.push(texture_bind_group);
+                        kind_bind_groups.push(sprites_bind_group);
+                    }
+                    Run::Surface(surface) => {
+                        // A nested layer that is itself rasterized (or, in
+                        // principle, an app-provided external surface
+                        // painted inside a rasterized panel): resolve to a
+                        // texture view exactly like the main pass's own
+                        // `PrimitiveBatch::Surfaces` arm, then draw the same
+                        // one full-quad blit.
+                        let resolved = match &surface.content {
+                            SurfaceContent::Wgpu(id) => Some(*id),
+                            SurfaceContent::Layer(nested_id) => {
+                                self.layer_surfaces.get(nested_id).copied()
+                            }
+                        };
+                        let Some(surface_id) = resolved else { continue };
+                        let Some(tex_view) = self.context.surface_registry.front_view(surface_id)
+                        else {
+                            continue;
+                        };
+
+                        let params = SurfaceParams {
+                            bounds: Bounds {
+                                origin: [surface.bounds.origin.x.0, surface.bounds.origin.y.0],
+                                size: [surface.bounds.size.width.0, surface.bounds.size.height.0],
+                            },
+                            content_mask: Bounds {
+                                origin: [
+                                    surface.content_mask.bounds.origin.x.0,
+                                    surface.content_mask.bounds.origin.y.0,
+                                ],
+                                size: [
+                                    surface.content_mask.bounds.size.width.0,
+                                    surface.content_mask.bounds.size.height.0,
+                                ],
+                            },
+                        };
+                        let params_buffer =
+                            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("layer_rasterize_surface_params_buffer"),
+                                contents: bytemuck::bytes_of(&params),
+                                usage: wgpu::BufferUsages::UNIFORM,
+                            });
+                        let surface_bind_group =
+                            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("layer_rasterize_surface_bind_group"),
+                                layout: &self.pipelines.surfaces_bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::Buffer(
+                                            wgpu::BufferBinding {
+                                                buffer: &params_buffer,
+                                                offset: 0,
+                                                size: None,
+                                            },
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::TextureView(&tex_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::Sampler(
+                                            &self.surface_sampler,
+                                        ),
+                                    },
+                                ],
+                            });
+                        pass.set_pipeline(&self.pipelines.surfaces_pipeline);
+                        pass.set_bind_group(0, &globals_bind_group, &[]);
+                        pass.set_bind_group(1, &surface_bind_group, &[]);
+                        pass.draw(0..4, 0..1);
+                        kind_buffers.push(params_buffer);
+                        kind_bind_groups.push(surface_bind_group);
+                        surface_views.push(tex_view);
+                    }
+                }
+            }
+        }
+
+        self.context.queue.submit(Some(command_encoder.finish()));
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
         log::debug!("Renderer::draw: starting frame");
+
+        // Phase 11 (`docs/retained-layers.md` §3.3): build/refresh any
+        // rasterized-layer textures and free any evicted ones, each in its
+        // own command buffer and submit, strictly before this frame's own
+        // encoder exists — see `process_layer_rasterize_requests`'s doc
+        // comment for why that ordering is load-bearing. Both lists are
+        // empty (so this is a no-op) unless `WGPUI_LAYERS_RASTERIZE=1`.
+        if !scene.rasterize_requests.is_empty() {
+            self.process_layer_rasterize_requests(&scene.rasterize_requests);
+        }
+        if !scene.rasterize_evictions.is_empty() {
+            self.process_layer_rasterize_evictions(&scene.rasterize_evictions);
+        }
 
         let mut command_encoder =
             self.context
@@ -2663,7 +3169,22 @@ impl WgpuRenderer {
                     PrimitiveBatch::Surfaces(surfaces) => {
                         log::debug!("Renderer: processing {} surface(s)", surfaces.len());
                         for surface in surfaces {
-                            if let crate::SurfaceContent::Wgpu(surface_id) = &surface.content {
+                            // A `Layer` surface resolves through this
+                            // renderer's own `LayerId -> SurfaceId` map
+                            // (Phase 11, `docs/retained-layers.md` §3.3)
+                            // rather than carrying a `SurfaceId` itself —
+                            // `Scene`/`Layer` never see one, since the
+                            // renderer owns that texture's whole lifecycle.
+                            // Resolved to `Option<&SurfaceId>` specifically
+                            // so the body below — identical either way —
+                            // doesn't need to change at all.
+                            let resolved_surface_id: Option<SurfaceId> = match &surface.content {
+                                crate::SurfaceContent::Wgpu(id) => Some(*id),
+                                crate::SurfaceContent::Layer(layer_id) => {
+                                    self.layer_surfaces.get(layer_id).copied()
+                                }
+                            };
+                            if let Some(surface_id) = resolved_surface_id.as_ref() {
                                 // Swap ready → display ONLY if the external renderer produced
                                 // a new frame since we last composited this surface. This paint
                                 // path runs every GPUI frame whether or not the producer rendered

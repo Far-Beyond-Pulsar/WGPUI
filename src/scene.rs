@@ -128,6 +128,42 @@ pub(crate) struct Scene {
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
     pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
     pub(crate) surfaces: Vec<PaintSurface>,
+    /// Layers that finished a fresh (re-)render this frame and crossed
+    /// [`crate::layer::LayerPolicy::rasterize_above`] — see
+    /// `docs/retained-layers.md` §3.3/Phase 11. The renderer consumes this
+    /// before its normal draw pass, rendering each job's primitives into a
+    /// persistent texture keyed by [`crate::layer::LayerId`] so that a later
+    /// *clean* composite of the same layer can stand in with a single
+    /// [`Primitive::Surface`] (`SurfaceContent::Layer`) instead of replaying
+    /// however many primitives the layer actually holds.
+    ///
+    /// Gated behind `WGPUI_LAYERS_RASTERIZE=1` (default off, per the "whole
+    /// thing destabilizes the crate" risk in the design doc) — empty on every
+    /// frame until that is set, so this costs nothing by default.
+    pub(crate) rasterize_requests: Vec<LayerRasterizeJob>,
+    /// Layers evicted this frame that were rasterized — the renderer must
+    /// free their persistent textures, or they leak for the life of the
+    /// window.
+    pub(crate) rasterize_evictions: Vec<crate::layer::LayerId>,
+}
+
+/// One layer's worth of retained primitives, handed to the renderer so it can
+/// (re)build that layer's persistent backing texture. See
+/// [`Scene::rasterize_requests`].
+#[derive(Clone)]
+pub(crate) struct LayerRasterizeJob {
+    pub(crate) id: crate::layer::LayerId,
+    /// Window-space bounds (scaled) the texture should cover. The renderer
+    /// sizes the texture to `bounds.size` and expects `primitives` already
+    /// translated (via [`Primitive::translate`]) so `bounds.origin` maps to
+    /// the texture's own `(0, 0)`.
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    /// Fully resolved — `LayerItem::Nested` references have already been
+    /// inlined (or, for a nested layer that is itself rasterized, replaced
+    /// with a `Primitive::Surface(SurfaceContent::Layer(..))` reference) by
+    /// `Window::flatten_for_rasterize` — and already translated into this
+    /// texture's own zero origin. In layer-local paint order.
+    pub(crate) primitives: Vec<Primitive>,
 }
 
 impl Default for Scene {
@@ -152,6 +188,8 @@ impl Default for Scene {
             monochrome_sprites: Vec::new(),
             polychrome_sprites: Vec::new(),
             surfaces: Vec::new(),
+            rasterize_requests: Vec::new(),
+            rasterize_evictions: Vec::new(),
         }
     }
 }
@@ -180,6 +218,8 @@ impl Scene {
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.rasterize_requests.clear();
+        self.rasterize_evictions.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -749,6 +789,40 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropFilter(filter) => &filter.content_mask,
             Primitive::FilterBoundary(boundary) => &boundary.content_mask,
+        }
+    }
+
+    /// Shift this primitive's absolute (window-space) position by `offset`,
+    /// leaving its size untouched.
+    ///
+    /// Used to translate a layer's captured primitives — recorded in window
+    /// coordinates, since that's what `paint_*` always records in — into the
+    /// local, zero-origin space of its own rasterized texture
+    /// (`docs/retained-layers.md` §3.3/Phase 11, `Window::flatten_for_rasterize`).
+    pub(crate) fn translate(&mut self, offset: Point<ScaledPixels>) {
+        fn shift(
+            bounds: &mut Bounds<ScaledPixels>,
+            content_mask: &mut ContentMask<ScaledPixels>,
+            offset: Point<ScaledPixels>,
+        ) {
+            bounds.origin = bounds.origin + offset;
+            content_mask.bounds.origin = content_mask.bounds.origin + offset;
+        }
+        match self {
+            Primitive::Shadow(p) => shift(&mut p.bounds, &mut p.content_mask, offset),
+            Primitive::Quad(p) => shift(&mut p.bounds, &mut p.content_mask, offset),
+            Primitive::Path(p) => {
+                shift(&mut p.bounds, &mut p.content_mask, offset);
+                for vertex in &mut p.vertices {
+                    vertex.xy_position = vertex.xy_position + offset;
+                }
+            }
+            Primitive::Underline(p) => shift(&mut p.bounds, &mut p.content_mask, offset),
+            Primitive::MonochromeSprite(p) => shift(&mut p.bounds, &mut p.content_mask, offset),
+            Primitive::PolychromeSprite(p) => shift(&mut p.bounds, &mut p.content_mask, offset),
+            Primitive::Surface(p) => shift(&mut p.bounds, &mut p.content_mask, offset),
+            Primitive::BackdropFilter(p) => shift(&mut p.bounds, &mut p.content_mask, offset),
+            Primitive::FilterBoundary(p) => shift(&mut p.bounds, &mut p.content_mask, offset),
         }
     }
 }
@@ -1354,6 +1428,13 @@ impl From<PolychromeSprite> for Primitive {
 pub(crate) enum SurfaceContent {
     /// A WGPU surface managed by the SurfaceRegistry.
     Wgpu(SurfaceId),
+    /// A retained layer's rasterized backing texture. Keyed by `LayerId`
+    /// rather than a `SurfaceId` directly because the renderer owns that
+    /// texture's whole lifecycle (allocation, resize, eviction) in its own
+    /// `LayerId -> SurfaceId` map; `Layer`/`Scene` only ever ask for it by
+    /// the stable id. See `docs/retained-layers.md` §3.3/Phase 11 and
+    /// `Scene::rasterize_requests`.
+    Layer(crate::layer::LayerId),
 }
 
 #[derive(Clone, Debug)]

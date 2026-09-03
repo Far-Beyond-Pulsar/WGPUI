@@ -77,6 +77,10 @@ mod conditional {
         /// CPU+GPU flamegraph/profiler panel, backed by the `flamegraph` capture engine.
         #[cfg(feature = "flamegraph")]
         Profiler,
+        /// Runtime toggles for renderer debug visualizers (layer tinting, and
+        /// whatever else joins it) — switches, not a capture engine, so
+        /// unlike `Profiler` this is never feature-gated.
+        Utilities,
     }
 
     impl InspectorTab {
@@ -90,6 +94,7 @@ mod conditional {
             ];
             #[cfg(feature = "flamegraph")]
             tabs.push(InspectorTab::Profiler);
+            tabs.push(InspectorTab::Utilities);
             tabs
         }
 
@@ -102,6 +107,7 @@ mod conditional {
                 InspectorTab::EventListeners => "Listeners",
                 #[cfg(feature = "flamegraph")]
                 InspectorTab::Profiler => "Profiler",
+                InspectorTab::Utilities => "Utilities",
             }
         }
     }

@@ -286,7 +286,32 @@ pub(crate) struct Layer {
     /// individual entries here are only overwritten for the children that
     /// actually rebuilt; a reconciled child's entry is left untouched.
     pub instances: FxHashMap<InstanceKey, ElementInstance>,
+    /// Whether the renderer holds (or, within this same frame's `draw()`,
+    /// is about to build) a persistent texture backing this layer's current
+    /// content (Phase 11, `docs/retained-layers.md` §3.3).
+    ///
+    /// Set by `Window::record_layer` whenever a fresh re-render crosses
+    /// [`LayerPolicy::rasterize_above`] with `WGPUI_LAYERS_RASTERIZE=1` *and*
+    /// every primitive in it is one rasterization supports (see
+    /// `Window::flatten_for_rasterize`); cleared by [`Self::drop_content`] on
+    /// eviction. `Window::composite_layer` reads this to decide whether a
+    /// clean composite can stand in with a single
+    /// `SurfaceContent::Layer` primitive instead of replaying `items`.
+    pub(crate) rasterized: bool,
+    /// Rolling history of recent re-render timestamps, most recent last,
+    /// bounded to [`RERENDER_HISTORY_LEN`] entries. Feeds
+    /// [`Self::rerender_rate_hz`], which powers the Inspector's optional
+    /// per-layer FPS labels (`hud::is_layer_fps_enabled`) — display only,
+    /// never consulted for anything that affects what gets drawn.
+    pub(crate) rerender_times: std::collections::VecDeque<crate::time_ext::Instant>,
 }
+
+/// Cap on [`Layer::rerender_times`]. Large enough that a layer re-rendering
+/// once or twice a second still produces a stable rate (the oldest and
+/// newest samples span several seconds), small enough that a 120Hz-animating
+/// layer's history is trivial to keep and doesn't need trimming by age, only
+/// by count.
+const RERENDER_HISTORY_LEN: usize = 20;
 
 impl Layer {
     pub fn new(id: LayerId, policy: LayerPolicy, frame: u64) -> Self {
@@ -307,12 +332,70 @@ impl Layer {
             deferred_dirty: false,
             poisoned_bounds: Vec::new(),
             instances: FxHashMap::default(),
+            rasterized: false,
+            rerender_times: std::collections::VecDeque::with_capacity(RERENDER_HISTORY_LEN),
         }
     }
 
     /// Whether the layer holds content it could composite from.
     pub fn has_content(&self) -> bool {
         !self.items.is_empty()
+    }
+
+    /// Whether this layer's current `items` are worth handing the renderer a
+    /// [`crate::scene::LayerRasterizeJob`] for, per
+    /// [`LayerPolicy::rasterize_above`] (or the Utilities tab's override —
+    /// see [`effective_rasterize_above`]). `Window::composite_layer` reads
+    /// [`Self::rasterized`], set from this, to decide whether a clean
+    /// composite can stand in with a single `SurfaceContent::Layer`
+    /// primitive.
+    pub(crate) fn should_rasterize(&self) -> bool {
+        layers_rasterize_enabled()
+            && Self::crosses_rasterize_threshold(
+                self.items.len(),
+                effective_rasterize_above(&self.policy),
+            )
+    }
+
+    /// Record that this layer just re-rendered, for
+    /// [`Self::rerender_rate_hz`]. Called only from the dirty (re-render)
+    /// path in `Window::record_layer` — a clean composite is, by
+    /// definition, not a new data point.
+    pub(crate) fn record_rerender(&mut self, now: crate::time_ext::Instant) {
+        self.rerender_times.push_back(now);
+        while self.rerender_times.len() > RERENDER_HISTORY_LEN {
+            self.rerender_times.pop_front();
+        }
+    }
+
+    /// This layer's re-render rate in Hz, estimated from the span between
+    /// its oldest and newest recorded re-renders — `None` with fewer than
+    /// two samples (a span needs two points), or when the newest sample is
+    /// more than five seconds old (the layer has gone quiet; a rate
+    /// computed from a stale window would understate how idle it actually
+    /// is). Display-only: see [`Self::rerender_times`].
+    pub(crate) fn rerender_rate_hz(&self, now: crate::time_ext::Instant) -> Option<f32> {
+        let newest = *self.rerender_times.back()?;
+        if now.saturating_duration_since(newest) > std::time::Duration::from_secs(5) {
+            return None;
+        }
+        let oldest = *self.rerender_times.front()?;
+        let span = newest.saturating_duration_since(oldest).as_secs_f32();
+        if span <= 0.0 {
+            return None;
+        }
+        Some((self.rerender_times.len() - 1) as f32 / span)
+    }
+
+    /// Pure comparison behind [`Self::should_rasterize`], split out so the
+    /// threshold logic is unit-testable independent of the process-global
+    /// `WGPUI_LAYERS_RASTERIZE` env read (which, like `layers_enabled`'s own
+    /// `LazyLock`, is read once per process and so cannot be toggled
+    /// per-test). `pub(crate)` because `Window::record_layer` checks the
+    /// threshold against the freshly captured item list before it becomes
+    /// `self.items` (see that call site for why).
+    pub(crate) fn crosses_rasterize_threshold(item_count: usize, rasterize_above: usize) -> bool {
+        item_count > rasterize_above
     }
 
     /// Drop retained content, keeping the record so the layer can
@@ -328,6 +411,14 @@ impl Layer {
         // worst a later InstanceKey collision (extremely unlikely, but the
         // failure mode matters) could reuse one against unrelated content.
         self.instances.clear();
+        // Whatever texture the renderer built for the old content is about
+        // to be freed by the eviction report `Window::evict_stale_layers`
+        // sends alongside this call; a re-materialised layer starts unknown
+        // again rather than assuming stale backing survived.
+        self.rasterized = false;
+        // A re-materialised layer's re-render rate starts from nothing
+        // rather than carrying a stale span across the gap.
+        self.rerender_times.clear();
     }
 }
 
@@ -349,21 +440,128 @@ pub(crate) fn layers_enabled() -> bool {
     *ENABLED
 }
 
+/// Runtime switch for the layer diagnostic overlay, defaulting off.
+///
+/// Was a `LazyLock` reading `WGPUI_LAYER_DEBUG` once at process start, then
+/// briefly a hardcoded `true` — both wrong for the same reason: a debug
+/// visualizer belongs behind a switch a user can flip while the app is
+/// running, not an env var fixed for the process's whole lifetime. The
+/// Inspector's Utilities tab is that switch; see [`set_layer_debug_enabled`].
+static LAYER_DEBUG_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether to draw the layer diagnostic overlay.
 ///
-/// `WGPUI_LAYER_DEBUG=1` tints every composite by its [`LayerId`] and flashes
-/// the tint on a frame the layer re-rendered. The failure this exists to catch
-/// is a layer that is silently re-rendering every frame: without it that layer
-/// is merely slow, which is indistinguishable from the layer being large.
-///
-/// Read once, at first use.
+/// Tints every composite by its [`LayerId`] and flashes the tint on a frame
+/// the layer re-rendered. The failure this exists to catch is a layer that is
+/// silently re-rendering every frame: without it that layer is merely slow,
+/// which is indistinguishable from the layer being large.
 pub(crate) fn layer_debug_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("WGPUI_LAYER_DEBUG")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
-    });
-    *ENABLED
+    LAYER_DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the layer diagnostic overlay on or off at runtime.
+///
+/// Public so a host UI — the Inspector's Utilities tab, in this codebase —
+/// can wire it to a switch. Takes effect on the next frame; nothing needs
+/// re-rendering to pick it up, since every composite/re-render checks
+/// [`layer_debug_enabled`] fresh.
+pub fn set_layer_debug_enabled(enabled: bool) {
+    LAYER_DEBUG_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current state of the layer diagnostic overlay switch.
+pub fn is_layer_debug_enabled() -> bool {
+    layer_debug_enabled()
+}
+
+/// Whether a layer that crosses [`LayerPolicy::rasterize_above`] queues a
+/// [`crate::scene::LayerRasterizeJob`] for the renderer to build into a
+/// persistent texture (Phase 11, `docs/retained-layers.md` §3.3) — see
+/// `Window::flatten_for_rasterize` and `WgpuRenderer::process_layer_rasterize_requests`
+/// for the two ends of that pipeline.
+///
+/// Unconditionally on — was gated behind `WGPUI_LAYERS_RASTERIZE` while the
+/// renderer side didn't exist yet (turning it on would only have grown
+/// `Scene::rasterize_requests` for no effect); both ends are wired now, and
+/// the flag was removed at the project's request.
+pub(crate) fn layers_rasterize_enabled() -> bool {
+    true
+}
+
+// ---- Runtime tunables (Inspector → Utilities → Layers) --------------------
+//
+// Every call site still builds its own `LayerPolicy` with its own opinion of
+// `rasterize_above`/`evict_after_frames` — these don't change that. They sit
+// *in front of* it: `effective_rasterize_above`/`effective_evict_after_frames`
+// are what `Layer::should_rasterize`, `Window::record_layer` and
+// `Window::evict_stale_layers` actually call, and an override there wins over
+// every policy in the window at once. `0` is the sentinel for "no override"
+// in both `AtomicUsize`/`AtomicU32` stores below, since a real threshold of
+// `0` is already expressible as [`is_force_rasterize_all`] and a real evict
+// window of `0` frames would evict content the instant it stopped being
+// visited, which nothing wants.
+
+static RASTERIZE_ABOVE_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FORCE_RASTERIZE_ALL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static EVICT_AFTER_FRAMES_OVERRIDE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Override [`LayerPolicy::rasterize_above`] for every layer in the process,
+/// regardless of what policy its own call site built. `None` clears the
+/// override, returning each layer to its own policy's value.
+pub fn set_rasterize_above_override(threshold: Option<usize>) {
+    RASTERIZE_ABOVE_OVERRIDE.store(threshold.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current `rasterize_above` override, if any is set.
+pub fn rasterize_above_override() -> Option<usize> {
+    match RASTERIZE_ABOVE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Force every non-empty layer to rasterize, bypassing
+/// `rasterize_above`/its override entirely. The blunt instrument next to
+/// [`set_rasterize_above_override`]'s scalpel — useful for finding a layer
+/// whose texture path has a bug that only shows up once it exists, without
+/// hunting for how big it needs to get first.
+pub fn set_force_rasterize_all(enabled: bool) {
+    FORCE_RASTERIZE_ALL.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_force_rasterize_all`] is currently on.
+pub fn is_force_rasterize_all() -> bool {
+    FORCE_RASTERIZE_ALL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The `rasterize_above` threshold actually in effect for `policy`, folding
+/// in both overrides above: "force all" wins outright (an empty layer still
+/// never rasterizes — there is nothing to put in a texture — so this reads
+/// as "threshold zero", not "always"), otherwise an explicit numeric
+/// override replaces the call site's own value.
+pub(crate) fn effective_rasterize_above(policy: &LayerPolicy) -> usize {
+    if is_force_rasterize_all() {
+        return 0;
+    }
+    rasterize_above_override().unwrap_or(policy.rasterize_above)
+}
+
+/// Override [`LayerPolicy::evict_after_frames`] for every layer in the
+/// process. `None` clears the override.
+pub fn set_evict_after_frames_override(frames: Option<u32>) {
+    EVICT_AFTER_FRAMES_OVERRIDE.store(frames.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current `evict_after_frames` override, if any is set.
+pub fn evict_after_frames_override() -> Option<u32> {
+    match EVICT_AFTER_FRAMES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
 }
 
 /// The tint for `layer_id`, and whether it should be drawn at full strength
@@ -445,5 +643,102 @@ mod tests {
         let local = Point::new(px(4.), px(9.));
 
         assert_eq!(transform.invert(transform.apply(local)), local);
+    }
+
+    #[test]
+    fn rasterize_threshold_is_strictly_greater_than() {
+        // Default policy: 256. At the threshold a layer stays
+        // primitive-retained; one item past it, it qualifies.
+        assert!(!Layer::crosses_rasterize_threshold(256, 256));
+        assert!(Layer::crosses_rasterize_threshold(257, 256));
+        assert!(!Layer::crosses_rasterize_threshold(0, 0));
+        assert!(Layer::crosses_rasterize_threshold(1, 0));
+    }
+
+    #[test]
+    fn dropping_content_clears_the_rasterized_flag() {
+        let mut layer = Layer::new(LayerId(1), LayerPolicy::default(), 0);
+        layer.rasterized = true;
+
+        layer.drop_content();
+
+        assert!(
+            !layer.rasterized,
+            "a re-materialised layer must not claim a texture the eviction just freed"
+        );
+    }
+
+    #[test]
+    fn dropping_content_clears_rerender_history() {
+        let mut layer = Layer::new(LayerId(1), LayerPolicy::default(), 0);
+        let now = crate::time_ext::Instant::now();
+        layer.record_rerender(now);
+        layer.record_rerender(now + std::time::Duration::from_millis(16));
+
+        layer.drop_content();
+
+        assert!(
+            layer.rerender_times.is_empty(),
+            "a re-materialised layer must not report a rate spanning the gap before it existed again"
+        );
+    }
+
+    #[test]
+    fn rerender_history_is_bounded() {
+        let mut layer = Layer::new(LayerId(1), LayerPolicy::default(), 0);
+        let start = crate::time_ext::Instant::now();
+        for i in 0..(RERENDER_HISTORY_LEN * 3) {
+            layer.record_rerender(start + std::time::Duration::from_millis(i as u64 * 16));
+        }
+        assert_eq!(layer.rerender_times.len(), RERENDER_HISTORY_LEN);
+    }
+
+    #[test]
+    fn rerender_rate_needs_at_least_two_samples() {
+        let mut layer = Layer::new(LayerId(1), LayerPolicy::default(), 0);
+        let now = crate::time_ext::Instant::now();
+        assert_eq!(layer.rerender_rate_hz(now), None, "no samples yet");
+
+        layer.record_rerender(now);
+        assert_eq!(
+            layer.rerender_rate_hz(now),
+            None,
+            "one sample has no span to compute a rate from"
+        );
+    }
+
+    #[test]
+    fn rerender_rate_matches_a_steady_cadence() {
+        let mut layer = Layer::new(LayerId(1), LayerPolicy::default(), 0);
+        let start = crate::time_ext::Instant::now();
+        // 60Hz: 16 samples spaced 1/60s apart span 15/60s, so the rate is
+        // 15 intervals over that span — exactly 60Hz again, by construction.
+        for i in 0..16u64 {
+            layer.record_rerender(start + std::time::Duration::from_secs_f64(i as f64 / 60.0));
+        }
+        let now = start + std::time::Duration::from_secs_f64(15.0 / 60.0);
+        let rate = layer.rerender_rate_hz(now).expect("has samples");
+        assert!(
+            (rate - 60.0).abs() < 0.01,
+            "expected ~60Hz, got {rate}"
+        );
+    }
+
+    #[test]
+    fn rerender_rate_goes_stale_after_five_seconds_of_silence() {
+        let mut layer = Layer::new(LayerId(1), LayerPolicy::default(), 0);
+        let start = crate::time_ext::Instant::now();
+        layer.record_rerender(start);
+        layer.record_rerender(start + std::time::Duration::from_millis(16));
+
+        let still_fresh = start + std::time::Duration::from_secs(4);
+        assert!(layer.rerender_rate_hz(still_fresh).is_some());
+
+        let gone_quiet = start + std::time::Duration::from_secs(6);
+        assert_eq!(
+            layer.rerender_rate_hz(gone_quiet),
+            None,
+            "a layer that hasn't re-rendered in 5s should read as idle, not a stale rate"
+        );
     }
 }

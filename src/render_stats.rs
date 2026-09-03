@@ -1,11 +1,13 @@
 //! Frame-path instrumentation.
 //!
-//! Enable with `WGPUI_RENDER_STATS=1`. Once per second every accumulated timer
-//! and counter is dumped to stderr, so a slow frame can be attributed to a
-//! specific stage instead of guessed at.
+//! Always on. Once per second every accumulated timer and counter is dumped
+//! to stderr, so a slow frame can be attributed to a specific stage instead
+//! of guessed at.
 //!
-//! Everything here compiles to an atomic load of `ENABLED` when disabled, so it
-//! is safe to leave the call sites in place.
+//! Was gated behind `WGPUI_RENDER_STATS`; removed at the project's request
+//! rather than left as a default-changing env var. Every call site still
+//! checks [`enabled`] first, so nothing here got cheaper to skip — it just
+//! never returns `false` anymore.
 //!
 //! Timers report count, mean and max in milliseconds; the max column is the one
 //! that matters for stalls, since a single multi-second frame vanishes into a
@@ -43,29 +45,28 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use crate::time_ext::Instant;
 
-static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("WGPUI_RENDER_STATS")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
-});
-
 #[cfg(any(test, feature = "test-support"))]
 static FORCE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether instrumentation is on. Check this before doing any work that only
 /// exists to feed the stats.
+///
+/// Unconditionally `true` outside test builds (see the module doc comment for
+/// why); test builds keep [`set_force_enabled`] as a no-op-compatible override
+/// for parity with how they always called this.
 #[inline]
 pub fn enabled() -> bool {
     #[cfg(any(test, feature = "test-support"))]
     if FORCE_ENABLED.load(Ordering::Relaxed) {
         return true;
     }
-    *ENABLED
+    true
 }
 
-/// Turn instrumentation on regardless of `WGPUI_RENDER_STATS`, so tests can
-/// exercise the recording paths without depending on ambient environment
-/// variables. Only available in test builds.
+/// Turn instrumentation on regardless of ambient state, so tests can exercise
+/// the recording paths deterministically. Only available in test builds.
+/// `enabled()` no longer needs this to return `true` — it always does — but
+/// tests that call this to be explicit about intent keep working unchanged.
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_force_enabled(force: bool) {
     FORCE_ENABLED.store(force, Ordering::Relaxed);
@@ -359,12 +360,16 @@ mod tests {
     }
 
     #[test]
-    fn force_enabled_overrides_the_environment_flag() {
+    fn enabled_regardless_of_force_enabled() {
         let _serialization_guard = SERIALIZATION.lock();
         set_force_enabled(true);
         assert!(enabled());
         set_force_enabled(false);
-        assert_eq!(enabled(), *ENABLED);
+        // Unconditionally on now (`WGPUI_RENDER_STATS` was removed at the
+        // project's request) — `set_force_enabled` no longer changes the
+        // outcome, only whether it was `enabled()`'s own default or the
+        // override that produced `true`.
+        assert!(enabled());
     }
 
     #[test]

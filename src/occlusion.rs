@@ -6,9 +6,44 @@
 
 use crate::{Bounds, Pixels, Point};
 
+/// Runtime kill switch layered in front of [`mode`], toggled from the
+/// Inspector's Utilities tab. `WGPUI_OCCLUSION=0` fixes the answer for the
+/// process's whole lifetime; this is the same off switch, flippable while
+/// the app is running, for comparing "with occlusion" against "without" on
+/// the same frame instead of restarting with a different env var.
+static RUNTIME_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Force occlusion culling off, regardless of `mode()`. `false` (the
+/// default) defers entirely to `mode()`/`WGPUI_OCCLUSION`.
+pub fn set_occlusion_disabled(disabled: bool) {
+    RUNTIME_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_occlusion_disabled`] is currently forcing occlusion off.
+pub fn is_occlusion_disabled() -> bool {
+    RUNTIME_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runtime switch for the occlusion visualizer: layers the culling sweep
+/// skips get a hatched marker at their bounds instead of simply vanishing
+/// from the draw, so "nothing drew here" (working as intended) stays
+/// visually distinct from "something is missing" (a bug).
+static VISUALIZER_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the occlusion visualizer on or off at runtime.
+pub fn set_occlusion_visualizer_enabled(enabled: bool) {
+    VISUALIZER_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the occlusion visualizer is currently on.
+pub fn is_occlusion_visualizer_enabled() -> bool {
+    VISUALIZER_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether layer-tier occlusion is enabled.
 pub(crate) fn enabled() -> bool {
-    mode() != Mode::Off
+    !is_occlusion_disabled() && mode() != Mode::Off
 }
 
 /// The current occlusion mode.

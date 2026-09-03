@@ -2924,6 +2924,12 @@ impl Window {
             None,
         );
 
+        // Recorded unconditionally, like `render_stats`'s own timers — cheap
+        // (one lock, one duration, one push), and it means switching the
+        // HUD on shows an already-populated graph instead of one that fills
+        // in over the next few seconds. See `crate::hud`'s module doc.
+        crate::hud::record_frame();
+
         self.apply_invalidations();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -3293,6 +3299,14 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        // Mesa/MangoHud-style debug overlays: painted last, so they sit on
+        // top of literally everything else this pass just painted, root
+        // content and Inspector alike. Both are no-ops (one atomic load
+        // each) unless their respective switches in the Inspector's
+        // Utilities tab are on.
+        self.paint_layer_fps_labels(cx);
+        self.paint_hud(cx);
 
         drop(paint_timer);
     }
@@ -4367,6 +4381,9 @@ impl Window {
                 if let Some(layer) = self.layers.get_mut(&key) {
                     layer.deferred_dirty = false;
                 }
+                if crate::occlusion::is_occlusion_visualizer_enabled() {
+                    self.paint_occlusion_visualizer_marker(bounds);
+                }
             } else {
                 self.composite_layer(key);
             }
@@ -4385,6 +4402,9 @@ impl Window {
             }
             let range = self.layers[&key].paint_range.clone();
             self.reuse_paint_except_scene(&range);
+            if crate::occlusion::is_occlusion_visualizer_enabled() {
+                self.paint_occlusion_visualizer_marker(bounds);
+            }
             return None;
         }
 
@@ -4420,10 +4440,34 @@ impl Window {
         crate::render_stats::count("layer: re-rendered");
         let scaled_bounds = cache_key.bounds.scale(cache_key.scale_factor);
         let paint_start = self.paint_index();
-        let id = self.next_layer_id;
         let frame = self.layer_frame;
 
         {
+            // Bug (reported: rasterizing panels started showing each
+            // other's content): `next_layer_id` used to advance *after*
+            // `f(self)` painted this layer's children below, only if this
+            // call actually consumed its candidate id. But a nested
+            // `.layer()` created fresh during that same `f(self)` runs its
+            // own `record_layer` *before* this call gets back around to
+            // advancing the counter — so it read, and claimed, the exact
+            // same candidate this outer call already took. `LayerId` was
+            // cosmetic (just a debug-tint hue) when that was written, so the
+            // collision was invisible; it became a real key into
+            // `WgpuRenderer::layer_surfaces: HashMap<LayerId, SurfaceId>`
+            // with Phase 11's rasterization, at which point two colliding
+            // layers started sharing one texture slot. Fixed by claiming
+            // the id — and advancing the counter — atomically, right here,
+            // strictly before any nested `record_layer` call can run.
+            // Covered by `nested_layers_created_in_the_same_frame_get_distinct_ids`
+            // and the fuzz test below it.
+            let is_new_layer = !self.layers.contains_key(&key);
+            let id = if is_new_layer {
+                let id = self.next_layer_id;
+                self.next_layer_id = self.next_layer_id.wrapping_add(1);
+                id
+            } else {
+                0 // unused: `or_insert_with` below only runs for a new layer.
+            };
             let layer = self.layers.entry(key).or_insert_with(|| {
                 crate::render_stats::count("layer: created");
                 Layer::new(LayerId(id), policy, frame)
@@ -4440,11 +4484,38 @@ impl Window {
             .end_layer()
             .expect("a recording layer must return its captured items");
 
+        // Phase 11 (`docs/retained-layers.md` §3.3): decide whether this
+        // layer's fresh content is worth a texture, and if so, resolve it
+        // into a self-contained primitive list for the renderer — computed
+        // here, before the mutable borrow of `self.layers` below, because
+        // flattening needs read access to `self.layers` for nested
+        // references. `None` covers both "not big enough" and "contains a
+        // primitive rasterization can't express yet" (see
+        // `flatten_for_rasterize`'s doc comment) — either way the layer
+        // stays on the ordinary primitive-retained composite path.
+        let rasterize_primitives = if crate::layer::layers_rasterize_enabled()
+            && Layer::crosses_rasterize_threshold(
+                items.len(),
+                crate::layer::effective_rasterize_above(&policy),
+            )
+        {
+            self.flatten_for_rasterize(&items).map(|mut primitives| {
+                let origin = scaled_bounds.origin;
+                let offset = Point {
+                    x: ScaledPixels(-origin.x.0),
+                    y: ScaledPixels(-origin.y.0),
+                };
+                for primitive in &mut primitives {
+                    primitive.translate(offset);
+                }
+                primitives
+            })
+        } else {
+            None
+        };
+
         let paint_range = paint_start..self.paint_index();
         if let Some(layer) = self.layers.get_mut(&key) {
-            if layer.id.0 == id {
-                self.next_layer_id = self.next_layer_id.wrapping_add(1);
-            }
             layer.policy = policy;
             layer.items = items;
             layer.paint_range = paint_range;
@@ -4458,6 +4529,24 @@ impl Window {
             layer.had_mouse = false;
             layer.deferred_dirty = false;
             layer.poisoned_bounds.clear();
+            // Display-only, for the Inspector's optional per-layer FPS
+            // labels (`hud::is_layer_fps_enabled`) — recorded unconditionally
+            // like `hud::record_frame`, so the label reads correctly the
+            // instant the switch is flipped on rather than needing a few
+            // re-renders to warm up.
+            layer.record_rerender(Instant::now());
+
+            layer.rasterized = rasterize_primitives.is_some();
+            if let Some(primitives) = rasterize_primitives {
+                self.next_frame
+                    .scene
+                    .rasterize_requests
+                    .push(crate::scene::LayerRasterizeJob {
+                        id: layer.id,
+                        bounds: scaled_bounds,
+                        primitives,
+                    });
+            }
 
             if crate::layer::layer_debug_enabled() {
                 self.paint_layer_debug_tint(key, bounds, true);
@@ -4465,6 +4554,73 @@ impl Window {
         }
 
         result
+    }
+
+    /// Resolve `items` — one layer's freshly captured content — into a flat,
+    /// self-contained primitive list the renderer can rasterize into a
+    /// texture, or `None` if that is not possible this frame.
+    ///
+    /// `None` covers three cases, all handled the same way by the caller
+    /// (the layer simply stays on the ordinary primitive-retained composite
+    /// path this cycle):
+    /// - a `Path`, `BackdropFilter` or `FilterBoundary` primitive appears
+    ///   anywhere in the subtree. These drive render-target switches or a
+    ///   raw vertex stream rather than a plain instanced draw, and
+    ///   rasterization does not support them yet — matching
+    ///   `scene_pack`'s own "fail loud, never pack partially" policy for the
+    ///   same primitives (`docs/retained-layers.md` §3.3);
+    /// - a nested layer reference points at a layer no longer in
+    ///   `self.layers` (evicted out from under its still-rendering parent —
+    ///   `composite_layer` tolerates this by skipping the reference, but a
+    ///   rasterize job has no "skip a hole in the texture" equivalent, so it
+    ///   is rejected instead of drawn incompletely).
+    ///
+    /// A nested `.layer()` that is itself currently rasterized is **not**
+    /// inlined: it is represented by the same
+    /// `Primitive::Surface(SurfaceContent::Layer(..))` reference a live
+    /// composite of it would emit, so the two stay visually identical and
+    /// the nested layer's own texture is reused rather than duplicated.
+    ///
+    /// Primitives come back in the window's absolute coordinate space, same
+    /// as everywhere else in the paint path — [`Self::record_layer`]
+    /// translates them into the texture's own zero origin afterward.
+    fn flatten_for_rasterize(&self, items: &[LayerItem]) -> Option<Vec<crate::scene::Primitive>> {
+        let mut out = Vec::with_capacity(items.len());
+        self.flatten_for_rasterize_into(items, &mut out)?;
+        Some(out)
+    }
+
+    fn flatten_for_rasterize_into(
+        &self,
+        items: &[LayerItem],
+        out: &mut Vec<crate::scene::Primitive>,
+    ) -> Option<()> {
+        use crate::scene::{PaintSurface, Primitive, SurfaceContent};
+        for item in items {
+            match item {
+                LayerItem::Primitive(primitive) => match primitive {
+                    Primitive::Path(_)
+                    | Primitive::BackdropFilter(_)
+                    | Primitive::FilterBoundary(_) => return None,
+                    _ => out.push(primitive.clone()),
+                },
+                LayerItem::Nested(nested_key) => {
+                    let layer = self.layers.get(nested_key)?;
+                    if layer.rasterized {
+                        let scale_factor = self.scale_factor();
+                        out.push(Primitive::Surface(PaintSurface {
+                            order: 0,
+                            bounds: layer.cache_key.bounds.scale(scale_factor),
+                            content_mask: layer.cache_key.content_mask.scale(scale_factor),
+                            content: SurfaceContent::Layer(layer.id),
+                        }));
+                    } else {
+                        self.flatten_for_rasterize_into(&layer.items, out)?;
+                    }
+                }
+            }
+        }
+        Some(())
     }
 
     /// Mark the current retained layer as fully opaque over `bounds`.
@@ -4594,17 +4750,40 @@ impl Window {
             };
             layer.last_visited = frame;
             let bounds = layer.cache_key.bounds.scale(scale_factor);
+            // Phase 11 (`docs/retained-layers.md` §3.3): a rasterized layer
+            // stands in for however many primitives it holds with exactly
+            // one, referencing the renderer's persistent texture for it —
+            // computed before the `mem::take` below so it sees the real
+            // count.
+            let rasterized = layer.rasterized && layer.should_rasterize();
+            let content_mask = layer.cache_key.content_mask.scale(scale_factor);
+            let id = layer.id;
             // Taken out so the recursive call can borrow the map; put back
             // below. A layer never appears twice in one composite tree, so
             // nothing can observe the gap.
             let items = mem::take(&mut layer.items);
 
             scene.begin_layer(key, bounds, false);
-            for item in &items {
-                match item {
-                    LayerItem::Primitive(primitive) => scene.push_retained(primitive),
-                    LayerItem::Nested(nested) => {
-                        composite(scene, layers, *nested, frame, scale_factor)
+            if rasterized {
+                // Nested layers baked into this texture still need their
+                // `last_visited` touched, or mark-and-sweep would evict
+                // content the texture depends on while it is still being
+                // displayed on screen.
+                touch_nested_last_visited(layers, &items, frame);
+                scene.push_retained(&crate::scene::Primitive::Surface(crate::scene::PaintSurface {
+                    order: 0,
+                    bounds,
+                    content_mask,
+                    content: crate::scene::SurfaceContent::Layer(id),
+                }));
+                crate::render_stats::count("layer: composited as surface");
+            } else {
+                for item in &items {
+                    match item {
+                        LayerItem::Primitive(primitive) => scene.push_retained(primitive),
+                        LayerItem::Nested(nested) => {
+                            composite(scene, layers, *nested, frame, scale_factor)
+                        }
                     }
                 }
             }
@@ -4612,6 +4791,33 @@ impl Window {
 
             if let Some(layer) = layers.get_mut(&key) {
                 layer.items = items;
+            }
+        }
+
+        /// Stamp `last_visited` on every layer nested (transitively) inside
+        /// `items`, without emitting anything. Companion to the `rasterized`
+        /// branch above: those nested layers' own primitives are baked into
+        /// the parent's texture rather than replayed, so they would
+        /// otherwise never look visited and `evict_stale_layers` would drop
+        /// content the texture still depends on.
+        fn touch_nested_last_visited(
+            layers: &mut FxHashMap<LayerKey, Layer>,
+            items: &[LayerItem],
+            frame: u64,
+        ) {
+            for item in items {
+                let LayerItem::Nested(nested) = item else {
+                    continue;
+                };
+                let Some(layer) = layers.get_mut(nested) else {
+                    continue;
+                };
+                layer.last_visited = frame;
+                let nested_items = mem::take(&mut layer.items);
+                touch_nested_last_visited(layers, &nested_items, frame);
+                if let Some(layer) = layers.get_mut(nested) {
+                    layer.items = nested_items;
+                }
             }
         }
 
@@ -4664,6 +4870,246 @@ impl Window {
         });
     }
 
+    /// Small filled-background text label, shared by the HUD overlay and the
+    /// per-layer FPS labels below. Not part of the normal element/style
+    /// system — a fixed-size run shaped and painted directly into the
+    /// scene, the same way [`Self::paint_layer_debug_tint`] paints its quad
+    /// directly, rather than going through `div`/`Text`.
+    fn paint_debug_label(&mut self, origin: Point<Pixels>, text: &str, color: Hsla, cx: &mut App) {
+        let font_size = px(10.);
+        let mut style = self.text_style();
+        style.color = crate::solid_text_color(color);
+        style.font_size = font_size.into();
+        let run = style.to_run(text.len());
+        let shaped =
+            self.text_system()
+                .shape_line(SharedString::from(text.to_string()), font_size, &[run], None);
+
+        let line_height = px(12.);
+        let h_padding = px(3.);
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        self.next_frame.scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds {
+                origin: origin - Point::new(h_padding, px(0.)),
+                size: size(shaped.width + h_padding * 2., line_height),
+            }
+            .scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            background: Hsla { h: 0., s: 0., l: 0., a: 0.6 }.into(),
+            border_color: crate::transparent_black().into(),
+            corner_radii: Corners::all(px(2.)).scale(scale_factor),
+            border_widths: Edges::default(),
+        });
+
+        if let Err(err) = shaped.paint(origin, line_height, self, cx) {
+            log::warn!("wgpui: debug label paint failed: {err}");
+        }
+    }
+
+    /// Paint a re-render-rate label over every layer touched this frame,
+    /// when both the layer debug tint ([`crate::layer::layer_debug_enabled`])
+    /// and [`crate::hud::is_layer_fps_enabled`] are on. Meant to sit next to
+    /// the debug tint, not replace it — the tint shows *that* a layer
+    /// changed, this shows *how often*.
+    ///
+    /// A separate post-pass over `self.layers` rather than wired directly
+    /// into [`Self::paint_layer_debug_tint`]: that call happens deep inside
+    /// `record_layer`/`composite_layer`, neither of which carries the
+    /// `cx: &mut App` painting text needs. Walking the layer map here, after
+    /// every layer for this frame has already stamped `last_visited`, needs
+    /// none.
+    fn paint_layer_fps_labels(&mut self, cx: &mut App) {
+        if !crate::layer::layer_debug_enabled() || !crate::hud::is_layer_fps_enabled() {
+            return;
+        }
+        let now = Instant::now();
+        let this_frame = self.layer_frame;
+        let labels: Vec<(Point<Pixels>, String, Hsla)> = self
+            .layers
+            .values()
+            .filter(|layer| layer.last_visited == this_frame)
+            .map(|layer| {
+                let text = match layer.rerender_rate_hz(now) {
+                    Some(hz) if hz >= 59.0 => "60Hz+".to_string(),
+                    Some(hz) => format!("{hz:.1}Hz"),
+                    None => "static".to_string(),
+                };
+                let tint = crate::layer::debug_tint(layer.id, true);
+                let origin = layer.cache_key.bounds.origin + Point::new(px(2.), px(2.));
+                (origin, text, Hsla { a: 1.0, ..tint })
+            })
+            .collect();
+
+        for (origin, text, color) in labels {
+            self.paint_debug_label(origin, &text, color, cx);
+        }
+    }
+
+    /// Mesa/MangoHud-style performance overlay — see [`crate::hud`]'s module
+    /// doc comment for what each of its three switches does. Painted last,
+    /// after everything else `draw_roots` has painted (including the
+    /// Inspector panel), so it always sits on top.
+    fn paint_hud(&mut self, cx: &mut App) {
+        let hud_on = crate::hud::is_hud_enabled();
+        let flash_on = crate::hud::is_slow_frame_flash_enabled();
+        if !hud_on && !flash_on {
+            return;
+        }
+
+        let snapshot = crate::hud::snapshot();
+
+        if flash_on && crate::hud::is_slow_frame(snapshot.current_ms) {
+            self.paint_slow_frame_flash();
+        }
+
+        if !hud_on {
+            return;
+        }
+
+        // Snapshot content counts *before* adding the HUD's own primitives,
+        // so the readout describes what the app just drew, not the HUD
+        // drawing itself.
+        let quads = self.next_frame.scene.quads.len();
+        let shadows = self.next_frame.scene.shadows.len();
+        let sprites = self.next_frame.scene.monochrome_sprites.len()
+            + self.next_frame.scene.polychrome_sprites.len();
+        let layer_count = self.layers.len();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let viewport = self.viewport_size;
+
+        const MARGIN: f32 = 10.;
+        const PANEL_WIDTH: f32 = 210.;
+        const GRAPH_HEIGHT: f32 = 40.;
+        const PADDING: f32 = 8.;
+        const LINE_HEIGHT: f32 = 14.;
+        let panel_height = PADDING * 2. + GRAPH_HEIGHT + LINE_HEIGHT * 2.;
+
+        let panel_origin = Point::new(viewport.width - px(PANEL_WIDTH + MARGIN), px(MARGIN));
+
+        // Background.
+        self.next_frame.scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds {
+                origin: panel_origin,
+                size: size(px(PANEL_WIDTH), px(panel_height)),
+            }
+            .scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            background: Hsla { h: 0., s: 0., l: 0.05, a: 0.72 }.into(),
+            border_color: Hsla { h: 0., s: 0., l: 1., a: 0.15 }.into(),
+            corner_radii: Corners::all(px(4.)).scale(scale_factor),
+            border_widths: Edges::all(ScaledPixels(1.)),
+        });
+
+        // Frame-time graph: one 1px-wide bar per sample, most recent on the
+        // right, bottom-aligned, height clamped against a fixed ceiling so
+        // one freak stall doesn't flatten the rest of the graph to
+        // invisibility.
+        const GRAPH_CEILING_MS: f32 = 50.;
+        let graph_origin = panel_origin + Point::new(px(PADDING), px(PADDING));
+        let graph_width = PANEL_WIDTH - PADDING * 2.;
+        let bar_count = snapshot.samples.len().min(graph_width as usize);
+        let visible = &snapshot.samples[snapshot.samples.len() - bar_count..];
+        for (i, &ms) in visible.iter().enumerate() {
+            let bar_height = (ms / GRAPH_CEILING_MS).clamp(0.0, 1.0) * GRAPH_HEIGHT;
+            if bar_height <= 0.0 {
+                continue;
+            }
+            let (h, s, l) = crate::hud::frame_time_color(ms);
+            let x = graph_origin.x + px(i as f32);
+            let y = graph_origin.y + px(GRAPH_HEIGHT - bar_height);
+            self.next_frame.scene.insert_primitive(Quad {
+                order: 0,
+                border_style: BorderStyle::Solid,
+                bounds: Bounds {
+                    origin: Point::new(x, y),
+                    size: size(px(1.), px(bar_height)),
+                }
+                .scale(scale_factor),
+                content_mask: content_mask.scale(scale_factor),
+                background: Hsla { h, s, l, a: 0.9 }.into(),
+                border_color: crate::transparent_black().into(),
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+            });
+        }
+
+        // Text lines.
+        let text_origin = panel_origin + Point::new(px(PADDING), px(PADDING * 2. + GRAPH_HEIGHT));
+        let fps_line = format!(
+            "{:.0} fps  {:.1}ms avg  {:.1}ms max",
+            snapshot.fps(),
+            snapshot.avg_ms,
+            snapshot.max_ms,
+        );
+        self.paint_debug_label(text_origin, &fps_line, crate::white(), cx);
+
+        let counts_line =
+            format!("quads {quads}  sprites {sprites}  shadows {shadows}  layers {layer_count}");
+        self.paint_debug_label(
+            text_origin + Point::new(px(0.), px(LINE_HEIGHT)),
+            &counts_line,
+            Hsla { h: 0., s: 0., l: 0.75, a: 1.0 },
+            cx,
+        );
+    }
+
+    /// Mark `bounds` as occlusion-culled this frame — a magenta wash with a
+    /// solid border, deliberately not the same colour family as the layer
+    /// debug tint's golden-ratio hues so the two never get confused. Nothing
+    /// else painted here; this replaces zero pixels, since the entire point
+    /// of the layer being culled is that nothing else *was* going to be
+    /// drawn for it.
+    ///
+    /// Distinguishes "nothing drew here because it's occluded, as intended"
+    /// from "nothing drew here because something is broken" — the two look
+    /// identical without this, since a working occlusion sweep and a
+    /// dropped layer both produce zero draws for a region.
+    fn paint_occlusion_visualizer_marker(&mut self, bounds: Bounds<Pixels>) {
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        self.next_frame.scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: bounds.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            background: Hsla { h: 0.83, s: 0.9, l: 0.5, a: 0.28 }.into(),
+            border_color: Hsla { h: 0.83, s: 0.9, l: 0.6, a: 0.9 }.into(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::all(ScaledPixels(2.)),
+        });
+    }
+
+    /// A thin red border flashed for exactly one frame whenever the
+    /// just-drawn frame exceeded [`crate::hud::SLOW_FRAME_MS`] — the "you
+    /// might not have been looking at the graph, but you'll see this" half
+    /// of the slow-frame flash.
+    fn paint_slow_frame_flash(&mut self) {
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let viewport = self.viewport_size;
+        self.next_frame.scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: Bounds {
+                origin: Point::default(),
+                size: viewport,
+            }
+            .scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            background: crate::transparent_black().into(),
+            border_color: Hsla { h: 0., s: 0.85, l: 0.55, a: 0.9 }.into(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::all(ScaledPixels(4.)),
+        });
+    }
+
     /// Drop retained content for layers no draw has visited recently.
     ///
     /// Mark-and-sweep: every layer that composited or re-rendered this draw
@@ -4680,11 +5126,27 @@ impl Window {
         let frame = self.layer_frame;
         let mut dropped_content = 0usize;
         let mut dropped_records = 0usize;
+        // Phase 11: a rasterized layer dropped here owned a renderer-side
+        // texture (once the renderer actually builds one — see
+        // `Layer::rasterized`) that nothing else will ever ask to free.
+        // Collected separately from the retain closure because `self.layers`
+        // is already mutably borrowed by `retain` itself.
+        let mut rasterized_evicted: Vec<LayerId> = Vec::new();
+        // Utilities-tab override, checked once per sweep rather than per
+        // layer inside the closure below purely to keep that closure
+        // reading one less global on every one of potentially thousands of
+        // layers; the value is the same either way.
+        let evict_after_override = crate::layer::evict_after_frames_override();
         self.layers.retain(|key, layer| {
             let age = frame.saturating_sub(layer.last_visited);
-            let evict_after = layer.policy.evict_after_frames as u64;
+            let evict_after = evict_after_override
+                .map(|frames| frames as u64)
+                .unwrap_or(layer.policy.evict_after_frames as u64);
             if age > evict_after.saturating_mul(2) {
                 dropped_records += 1;
+                if layer.rasterized {
+                    rasterized_evicted.push(layer.id);
+                }
                 log::trace!(
                     "layer {key:?} ({:?}) forgotten after {age} frames",
                     layer.id
@@ -4693,6 +5155,9 @@ impl Window {
             }
             if age > evict_after && layer.has_content() {
                 dropped_content += 1;
+                if layer.rasterized {
+                    rasterized_evicted.push(layer.id);
+                }
                 log::trace!(
                     "layer {key:?} ({:?}) dropped its content after {age} frames",
                     layer.id
@@ -4703,6 +5168,12 @@ impl Window {
         });
         for _ in 0..dropped_content + dropped_records {
             crate::render_stats::count("layer: evicted");
+        }
+        if !rasterized_evicted.is_empty() {
+            self.next_frame
+                .scene
+                .rasterize_evictions
+                .extend(rasterized_evicted);
         }
     }
 
@@ -7631,7 +8102,11 @@ pub fn outline(
 
 #[cfg(test)]
 mod test {
-    use crate::{Invalidation, TestAppContext, Window, prelude::*, px, size};
+    use crate::{
+        AnyElement, AnyView, Entity, Invalidation, LayerKey, StyleRefinement, TestAppContext,
+        Window, prelude::*, px, size,
+    };
+    use super::Layer;
 
     struct EmptyView;
     impl crate::Render for EmptyView {
@@ -9194,6 +9669,461 @@ mod test {
                     previous_position.ids.is_empty(),
                     "the hitbox must not remain at the layer's previous position"
                 );
+            })
+            .unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // LayerId uniqueness (Phase 11 rasterization bug report)
+    // -------------------------------------------------------------------
+    //
+    // Reported symptom: with the rasterize threshold lowered or
+    // force-rasterize-all on, one panel's content starts appearing inside a
+    // different panel. `LayerId` used to be cosmetic only (it just picked a
+    // debug-tint hue), so a collision was invisible; Phase 11 made it a real
+    // key (`WgpuRenderer::layer_surfaces: HashMap<LayerId, SurfaceId>`), so a
+    // collision now means two layers share one texture. These tests probe
+    // `record_layer`'s id assignment directly — no GPU, no rasterization
+    // even required for the first one, since the allocation itself is a
+    // plain CPU-side bookkeeping question.
+
+    /// Serializes tests that flip [`crate::set_force_rasterize_all`], a
+    /// process-global switch `cargo test`'s default parallelism would
+    /// otherwise let two such tests step on.
+    static FORCE_RASTERIZE_ALL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ForceRasterizeAllGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ForceRasterizeAllGuard {
+        fn new() -> Self {
+            let lock = FORCE_RASTERIZE_ALL_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::set_force_rasterize_all(true);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for ForceRasterizeAllGuard {
+        fn drop(&mut self) {
+            crate::set_force_rasterize_all(false);
+        }
+    }
+
+    /// An outer `.layer()` div directly wrapping another `.layer()` div —
+    /// both created fresh on the very first frame. This is the dock's own
+    /// shape in miniature: a panel container layer around its actual
+    /// content layer (see `TabPanel::render_active_panel`'s `.cached()`,
+    /// itself a layer, sitting inside whatever `.layer()`s the panels
+    /// around it use).
+    struct NestedLayersView;
+
+    impl crate::Render for NestedLayersView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div().size_full().child(
+                crate::div()
+                    .id("outer")
+                    .layer()
+                    .absolute()
+                    .left(px(200.))
+                    .top(px(200.))
+                    .w(px(120.))
+                    .h(px(120.))
+                    .bg(crate::red())
+                    .child(
+                        crate::div()
+                            .id("inner")
+                            .layer()
+                            .absolute()
+                            .left(px(10.))
+                            .top(px(10.))
+                            .w(px(50.))
+                            .h(px(50.))
+                            .bg(crate::blue()),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn nested_layers_created_in_the_same_frame_get_distinct_ids(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| NestedLayersView);
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, this, _| {
+                assert_eq!(
+                    this.layers.len(),
+                    2,
+                    "both the outer and inner `.layer()` divs should have created a \
+                     retained layer"
+                );
+
+                let ids: Vec<_> = this.layers.values().map(|l| l.id).collect();
+                assert_ne!(
+                    ids[0], ids[1],
+                    "a layer and a `.layer()` div nested directly inside it, both \
+                     created fresh in the same frame, were assigned the same LayerId \
+                     ({:?}). `record_layer` reads `next_layer_id` as its candidate id \
+                     *before* painting children, and only advances the counter *after* \
+                     they finish — so the nested layer's own `record_layer` call, which \
+                     runs during that gap, reads the same candidate the outer layer is \
+                     about to also claim for itself.",
+                    ids[0]
+                );
+            })
+            .unwrap();
+    }
+
+    /// Three sibling panels, each itself wrapping a nested content layer —
+    /// closer to the real dock's shape than a single nested pair, and with
+    /// force-rasterize-all on, closer to the reported repro steps too.
+    struct MultiPanelView;
+
+    impl crate::Render for MultiPanelView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div()
+                .size_full()
+                .flex()
+                .flex_row()
+                .children((0..3).map(|i| {
+                    crate::div()
+                        .id(format!("panel-{i}"))
+                        .layer()
+                        .flex_1()
+                        .h_full()
+                        .bg(crate::red())
+                        .child(
+                            crate::div()
+                                .id(format!("panel-{i}-content"))
+                                .layer()
+                                .size_full()
+                                .bg(crate::blue()),
+                        )
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn force_rasterizing_multiple_panels_gives_every_layer_a_unique_id(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let _guard = ForceRasterizeAllGuard::new();
+
+        let window = cx.open_window(size(px(900.), px(600.)), |_, _| MultiPanelView);
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, this, _| {
+                assert_eq!(
+                    this.layers.len(),
+                    6,
+                    "3 panel-container layers + 3 nested content layers"
+                );
+
+                let mut seen = collections::FxHashSet::default();
+                for layer in this.layers.values() {
+                    assert!(
+                        seen.insert(layer.id),
+                        "two different layers share LayerId {:?} — with force-rasterize-all \
+                         on, both would be assigned the same renderer texture slot, which \
+                         is exactly the \"one panel's content shows up in another\" symptom",
+                        layer.id
+                    );
+                }
+
+                // The bug also matters one level up: every queued rasterize
+                // job must resolve to *exactly* one currently-live layer, or
+                // the renderer has no way to know which content a given
+                // `LayerId` should actually hold.
+                for job in &this.next_frame.scene.rasterize_requests {
+                    let matching = this.layers.values().filter(|l| l.id == job.id).count();
+                    assert_eq!(
+                        matching, 1,
+                        "rasterize job for {:?} matches {matching} live layers, not \
+                         exactly one",
+                        job.id
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    /// Shared invariant for every test in this section: no two currently-live
+    /// layers may share a [`LayerId`]. `context` is folded into the panic
+    /// message so a failure names which scenario caught it.
+    fn assert_layer_ids_unique(layers: &collections::FxHashMap<LayerKey, Layer>, context: &str) {
+        let mut seen = collections::FxHashSet::default();
+        for layer in layers.values() {
+            assert!(
+                seen.insert(layer.id),
+                "{context}: LayerId {:?} is shared by more than one layer — with \
+                 rasterization on, colliding layers share one renderer texture slot",
+                layer.id
+            );
+        }
+    }
+
+    /// A chain of `depth` `.layer()` divs, each wrapping the next.
+    fn nested_layer_chain(depth: usize, id_prefix: &str) -> AnyElement {
+        if depth == 0 {
+            return crate::div().size_full().into_any_element();
+        }
+        crate::div()
+            .id(format!("{id_prefix}-{depth}"))
+            .layer()
+            .size_full()
+            .child(nested_layer_chain(depth - 1, id_prefix))
+            .into_any_element()
+    }
+
+    struct DeepChainView;
+
+    impl crate::Render for DeepChainView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            nested_layer_chain(6, "chain")
+        }
+    }
+
+    #[gpui::test]
+    fn deeply_nested_layers_all_get_distinct_ids(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| DeepChainView);
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, this, _| {
+                assert_eq!(this.layers.len(), 6, "one layer per level of the chain");
+                assert_layer_ids_unique(&this.layers, "6-deep chain, first frame");
+            })
+            .unwrap();
+    }
+
+    /// 3 branches × (1 branch layer + 2 sub layers + 2 leaf layers) = 15
+    /// layers total, closer to a real dock's shape (splits containing tabs
+    /// containing panel content) than either a flat sibling list or a single
+    /// nested chain alone.
+    fn wide_and_deep_layer_tree() -> AnyElement {
+        crate::div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .children((0..3).map(|i| {
+                crate::div()
+                    .id(format!("branch-{i}"))
+                    .layer()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .children((0..2).map(|j| {
+                        crate::div()
+                            .id(format!("branch-{i}-sub-{j}"))
+                            .layer()
+                            .flex_1()
+                            .w_full()
+                            .child(
+                                crate::div()
+                                    .id(format!("branch-{i}-sub-{j}-leaf"))
+                                    .layer()
+                                    .size_full(),
+                            )
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            }))
+            .into_any_element()
+    }
+
+    struct WideAndDeepView;
+
+    impl crate::Render for WideAndDeepView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            wide_and_deep_layer_tree()
+        }
+    }
+
+    #[gpui::test]
+    fn wide_and_deep_layer_tree_has_unique_ids(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        let window = cx.open_window(size(px(900.), px(700.)), |_, _| WideAndDeepView);
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, this, _| {
+                assert_eq!(this.layers.len(), 15, "3 branch + 6 sub + 6 leaf layers");
+                assert_layer_ids_unique(&this.layers, "3-branch wide+deep tree, first frame");
+            })
+            .unwrap();
+    }
+
+    /// A view whose panel count varies frame to frame — panels (each a
+    /// container layer wrapping a content layer, so every visible panel is
+    /// itself a same-frame nested pair) come and go the way real dock tabs
+    /// opening/closing would.
+    struct ChurnView {
+        visible_count: usize,
+    }
+
+    impl crate::Render for ChurnView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div()
+                .size_full()
+                .flex()
+                .flex_row()
+                .children((0..self.visible_count).map(|i| {
+                    crate::div()
+                        .id(format!("churn-{i}"))
+                        .layer()
+                        .flex_1()
+                        .h_full()
+                        .child(
+                            crate::div()
+                                .id(format!("churn-{i}-content"))
+                                .layer()
+                                .size_full(),
+                        )
+                        .into_any_element()
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn layer_ids_stay_unique_across_frames_of_panel_churn(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        // Deliberately does *not* touch `set_evict_after_frames_override` —
+        // that's process-global, and `cargo test`'s default parallelism runs
+        // this alongside other tests (e.g. the `occlusion_eviction_*` suite)
+        // that depend on the *default* eviction timing; overriding it here
+        // was tried and did briefly break one of those under `--test-threads`
+        // > 1, exactly the cross-test interference this file's other
+        // globals-touching tests (`ForceRasterizeAllGuard`) exist to prevent.
+        // The id-uniqueness invariant this test checks doesn't actually need
+        // eviction to fire at all — same-frame *creation* is what collides,
+        // per `nested_layers_created_in_the_same_frame_get_distinct_ids` —
+        // so it's simplest and safest to just not go there.
+        let window = cx.open_window(size(px(900.), px(600.)), |_, _| ChurnView {
+            visible_count: 1,
+        });
+        cx.run_until_parked();
+
+        // A deterministic, easily-reproduced sequence rather than a random
+        // one: covers zero, one, growing, shrinking, and back-to-back
+        // repeats of the same count (which should composite, not recreate).
+        let counts = [1, 3, 5, 2, 0, 4, 1, 1, 6, 3, 0, 0, 2, 5];
+        let mut ids_ever_seen = collections::FxHashSet::default();
+
+        for (round, &count) in counts.iter().enumerate() {
+            window
+                .update(cx, |view, _, cx| {
+                    view.visible_count = count;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+
+            window
+                .update(cx, |_, this, _| {
+                    assert_layer_ids_unique(
+                        &this.layers,
+                        &format!("round {round} (visible_count={count})"),
+                    );
+                    for layer in this.layers.values() {
+                        // Ids are a monotonic counter (`Window::next_layer_id`),
+                        // never recycled — so the set of ids ever observed
+                        // must only grow, never reuse a value a still-live
+                        // layer already holds. Folded into the same set every
+                        // round rather than compared round-to-round, since a
+                        // hidden-then-reshown panel legitimately keeps its
+                        // original id (layers aren't evicted just for going
+                        // unvisited for one frame) and re-appearing is not
+                        // "reuse".
+                        ids_ever_seen.insert(layer.id);
+                    }
+                })
+                .unwrap();
+        }
+        assert!(
+            ids_ever_seen.len() >= 6,
+            "expected at least 6 distinct ids across a sequence that peaks at 6 \
+             simultaneously-visible panels, saw {}",
+            ids_ever_seen.len()
+        );
+    }
+
+    /// The real dock's actual shape: a `.layer()` div wrapping an
+    /// `AnyView::cached` (not a raw nested `.layer()` div) whose own render
+    /// output contains a further nested `.layer()` — matching
+    /// `TabPanel::render_active_panel`, which wraps the active panel's view
+    /// in `.cached(..)` rather than a bare `.layer()`. `AnyView::cached`
+    /// reaches `record_layer` through a different call path
+    /// (`view.rs`'s `paint`, not `elements/div.rs`), so this is not
+    /// redundant with the raw-`.layer()` tests above — it confirms the fix
+    /// covers both entry points to the same shared function.
+    struct CachedInnerView;
+
+    impl crate::Render for CachedInnerView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div()
+                .id("cached-inner-layer")
+                .layer()
+                .size_full()
+        }
+    }
+
+    struct CachedOuterView {
+        inner: Entity<CachedInnerView>,
+    }
+
+    impl crate::Render for CachedOuterView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            crate::div().size_full().child(
+                crate::div()
+                    .id("cached-outer-layer")
+                    .layer()
+                    .size_full()
+                    .child(
+                        AnyView::from(self.inner.clone())
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_layer_wrapping_a_cached_view_with_its_own_nested_layer_gets_distinct_ids(
+        cx: &mut TestAppContext,
+    ) {
+        if layers_off() {
+            return;
+        }
+        let window = cx.open_window(size(px(800.), px(600.)), |_, cx| {
+            let inner = cx.new(|_| CachedInnerView);
+            CachedOuterView { inner }
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, this, _| {
+                assert_eq!(
+                    this.layers.len(),
+                    3,
+                    "the outer `.layer()` div, the implicit layer `.cached()` itself \
+                     creates for the AnyView, and the inner `.layer()` div inside it"
+                );
+                assert_layer_ids_unique(&this.layers, "layer() wrapping a cached() AnyView");
             })
             .unwrap();
     }
