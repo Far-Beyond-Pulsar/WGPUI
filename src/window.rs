@@ -7421,6 +7421,22 @@ impl Window {
     #[cfg(any(feature = "inspector", debug_assertions))]
     fn prepaint_inspector(&mut self, inspector_width: Pixels, cx: &mut App) -> Option<AnyElement> {
         if let Some(inspector) = self.inspector.take() {
+            // NOT `.cached()`: tried it (see git history), reverted it. The
+            // Inspector's Profiler tab embeds `wgpu_surface` elements (the
+            // flame chart lanes, the Record overview), and at least one of
+            // them apparently depends on its own `paint`/`prepaint` running
+            // every real draw — to request a resize against current bounds,
+            // or to swap to a freshly rendered texture — a side effect a
+            // composited (skipped-paint) frame does not run. Caching this
+            // subtree left every `wgpu_surface` inside it rendering solid
+            // black instead of their actual content. This is exactly the
+            // hazard class `docs/retained-layers.md` §0.2 warns `.cached()`
+            // about generally ("side effects are silently skipped"); it
+            // just wasn't caught by inspection before landing. If this gets
+            // revisited, it needs `Element::on_frame` (§2.4 of that doc) to
+            // give `WgpuSurface` a place to run that logic unconditionally
+            // even inside a composited layer — not a blind re-add of
+            // `.cached()` here.
             let mut inspector_element = AnyView::from(inspector.clone()).into_any_element();
             inspector_element.prepaint_as_root(
                 point(self.viewport_size.width - inspector_width, px(0.0)),
