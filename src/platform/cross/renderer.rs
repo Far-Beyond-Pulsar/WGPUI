@@ -1539,6 +1539,16 @@ pub struct WgpuRenderer {
     // `gpu_query_manager` above rather than sharing its machinery.
     #[cfg(feature = "flamegraph")]
     deep_capture: parking_lot::Mutex<Option<crate::flamegraph_gpu::DeepCapturePendingReadback>>,
+
+    // Periodic screenshot capture ("filmstrip", Phase 5 of the profiling
+    // epic). Opt-in via `CaptureOptions::capture_screenshots` (default
+    // `false`); `None` except for the brief window between a sample being
+    // requested and its full-resolution readback completing a couple of
+    // frames later -- the exact same single-in-flight, non-persistent shape
+    // as `deep_capture` above, for the same reason (see
+    // `flamegraph_gpu`'s Phase 5 section doc comment).
+    #[cfg(feature = "flamegraph")]
+    thumbnail_capture: parking_lot::Mutex<Option<crate::flamegraph_gpu::PendingThumbnailReadback>>,
 }
 
 impl WgpuRenderer {
@@ -1722,6 +1732,8 @@ impl WgpuRenderer {
             gpu_query_manager: parking_lot::Mutex::new(None),
             #[cfg(feature = "flamegraph")]
             deep_capture: parking_lot::Mutex::new(None),
+            #[cfg(feature = "flamegraph")]
+            thumbnail_capture: parking_lot::Mutex::new(None),
         })
     }
 
@@ -2321,6 +2333,30 @@ impl WgpuRenderer {
                 None
             }
         };
+
+        // Periodic screenshot capture (issue-less "Phase 5" follow-on to the
+        // profiling epic; opt-in via `CaptureOptions::capture_screenshots`,
+        // off by default): harvest any previous thumbnail sample whose
+        // full-resolution readback has completed, non-blocking, same
+        // render-thread poll pattern as the deep capture and GPU query
+        // manager above. See `flamegraph_gpu`'s Phase 5 section doc comment
+        // for the full design.
+        #[cfg(feature = "flamegraph")]
+        {
+            let mut guard = self.thumbnail_capture.lock();
+            if let Some(pending) = guard.as_mut() {
+                match pending.poll(&self.context.device) {
+                    crate::flamegraph_gpu::ThumbnailPollOutcome::Pending => {}
+                    crate::flamegraph_gpu::ThumbnailPollOutcome::Failed => {
+                        *guard = None;
+                    }
+                    crate::flamegraph_gpu::ThumbnailPollOutcome::Ready(timestamp_ns, thumbnail) => {
+                        crate::flamegraph::attach_thumbnail(timestamp_ns, thumbnail);
+                        *guard = None;
+                    }
+                }
+            }
+        }
 
         self.atlas.before_frame(&mut command_encoder);
         log::trace!("Renderer::draw: atlas.before_frame complete");
@@ -3446,6 +3482,33 @@ impl WgpuRenderer {
             )
         });
 
+        // Periodic screenshot capture: decide whether this frame should
+        // start a new sample, and if so, record its full-resolution
+        // `copy_texture_to_buffer` into `command_encoder` now -- same "while
+        // finish still has a chance to record commands" timing as the deep
+        // capture handoff just above. Skip even asking
+        // `should_sample_thumbnail_now` while a previous sample's readback
+        // is still in flight: thumbnails are one-at-a-time (like deep
+        // capture, not like the triple-buffered GPU query manager), so
+        // there is nothing to stage until `self.thumbnail_capture` frees up
+        // via the poll earlier in this function -- the bucket that would
+        // have been claimed here simply isn't, and
+        // `should_sample_thumbnail_now` will claim whatever bucket capture
+        // time has reached the next time this function gets to ask.
+        #[cfg(feature = "flamegraph")]
+        let thumbnail_pending = if self.thumbnail_capture.lock().is_some() {
+            None
+        } else {
+            crate::flamegraph::should_sample_thumbnail_now().and_then(|timestamp_ns| {
+                crate::flamegraph_gpu::stage_thumbnail_readback(
+                    &self.context.device,
+                    &mut command_encoder,
+                    &surface_texture.texture,
+                    timestamp_ns,
+                )
+            })
+        };
+
         log::debug!("Renderer::draw: submitting command buffer");
         self.context.queue.submit(Some(command_encoder.finish()));
         log::debug!("Renderer::draw: presenting surface");
@@ -3472,6 +3535,18 @@ impl WgpuRenderer {
         if let Some(mut pending) = deep_capture_pending {
             pending.begin_readback();
             *self.deep_capture.lock() = Some(pending);
+        }
+
+        // Start this frame's thumbnail readback (if one was staged above)
+        // now that its copy command has actually been submitted, and hand
+        // it off to `self.thumbnail_capture` so future `draw()` calls poll
+        // it to completion. Mirrors the deep-capture handoff immediately
+        // above -- see its comment for why this ordering (submit, then
+        // `begin_readback`) is required.
+        #[cfg(feature = "flamegraph")]
+        if let Some(mut pending) = thumbnail_pending {
+            pending.begin_readback();
+            *self.thumbnail_capture.lock() = Some(pending);
         }
 
         log::debug!("Renderer::draw: frame complete");

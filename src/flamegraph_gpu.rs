@@ -947,6 +947,244 @@ impl DeepCapturePendingReadback {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5: periodic screenshot capture ("filmstrip"). See `flamegraph.rs`'s
+// own Phase 5 section doc comment (above its `Thumbnail` type) for the full
+// design rationale -- sample interval, resolution, format, data-model choice,
+// and why full-resolution readback + CPU downscale was chosen over a GPU
+// downscale pass. This section is the GPU-side half: staging the readback
+// from a real `wgpu::Texture` and driving it to completion, mirroring
+// `DeepCapturePendingReadback`'s single-resource (not triple-buffered),
+// one-at-a-time shape rather than `GpuQueryManager`'s rotating generations --
+// like a deep capture, a thumbnail sample is a one-off, drop-when-done
+// resource (see `WgpuRenderer::draw`'s call site for why only one is ever in
+// flight at a time), not a steady per-frame stream needing rotation.
+
+/// Outcome of one [`PendingThumbnailReadback::poll`] call.
+pub(crate) enum ThumbnailPollOutcome {
+    /// The async map has not resolved yet; keep polling on a later frame.
+    Pending,
+    /// The map resolved but reported an error. Dropped rather than retried
+    /// or panicked on -- a missed sample is an acceptable outcome for a
+    /// best-effort diagnostic filmstrip (the next `THUMBNAIL_SAMPLE_INTERVAL_NS`
+    /// bucket will simply try again), the same tolerance
+    /// `DeepCapturePendingReadback::poll` already extends to an individual
+    /// failed buffer/texture map via `resources_finalized: false`.
+    Failed,
+    /// The map resolved successfully. The caller should attach this to the
+    /// active capture via `flamegraph::attach_thumbnail` and then drop
+    /// `self` (its staging buffer is no longer needed).
+    Ready(u64, flamegraph::Thumbnail),
+}
+
+/// One periodic screenshot sample mid-readback: the full-resolution
+/// GPU->CPU copy's staging buffer, its async map state, and the metadata
+/// `poll` needs (row padding, timestamp, source pixel format) to turn the
+/// raw mapped bytes into a finished, downscaled [`flamegraph::Thumbnail`].
+/// Held in `WgpuRenderer::thumbnail_capture` from the frame it was recorded
+/// until `poll` reports completion (successful or not), mirroring
+/// `DeepCapturePendingReadback`'s same "created, polled, dropped" lifecycle.
+pub(crate) struct PendingThumbnailReadback {
+    timestamp_ns: u64,
+    width: u32,
+    height: u32,
+    /// The swapchain's actual pixel format at capture time, needed by `poll`
+    /// to normalize BGRA-ordered swapchains to RGBA (see
+    /// `normalize_to_rgba_order`) before downscaling.
+    format: wgpu::TextureFormat,
+    unpadded_bytes_per_row: u32,
+    padded_bytes_per_row: u32,
+    size: u64,
+    buffer: wgpu::Buffer,
+    map_state: Arc<AtomicU8>,
+    state: PendingReadbackState,
+}
+
+/// Record a full-resolution `copy_texture_to_buffer` of `surface_texture`
+/// into `encoder`, staged for later async readback. Must be called before
+/// `encoder.finish()`; the returned value's `begin_readback` must not be
+/// called until the encoder holding this copy has actually been submitted
+/// to the queue (mirrors `DeepCapturePendingReadback`'s identical ordering
+/// requirement -- see [`PendingReadbackState::AwaitingSubmit`]'s doc
+/// comment for why: mapping a buffer a not-yet-submitted copy still targets
+/// is a wgpu validation error).
+///
+/// Returns `None` (recording nothing, allocating nothing beyond what was
+/// already necessary to check) when `surface_texture`'s format isn't a
+/// 4-byte-per-pixel format this function knows how to interpret, or when
+/// its dimensions are degenerate -- see the inline comments below for why
+/// this is the right degrade-gracefully behavior rather than a panic.
+///
+/// This reads back the *entire* frame at full resolution, not a
+/// pre-downscaled copy -- `copy_texture_to_buffer` cannot resize, and a
+/// GPU-side downscale would need its own render pass, shader, and a
+/// `TEXTURE_BINDING`-capable copy of a swapchain image that (see
+/// `WgpuRenderer::new`'s `surface_configuration.usage`) is deliberately not
+/// sampler-bindable. See `flamegraph.rs`'s Phase 5 section doc comment for
+/// the full tradeoff.
+pub(crate) fn stage_thumbnail_readback(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    surface_texture: &wgpu::Texture,
+    timestamp_ns: u64,
+) -> Option<PendingThumbnailReadback> {
+    let format = surface_texture.format();
+    // Thumbnail capture only understands 4-byte-per-pixel 8-bit formats
+    // (RGBA/BGRA order -- see `normalize_to_rgba_order`), the only kind of
+    // format `WgpuRenderer::new` ever selects for the swapchain (it
+    // explicitly searches for a non-sRGB 8-bit format). A platform that
+    // somehow only offers a different swapchain format (e.g. a 16-bit float
+    // surface) degrades to "no thumbnail this sample" rather than
+    // misinterpreting raw bytes.
+    let bytes_per_pixel = format.block_copy_size(None).unwrap_or(0);
+    if bytes_per_pixel != 4 {
+        return None;
+    }
+
+    let size = surface_texture.size();
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let unpadded_bytes_per_row = size.width * bytes_per_pixel;
+    let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+    let buffer_size = (padded_bytes_per_row as u64) * (size.height as u64);
+
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("flamegraph_thumbnail_staging_buffer"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    encoder.copy_texture_to_buffer(
+        surface_texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(size.height),
+            },
+        },
+        wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
+    );
+
+    Some(PendingThumbnailReadback {
+        timestamp_ns,
+        width: size.width,
+        height: size.height,
+        format,
+        unpadded_bytes_per_row,
+        padded_bytes_per_row,
+        size: buffer_size,
+        buffer,
+        map_state: Arc::new(AtomicU8::new(MAP_STATE_PENDING)),
+        state: PendingReadbackState::AwaitingSubmit,
+    })
+}
+
+/// Swap byte order in place if `format` stores pixels as BGRA rather than
+/// RGBA. Swapchain formats on this crate's supported backends are always
+/// one of these two 8-bit-per-channel orders (see `WgpuRenderer::new`'s
+/// format-selection comment, which explicitly searches for a non-sRGB
+/// 8-bit format), so this is a simple, exhaustively-matched byte swap
+/// rather than a general color-management conversion -- there is no third
+/// case among what `WgpuRenderer::new` can actually select. Any other
+/// format that happened to report a 4-byte `block_copy_size` (defensively
+/// possible in principle, never true in practice for a swapchain this
+/// renderer created) falls through unchanged: a best-effort thumbnail with
+/// possibly-swapped channels is preferable to silently dropping the sample.
+fn normalize_to_rgba_order(format: wgpu::TextureFormat, rgba: &mut [u8]) {
+    let is_bgra = matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+    if !is_bgra {
+        return;
+    }
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+}
+
+impl PendingThumbnailReadback {
+    /// Start the async readback map. Must be called once, after the encoder
+    /// `stage_thumbnail_readback` recorded the copy into has actually been
+    /// submitted to the queue -- see that function's doc comment for why.
+    pub(crate) fn begin_readback(&mut self) {
+        if self.state != PendingReadbackState::AwaitingSubmit {
+            return;
+        }
+        let map_state = self.map_state.clone();
+        self.buffer.slice(0..self.size).map_async(wgpu::MapMode::Read, move |result| {
+            map_state.store(
+                if result.is_ok() { MAP_STATE_OK } else { MAP_STATE_ERR },
+                Ordering::Release,
+            );
+        });
+        self.state = PendingReadbackState::MapPending;
+    }
+
+    /// Non-blocking poll (`PollType::Poll`, never `Wait` -- see this file's
+    /// module-level threading note), mirroring `DeepCapturePendingReadback::poll`'s
+    /// same render-thread-only pattern. On success, strips
+    /// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` row padding (identical to
+    /// `DeepCapturePendingReadback::poll`'s texture-content handling),
+    /// normalizes BGRA->RGBA if needed, and downscales via
+    /// `flamegraph::downscale_rgba8_box_filter` before returning the
+    /// finished thumbnail.
+    pub(crate) fn poll(&mut self, device: &wgpu::Device) -> ThumbnailPollOutcome {
+        if self.state != PendingReadbackState::MapPending {
+            return ThumbnailPollOutcome::Pending;
+        }
+        let _ = device.poll(wgpu::PollType::Poll);
+        match self.map_state.load(Ordering::Acquire) {
+            MAP_STATE_PENDING => ThumbnailPollOutcome::Pending,
+            MAP_STATE_ERR => ThumbnailPollOutcome::Failed,
+            _ => {
+                let full_res_rgba = {
+                    let slice = self.buffer.slice(0..self.size);
+                    match slice.get_mapped_range() {
+                        Ok(view) => {
+                            let mut bytes = Vec::with_capacity(
+                                (self.unpadded_bytes_per_row as usize) * (self.height as usize),
+                            );
+                            for row in 0..self.height as usize {
+                                let start = row * self.padded_bytes_per_row as usize;
+                                let end = start + self.unpadded_bytes_per_row as usize;
+                                bytes.extend_from_slice(&view[start..end]);
+                            }
+                            Some(bytes)
+                        }
+                        Err(_) => None,
+                    }
+                };
+                self.buffer.unmap();
+
+                let Some(mut full_res_rgba) = full_res_rgba else {
+                    return ThumbnailPollOutcome::Failed;
+                };
+                normalize_to_rgba_order(self.format, &mut full_res_rgba);
+                let downscaled = flamegraph::downscale_rgba8_box_filter(
+                    &full_res_rgba,
+                    self.width,
+                    self.height,
+                    flamegraph::THUMBNAIL_WIDTH,
+                    flamegraph::THUMBNAIL_HEIGHT,
+                );
+
+                ThumbnailPollOutcome::Ready(
+                    self.timestamp_ns,
+                    flamegraph::Thumbnail {
+                        width: flamegraph::THUMBNAIL_WIDTH,
+                        height: flamegraph::THUMBNAIL_HEIGHT,
+                        rgba: downscaled,
+                    },
+                )
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1355,6 +1593,7 @@ mod tests {
         let handle = flamegraph::start_capture(flamegraph::CaptureOptions {
             max_frames: 8,
             capture_gpu: true,
+            capture_screenshots: false,
         })
         .expect("no other capture should be active in this test process");
 
@@ -1411,5 +1650,142 @@ mod tests {
              submit_ns={submit_ns}, observed_ns={observed_ns}"
         );
         assert!(!frame.gpu_spans.is_empty(), "the reserved pass should have resolved into a GpuSpan");
+    }
+
+    // Phase 5 (periodic screenshot capture / "filmstrip"): the pure downscale
+    // math and nearest-timestamp lookup are covered without a device in
+    // `flamegraph.rs`'s own test module -- these tests cover the GPU-specific
+    // half this module owns: staging a real `copy_texture_to_buffer`,
+    // driving `PendingThumbnailReadback` through `begin_readback` -> `poll`
+    // to completion against a real headless device, and the row-padding-
+    // strip + BGRA->RGBA channel normalization that only matters once real
+    // GPU-mapped bytes are involved.
+
+    /// End-to-end readback test: clears a real `Bgra8Unorm` render-attachment
+    /// texture (the same format Windows/DX12 swapchains typically report --
+    /// see `WgpuRenderer::new`'s format-selection comment) to opaque red,
+    /// stages a thumbnail readback of it, drives it to completion, and
+    /// asserts every pixel of the resulting downscaled thumbnail is
+    /// RGBA-ordered opaque red -- exercising both the row-padding strip
+    /// (the source width here is deliberately not a multiple of
+    /// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT / 4`) and the BGRA->RGBA channel
+    /// swap `normalize_to_rgba_order` performs, together, against real
+    /// mapped GPU bytes rather than synthetic in-memory buffers.
+    #[test]
+    fn stage_thumbnail_readback_produces_a_downscaled_rgba_thumbnail_from_a_bgra_surface() {
+        let Some((device, queue)) = create_headless_device() else {
+            eprintln!(
+                "skipping stage_thumbnail_readback_produces_a_downscaled_rgba_thumbnail_from_a_bgra_surface: \
+                 no wgpu adapter available in this environment"
+            );
+            return;
+        };
+
+        let width = 63u32; // deliberately not row-alignment-friendly
+        let height = 40u32;
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_thumbnail_source_texture"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            // Pure opaque red via `wgpu::Color`'s logical r/g/b/a converts to
+            // Bgra8Unorm's exact endpoint byte values (physically stored as
+            // B=0, G=0, R=255, A=255) regardless of the backend's rounding
+            // behavior for intermediate values, so the byte-exact assertion
+            // below is safe -- the same reasoning this crate's existing
+            // `finish_and_poll_read_back_real_buffer_and_texture_contents`
+            // test already relies on for its own Rgba8Unorm surface.
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("test_clear_thumbnail_source_red"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
+        let mut pending = stage_thumbnail_readback(&device, &mut encoder, &texture, 12_345)
+            .expect("a 4-byte-per-pixel, non-degenerate texture should always stage a readback");
+        queue.submit(Some(encoder.finish()));
+        pending.begin_readback();
+
+        let outcome = loop {
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            match pending.poll(&device) {
+                ThumbnailPollOutcome::Pending => continue,
+                other => break other,
+            }
+        };
+
+        let (timestamp_ns, thumbnail) = match outcome {
+            ThumbnailPollOutcome::Ready(timestamp_ns, thumbnail) => (timestamp_ns, thumbnail),
+            ThumbnailPollOutcome::Failed => panic!("readback of a freshly-cleared texture should succeed"),
+            ThumbnailPollOutcome::Pending => {
+                unreachable!("the loop above only exits on a resolved (non-Pending) outcome")
+            }
+        };
+
+        assert_eq!(timestamp_ns, 12_345);
+        assert_eq!(thumbnail.width, flamegraph::THUMBNAIL_WIDTH);
+        assert_eq!(thumbnail.height, flamegraph::THUMBNAIL_HEIGHT);
+        assert_eq!(
+            thumbnail.rgba.len(),
+            (flamegraph::THUMBNAIL_WIDTH * flamegraph::THUMBNAIL_HEIGHT * 4) as usize
+        );
+        assert!(
+            thumbnail.rgba.chunks_exact(4).all(|pixel| pixel == [255, 0, 0, 255]),
+            "a uniform red BGRA source should downscale to a uniform RGBA-ordered red thumbnail"
+        );
+    }
+
+    /// `stage_thumbnail_readback` should decline (return `None`, recording no
+    /// copy command) rather than misinterpret bytes when the source
+    /// texture's format isn't the 4-byte-per-pixel RGBA/BGRA shape this
+    /// feature understands -- see that function's doc comment.
+    #[test]
+    fn stage_thumbnail_readback_declines_unsupported_pixel_formats() {
+        let Some((device, _queue)) = create_headless_device() else {
+            eprintln!(
+                "skipping stage_thumbnail_readback_declines_unsupported_pixel_formats: \
+                 no wgpu adapter available in this environment"
+            );
+            return;
+        };
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_unsupported_format_texture"),
+            size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        assert!(
+            stage_thumbnail_readback(&device, &mut encoder, &texture, 0).is_none(),
+            "an 8-byte-per-pixel format should be declined rather than misread as RGBA8"
+        );
     }
 }

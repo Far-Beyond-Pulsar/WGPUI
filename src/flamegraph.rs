@@ -515,6 +515,13 @@ pub struct Capture {
     /// Total `Window::on_request_frame` invocations across the whole session
     /// that took the fast, no-compositor present-only path.
     pub fast_path_frame_count: u64,
+    /// Periodic screenshot samples (Phase 5, see [`Thumbnail`]'s doc
+    /// comment), timestamp-ordered, oldest first. Stored as a separate
+    /// parallel vector rather than a field on [`FrameCapture`] -- see the
+    /// "Phase 5" section doc comment above [`Thumbnail`] for why. Empty
+    /// unless the session was started with `CaptureOptions::capture_screenshots:
+    /// true`.
+    thumbnails: Vec<(u64, Thumbnail)>,
 }
 
 impl Capture {
@@ -546,7 +553,30 @@ impl Capture {
     /// *live*, still-recording engine's footprint) as the equivalent number
     /// for a trace that has already been stopped and handed to the caller.
     pub fn retained_trace_bytes(&self) -> u64 {
-        self.frames.iter().map(frame_capture_memory_usage).sum()
+        self.frames.iter().map(frame_capture_memory_usage).sum::<u64>()
+            + self.thumbnails.iter().map(|(_, thumbnail)| thumbnail.byte_size()).sum::<u64>()
+    }
+
+    /// Iterate over every periodic screenshot sample, oldest first. See
+    /// [`Thumbnail`]'s doc comment for the Phase 5 design this is part of.
+    /// Empty unless the session was started with
+    /// `CaptureOptions::capture_screenshots: true`.
+    pub fn thumbnails(&self) -> impl Iterator<Item = &(u64, Thumbnail)> {
+        self.thumbnails.iter()
+    }
+
+    /// The thumbnail whose timestamp is at-or-before `ns`, i.e. "what did the
+    /// window last look like as of this point in the recording" -- the query
+    /// a future scrubbing UI (hovering the flamegraph timeline, matching
+    /// Chrome DevTools' own filmstrip hover behavior) needs. Falls back to
+    /// the *earliest* available thumbnail when `ns` is before the first
+    /// sample (there is nothing "before" the recording started, so the
+    /// earliest sample is the closest thing that exists) rather than
+    /// returning `None` -- see [`nearest_thumbnail_index`]'s doc comment for
+    /// the exact tie-breaking rule this delegates to. Returns `None` only
+    /// when no thumbnail was ever captured this session.
+    pub fn thumbnail_near(&self, ns: u64) -> Option<&Thumbnail> {
+        nearest_thumbnail_index(&self.thumbnails, ns).map(|index| &self.thumbnails[index].1)
     }
 
     /// Aggregate mean/max statistics over the frames currently held in this
@@ -721,6 +751,17 @@ pub struct CaptureOptions {
     /// never allocates a `QuerySet`, so GPU capture is also zero-cost when
     /// unused.
     pub capture_gpu: bool,
+    /// Whether to periodically capture low-resolution thumbnails of the
+    /// window's rendered output, the same idea as Chrome DevTools'
+    /// Performance panel filmstrip (see the "Phase 5" section doc comment
+    /// near [`Thumbnail`] for the full design). Defaults to `false`: when
+    /// disabled, `WgpuRenderer::draw` never records a screenshot copy, never
+    /// allocates a readback staging buffer, and does no CPU-side downscale
+    /// work -- the entire feature costs one relaxed atomic load per frame
+    /// (the same `capture_enabled()` check every other capture facility in
+    /// this module already pays), matching this module's zero-overhead-
+    /// when-idle rule.
+    pub capture_screenshots: bool,
 }
 
 impl Default for CaptureOptions {
@@ -728,6 +769,7 @@ impl Default for CaptureOptions {
         Self {
             max_frames: 600,
             capture_gpu: true,
+            capture_screenshots: false,
         }
     }
 }
@@ -755,6 +797,7 @@ impl CaptureHandle {
             enabled: AtomicBool::new(false),
             full_draw_frame_count: self.state.full_draw_frames.load(Ordering::Relaxed),
             fast_path_frame_count: self.state.fast_path_frames.load(Ordering::Relaxed),
+            thumbnails: self.state.thumbnails.lock().clone(),
         }
     }
 
@@ -945,11 +988,42 @@ struct CaptureState {
     /// `record_frame_pacing` and `Capture::full_draw_frame_count`.
     full_draw_frames: AtomicU64,
     fast_path_frames: AtomicU64,
+    /// Whether this session wants periodic screenshot capture (Phase 5, see
+    /// [`Thumbnail`]'s doc comment). Mirrors `capture_gpu` above.
+    capture_screenshots: bool,
+    /// The [`thumbnail_sample_bucket`] of the most recently *requested*
+    /// thumbnail sample, or `u64::MAX` if none has been requested yet this
+    /// session. See [`should_sample_thumbnail_now`]'s doc comment for why
+    /// this is updated at request time rather than at readback-completion
+    /// time.
+    last_thumbnail_bucket: AtomicU64,
+    /// Completed periodic screenshot samples, timestamp-ordered (guaranteed
+    /// by construction: `should_sample_thumbnail_now` only ever claims a
+    /// strictly-later bucket than the last one claimed, and at most one
+    /// readback is ever in flight at a time -- see that function's and
+    /// `WgpuRenderer::draw`'s call site's doc comments -- so completions
+    /// can't arrive out of order). Copied into `Capture::thumbnails` at
+    /// `stop()` time, same as `finished_frames`.
+    thumbnails: parking_lot::Mutex<Vec<(u64, Thumbnail)>>,
 }
 
 const MAX_DIAGNOSTICS_PER_FRAME: usize = 4096;
 const MAX_PENDING_DIAGNOSTICS: usize = 8192;
 const MAX_PENDING_BACKGROUND_SPANS: usize = 131_072;
+/// Hard ceiling on how many thumbnails one capture session retains. Unlike
+/// `max_frames` (which bounds CPU/GPU span memory by *frame count*),
+/// thumbnails are sampled on a wall-clock cadence (`THUMBNAIL_SAMPLE_INTERVAL_NS`)
+/// and keep arriving for as long as the session runs, independent of how
+/// fast frames are being drawn -- so a very long recording needs its own
+/// bound to avoid unbounded growth. At the default 250ms interval and
+/// 160x100 RGBA8 thumbnails (`THUMBNAIL_WIDTH * THUMBNAIL_HEIGHT * 4` =
+/// 62,500 bytes each), 4096 samples is about 17 minutes of recording and
+/// roughly 256MB -- generous for this feature's purpose (a whole-session
+/// filmstrip a future viewer scrubs through) while still being a hard stop
+/// rather than truly unbounded growth. Oldest-first eviction, mirroring
+/// `pending_diagnostics`/`pending_background_spans`'s same bounded-queue
+/// shape elsewhere in this module.
+const MAX_THUMBNAILS_PER_CAPTURE: usize = 4096;
 
 #[derive(Default)]
 struct SpanNameTable {
@@ -1023,6 +1097,9 @@ impl CaptureState {
             span_names: parking_lot::Mutex::new(SpanNameTable::default()),
             full_draw_frames: AtomicU64::new(0),
             fast_path_frames: AtomicU64::new(0),
+            capture_screenshots: options.capture_screenshots,
+            last_thumbnail_bucket: AtomicU64::new(u64::MAX),
+            thumbnails: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -2009,7 +2086,9 @@ pub(crate) fn capture_engine_memory_usage() -> u64 {
         let pending_bytes = (state.pending_background_spans.lock().len() as u64)
             * (core::mem::size_of::<CpuSpan>() as u64);
         let frames_bytes: u64 = state.finished_frames.lock().iter().map(frame_capture_memory_usage).sum();
-        pending_bytes + frames_bytes
+        let thumbnail_bytes: u64 =
+            state.thumbnails.lock().iter().map(|(_, thumbnail)| thumbnail.byte_size()).sum();
+        pending_bytes + frames_bytes + thumbnail_bytes
     });
 
     thread_recorder_bytes + active_capture_bytes
@@ -2302,6 +2381,326 @@ pub fn take_completed_deep_capture() -> Option<DeepCapture> {
     COMPLETED_DEEP_CAPTURE.lock().take()
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5: periodic screenshot capture ("filmstrip").
+//
+// The UI-layer "Record" tab (`wgpui-component`, a different crate) visualizes
+// a `Capture` as a Chrome-DevTools-Performance-panel-style timeline. Chrome's
+// own timeline has a filmstrip -- small periodic screenshots of the page
+// across the recording, used for hover-scrubbing "what did the page look
+// like at this point in time." This section adds the WGPUI-side capture
+// mechanism for the equivalent feature: periodic low-resolution thumbnails of
+// a window's actual rendered output, retrievable afterward by timestamp. The
+// UI that displays them is explicitly out of scope here (a later, separate
+// piece of work in `wgpui-component`) -- this section is capture-engine only.
+//
+// Design decisions, and why:
+//
+// - **Periodic, not per-frame** (`THUMBNAIL_SAMPLE_INTERVAL_NS`). A thumbnail
+//   captured every single frame would (a) cost a full-resolution GPU->CPU
+//   readback 60+ times a second, dwarfing every other cost in this module,
+//   and (b) be pointless: a filmstrip's entire purpose is showing the
+//   *shape* of a recording at a glance, not per-frame fidelity (that's what
+//   the CPU/GPU span data is for). 250ms splits the difference Chrome itself
+//   settled on for its own filmstrip -- frequent enough that scrubbing a
+//   multi-second capture still feels responsive (4 samples/second), sparse
+//   enough that a multi-minute capture stays a small fraction of this
+//   module's other memory costs. See `MAX_THUMBNAILS_PER_CAPTURE`'s doc
+//   comment for the resulting memory math and the ring-buffer eviction that
+//   backstops it for very long recordings.
+//
+// - **Gated on the capture session's own elapsed time, not a second clock.**
+//   `should_sample_thumbnail_now` reuses `CaptureState::now_ns()` -- the same
+//   anchor-relative clock `FrameCapture::frame_start_ns` and every other
+//   timestamp in this module already use -- via `thumbnail_sample_bucket`.
+//   Bucketing (integer-dividing the current timestamp by the interval)
+//   rather than "has >= INTERVAL_NS passed since the last sample" means the
+//   cadence can't drift or double-fire if this function is ever polled more
+//   than once within the same interval: the bucket only changes once real
+//   elapsed time actually crosses the next interval boundary.
+//
+// - **160x100 RGBA8** (`THUMBNAIL_WIDTH`/`THUMBNAIL_HEIGHT`). Small enough
+//   that even `MAX_THUMBNAILS_PER_CAPTURE` samples (a very long recording)
+//   stays in the hundreds of megabytes rather than gigabytes, while still
+//   being large enough to recognize gross layout/content at a glance in a
+//   scrubbing UI -- these are thumbnails, not full frames, so exact aspect
+//   ratio is not preserved (a fixed-size downscale keeps every sample's
+//   dimensions uniform and its size predictable, which matters more for a
+//   memory-bounded ring-buffered feature than pixel-perfect proportions).
+//   RGBA8 matches [`DeepCaptureTextureContents`]'s own choice of format for
+//   the same reason: simple, well-understood, and what the rest of this
+//   renderer already uses for pixel data.
+//
+// - **Async poll-and-attach, not a blocking readback.** A full-resolution
+//   GPU->CPU copy is inherently latent (the same reason `GpuQueryManager`'s
+//   timestamp resolve and `DeepCaptureRecorder`'s buffer/texture readback are
+//   both non-blocking `map_async`+poll state machines rather than
+//   `device.poll(Wait)`). Blocking the render thread on a screenshot readback
+//   would stall every frame while one is in flight, which is exactly the
+//   failure mode this crate's whole flamegraph GPU-readback design (see
+//   `flamegraph_gpu.rs`'s module doc comment) exists to avoid. `WgpuRenderer`
+//   (in `platform/cross/renderer.rs`) stages the copy into a fresh staging
+//   buffer, submits, calls `begin_readback`, and polls non-blockingly on
+//   later `draw()` calls -- the exact same "kick off, poll, attach when
+//   ready" shape `DeepCapturePendingReadback` already uses, deliberately not
+//   a new concurrency pattern.
+//
+// - **Full-resolution readback + CPU-side downscale, not a GPU downscale
+//   pass.** `copy_texture_to_texture` (used elsewhere in `renderer.rs` for
+//   the backdrop-blur feature) requires matching source/destination sizes,
+//   so it cannot itself produce a smaller thumbnail. A GPU-side downscale
+//   would need a textured-quad render pass sampling the swapchain image --
+//   but the swapchain surface is configured with
+//   `RENDER_ATTACHMENT | COPY_SRC | COPY_DST` only (see `WgpuRenderer::new`),
+//   deliberately omitting `TEXTURE_BINDING`, so it cannot be bound as a
+//   shader-sampled texture without first copying it into a second
+//   full-resolution `TEXTURE_BINDING` texture -- at which point the "extra
+//   full-frame copy" cost has already been paid and a whole new pipeline/
+//   shader/bind-group/sampler has been added for what a `Vec<u8>` box filter
+//   accomplishes just as correctly. Since this only runs once per
+//   `THUMBNAIL_SAMPLE_INTERVAL_NS` rather than every frame, the extra PCIe
+//   bandwidth of reading back the full frame is immaterial next to the
+//   per-frame GPU span timestamp readback this crate already does
+//   continuously -- see `stage_thumbnail_readback` in `flamegraph_gpu.rs`
+//   for where this tradeoff is implemented.
+//
+// - **A separate parallel `Vec<(timestamp_ns, Thumbnail)>` on `Capture`, not
+//   a field on `FrameCapture`.** Sampling is periodic (every ~250ms, i.e.
+//   roughly once every several to tens of frames at typical frame rates),
+//   so a `FrameCapture` field would be `None` for the overwhelming majority
+//   of frames -- bloating every single `FrameCapture` (already held by the
+//   thousands across a session) with a field only ever populated in a small
+//   minority of them. A `Thumbnail`'s pixel data is also far larger (62,500
+//   bytes at the default resolution) than everything else on `FrameCapture`
+//   combined, so even an `Option` field's discriminant-only cost when
+//   `None` is the wrong tradeoff -- it's `Capture::retained_trace_bytes` and
+//   `capture_engine_memory_usage` that would need to account for it either
+//   way. A separate timestamp-ordered vector keeps `FrameCapture` exactly
+//   as it was and makes the "find the sample nearest a query timestamp"
+//   lookup (`nearest_thumbnail_index`) a simple, independently testable
+//   binary search over a flat, densely-packed array instead of a scan
+//   through the (much larger, mostly-`None`-for-this-purpose) frame ring
+//   buffer.
+
+/// One low-resolution, RGBA8 screenshot of a window's rendered output,
+/// captured periodically during a session started with
+/// `CaptureOptions::capture_screenshots: true`. See the "Phase 5" section
+/// doc comment above for the full design rationale (sample interval,
+/// resolution, format, and data-model choices).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Thumbnail {
+    /// Thumbnail width in pixels. Always [`THUMBNAIL_WIDTH`] today (every
+    /// sample is downscaled to the same fixed size), but recorded per-sample
+    /// rather than assumed, so a future change to the target resolution
+    /// doesn't silently misinterpret old in-memory samples.
+    pub width: u32,
+    /// Thumbnail height in pixels. See `width`'s doc comment.
+    pub height: u32,
+    /// Tightly packed RGBA8 pixel bytes, `width * height * 4` bytes,
+    /// row-major from the top-left -- no row padding (unlike the raw GPU
+    /// readback this is downscaled from, which does have
+    /// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` padding stripped out before it
+    /// ever reaches this type; see `flamegraph_gpu::stage_thumbnail_readback`).
+    pub rgba: Vec<u8>,
+}
+
+impl Thumbnail {
+    /// Heap bytes held by this thumbnail's pixel buffer. Used by
+    /// `Capture::retained_trace_bytes` and `capture_engine_memory_usage` so
+    /// this feature's footprint is visible in the same "how much is this
+    /// profiler holding onto" accounting every other capture facility in
+    /// this module already participates in.
+    fn byte_size(&self) -> u64 {
+        self.rgba.len() as u64
+    }
+}
+
+/// Fixed thumbnail width, in pixels. See the "Phase 5" section doc comment's
+/// resolution rationale.
+pub const THUMBNAIL_WIDTH: u32 = 160;
+/// Fixed thumbnail height, in pixels. See the "Phase 5" section doc comment's
+/// resolution rationale.
+pub const THUMBNAIL_HEIGHT: u32 = 100;
+
+/// How often (in capture-session elapsed time, i.e. the same anchor-relative
+/// clock as `FrameCapture::frame_start_ns`) a new thumbnail is sampled. See
+/// the "Phase 5" section doc comment's sample-interval rationale. `pub` (not
+/// `pub(crate)`) so an embedding app or future viewer can reason about
+/// expected filmstrip density without needing to count samples itself.
+pub const THUMBNAIL_SAMPLE_INTERVAL_NS: u64 = 250_000_000; // 250ms
+
+/// Which fixed-width `interval_ns` bucket `timestamp_ns` falls into. Pulled
+/// out as a pure, free function (independent of `ACTIVE_CAPTURE`/wall-clock
+/// time) precisely so the periodic-sampling cadence logic is unit-testable
+/// without a live capture session -- see this module's other GPU-independent
+/// pure helpers (e.g. `mean_max`, `gpu_timeline_summary`) for the same
+/// "pull the math out of the stateful call site" pattern.
+fn thumbnail_sample_bucket(timestamp_ns: u64, interval_ns: u64) -> u64 {
+    debug_assert!(interval_ns > 0, "an interval of zero would make every timestamp its own bucket");
+    timestamp_ns / interval_ns
+}
+
+/// Decide whether the render thread should kick off a new periodic
+/// thumbnail capture right now, claiming that sample's interval bucket if
+/// so. Returns `Some(now_ns)` -- the anchor-relative timestamp to tag the
+/// new sample with -- exactly when a capture is active, it requested
+/// `capture_screenshots: true`, and capture time has crossed into a new
+/// `THUMBNAIL_SAMPLE_INTERVAL_NS` bucket since the last *requested* sample
+/// (see `thumbnail_sample_bucket`). Returns `None` the rest of the time,
+/// including every call when `capture_screenshots` is `false` or no capture
+/// is active -- both cheap paths (a `capture_enabled()` atomic load, or that
+/// plus one more field read), matching this module's zero-overhead-when-idle
+/// rule.
+///
+/// This claims the bucket the moment it decides to request a sample, not
+/// once the corresponding GPU readback completes -- `flamegraph_gpu`'s
+/// readback can take a couple of frames (the same latency class as GPU span
+/// readback; see [`GpuSpan`]'s doc comment), and re-claiming the same bucket
+/// on every one of those in-between frames would be wrong. The render
+/// thread is expected to additionally skip calling this at all while a
+/// previous thumbnail readback is still in flight (see
+/// `WgpuRenderer::draw`'s call site), since this function has no visibility
+/// into wgpu-side readback state -- only one thumbnail capture is ever
+/// in-flight at a time, mirroring `DeepCapture`'s own "no stacking" rule.
+pub(crate) fn should_sample_thumbnail_now() -> Option<u64> {
+    if !capture_enabled() {
+        return None;
+    }
+    let state = ACTIVE_CAPTURE.lock().as_ref().cloned()?;
+    if !state.capture_screenshots {
+        return None;
+    }
+    let now_ns = state.now_ns();
+    let bucket = thumbnail_sample_bucket(now_ns, THUMBNAIL_SAMPLE_INTERVAL_NS);
+    let previous_bucket = state.last_thumbnail_bucket.swap(bucket, Ordering::AcqRel);
+    if previous_bucket == bucket {
+        return None;
+    }
+    Some(now_ns)
+}
+
+/// Attach a completed thumbnail readback to the active capture, if one is
+/// still running. Called by `flamegraph_gpu`'s pending-readback poll once a
+/// periodic screenshot's GPU->CPU copy has resolved -- the async counterpart
+/// to `should_sample_thumbnail_now`'s synchronous "should we start one"
+/// decision, the same relationship `attach_gpu_spans` has to
+/// `open_frame_cpu_side`/`close_frame_cpu_side`.
+///
+/// If the capture has since stopped (`ACTIVE_CAPTURE` is empty by the time
+/// this readback resolves), the thumbnail is silently dropped -- there is
+/// nothing left to attach it to, exactly like `attach_gpu_spans` silently
+/// no-ops when the owning frame has already been evicted or the session
+/// stopped.
+pub(crate) fn attach_thumbnail(timestamp_ns: u64, thumbnail: Thumbnail) {
+    if let Some(state) = ACTIVE_CAPTURE.lock().as_ref() {
+        let mut thumbnails = state.thumbnails.lock();
+        if thumbnails.len() >= MAX_THUMBNAILS_PER_CAPTURE {
+            thumbnails.remove(0);
+        }
+        thumbnails.push((timestamp_ns, thumbnail));
+    }
+}
+
+/// Downscale a tightly packed RGBA8 image to `dst_width x dst_height` using a
+/// box filter: each destination pixel is the average of the (possibly
+/// multi-pixel) source rectangle it covers. Chosen over nearest-neighbor
+/// because a screenshot's source resolution is typically many times the
+/// thumbnail's target size, and nearest-neighbor sampling at that ratio
+/// would alias badly (dropping most source pixels rather than blending
+/// them) -- a box filter is barely more code and gives a much more legible
+/// thumbnail. Pure and free of any wgpu/GPU dependency (unlike the row-
+/// padding-stripping and BGRA/RGBA channel-order normalization this is
+/// paired with in `flamegraph_gpu::stage_thumbnail_readback`, which do need
+/// GPU-format knowledge), so it's unit-testable with plain in-memory buffers
+/// -- see this module's other pure free functions for the same reasoning.
+///
+/// Returns an all-zero buffer of the requested destination size if `src` is
+/// degenerate (zero width or height) rather than panicking; a malformed
+/// screenshot should produce a blank thumbnail, not bring down the render
+/// thread.
+pub(crate) fn downscale_rgba8_box_filter(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_width as usize) * (dst_height as usize) * 4];
+    if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
+        return dst;
+    }
+    debug_assert!(
+        src.len() >= (src_width as usize) * (src_height as usize) * 4,
+        "src must hold at least src_width * src_height RGBA8 pixels"
+    );
+
+    for dst_y in 0..dst_height {
+        let src_y0 = (dst_y as u64 * src_height as u64 / dst_height as u64) as u32;
+        let src_y1 = (((dst_y as u64 + 1) * src_height as u64).div_ceil(dst_height as u64) as u32)
+            .max(src_y0 + 1)
+            .min(src_height);
+
+        for dst_x in 0..dst_width {
+            let src_x0 = (dst_x as u64 * src_width as u64 / dst_width as u64) as u32;
+            let src_x1 = (((dst_x as u64 + 1) * src_width as u64).div_ceil(dst_width as u64) as u32)
+                .max(src_x0 + 1)
+                .min(src_width);
+
+            let mut sum = [0u64; 4];
+            let mut count = 0u64;
+            for src_y in src_y0..src_y1 {
+                let row_start = (src_y as usize) * (src_width as usize) * 4;
+                for src_x in src_x0..src_x1 {
+                    let pixel_start = row_start + (src_x as usize) * 4;
+                    for channel in 0..4 {
+                        sum[channel] += src[pixel_start + channel] as u64;
+                    }
+                    count += 1;
+                }
+            }
+
+            let dst_start = ((dst_y as usize) * (dst_width as usize) + dst_x as usize) * 4;
+            if count > 0 {
+                for channel in 0..4 {
+                    dst[dst_start + channel] = (sum[channel] / count) as u8;
+                }
+            }
+        }
+    }
+
+    dst
+}
+
+/// The thumbnail sample whose timestamp is at-or-before `query_ns`, or (if
+/// `query_ns` is before every sample) the earliest sample -- see
+/// `Capture::thumbnail_near`'s doc comment for why "at-or-before, falling
+/// back to earliest" is the right rule for a scrubbing UI. Pulled out as a
+/// pure function over a plain `&[(u64, Thumbnail)]` slice, independent of
+/// `Capture` itself, so the lookup logic is unit-testable with a handful of
+/// synthetic samples instead of needing a real capture session -- matching
+/// how `wgpui-component`'s `profiler/record/overview.rs` (a sibling crate,
+/// not this one) pulls its own timeline math out into small pure functions
+/// for the same reason.
+///
+/// Assumes `samples` is sorted ascending by timestamp, which
+/// `CaptureState::thumbnails`'s own doc comment establishes is always true
+/// for the vector this is actually called with.
+fn nearest_thumbnail_index(samples: &[(u64, Thumbnail)], query_ns: u64) -> Option<usize> {
+    if samples.is_empty() {
+        return None;
+    }
+    // First index whose timestamp is strictly after the query -- everything
+    // before it is at-or-before `query_ns`.
+    let first_after = samples.partition_point(|(timestamp, _)| *timestamp <= query_ns);
+    Some(if first_after == 0 {
+        // Every sample is after the query (it predates the first one
+        // captured); the earliest sample is the closest thing that exists.
+        0
+    } else {
+        first_after - 1
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2490,6 +2889,7 @@ mod tests {
         let handle = start_capture(CaptureOptions {
             max_frames: 8,
             capture_gpu: false,
+            capture_screenshots: false,
         })
         .expect("no other capture should be active in this test process at this point");
 
@@ -2645,6 +3045,7 @@ mod tests {
         let empty_handle = start_capture(CaptureOptions {
             max_frames: 8,
             capture_gpu: false,
+            capture_screenshots: false,
         })
         .expect("the capture above was already stopped, so starting a new one here should succeed");
         let empty_capture = empty_handle.stop();
@@ -2669,6 +3070,7 @@ mod tests {
         let handle = start_capture(CaptureOptions {
             max_frames: 4,
             capture_gpu: false,
+            capture_screenshots: false,
         })
         .expect("no other capture should be active in this test process at this point");
 
@@ -2704,6 +3106,7 @@ mod tests {
         let handle = start_capture(CaptureOptions {
             max_frames: 4,
             capture_gpu: false,
+            capture_screenshots: false,
         })
         .expect("no other capture should be active in this test process at this point");
 
@@ -2825,6 +3228,234 @@ mod tests {
         assert!(
             take_completed_deep_capture().is_none(),
             "taking the completed capture should clear the mailbox, so a second take is empty"
+        );
+    }
+
+    // Phase 5 (periodic screenshot capture / "filmstrip"): everything below
+    // is pure and GPU-independent -- the actual GPU readback/downscale
+    // pipeline (`stage_thumbnail_readback`, `PendingThumbnailReadback`) lives
+    // in `flamegraph_gpu.rs` and is covered by its own test module (it needs
+    // a real `wgpu::Device`), mirroring how `DeepCapture`'s recording/
+    // readback is split the same way between the two modules.
+
+    #[test]
+    fn thumbnail_sample_bucket_groups_timestamps_into_fixed_width_intervals() {
+        let interval = 250_000_000u64; // 250ms, matches THUMBNAIL_SAMPLE_INTERVAL_NS
+        assert_eq!(thumbnail_sample_bucket(0, interval), 0, "the very first instant is bucket 0");
+        assert_eq!(thumbnail_sample_bucket(1, interval), 0, "just after the anchor is still bucket 0");
+        assert_eq!(
+            thumbnail_sample_bucket(interval - 1, interval),
+            0,
+            "one nanosecond before the boundary is still bucket 0"
+        );
+        assert_eq!(
+            thumbnail_sample_bucket(interval, interval),
+            1,
+            "exactly on the boundary rolls over to the next bucket"
+        );
+        assert_eq!(thumbnail_sample_bucket(interval + 1, interval), 1);
+        assert_eq!(
+            thumbnail_sample_bucket(10 * interval, interval),
+            10,
+            "buckets should keep advancing linearly, not saturate or wrap"
+        );
+    }
+
+    fn test_thumbnail(marker: u8) -> Thumbnail {
+        Thumbnail { width: 1, height: 1, rgba: vec![marker, marker, marker, 255] }
+    }
+
+    #[test]
+    fn nearest_thumbnail_index_finds_the_sample_at_or_before_the_query() {
+        let samples = vec![(100u64, test_thumbnail(1)), (200, test_thumbnail(2)), (300, test_thumbnail(3))];
+
+        assert_eq!(
+            nearest_thumbnail_index(&samples, 0),
+            Some(0),
+            "a query before the first sample falls back to the earliest sample"
+        );
+        assert_eq!(
+            nearest_thumbnail_index(&samples, 99),
+            Some(0),
+            "still before the first sample"
+        );
+        assert_eq!(
+            nearest_thumbnail_index(&samples, 100),
+            Some(0),
+            "exactly on a sample's own timestamp should return that sample"
+        );
+        assert_eq!(
+            nearest_thumbnail_index(&samples, 150),
+            Some(0),
+            "between two samples should return the earlier (at-or-before) one, not round to nearest"
+        );
+        assert_eq!(nearest_thumbnail_index(&samples, 200), Some(1));
+        assert_eq!(nearest_thumbnail_index(&samples, 250), Some(1));
+        assert_eq!(nearest_thumbnail_index(&samples, 300), Some(2));
+        assert_eq!(
+            nearest_thumbnail_index(&samples, 10_000),
+            Some(2),
+            "a query after the last sample returns the most recent one"
+        );
+    }
+
+    #[test]
+    fn nearest_thumbnail_index_returns_none_for_an_empty_slice() {
+        assert_eq!(nearest_thumbnail_index(&[], 12345), None);
+    }
+
+    #[test]
+    fn downscale_rgba8_box_filter_preserves_a_uniform_color() {
+        // A box filter averaging a constant color should reproduce that
+        // exact color at every destination pixel -- the simplest possible
+        // correctness check that doesn't depend on rounding behavior.
+        let src_width = 32;
+        let src_height = 20;
+        let color = [12u8, 200, 40, 255];
+        let src: Vec<u8> = color.iter().copied().cycle().take((src_width * src_height * 4) as usize).collect();
+
+        let downscaled = downscale_rgba8_box_filter(&src, src_width, src_height, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
+
+        assert_eq!(downscaled.len(), (THUMBNAIL_WIDTH * THUMBNAIL_HEIGHT * 4) as usize);
+        assert!(
+            downscaled.chunks_exact(4).all(|pixel| pixel == color),
+            "every destination pixel should exactly reproduce the uniform source color"
+        );
+    }
+
+    #[test]
+    fn downscale_rgba8_box_filter_averages_a_known_2x2_block_into_1x1() {
+        // Four distinct pixels, each a different single-channel value in a
+        // different RGBA slot, laid out as a 2x2 image:
+        //   (0,0)=[40,0,0,0]   (1,0)=[0,60,0,0]
+        //   (0,1)=[0,0,80,0]   (1,1)=[0,0,0,100]
+        // Downscaling to 1x1 should average all four into one pixel.
+        #[rustfmt::skip]
+        let src: [u8; 16] = [
+            40, 0, 0, 0,     0, 60, 0, 0,
+            0, 0, 80, 0,     0, 0, 0, 100,
+        ];
+
+        let downscaled = downscale_rgba8_box_filter(&src, 2, 2, 1, 1);
+
+        assert_eq!(downscaled, vec![10, 15, 20, 25], "each channel should be the mean of the four source pixels");
+    }
+
+    #[test]
+    fn downscale_rgba8_box_filter_handles_degenerate_source_without_panicking() {
+        let downscaled = downscale_rgba8_box_filter(&[], 0, 0, THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
+        assert_eq!(downscaled.len(), (THUMBNAIL_WIDTH * THUMBNAIL_HEIGHT * 4) as usize);
+        assert!(downscaled.iter().all(|&byte| byte == 0), "a degenerate source should produce an all-zero thumbnail");
+    }
+
+    #[test]
+    fn should_sample_thumbnail_now_respects_the_opt_in_flag() {
+        // `capture_screenshots: false` should never sample, regardless of
+        // timing -- checked first, before the opted-in case below, so this
+        // assertion can't accidentally pass because a previous test in this
+        // process happened to leave a screenshot-enabled session active
+        // (only one flamegraph capture may be active process-wide).
+        let handle = start_capture(CaptureOptions {
+            max_frames: 4,
+            capture_gpu: false,
+            capture_screenshots: false,
+        })
+        .expect("no other capture should be active in this test process at this point");
+        assert!(
+            should_sample_thumbnail_now().is_none(),
+            "capture_screenshots: false must never sample"
+        );
+        handle.stop();
+    }
+
+    #[test]
+    fn should_sample_thumbnail_now_fires_on_the_first_poll_and_attaches_via_capture_thumbnail_near() {
+        let handle = start_capture(CaptureOptions {
+            max_frames: 4,
+            capture_gpu: false,
+            capture_screenshots: true,
+        })
+        .expect("no other capture should be active in this test process at this point");
+
+        // The very first poll after starting a screenshot-enabled session
+        // should claim bucket 0 immediately (mirrors Chrome's own filmstrip
+        // capturing a frame near recording start, not waiting a full
+        // interval first).
+        let first_ns = should_sample_thumbnail_now();
+        assert!(first_ns.is_some(), "the first poll should always claim a sample");
+
+        // `attach_thumbnail` (normally called once `flamegraph_gpu`'s async
+        // readback resolves) is exercised directly here since this test has
+        // no real wgpu device -- it's the same mailbox either way.
+        attach_thumbnail(first_ns.unwrap(), test_thumbnail(7));
+        attach_thumbnail(first_ns.unwrap() + 1, test_thumbnail(8));
+
+        let capture = handle.stop();
+        let thumbnails: Vec<&(u64, Thumbnail)> = capture.thumbnails().collect();
+        assert_eq!(thumbnails.len(), 2);
+        assert_eq!(
+            capture.thumbnail_near(first_ns.unwrap()).map(|thumbnail| thumbnail.rgba[0]),
+            Some(7),
+            "a query exactly at the first sample's timestamp should return that sample"
+        );
+        assert_eq!(
+            capture.thumbnail_near(0).map(|thumbnail| thumbnail.rgba[0]),
+            Some(7),
+            "a query before the first sample falls back to the earliest one"
+        );
+        assert_eq!(
+            capture.thumbnail_near(u64::MAX).map(|thumbnail| thumbnail.rgba[0]),
+            Some(8),
+            "a query after every sample returns the most recent one"
+        );
+    }
+
+    #[test]
+    fn attach_thumbnail_enforces_the_per_capture_ceiling_with_oldest_first_eviction() {
+        let handle = start_capture(CaptureOptions {
+            max_frames: 4,
+            capture_gpu: false,
+            capture_screenshots: true,
+        })
+        .expect("no other capture should be active in this test process at this point");
+
+        // One more than the ceiling: the oldest (timestamp 0) should be
+        // evicted, leaving exactly `MAX_THUMBNAILS_PER_CAPTURE` samples
+        // starting from timestamp 1.
+        for timestamp_ns in 0..=(MAX_THUMBNAILS_PER_CAPTURE as u64) {
+            attach_thumbnail(timestamp_ns, test_thumbnail(1));
+        }
+
+        let capture = handle.stop();
+        let thumbnails: Vec<&(u64, Thumbnail)> = capture.thumbnails().collect();
+        assert_eq!(thumbnails.len(), MAX_THUMBNAILS_PER_CAPTURE);
+        assert_eq!(
+            thumbnails.first().map(|(timestamp, _)| *timestamp),
+            Some(1),
+            "the oldest sample (timestamp 0) should have been evicted to stay at the ceiling"
+        );
+        assert_eq!(thumbnails.last().map(|(timestamp, _)| *timestamp), Some(MAX_THUMBNAILS_PER_CAPTURE as u64));
+    }
+
+    #[test]
+    fn thumbnail_byte_size_and_retained_trace_bytes_account_for_thumbnails() {
+        let handle = start_capture(CaptureOptions {
+            max_frames: 4,
+            capture_gpu: false,
+            capture_screenshots: true,
+        })
+        .expect("no other capture should be active in this test process at this point");
+
+        let thumbnail = Thumbnail { width: 2, height: 2, rgba: vec![0u8; 16] };
+        assert_eq!(thumbnail.byte_size(), 16);
+        attach_thumbnail(0, thumbnail.clone());
+        attach_thumbnail(THUMBNAIL_SAMPLE_INTERVAL_NS, thumbnail);
+
+        let capture = handle.stop();
+        assert_eq!(
+            capture.retained_trace_bytes(),
+            32,
+            "an otherwise-empty capture's retained bytes should be exactly the sum of its thumbnails' pixel buffers"
         );
     }
 }
