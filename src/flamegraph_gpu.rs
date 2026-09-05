@@ -121,7 +121,30 @@ impl QueryGeneration {
     /// earlier frame's GPU spans are dropped rather than blocking here —
     /// `FrameCapture::gpu_spans_finalized` simply stays false for it forever,
     /// which a viewer can treat the same as "never arrived".
+    ///
+    /// Critically, "dropped" only actually happens when it's safe to: while
+    /// `state == MapPending`, `self.staging_buffer` may *still be mapped* —
+    /// the async `map_async` this generation's own `begin_readback` kicked
+    /// off hasn't necessarily resolved yet (`try_harvest`, which calls
+    /// `unmap()`, only runs once `map_ready` flips). Overwriting `state` to
+    /// `Recording` unconditionally here used to let the caller believe this
+    /// generation was ready to record a fresh frame into — `resolve` would
+    /// then record a `copy_buffer_to_buffer` that targets a buffer wgpu
+    /// still considers mapped, which surfaces (not at record time, but
+    /// later, opaquely) as a `Queue::submit` validation panic
+    /// ("Buffer ... is still mapped"). So: if a previous readback is still
+    /// genuinely in flight, this call is a no-op — the generation stays
+    /// `MapPending` (and thus unusable by `reserve_pair`/`resolve`, both of
+    /// which already require `state == Recording`/`Resolving`) until a later
+    /// frame's `GpuQueryManager::poll_readback` observes `map_ready` and
+    /// `try_harvest` actually unmaps it. This frame (and every frame until
+    /// that happens) simply captures no GPU spans in this slot, rather than
+    /// corrupting the buffer — the exact "drop it, don't block" tradeoff
+    /// this comment already documented, now actually implemented safely.
     fn reset_for_frame(&mut self, frame_index: u64) {
+        if self.state == GenerationState::MapPending {
+            return;
+        }
         self.pending_labels.clear();
         self.frame_index = frame_index;
         self.state = GenerationState::Recording;
@@ -1580,6 +1603,105 @@ mod tests {
     /// all, only the CPU-side `frame_start_ns`/`frame_end_ns` (drawing, not
     /// GPU submission) and the calibrated (inferred, not directly observed)
     /// `GpuSpan` timestamps.
+    /// Regression test for a real crash: if a generation's readback is still
+    /// in flight (`MapPending`) when the triple-buffer rotation wraps back
+    /// around to it (`GENERATION_COUNT` frames later), `begin_frame` used to
+    /// reset it unconditionally, and a subsequent `finish_frame` would then
+    /// record a `copy_buffer_to_buffer` targeting a `staging_buffer` wgpu
+    /// still considered mapped -- surfacing later, opaquely, as a
+    /// `Queue::submit` validation panic ("Buffer ... is still mapped").
+    /// Deliberately never calls `poll_readback` between staging the readback
+    /// and wrapping back around to it, so the generation's map genuinely
+    /// stays pending (wgpu only resolves `map_async` callbacks when the
+    /// device is polled) -- exercising the exact "readback fell behind"
+    /// scenario `reset_for_frame`'s own doc comment describes, but that
+    /// this test now proves is handled *safely* rather than just
+    /// documented as an aspiration.
+    #[test]
+    fn begin_frame_does_not_reset_a_generation_whose_readback_is_still_pending() {
+        let required = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let Some((device, queue)) = create_headless_device_with_features(required) else {
+            eprintln!(
+                "skipping begin_frame_does_not_reset_a_generation_whose_readback_is_still_pending: \
+                 no wgpu adapter available in this environment"
+            );
+            return;
+        };
+
+        let handle = flamegraph::start_capture(flamegraph::CaptureOptions {
+            max_frames: 8,
+            capture_gpu: true,
+            capture_screenshots: false,
+        })
+        .expect("no other capture should be active in this test process");
+
+        let mut manager_slot: Option<GpuQueryManager> = None;
+        sync_with_active_capture(&mut manager_slot, &device, &queue);
+        let manager = manager_slot.as_mut().expect("capture_gpu: true should allocate a manager");
+
+        // Frame 1: give generation 0 (index (0+1)%3 = 1, see `begin_frame`)
+        // real work and start its async readback -- then, critically, never
+        // poll it to completion.
+        manager.begin_frame(1);
+        let reserved = manager
+            .reserve_pair(SpanName::Static("pending_forever"), GpuPassKind::Main)
+            .expect("first reservation in a freshly-begun frame should always succeed");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.write_timestamp(reserved.query_set(), reserved.begin_index());
+        encoder.write_timestamp(reserved.query_set(), reserved.end_index());
+        manager.finish_frame(&mut encoder);
+        queue.submit(Some(encoder.finish()));
+        manager.begin_readback();
+        let pending_generation = manager.current;
+        assert_eq!(
+            manager.generations[pending_generation].state,
+            GenerationState::MapPending,
+            "begin_readback should have moved this generation to MapPending"
+        );
+
+        // Frames 2 and 3: advance through the other two generations with no
+        // GPU work of their own (an empty frame is a legitimate, common
+        // case -- `resolve` itself already no-ops when nothing was
+        // reserved). Deliberately no `poll_readback` call anywhere in this
+        // loop.
+        manager.begin_frame(2);
+        manager.begin_frame(3);
+
+        // Frame 4: the rotation wraps back to `pending_generation`. Before
+        // the fix, this would silently stomp its state to `Recording`; now
+        // it should be refused and the generation should still be exactly
+        // where `begin_readback` left it.
+        manager.begin_frame(4);
+        assert_eq!(
+            manager.current, pending_generation,
+            "GENERATION_COUNT (3) frames after claiming a generation, the round-robin should land \
+             back on it"
+        );
+        assert_eq!(
+            manager.generations[pending_generation].state,
+            GenerationState::MapPending,
+            "a generation whose readback hasn't completed must not be reset out from under it"
+        );
+
+        // The real proof: recording and submitting this "frame 4" must not
+        // panic. Before the fix, `finish_frame` would (incorrectly, since
+        // `reset_for_frame` had wrongly flipped `state` to `Recording`)
+        // record a fresh copy into the still-mapped staging buffer, and
+        // this `queue.submit` would be where wgpu's validation panic fired.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        manager.finish_frame(&mut encoder);
+        queue.submit(Some(encoder.finish()));
+
+        // Let the original readback actually finish before the capture
+        // (and its `Arc<AtomicBool>` the map_async callback still holds)
+        // gets torn down.
+        for _ in 0..20 {
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            manager.poll_readback(&device);
+        }
+        drop(handle.stop());
+    }
+
     #[test]
     fn gpu_query_manager_records_cpu_submit_and_fence_observed_instants() {
         let required = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
