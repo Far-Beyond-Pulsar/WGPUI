@@ -3762,11 +3762,109 @@ impl WgpuRenderer {
         }
     }
 
-    /// Present without running compositor (fast blit already updated swapchain)
+    /// Present the already-composited `persistent_framebuffer` into the
+    /// swapchain image acquired for *this* frame, without re-running the
+    /// compositor. This is the "nothing changed, but the platform still
+    /// wants a fresh present" path -- see `on_request_frame`'s `needs_present`
+    /// branch in `window.rs`, which takes it to avoid underclocking the
+    /// display for up to a second after the last real activity.
+    ///
+    /// This used to be a pure no-op ("when we implement persistent
+    /// framebuffer properly, this will blit framebuffer → swapchain" --
+    /// never implemented). `persistent_framebuffer` genuinely holds the last
+    /// real frame's fully composited content (the main draw path always
+    /// renders into it, then blits it into whichever swapchain image was
+    /// current that frame -- see the `copy_texture_to_texture` a few
+    /// hundred lines up in `draw`), but with this a no-op, that content
+    /// never reached the image *this* call acquires. With more than one
+    /// swapchain image in flight, every `present_framebuffer_only` frame
+    /// left its acquired image untouched and unpresented, so idle stretches
+    /// only ever showed real content on the frame a full draw actually ran
+    /// (e.g. once per cursor-blink tick) and went blank the rest of the
+    /// time -- reported as the editor/compile-history content "flickering
+    /// in and out" while idle, but staying solid while scrolling (which
+    /// keeps the invalidator dirty every frame, so the full draw path always
+    /// runs instead of this one).
     pub fn present_framebuffer_only(&self) {
-        // NOTE: Fast blit already presented to swapchain, so this is a no-op
-        // When we implement persistent framebuffer properly, this will blit framebuffer → swapchain
-        log::debug!("Present framebuffer only (no compositor) - fast blit already presented");
+        let Some(persistent_framebuffer) = self.persistent_framebuffer.as_ref() else {
+            log::debug!("present_framebuffer_only: no persistent framebuffer yet, skipping");
+            return;
+        };
+        let fb_size = persistent_framebuffer.size();
+        if fb_size.width != self.surface_configuration.width
+            || fb_size.height != self.surface_configuration.height
+        {
+            // Mid-resize race: `update_drawable_size` hasn't recreated the
+            // persistent framebuffer at the new size yet. Skip rather than
+            // hand `copy_texture_to_texture` mismatched extents; the next
+            // real draw (resize itself invalidates) will catch up.
+            log::debug!(
+                "present_framebuffer_only: persistent framebuffer size {}x{} does not match \
+                 surface {}x{}, skipping",
+                fb_size.width,
+                fb_size.height,
+                self.surface_configuration.width,
+                self.surface_configuration.height
+            );
+            return;
+        }
+
+        let surface_texture = match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(t) | CurrentSurfaceTexture::Suboptimal(t) => t,
+            CurrentSurfaceTexture::Outdated
+            | CurrentSurfaceTexture::Lost
+            | CurrentSurfaceTexture::Validation => {
+                self.reconfigure_surface();
+                match self.surface.get_current_texture() {
+                    CurrentSurfaceTexture::Success(t) | CurrentSurfaceTexture::Suboptimal(t) => t,
+                    other => {
+                        log::warn!(
+                            "present_framebuffer_only: failed to acquire swap chain texture \
+                             after reconfigure: {:?}",
+                            other
+                        );
+                        return;
+                    }
+                }
+            }
+            CurrentSurfaceTexture::Timeout => {
+                log::warn!("present_framebuffer_only: swap chain acquire timed out");
+                return;
+            }
+            CurrentSurfaceTexture::Occluded => {
+                log::warn!("present_framebuffer_only: swap chain acquire occluded");
+                return;
+            }
+        };
+
+        let mut encoder = self
+            .context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("present_framebuffer_only blit"),
+            });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: persistent_framebuffer,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &surface_texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.surface_configuration.width,
+                height: self.surface_configuration.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.context.queue.submit(Some(encoder.finish()));
+        self.context.queue.present(surface_texture);
+        log::debug!("present_framebuffer_only: blitted persistent framebuffer to swapchain");
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
