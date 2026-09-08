@@ -354,6 +354,7 @@ impl Platform for CrossPlatform {
             wgpu_context: self.wgpu_context.clone(),
             wgpu_options: WgpuOptions {
                 additional_features: self.wgpu_options.additional_features,
+                desired_maximum_frame_latency: self.wgpu_options.desired_maximum_frame_latency,
             },
             proxy: self.event_loop_proxy.clone(),
         };
@@ -1233,6 +1234,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 let wgpu_ctx = self.wgpu_context.clone();
                 let wgpu_opts = WgpuOptions {
                     additional_features: self.wgpu_options.additional_features,
+                    desired_maximum_frame_latency: self.wgpu_options.desired_maximum_frame_latency,
                 };
                 let proxy = self.proxy.clone();
                 // Use setTimeout(0) instead of spawn_local because winit's
@@ -1241,6 +1243,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     let wgpu_ctx = wgpu_ctx.clone();
                     let wgpu_opts_clone = WgpuOptions {
                         additional_features: wgpu_opts.additional_features,
+                        desired_maximum_frame_latency: wgpu_opts.desired_maximum_frame_latency,
                     };
                     move || {
                         web_sys::console::log_1(&"WGPUI: async WGPU init starting via setTimeout".into());
