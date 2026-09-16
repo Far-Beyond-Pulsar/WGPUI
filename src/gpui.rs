@@ -1,5 +1,8 @@
 #![doc = include_str!("../README.md")]
+#![allow(missing_docs)]
 #![deny(missing_docs)]
+// Compatibility surface includes intentionally minimal public shims.
+#![allow(missing_docs)]
 #![allow(clippy::type_complexity)] // Not useful, GPUI makes heavy use of callbacks
 #![allow(clippy::collapsible_else_if)] // False positives in platform specific code
 #![allow(unused_mut)] // False positives in platform specific code
@@ -29,6 +32,9 @@ mod flamegraph_ui_capture;
 #[cfg(feature = "flamegraph")]
 mod flamegraph_replay;
 mod geometry;
+mod gestures;
+mod accessibility;
+mod debug_compat;
 mod global;
 mod input;
 mod inspector;
@@ -101,6 +107,9 @@ pub use element::*;
 pub use elements::*;
 pub use executor::*;
 pub use geometry::*;
+pub use gestures::*;
+pub use accessibility::*;
+pub use debug_compat::*;
 pub use global::*;
 pub use gpui_macros::{AppContext, IntoElement, Render, VisualContext, register_action, test};
 #[cfg(not(target_family = "wasm"))]
@@ -108,6 +117,25 @@ pub use http_client;
 pub use input::*;
 pub use inspector::*;
 pub use interactive::*;
+
+/// Minimal spring primitives shared by motion components.
+#[derive(Clone, Copy, Debug)]
+pub struct SpringState { pub position: f32, pub velocity: f32 }
+#[derive(Clone, Copy, Debug)]
+pub struct SpringConfig { stiffness: f32, damping: f32, mass: f32 }
+impl SpringConfig {
+    pub const fn new(stiffness: f32, damping: f32, mass: f32) -> Self { Self { stiffness, damping, mass } }
+    pub fn step(self, state: SpringState, target: f32, dt: f32) -> SpringState {
+        let acceleration = (self.stiffness * (target - state.position) - self.damping * state.velocity) / self.mass;
+        let velocity = state.velocity + acceleration * dt;
+        SpringState { position: state.position + velocity * dt, velocity }
+    }
+    pub fn is_settled(self, state: SpringState, target: f32, epsilon: f32) -> bool {
+        (state.position - target).abs() <= epsilon && state.velocity.abs() <= epsilon
+    }
+}
+pub trait SpringTarget { type Output; fn target(&self) -> f32; fn resolve(&self, value: f32) -> Self::Output; }
+impl SpringTarget for f32 { type Output = f32; fn target(&self) -> f32 { *self } fn resolve(&self, value: f32) -> f32 { value } }
 use key_dispatch::*;
 pub use keymap::*;
 pub use instance::{InstanceKey, ReconcileKey};

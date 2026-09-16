@@ -73,7 +73,13 @@ struct StateInner {
     scrollbar_drag_start_height: Option<Pixels>,
     measuring_behavior: ListMeasuringBehavior,
     smooth_scroll: SmoothScrollState,
+    follow_mode: FollowMode,
 }
+
+/// Controls whether a list follows its tail as content is appended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum FollowMode { #[default] None, Tail }
 
 /// Whether the list is scrolling from top to bottom or bottom to top.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,9 +234,29 @@ impl ListState {
             scrollbar_drag_start_height: None,
             measuring_behavior: ListMeasuringBehavior::default(),
             smooth_scroll: SmoothScrollState::default(),
+            follow_mode: FollowMode::None,
         })));
         this.splice(0..0, item_count);
         this
+    }
+
+    /// Mark all cached item measurements stale.
+    pub fn remeasure(&self) { let mut state = self.0.borrow_mut(); state.measuring_behavior.reset(); state.reset = true; }
+
+    /// Mark a range of item measurements stale. The current implementation safely
+    /// invalidates the complete cache; this preserves correctness for dynamic rows.
+    pub fn remeasure_items(&self, _range: Range<usize>) { self.remeasure(); }
+
+    /// Request that the next layout place the list at its tail.
+    pub fn scroll_to_end(&self) { let mut s=self.0.borrow_mut(); s.logical_scroll_top=Some(ListOffset { item_ix: s.items.summary().count, offset_in_item: Pixels::ZERO }); s.follow_mode=FollowMode::Tail; }
+    /// Set the list's tail-following policy.
+    pub fn set_follow_mode(&self, mode: FollowMode) { self.0.borrow_mut().follow_mode=mode; }
+    /// Returns whether the list is configured to keep the logical tail visible.
+    pub fn is_following_tail(&self) -> bool { self.0.borrow().follow_mode == FollowMode::Tail }
+    /// Returns whether the current logical position is at the end of the list.
+    pub fn is_scrolled_to_end(&self) -> Option<bool> {
+        let state = self.0.borrow();
+        Some(state.logical_scroll_top.map_or(true, |offset| offset.item_ix >= state.items.summary().count))
     }
 
     /// Set the list to measure all items in the list in the first layout phase.

@@ -77,6 +77,7 @@ mod conditional {
         /// CPU+GPU flamegraph/profiler panel, backed by the `flamegraph` capture engine.
         #[cfg(feature = "flamegraph")]
         Profiler,
+        Utilities,
     }
 
     impl InspectorTab {
@@ -102,6 +103,7 @@ mod conditional {
                 InspectorTab::EventListeners => "Listeners",
                 #[cfg(feature = "flamegraph")]
                 InspectorTab::Profiler => "Profiler",
+                InspectorTab::Utilities => "Utilities",
             }
         }
     }

@@ -40,6 +40,14 @@ impl Animation {
         self
     }
 
+    /// Set the animation to repeat using the shared animation clock.
+    ///
+    /// Pulsar currently uses the same frame clock for all animations, so this
+    /// is an additive compatibility API equivalent to [`Animation::repeat`].
+    pub fn repeat_synced(self) -> Self {
+        self.repeat()
+    }
+
     /// Set the easing function to use for this animation.
     /// The easing function will take a time delta between 0 and 1 and return a new delta
     /// between 0 and 1

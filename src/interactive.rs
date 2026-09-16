@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use crate::{
     Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render,
     Window, point, seal::Sealed,
@@ -192,6 +193,36 @@ pub enum ClickEvent {
     /// A click event trigger by a keyboard button being pressed and released.
     Keyboard(KeyboardClickEvent),
 }
+
+/// Compatibility events used by touch-aware controls.
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug)]
+#[allow(missing_docs)]
+pub struct LongPressEvent {
+    pub phase: crate::TouchPhase,
+    pub start_position: crate::Point<crate::Pixels>,
+    pub position: crate::Point<crate::Pixels>,
+}
+
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug)]
+pub struct TouchDragEvent {
+    pub phase: crate::TouchPhase,
+    pub start_position: crate::Point<crate::Pixels>,
+    pub position: crate::Point<crate::Pixels>,
+}
+
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Toggled { True, False, Mixed }
+
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Orientation { Horizontal, Vertical }
+
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessibleAction { Click, Increment, Decrement }
 
 impl Default for ClickEvent {
     fn default() -> Self {

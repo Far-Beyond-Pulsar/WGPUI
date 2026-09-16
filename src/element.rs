@@ -49,6 +49,10 @@ use std::{
 /// You can create custom elements by implementing this trait, see the module-level documentation
 /// for more details.
 pub trait Element: 'static + IntoElement {
+    /// Optional accessibility role used by compatibility components.
+    fn a11y_role(&self) -> Option<crate::Role> { None }
+    /// Populate compatibility accessibility metadata when supported.
+    fn write_a11y_info(&self, _node: &mut crate::accesskit::Node) {}
     /// The type of state returned from [`Element::request_layout`]. A mutable reference to this state is subsequently
     /// provided to [`Element::prepaint`] and [`Element::paint`].
     type RequestLayoutState: 'static;

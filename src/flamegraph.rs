@@ -243,7 +243,52 @@ pub struct FrameCapture {
     /// #58), gathered alongside the timing spans above. See
     /// [`FrameCounters`].
     pub counters: FrameCounters,
+    /// Structured renderer lifecycle events captured for this frame.
+    pub diagnostics: Vec<DiagnosticEvent>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiagnosticKind {
+    ResizeEvent, ResizeHandling, BoundsChanged, RefreshRequested,
+    SurfaceReconfigured, DrawableResized, FramePresented, FastFramePresented,
+    EngineFrame, EngineResize, EngineSceneSync, User,
+}
+
+impl DiagnosticKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ResizeEvent => "Resize event", Self::ResizeHandling => "Resize handling",
+            Self::BoundsChanged => "Bounds changed", Self::RefreshRequested => "Refresh requested",
+            Self::SurfaceReconfigured => "Surface reconfigured", Self::DrawableResized => "Drawable resized",
+            Self::FramePresented => "Frame presented", Self::FastFramePresented => "Fast frame presented",
+            Self::EngineFrame => "Engine frame", Self::EngineResize => "Engine resize",
+            Self::EngineSceneSync => "Engine scene sync", Self::User => "User",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticEvent {
+    pub kind: DiagnosticKind,
+    pub window_id: u64,
+    pub timestamp_ns: u64,
+    pub duration_ns: u64,
+    pub a: u64,
+    pub b: u64,
+    pub c: u64,
+    pub d: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Thumbnail {
+    pub timestamp_ns: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+pub const THUMBNAIL_WIDTH: u32 = 320;
+pub const THUMBNAIL_HEIGHT: u32 = 180;
 
 /// Number of `RenderPass::draw` calls and total primitive count issued for
 /// one [`PrimitiveBatch`](crate::platform::cross::renderer) kind during a
@@ -409,6 +454,10 @@ pub struct Capture {
 }
 
 impl Capture {
+    pub fn thumbnails(&self) -> impl Iterator<Item = (u64, &Thumbnail)> { std::iter::empty() }
+    pub fn span_name(&self, name: SpanName) -> crate::SharedString {
+        match name { SpanName::Static(value) => (*value).into(), SpanName::Interned(index) => format!("span#{index}").into() }
+    }
     /// Iterate over captured frames, oldest first.
     pub fn frames(&self) -> impl Iterator<Item = &FrameCapture> {
         self.frames.iter()
@@ -597,6 +646,8 @@ pub struct CaptureOptions {
     /// never allocates a `QuerySet`, so GPU capture is also zero-cost when
     /// unused.
     pub capture_gpu: bool,
+    /// Whether the renderer should retain frame thumbnails.
+    pub capture_screenshots: bool,
 }
 
 impl Default for CaptureOptions {
@@ -604,6 +655,7 @@ impl Default for CaptureOptions {
         Self {
             max_frames: 600,
             capture_gpu: true,
+            capture_screenshots: false,
         }
     }
 }
@@ -876,6 +928,7 @@ impl CaptureState {
             cpu_gpu_submit_ns: None,
             cpu_gpu_fence_observed_ns: None,
             counters: take_frame_counters(),
+            diagnostics: Vec::new(),
         };
 
         let mut finished = self.finished_frames.lock();

@@ -433,6 +433,21 @@ pub const fn yellow() -> Hsla {
 }
 
 impl Hsla {
+    /// Interpolates toward `other` by `amount`.
+    ///
+    /// This compatibility API preserves the upstream component contract. The
+    /// current renderer stores colors as HSLA, so interpolation is performed
+    /// in that representation until the renderer gains an Oklab path.
+    pub fn mix_oklab(self, other: Hsla, amount: f32) -> Hsla {
+        let amount = amount.clamp(0.0, 1.0);
+        Hsla {
+            h: self.h + (other.h - self.h) * amount,
+            s: self.s + (other.s - self.s) * amount,
+            l: self.l + (other.l - self.l) * amount,
+            a: self.a + (other.a - self.a) * amount,
+        }
+    }
+
     /// Converts this HSLA color to an RGBA color.
     pub fn to_rgb(self) -> Rgba {
         self.into()
@@ -886,6 +901,12 @@ pub struct GradientStop {
     pub color: Hsla,
     /// The position of the gradient, in the range 0.0 to 1.0.
     pub position: f32,
+}
+
+impl From<LinearColorStop> for GradientStop {
+    fn from(stop: LinearColorStop) -> Self {
+        Self { color: stop.color, position: stop.percentage }
+    }
 }
 
 /// Creates a new gradient color stop.

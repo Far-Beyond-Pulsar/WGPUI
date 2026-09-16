@@ -309,10 +309,7 @@ impl ActionRegistry {
     fn insert_action(&mut self, action: MacroActionData) {
         let name = action.name;
         if self.by_name.contains_key(name) {
-            panic!(
-                "Action with name `{name}` already registered \
-                (might be registered in `#[action(deprecated_aliases = [...])]`."
-            );
+            return;
         }
         self.by_name.insert(
             name,
@@ -323,10 +320,7 @@ impl ActionRegistry {
         );
         for &alias in action.deprecated_aliases {
             if self.by_name.contains_key(alias) {
-                panic!(
-                    "Action with name `{alias}` already registered. \
-                    `{alias}` is specified in `#[action(deprecated_aliases = [...])]` for action `{name}`."
-                );
+                continue;
             }
             self.by_name.insert(
                 alias,

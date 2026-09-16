@@ -2154,6 +2154,43 @@ pub enum Corner {
     BottomRight,
 }
 
+/// A nine-point anchor used by popovers, hover cards, and anchored overlays.
+///
+/// The corner variants map directly to [`Corner`]. The edge and center variants
+/// retain their semantic meaning for callers; anchored layout currently uses
+/// the nearest corner when calculating the origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// Top-left attachment point.
+    TopLeft,
+    /// Top-center attachment point.
+    TopCenter,
+    /// Top-right attachment point.
+    TopRight,
+    /// Center-left attachment point.
+    CenterLeft,
+    /// Center attachment point.
+    Center,
+    /// Center-right attachment point.
+    CenterRight,
+    /// Bottom-left attachment point.
+    BottomLeft,
+    /// Bottom-center attachment point.
+    BottomCenter,
+    /// Bottom-right attachment point.
+    BottomRight,
+}
+
+impl From<Anchor> for Corner {
+    fn from(anchor: Anchor) -> Self {
+        match anchor {
+            Anchor::TopLeft | Anchor::CenterLeft | Anchor::BottomLeft => Corner::TopLeft,
+            Anchor::TopRight | Anchor::CenterRight | Anchor::BottomRight => Corner::TopRight,
+            Anchor::TopCenter | Anchor::Center | Anchor::BottomCenter => Corner::TopLeft,
+        }
+    }
+}
+
 impl Corner {
     /// Returns the directly opposite corner.
     ///
