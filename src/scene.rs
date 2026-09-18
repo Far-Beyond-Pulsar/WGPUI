@@ -326,6 +326,16 @@ impl Scene {
     /// captured — in paint order, carrying layer-local draw orders — if it was
     /// recording.
     pub fn end_layer(&mut self) -> Option<Vec<LayerItem>> {
+        self.end_layer_with_parent_reference(true)
+    }
+
+    pub(crate) fn end_layer_texture_bake(&mut self) {
+        // A bake is an offscreen side effect of recording the child, whose
+        // visible layer reference was already captured by the parent.
+        self.end_layer_with_parent_reference(false);
+    }
+
+    fn end_layer_with_parent_reference(&mut self, retain_in_parent: bool) -> Option<Vec<LayerItem>> {
         let (key, items) = self
             .capture_stack
             .pop()
@@ -335,7 +345,7 @@ impl Scene {
         // its primitives would merge two local order spaces into one and
         // silently reorder them, and it would also defeat the nested layer's
         // own independent invalidation.
-        if let Some((_, Some(parent_items))) = self.capture_stack.last_mut() {
+        if retain_in_parent && let Some((_, Some(parent_items))) = self.capture_stack.last_mut() {
             parent_items.push(LayerItem::Nested(key));
         }
         items
@@ -1942,6 +1952,21 @@ impl PathVertex<Pixels> {
 mod tests {
     use super::*;
     use crate::{Point, Size};
+
+    #[test]
+    fn texture_bake_does_not_duplicate_the_parents_child_reference() {
+        let mut scene = Scene::default();
+        let parent = LayerKey(10);
+        let child = LayerKey(11);
+        scene.begin_layer(parent, full_bounds(), true);
+        scene.begin_layer(child, full_bounds(), true);
+        scene.end_layer();
+        scene.begin_layer(child, full_bounds(), false);
+        scene.end_layer_texture_bake();
+        let items = scene.end_layer().expect("recorded parent");
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], LayerItem::Nested(key) if key == child));
+    }
 
     fn sp(value: f32) -> ScaledPixels {
         ScaledPixels(value)

@@ -4799,8 +4799,10 @@ impl Window {
                 if let Some(layer) = self.layers.get_mut(&key) {
                     layer.deferred_dirty = false;
                 }
-                // Occluded frames emit nothing new; the previous range still
-                // describes the last visible extent.
+                let composite_end = self.paint_index();
+                if let Some(layer) = self.layers.get_mut(&key) {
+                    layer.paint_range = composite_start..composite_end;
+                }
             } else if self.layers[&key].texture_retained {
                 // The #96 skip condition: the content lives in a persistent
                 // texture, so the whole composite is one surface draw. The
@@ -4831,6 +4833,10 @@ impl Window {
         // skip the re-render and keep old content until it becomes visible.
         if self.layers.get(&key).is_some_and(|layer| layer.has_content())
             && self.is_layer_occluded(key)
+            && self.invalid_reuse_range(
+                &(PrepaintStateIndex::default()..PrepaintStateIndex::default()),
+                &self.layers[&key].paint_range,
+            ).is_none()
         {
             crate::render_stats::count("occlusion: layers culled");
             crate::render_stats::count("occlusion: layers deferred-dirty");
@@ -4838,7 +4844,12 @@ impl Window {
                 layer.deferred_dirty = true;
             }
             let range = self.layers[&key].paint_range.clone();
+            let start = self.paint_index();
             self.reuse_paint_except_scene(&range);
+            let end = self.paint_index();
+            if let Some(layer) = self.layers.get_mut(&key) {
+                layer.paint_range = start..end;
+            }
             return None;
         }
 
@@ -5325,6 +5336,10 @@ impl Window {
                 if let Some(layer) = self.layers.get_mut(&key) {
                     layer.deferred_dirty = false;
                 }
+                let composite_end = self.paint_index();
+                if let Some(layer) = self.layers.get_mut(&key) {
+                    layer.paint_range = composite_start..composite_end;
+                }
                 return true;
             }
             crate::render_stats::count("layer: composited (texture)");
@@ -5392,8 +5407,10 @@ impl Window {
             if let Some(layer) = self.layers.get_mut(&key) {
                 layer.deferred_dirty = false;
             }
-            // Occluded frames emit nothing new; the previous range still
-            // describes the last visible extent.
+            let composite_end = self.paint_index();
+            if let Some(layer) = self.layers.get_mut(&key) {
+                layer.paint_range = composite_start..composite_end;
+            }
             return true;
         }
 
@@ -5461,7 +5478,11 @@ impl Window {
                 }
             }
         }
-        self.next_frame.scene.end_layer();
+        if texture.is_some() {
+            self.next_frame.scene.end_layer_texture_bake();
+        } else {
+            self.next_frame.scene.end_layer();
+        }
         if let Some(layer) = self.layers.get_mut(&key) {
             layer.last_visited = frame;
         }
@@ -13379,6 +13400,25 @@ mod test {
 
     fn rasterization_off() -> bool {
         !crate::layer::rasterization_enabled()
+    }
+
+    #[gpui::test]
+    fn occluded_panel_rebuilds_stale_text_ranges(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() { return; }
+        let (window, paints, _) = two_layer_occlusion_window(cx, false, false, false);
+        let before = paints.get();
+        window.update(cx, |_, window, _| {
+            let key = *window.layers.iter().min_by_key(|(_, layer)| layer.id)
+                .expect("background layer").0;
+            assert!(window.is_layer_occluded(key));
+            let invalid = window.text_system.previous_frame_layout_extent().lines_index + 5;
+            let layer = window.layers.get_mut(&key).expect("background layer");
+            layer.paint_range.start.line_layout_index.lines_index = invalid;
+            layer.paint_range.end.line_layout_index.lines_index = invalid;
+        }).expect("window update");
+        clean_frame(cx, window.into());
+        assert!(paints.get() > before, "stale text ranges must rebuild even while hidden");
+        for _ in 0..3 { clean_frame(cx, window.into()); }
     }
 
     #[gpui::test]

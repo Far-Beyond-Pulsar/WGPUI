@@ -340,6 +340,14 @@ impl SlabRegistry {
         std::mem::take(&mut self.pending_rerecord.lock())
     }
 
+    pub fn reject_upload(&mut self, key: LayerKey) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.uploaded_generation = None;
+            entry.awaiting_rerecord = true;
+        }
+        self.request_rerecord([key]);
+    }
+
     /// Decide whether drawing a span for (`key`, `content_token`) needs work.
     ///
     /// On anything other than [`SyncPlan::Clean`] the layer's slab ranges are
@@ -457,6 +465,13 @@ impl SlabRegistry {
             .is_some_and(|entry| entry.awaiting_rerecord)
     }
 
+    /// Gate stale data while allowing a newly recorded layer to recover.
+    pub fn is_awaiting_same_content(&self, key: LayerKey, content_token: u64) -> bool {
+        self.entries.get(&key).is_some_and(|entry| {
+            entry.awaiting_rerecord && entry.content_token == content_token
+        })
+    }
+
     /// Poison entries referencing any of `pages` (evicted atlas textures).
     ///
     /// Poisoned layers skip draws until their token changes via re-record —
@@ -550,8 +565,8 @@ impl SlabRegistry {
         self.allocator.compaction_plan()
     }
 
-    /// Apply `plan`, returning the moves whose bytes the caller must copy on
-    /// the GPU (source range, destination range, per kind).
+    /// Apply `plan`, invalidating moved layers for upload at their new offsets.
+    /// Returns the applied moves for scheduling and diagnostics, not GPU copies.
     pub fn apply_compaction(
         &mut self,
         plan: &CompactionPlan<LayerKey>,
@@ -574,10 +589,11 @@ impl SlabRegistry {
             let generation = self.allocator.generation(key);
             let entry = self.entries.get_mut(&key).expect("key came from entries");
             entry.slabs = slabs;
-            // The caller copies every moved range on the GPU this frame, so
-            // moved layers stay resident even though apply_compaction bumped
-            // their generations.
-            entry.uploaded_generation = generation;
+            // Preserve existing invalidation, and require moved layers to
+            // upload their retained data before they can be drawn again.
+            if entry.uploaded_generation != generation {
+                entry.uploaded_generation = None;
+            }
         }
 
         copies
@@ -988,6 +1004,19 @@ mod tests {
     }
 
     #[test]
+    fn rejected_upload_recovers_with_new_content() {
+        let mut registry = SlabRegistry::new();
+        let counts = counts_of(&[(SlabKind::PolySprites, 5)]);
+        registry.plan_sync(KEY, 1, counts).unwrap();
+        registry.reject_upload(KEY);
+        assert!(registry.is_awaiting_same_content(KEY, 1));
+        assert!(!registry.is_awaiting_same_content(KEY, 2));
+        assert!(registry.take_rerecord_requests().contains(&KEY));
+        assert_eq!(registry.plan_sync(KEY, 2, counts).unwrap(), SyncPlan::UploadAllOccupied);
+        assert!(!registry.is_awaiting_rerecord(KEY));
+    }
+
+    #[test]
     fn poisoned_entries_skip_until_token_changes() {
         let mut registry = SlabRegistry::new();
         registry
@@ -1002,6 +1031,8 @@ mod tests {
         }
 
         assert!(registry.is_awaiting_rerecord(KEY));
+        assert!(registry.is_awaiting_same_content(KEY, 1));
+        assert!(!registry.is_awaiting_same_content(KEY, 2));
         // Same token cannot clear the flag: stale tile ids must not re-upload.
         let plan = registry
             .plan_sync(KEY, 1, counts_of(&[(SlabKind::PolySprites, 5)]))
@@ -1265,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_preserves_residency_for_copied_ranges() {
+    fn compaction_requires_upload_for_moved_ranges() {
         let mut registry = SlabRegistry::new();
         // Big enough to clear should_compact's minimum-arena floor (16 Ki
         // elements): three 8 Ki-class reservations, then free the middle one.
@@ -1287,11 +1318,13 @@ mod tests {
         assert_eq!(dst.base, MIN_CLASS * 128);
         assert_eq!(src.count, dst.count);
 
-        // Residency survived: the copied layer reads Clean despite the
-        // allocator bumping generations.
+        // The moved layer must upload at its new offset, even with the same
+        // content token. An unmoved resident layer needs no upload.
         let moved_slabs = registry.entry_slabs(LayerKey(99)).unwrap();
         assert_eq!(moved_slabs.slab(SlabKind::Quads).base, dst.base);
+        assert_eq!(registry.plan_sync(LayerKey(99), 1, big).unwrap(), SyncPlan::UploadAllOccupied);
         assert_eq!(registry.plan_sync(LayerKey(99), 1, big).unwrap(), SyncPlan::Clean);
+        assert_eq!(registry.plan_sync(KEY, 1, big).unwrap(), SyncPlan::Clean);
     }
 
     #[test]

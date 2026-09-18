@@ -2137,6 +2137,23 @@ fn append_packed_kind_bytes(
     }
 }
 
+fn collect_layer_upload_bytes(
+    scene: &Scene,
+    key: LayerKey,
+    kind: SlabKind,
+    scratch: &mut Vec<u8>,
+) {
+    scratch.clear();
+    let mut seen = FxHashSet::default();
+    for span in &scene.layer_slab_spans {
+        // A layer can be referenced repeatedly (including a texture bake).
+        // Its allocation holds each packed stretch once, not once per draw.
+        if span.key == key && seen.insert(Arc::as_ptr(&span.packed)) {
+            append_packed_kind_bytes(scratch, kind, &span.packed);
+        }
+    }
+}
+
 impl RenderingParameters {
     fn from_env() -> Self {
         use std::env;
@@ -2695,6 +2712,25 @@ impl WgpuRenderer {
     fn resolve_slab_spans(&mut self, scene: &Scene) {
         profiling::scope!("wgpui: slab sync");
         let pages_by_layer = collect_referenced_pages_by_layer(scene);
+        let mut planned_layers = FxHashSet::default();
+        let mut uploads_required = FxHashSet::default();
+        // Planning can grow any arena and allocate transform slots. Complete
+        // all allocations before sizing buffers or uploading a single layer.
+        for span in &scene.layer_slab_spans {
+            if self.slab_registry.is_awaiting_same_content(span.key, span.content_token)
+                || !planned_layers.insert(span.key) {
+                continue;
+            }
+            match self.slab_registry.plan_sync(span.key, span.content_token, span.totals) {
+                Ok(SyncPlan::UploadAllOccupied) => { uploads_required.insert(span.key); }
+                Ok(SyncPlan::Clean) => {}
+                Err(error) => {
+                    slab_gpu::report_sync_overflow(error);
+                    self.slab_registry.reject_upload(span.key);
+                }
+            }
+        }
+        self.ensure_slab_buffer_capacities();
         let mut synced_layers: FxHashSet<LayerKey> = FxHashSet::default();
         for span in &scene.layer_slab_spans {
             if self.slab_registry.is_awaiting_rerecord(span.key) {
@@ -2712,9 +2748,14 @@ impl WgpuRenderer {
                     self.slab_registry.request_rerecord([span.key]);
                     continue;
                 }
-                Ok(SyncPlan::Clean) => self.slab_registry.note_span_drawn_clean(),
-                Ok(SyncPlan::UploadAllOccupied) => {
-                    self.upload_layer_slab_bytes(scene, span.key);
+                Ok(SyncPlan::Clean) if !uploads_required.contains(&span.key) => {
+                    self.slab_registry.note_span_drawn_clean();
+                }
+                Ok(SyncPlan::Clean | SyncPlan::UploadAllOccupied) => {
+                    if !self.upload_layer_slab_bytes(scene, span.key) {
+                        self.slab_registry.reject_upload(span.key);
+                        continue;
+                    }
                 }
             }
             // A texture-retained layer's pack was built at the texture origin,
@@ -2756,29 +2797,25 @@ impl WgpuRenderer {
     /// The byte scratch is renderer-owned and reused across dirty syncs: a
     /// steady-state window re-uploads some layer every few frames, so a fresh
     /// `Vec` per sync would churn the allocator for bytes it just freed.
-    fn upload_layer_slab_bytes(&mut self, scene: &Scene, key: LayerKey) {
+    fn upload_layer_slab_bytes(&mut self, scene: &Scene, key: LayerKey) -> bool {
         let Some(slabs) = self.slab_registry.entry_slabs(key) else {
-            return;
+            return false;
         };
         let mut scratch = std::mem::take(&mut self.slab_upload_scratch);
         for kind in SlabKind::ALL {
-            scratch.clear();
-            for span in &scene.layer_slab_spans {
-                if span.key != key {
-                    continue;
-                }
-                append_packed_kind_bytes(&mut scratch, kind, &span.packed);
-            }
+            collect_layer_upload_bytes(scene, key, kind, &mut scratch);
             let range = slabs.slab(kind);
-            if scratch.is_empty() || range.is_empty() {
-                continue;
-            }
             let stride = slab_gpu::instance_stride(kind);
-            debug_assert_eq!(
-                scratch.len() as u64,
-                range.count as u64 * stride,
-                "packed byte stream must match the reserved range"
-            );
+            let offset = range.byte_offset(stride);
+            let buffer = self.slab_buffers.kind_buffer(kind);
+            if scratch.len() as u64 != range.count as u64 * stride
+                || offset.checked_add(scratch.len() as u64).is_none_or(|end| end > buffer.size()) {
+                log::error!("invalid slab upload for {key:?}/{kind:?}: {} bytes at {offset}, reserved {}, buffer {}",
+                    scratch.len(), range.count as u64 * stride, buffer.size());
+                self.slab_upload_scratch = scratch;
+                return false;
+            }
+            if scratch.is_empty() { continue; }
             self.context.queue.write_buffer(
                 self.slab_buffers.kind_buffer(kind),
                 range.byte_offset(stride),
@@ -2787,6 +2824,7 @@ impl WgpuRenderer {
             crate::render_stats::add(slab_gpu::COUNTER_BYTES_UPLOADED, scratch.len() as u64);
         }
         self.slab_upload_scratch = scratch;
+        true
     }
 
     /// Bind groups for one frame's slab draws: per-kind storage bindings over
@@ -3056,16 +3094,10 @@ impl WgpuRenderer {
             } else {
                 self.slab_registry.note_moves_applied();
             }
-            for (kind, src, dst) in moves {
-                let stride = slab_gpu::instance_stride(kind);
-                command_encoder.copy_buffer_to_buffer(
-                    self.slab_buffers.kind_buffer(kind),
-                    src.byte_offset(stride),
-                    self.slab_buffers.kind_buffer(kind),
-                    dst.byte_offset(stride),
-                    src.count as u64 * stride,
-                );
-            }
+            // Compaction invalidates moved layers. resolve_slab_spans uploads
+            // their retained data at the new offsets before drawing. In-place
+            // GPU copies are forbidden, and staged copies on this encoder
+            // could overwrite newer queue writes submitted for this frame.
         }
 
 

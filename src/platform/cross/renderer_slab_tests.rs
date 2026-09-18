@@ -17,6 +17,24 @@ use crate::platform::cross::render_context::{WgpuContext, WgpuOptions};
 use crate::scene::{PolychromeSprite, SceneBatch, SlabRun};
 use crate::scene::{Path as ScenePath, Shadow as SceneShadow, Underline as SceneUnderline};
 
+#[test]
+fn repeated_layer_references_upload_each_packed_stretch_once() -> anyhow::Result<()> {
+    let (_, mut scene) = build_multi_span_frames((0., 0.))?;
+    let key = scene.layer_slab_spans[0].key;
+    let totals = scene.layer_slab_spans[0].totals;
+    let original = scene.layer_slab_spans.clone();
+    for _ in 0..16 {
+        scene.layer_slab_spans.extend(original.iter().cloned());
+    }
+    let mut scratch = Vec::new();
+    for kind in SlabKind::ALL {
+        collect_layer_upload_bytes(&scene, key, kind, &mut scratch);
+        assert_eq!(scratch.len() as u64,
+            totals[kind.index()] as u64 * slab_gpu::instance_stride(kind));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Naga validation.
 // ---------------------------------------------------------------------
