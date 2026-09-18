@@ -4889,7 +4889,6 @@ impl Window {
         crate::render_stats::count("layer: re-rendered");
         let scaled_bounds = cache_key.bounds.scale(cache_key.scale_factor);
         let paint_start = self.paint_index();
-        let id = self.next_layer_id;
         let frame = self.layer_frame;
 
         // Overscroll buffer (#96): the texture covers bounds + 2 × margin, so
@@ -4914,6 +4913,10 @@ impl Window {
         {
             let layer = self.layers.entry(key).or_insert_with(|| {
                 crate::render_stats::count("layer: created");
+                // Reserve before recording children: nested record_layer calls
+                // must not allocate the parent's texture identity again.
+                let id = self.next_layer_id;
+                self.next_layer_id = self.next_layer_id.wrapping_add(1);
                 Layer::new(LayerId(id), policy, frame)
             });
             layer.opaque_bounds = None;
@@ -4960,9 +4963,6 @@ impl Window {
 
         let paint_range = paint_start..self.paint_index();
         if let Some(layer) = self.layers.get_mut(&key) {
-            if layer.id.0 == id {
-                self.next_layer_id = self.next_layer_id.wrapping_add(1);
-            }
             layer.policy = policy;
             layer.items = items;
             layer.paint_range = paint_range;
@@ -5069,6 +5069,21 @@ impl Window {
         let Some(target) = self.layers.get(&key) else {
             return false;
         };
+        // Descendants are drawn by this composite. Counting them as external
+        // occluders would skip the parent AND the content supposedly covering it.
+        let mut descendants = FxHashSet::default();
+        let mut pending = vec![key];
+        while let Some(parent) = pending.pop() {
+            if !descendants.insert(parent) {
+                continue;
+            }
+            if let Some(layer) = self.layers.get(&parent) {
+                pending.extend(layer.items.iter().filter_map(|item| match item {
+                    LayerItem::Nested(child) => Some(*child),
+                    _ => None,
+                }));
+            }
+        }
         // Check backdrop filter / filter group poisoning: any layer above the
         // target with poisoned bounds that overlap the target's bounds prevents
         // occlusion. The filter reads the pixels underneath it.
@@ -5088,9 +5103,13 @@ impl Window {
 
         let occluders = self
             .layers
-            .values()
-            .filter(|layer| layer.id > target.id)
-            .filter_map(|layer| layer.opaque_bounds)
+            .iter()
+            .filter(|(candidate, layer)| {
+                layer.id > target.id
+                    && !descendants.contains(candidate)
+                    && !self.retained_layer_stack.contains(candidate)
+            })
+            .filter_map(|(_, layer)| layer.opaque_bounds)
             .collect::<Vec<_>>();
         crate::occlusion::fully_covered(target.cache_key.bounds, &occluders)
     }
@@ -5530,6 +5549,7 @@ impl Window {
             return;
         };
         if let Some(layer) = self.layers.get_mut(&key) {
+            layer.last_visited = self.layer_frame;
             layer.transform = LayerTransform {
                 offset: layer.cache_key.bounds.origin + content_offset,
             };
@@ -5537,6 +5557,11 @@ impl Window {
 
         crate::render_stats::count("layer: composited (texture)");
         use crate::{PaintSurface, scene::SurfaceContent};
+        // Preserve the child reference when an ancestor is recording. Retaining
+        // only the surface would orphan this layer from visitation and eviction.
+        self.next_frame
+            .scene
+            .begin_layer(key, visible_bounds.scale(scale_factor), false);
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds: texture_bounds.scale(scale_factor),
@@ -5545,6 +5570,7 @@ impl Window {
             },
             content: SurfaceContent::Layer(layer_id),
         });
+        self.next_frame.scene.end_layer();
     }
 
     /// Recurse into a nested layer from the slab path. The child decides its
@@ -13355,6 +13381,52 @@ mod test {
         !crate::layer::rasterization_enabled()
     }
 
+    #[gpui::test]
+    fn nested_panel_layers_keep_distinct_texture_identities(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        struct NestedPanels;
+        impl crate::Render for NestedPanels {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::div().size_full().child(
+                    crate::div()
+                        .id("panel")
+                        .layer_keyed(0u64)
+                        .absolute()
+                        .left(px(100.))
+                        .top(px(100.))
+                        .size(px(200.))
+                        .child(
+                            crate::div()
+                                .id("panel-content")
+                                .layer_keyed(0u64)
+                                .size_full()
+                                .bg(crate::red()),
+                        ),
+                )
+            }
+        }
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| NestedPanels);
+        cx.run_until_parked();
+        window.update(cx, |_, window, _| {
+            let ids: std::collections::HashSet<_> = window.layers.values().map(|layer| layer.id).collect();
+            assert_eq!(ids.len(), window.layers.len(), "nested layers must not share GPU texture identities");
+            let parent = window.layers.iter().find(|(_, layer)| layer.items.iter()
+                .any(|item| matches!(item, crate::layer::LayerItem::Nested(_)))).map(|(key, _)| *key)
+                .expect("parent layer");
+            assert!(!window.is_layer_occluded(parent), "a panel's own content cannot hide its parent");
+        }).expect("window update");
+        for _ in 0..3 {
+            clean_frame(cx, window.into());
+            window.update(cx, |_, window, _| {
+                assert!(!window.rendered_frame.scene.quads.is_empty()
+                    || !window.rendered_frame.scene.layer_slab_spans.is_empty()
+                    || !window.rendered_frame.scene.surfaces.is_empty(), "idle panel must still draw");
+            }).expect("window update");
+        }
+    }
+
     /// A layer holding three canvases; the rasterize threshold is shared so a
     /// test can move it through the real render path.
     struct RasterizedView {
@@ -13514,6 +13586,34 @@ mod test {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn visible_texture_layer_survives_idle_frames(cx: &mut TestAppContext) {
+        if layers_off() || rasterization_off() {
+            return;
+        }
+        let paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let view_paints = paints.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| RasterizedView {
+            paints: view_paints,
+            threshold: std::rc::Rc::new(std::cell::Cell::new(2)),
+        });
+        cx.run_until_parked();
+        let (key, eviction_frames) = window.update(cx, |_, window, _| {
+            let (key, layer) = window.layers.iter().find(|(_, layer)| layer.texture_retained)
+                .expect("rasterized panel");
+            (*key, layer.policy.evict_after_frames)
+        }).expect("window update");
+        for _ in 0..eviction_frames + 2 {
+            clean_frame(cx, window.into());
+            window.update(cx, |_, window, _| {
+                let layer = window.layers.get(&key).expect("visible layer remains registered");
+                assert!(layer.has_content(), "a visible cached panel must not be evicted while idle");
+                assert_eq!(layer.last_visited, window.layer_frame, "texture composites count as visits");
+            }).expect("window update");
+        }
+        assert_eq!(paints.get(), 1, "idle frames must reuse the texture without repainting");
     }
 
     /// Below `rasterize_above` a layer stays primitive-retained: no texture
