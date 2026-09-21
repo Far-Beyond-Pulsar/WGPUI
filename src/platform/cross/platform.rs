@@ -89,6 +89,34 @@ struct PlatformCallbacks {
     on_validate_app_menu_command: Cell<Option<Box<dyn FnMut(&dyn crate::Action) -> bool>>>,
 }
 
+thread_local! {
+    /// Open span covering the time the event loop is blocked in the OS waiting
+    /// for its next event (from the end of `about_to_wait` to `new_events`).
+    static IDLE_SCOPE: std::cell::RefCell<Option<Box<dyn Send>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Static span name for a window event, so the loop can attribute time per kind.
+fn window_event_span_name(event: &winit::event::WindowEvent) -> &'static str {
+    use winit::event::WindowEvent as E;
+    match event {
+        E::RedrawRequested => "Main: WindowEvent::RedrawRequested",
+        E::CursorMoved { .. } => "Main: WindowEvent::CursorMoved",
+        E::MouseInput { .. } => "Main: WindowEvent::MouseInput",
+        E::MouseWheel { .. } => "Main: WindowEvent::MouseWheel",
+        E::KeyboardInput { .. } => "Main: WindowEvent::KeyboardInput",
+        E::ModifiersChanged(_) => "Main: WindowEvent::ModifiersChanged",
+        E::Resized(_) => "Main: WindowEvent::Resized",
+        E::Moved(_) => "Main: WindowEvent::Moved",
+        E::Focused(_) => "Main: WindowEvent::Focused",
+        E::CursorEntered { .. } => "Main: WindowEvent::CursorEntered",
+        E::CursorLeft { .. } => "Main: WindowEvent::CursorLeft",
+        E::ScaleFactorChanged { .. } => "Main: WindowEvent::ScaleFactorChanged",
+        E::Ime(_) => "Main: WindowEvent::Ime",
+        E::CloseRequested => "Main: WindowEvent::CloseRequested",
+        _ => "Main: WindowEvent::other",
+    }
+}
+
 struct AppState {
     windows: FxHashMap<winit::window::WindowId, CrossWindow>,
     window_handles: FxHashMap<winit::window::WindowId, crate::AnyWindowHandle>,
@@ -983,12 +1011,22 @@ impl AppState {
     }
 
     fn drain_main_queue(&mut self) {
+        wgpui_scope!("Main: drain foreground task queue");
         while let Ok(Some(runnable)) = self.main_rx.try_pop() {
             match runnable {
                 RunnableVariant::Compat(runnable) => {
+                    wgpui_scope!("Main: foreground task (untracked spawn site)");
                     runnable.run();
                 }
                 RunnableVariant::Meta(runnable) => {
+                    // Label each task with the `file:line` that spawned it, so
+                    // a slow poll on the UI thread names its owner.
+                    let location = runnable.metadata().location;
+                    wgpui_scope_dyn!(format!(
+                        "Main: foreground task @ {}:{}",
+                        location.file(),
+                        location.line()
+                    ));
                     runnable.run();
                 }
             }
@@ -997,9 +1035,13 @@ impl AppState {
 }
 
 impl winit::application::ApplicationHandler<CrossEvent> for AppState {
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {}
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        // Ends the OS-wait span opened at the end of the previous `about_to_wait`.
+        IDLE_SCOPE.with(|idle| drop(idle.borrow_mut().take()));
+    }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: CrossEvent) {
+        wgpui_scope!("Main: user_event");
         #[cfg(target_family = "wasm")]
         web_sys::console::log_1(&"WGPUI: user_event".into());
         self.set_active_context(event_loop);
@@ -1053,6 +1095,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         _device_id: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
     ) {
+        wgpui_scope!("Main: device_event");
         if let winit::event::DeviceEvent::Button { button, state } = event {
             if let Some(mouse_button) = device_button_to_gpui(button) {
                 if std::env::var_os("GPUI_DEBUG_MOUSE").is_some() {
@@ -1157,6 +1200,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        wgpui_scope!("Main: about_to_wait");
         self.set_active_context(event_loop);
 
         self.drain_main_queue();
@@ -1210,6 +1254,14 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         self.clear_active_context();
 
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next_wake.into()));
+
+        // From here until `new_events` the thread is parked in the OS waiting for
+        // an event or the WaitUntil deadline. Making that visible is what tells
+        // "the UI thread was busy" apart from "the UI thread was asleep".
+        IDLE_SCOPE.with(|idle| {
+            *idle.borrow_mut() =
+                crate::render_stats::external_scope("Main: event loop idle (waiting for OS event)");
+        });
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {}
@@ -1292,6 +1344,9 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
+        // One span per winit event, named by kind; everything the event causes
+        // (input dispatch, resize, redraw) nests underneath.
+        let _window_event_scope = crate::render_stats::external_scope(window_event_span_name(&event));
         self.set_active_context(event_loop);
 
         let Some(window) = self.windows.get(&window_id) else {
@@ -1505,12 +1560,14 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 // thereby discard every cached view — at event-loop rate.
                 let mut force_render = false;
                 if let Some(renderer) = window.0.renderer.get() {
+                    wgpui_scope!("Main: fast-blit pending surfaces");
                     let renderer_ref = renderer.borrow();
                     if let Some(pending_surfaces) = renderer_ref.get_pending_surfaces() {
                         force_render = !renderer_ref.blit_surfaces_direct(&pending_surfaces);
                     }
                 }
 
+                wgpui_scope!("Main: on_request_frame callback");
                 window.0.state.callbacks.invoke_mut(
                     &window.0.state.callbacks.on_request_frame,
                     |cb| {

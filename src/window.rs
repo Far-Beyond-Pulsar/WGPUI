@@ -1991,12 +1991,24 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let last_input_timestamp = last_input_timestamp.clone();
             move |request_frame_options| {
+                wgpui_scope!("wgpui: on_request_frame");
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
+                    wgpui_scope_dyn!(format!(
+                        "wgpui: next-frame callbacks ({})",
+                        next_frame_callbacks.len()
+                    ));
                     handle
                         .update(&mut cx, |_, window, cx| {
                             for callback in next_frame_callbacks {
+                                // Anonymous closures: report only the slow ones.
+                                let t = crate::render_stats::external_timer();
                                 callback(window, cx);
+                                crate::render_stats::external_record_if_slow(
+                                    t,
+                                    Duration::from_micros(200),
+                                    || "wgpui: slow next-frame callback".to_string(),
+                                );
                             }
                         })
                         .log_err();
@@ -2023,11 +2035,13 @@ impl Window {
                                 if request_frame_options.force_render {
                                     // Bypass cached view reuse so we don't replay stale
                                     // atlas tile references after a GPU device recovery.
+                                    wgpui_scope!("wgpui: forced refresh (cache bypass)");
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
                                 window.present();
                                 // drop the arena elements after present to reduce latency
+                                wgpui_scope!("wgpui: arena clear");
                                 arena_clear_needed.clear();
                             })
                             .log_err();
@@ -2037,16 +2051,24 @@ impl Window {
                     crate::record_frame_pacing(false);
                     crate::render_stats::count("window: present only (no draw)");
                     // Fast path: framebuffer already updated by surface blit, just present it
+                    wgpui_scope!("wgpui: present-only frame (no draw)");
                     handle
                         .update(&mut cx, |_, window, _| window.present_framebuffer_only())
                         .log_err();
+                } else {
+                    // A redraw request that found nothing dirty and needed no
+                    // presentation: visible so idle wakeups can be counted.
+                    wgpui_scope!("wgpui: frame skipped (clean, no present)");
                 }
 
-                handle
-                    .update(&mut cx, |_, window, _| {
-                        window.complete_frame();
-                    })
-                    .log_err();
+                {
+                    wgpui_scope!("wgpui: complete_frame");
+                    handle
+                        .update(&mut cx, |_, window, _| {
+                            window.complete_frame();
+                        })
+                        .log_err();
+                }
 
                 // Drives the once-per-second dump for `WGPUI_RENDER_STATS=1`.
                 // Ticked per platform frame rather than per draw, so the
@@ -2478,7 +2500,14 @@ impl Window {
     /// Unlike the pre-#87 version, this is legal during a draw: a request made
     /// from prepaint or paint is deferred to the end of the frame rather than
     /// silently dropped.
+    #[track_caller]
     pub fn refresh(&mut self) {
+        // A full-window refresh discards every cached view. The marker names
+        // the caller so unexpected refreshes can be traced to their source.
+        crate::render_stats::external_caller_marker(
+            "wgpui: Window::refresh",
+            std::panic::Location::caller(),
+        );
         self.invalidator.invalidate_window(Invalidation::all());
     }
 
@@ -2517,7 +2546,12 @@ impl Window {
     ///
     /// Callers must still ensure the producing view renders when its *layout*
     /// changes — a view that never prepaints never observes new bounds.
+    #[track_caller]
     pub fn refresh_buffers(&mut self) {
+        crate::render_stats::external_caller_marker(
+            "wgpui: Window::refresh_buffers",
+            std::panic::Location::caller(),
+        );
         self.invalidator.invalidate_window(Invalidation::DISPLAY);
     }
 
@@ -2715,6 +2749,7 @@ impl Window {
             return;
         };
 
+        wgpui_scope!("wgpui: keystroke observers");
         cx.keystroke_observers.clone().retain(&(), move |callback| {
             (callback)(
                 &KeystrokeEvent {
@@ -2738,6 +2773,7 @@ impl Window {
             return;
         };
 
+        wgpui_scope!("wgpui: keystroke interceptors");
         cx.keystroke_interceptors
             .clone()
             .retain(&(), move |callback| {
@@ -2868,7 +2904,12 @@ impl Window {
     /// It will cause the window to redraw on the next frame, even if no other changes have occurred.
     ///
     /// If called from within a view, it will notify that view on the next frame. Otherwise, it will refresh the entire window.
+    #[track_caller]
     pub fn request_animation_frame(&self) {
+        crate::render_stats::external_caller_marker(
+            "wgpui: request_animation_frame",
+            std::panic::Location::caller(),
+        );
         if let Some(entity) = self.rendered_entity_stack.last().copied() {
             self.on_next_frame(move |_, cx| cx.notify(entity));
         } else {
@@ -2919,6 +2960,7 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
+        wgpui_scope!("wgpui: bounds_changed");
         let previous_viewport_size = self.viewport_size;
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
@@ -7069,8 +7111,21 @@ impl Window {
             } else {
                 0
             };
+            let mouse_span = if discriminator == type_name_hash::<MouseMoveEvent>() {
+                "wgpui: dispatch_mouse_event (move)"
+            } else if discriminator == type_name_hash::<MouseDownEvent>() {
+                "wgpui: dispatch_mouse_event (down)"
+            } else if discriminator == type_name_hash::<MouseUpEvent>() {
+                "wgpui: dispatch_mouse_event (up)"
+            } else if discriminator == type_name_hash::<ScrollWheelEvent>() {
+                "wgpui: dispatch_mouse_event (scroll)"
+            } else {
+                "wgpui: dispatch_mouse_event (other)"
+            };
+            let _mouse_scope = crate::render_stats::external_scope(mouse_span);
             self.dispatch_mouse_event(any_mouse_event, discriminator, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
+            wgpui_scope!("wgpui: dispatch_key_event");
             self.dispatch_key_event(any_key_event, cx);
         }
 
@@ -7081,9 +7136,11 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, discriminator: u64, cx: &mut App) {
-        let hit_test = self
-            .rendered_frame
-            .hit_test(self.mouse_position(), &self.layers);
+        let hit_test = {
+            wgpui_scope!("wgpui: mouse hit test");
+            self.rendered_frame
+                .hit_test(self.mouse_position(), &self.layers)
+        };
         if std::env::var_os("GPUI_DEBUG_MOUSE").is_some() {
             eprintln!(
                 "[WGPUI] dispatch_mouse_event pos={:?} hit_ids={:?} listeners={} active={} hover={}",
@@ -7095,6 +7152,7 @@ impl Window {
             );
         }
         if hit_test != self.mouse_hit_test {
+            wgpui_scope!("wgpui: hit-test changed -> reset_cursor_style");
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
         }
@@ -7129,12 +7187,26 @@ impl Window {
         // Only listeners whose discriminator matches the dispatched event type are called.
         // The discriminator (type_name_hash) is consistent across compilation units,
         // so DLL-registered listeners match correctly.
-        for entry in &mut mouse_listeners {
-            if let Some(entry) = entry {
-                if entry.discriminator == discriminator {
-                    (entry.listener)(event, DispatchPhase::Capture, self, cx);
-                    if !cx.propagate_event {
-                        break;
+        {
+            wgpui_scope_dyn!(format!(
+                "wgpui: mouse listeners: capture ({} registered)",
+                mouse_listeners.len()
+            ));
+            for entry in &mut mouse_listeners {
+                if let Some(entry) = entry {
+                    if entry.discriminator == discriminator {
+                        // Listeners are anonymous closures; time each one and
+                        // surface only the slow ones, named by phase.
+                        let t = crate::render_stats::external_timer();
+                        (entry.listener)(event, DispatchPhase::Capture, self, cx);
+                        crate::render_stats::external_record_if_slow(
+                            t,
+                            Duration::from_micros(150),
+                            || "wgpui: slow mouse listener (capture)".to_string(),
+                        );
+                        if !cx.propagate_event {
+                            break;
+                        }
                     }
                 }
             }
@@ -7142,10 +7214,17 @@ impl Window {
 
         // Bubble phase, where most normal handlers do their work.
         if cx.propagate_event {
+            wgpui_scope!("wgpui: mouse listeners: bubble");
             for entry in mouse_listeners.iter_mut().rev() {
                 if let Some(entry) = entry {
                     if entry.discriminator == discriminator {
+                        let t = crate::render_stats::external_timer();
                         (entry.listener)(event, DispatchPhase::Bubble, self, cx);
+                        crate::render_stats::external_record_if_slow(
+                            t,
+                            Duration::from_micros(150),
+                            || "wgpui: slow mouse listener (bubble)".to_string(),
+                        );
                         if !cx.propagate_event {
                             break;
                         }
@@ -7160,6 +7239,7 @@ impl Window {
             if event.is::<MouseMoveEvent>() {
                 // If this was a mouse move event, redraw the window so that the
                 // active drag can follow the mouse cursor.
+                wgpui_scope!("wgpui: active-drag refresh (mouse move)");
                 self.refresh();
             } else if event.is::<MouseUpEvent>() {
                 // If this was a mouse up event, cancel the active drag and redraw
@@ -7172,6 +7252,9 @@ impl Window {
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
         if self.invalidator.is_dirty() {
+            // A key event forces a full synchronous draw when the window is
+            // dirty, on top of the frame the loop would draw anyway.
+            wgpui_scope!("wgpui: dispatch_key_event forced draw (window dirty)");
             self.draw(cx).clear();
         }
 
@@ -7385,6 +7468,7 @@ impl Window {
 
             for (listener_disc, key_listener) in &listeners {
                 if *listener_disc == discriminator {
+                    wgpui_scope!("wgpui: key listener (capture)");
                     key_listener(event, DispatchPhase::Capture, self, cx);
                     if !cx.propagate_event {
                         return;
@@ -7404,6 +7488,7 @@ impl Window {
 
             for (listener_disc, key_listener) in &listeners {
                 if *listener_disc == discriminator {
+                    wgpui_scope!("wgpui: key listener (bubble)");
                     key_listener(event, DispatchPhase::Bubble, self, cx);
                     if !cx.propagate_event {
                         return;
@@ -7503,6 +7588,8 @@ impl Window {
         action: &dyn Action,
         cx: &mut App,
     ) {
+        // Named by action so a slow keybinding/menu command is attributable.
+        wgpui_scope_dyn!(format!("wgpui: dispatch action {}", action.name()));
         let action_registry = cx.actions.clone();
         let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
 

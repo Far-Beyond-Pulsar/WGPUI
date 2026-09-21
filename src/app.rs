@@ -1378,10 +1378,25 @@ impl App {
     /// such as notifying observers, emitting events, etc. Effects can themselves
     /// cause effects, so we continue looping until all effects are processed.
     fn flush_effects(&mut self) {
+        wgpui_scope!("wgpui: App::flush_effects");
         loop {
-            self.release_dropped_entities();
-            self.release_dropped_focus_handles();
+            {
+                wgpui_scope!("wgpui: release_dropped_entities + focus handles");
+                self.release_dropped_entities();
+                self.release_dropped_focus_handles();
+            }
             if let Some(effect) = self.pending_effects.pop_front() {
+                // Effects are numerous and individually tiny: time each with one
+                // clock read and surface only the slow ones, by kind.
+                let effect_kind = match &effect {
+                    Effect::Notify { .. } => "notify (observers)",
+                    Effect::Emit { .. } => "emit (event listeners)",
+                    Effect::RefreshWindows => "refresh windows",
+                    Effect::NotifyGlobalObservers { .. } => "global observers",
+                    Effect::Defer { .. } => "deferred callback",
+                    Effect::EntityCreated { .. } => "entity created",
+                };
+                let effect_timer = crate::render_stats::external_timer();
                 match effect {
                     Effect::Notify { emitter } => {
                         self.apply_notify_effect(emitter);
@@ -1412,6 +1427,11 @@ impl App {
                         self.apply_entity_created_effect(entity, tid, window);
                     }
                 }
+                crate::render_stats::external_record_if_slow(
+                    effect_timer,
+                    std::time::Duration::from_micros(100),
+                    || format!("wgpui: slow effect: {effect_kind}"),
+                );
             } else {
                 #[cfg(any(test, feature = "test-support"))]
                 for window in self
@@ -1483,9 +1503,16 @@ impl App {
     fn apply_notify_effect(&mut self, emitter: EntityId) {
         self.pending_notifications.remove(&emitter);
 
-        self.observers
-            .clone()
-            .retain(&emitter, |handler| handler(self));
+        self.observers.clone().retain(&emitter, |handler| {
+            let t = crate::render_stats::external_timer();
+            let keep = handler(self);
+            crate::render_stats::external_record_if_slow(
+                t,
+                std::time::Duration::from_micros(100),
+                || format!("wgpui: slow observer callback (entity {emitter:?})"),
+            );
+            keep
+        });
     }
 
     fn apply_emit_effect(&mut self, emitter: EntityId, event_type: TypeId, event: &dyn Any) {
@@ -1493,7 +1520,14 @@ impl App {
             .clone()
             .retain(&emitter, |(stored_type, handler)| {
                 if *stored_type == event_type {
-                    handler(event, self)
+                    let t = crate::render_stats::external_timer();
+                    let keep = handler(event, self);
+                    crate::render_stats::external_record_if_slow(
+                        t,
+                        std::time::Duration::from_micros(100),
+                        || format!("wgpui: slow event listener (emitter {emitter:?})"),
+                    );
+                    keep
                 } else {
                     true
                 }
@@ -1501,6 +1535,7 @@ impl App {
     }
 
     fn apply_refresh_effect(&mut self) {
+        wgpui_scope!("wgpui: apply_refresh_effect (refresh all windows)");
         for window in self.windows.values_mut() {
             if let Some(window) = window.as_deref_mut() {
                 window.refresh();
@@ -1510,9 +1545,16 @@ impl App {
 
     fn apply_notify_global_observers_effect(&mut self, type_id: TypeId) {
         self.pending_global_notifications.remove(&type_id);
-        self.global_observers
-            .clone()
-            .retain(&type_id, |observer| observer(self));
+        self.global_observers.clone().retain(&type_id, |observer| {
+            let t = crate::render_stats::external_timer();
+            let keep = observer(self);
+            crate::render_stats::external_record_if_slow(
+                t,
+                std::time::Duration::from_micros(100),
+                || format!("wgpui: slow global observer ({type_id:?})"),
+            );
+            keep
+        });
     }
 
     fn apply_defer_effect(&mut self, callback: Box<dyn FnOnce(&mut Self) + 'static>) {

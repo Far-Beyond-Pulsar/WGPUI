@@ -143,6 +143,9 @@ pub struct AnyView {
     entity: AnyEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
     cached_style: Option<Rc<StyleRefinement>>,
+    /// The concrete view type, for naming profiler spans. Static, so it costs
+    /// one pointer-pair per view handle and nothing per frame.
+    type_name: &'static str,
 }
 
 impl<V: Render> From<Entity<V>> for AnyView {
@@ -151,6 +154,7 @@ impl<V: Render> From<Entity<V>> for AnyView {
             entity: value.into_any(),
             render: any_view::render::<V>,
             cached_style: None,
+            type_name: std::any::type_name::<V>(),
         }
     }
 }
@@ -169,6 +173,7 @@ impl AnyView {
         AnyWeakView {
             entity: self.entity.downgrade(),
             render: self.render,
+            type_name: self.type_name,
         }
     }
 
@@ -181,6 +186,7 @@ impl AnyView {
                 entity,
                 render: self.render,
                 cached_style: self.cached_style,
+                type_name: self.type_name,
             }),
         }
     }
@@ -242,6 +248,7 @@ impl Element for AnyView {
                 _ => {
                     let mut element = {
                         let _t = crate::render_stats::scope("frame: render");
+                        wgpui_scope_dyn!(format!("render {}", self.type_name));
                         (self.render)(self, window, cx)
                     };
                     let layout_id = element.request_layout(window, cx);
@@ -352,6 +359,19 @@ impl Element for AnyView {
                         crate::render_stats::count("view cache: rebuilt (dependency changed)");
                     }
                     let _t = crate::render_stats::scope("view cache: rebuild");
+                    // Name the rebuilt view and why the cache missed, so the
+                    // hot, constantly-rebuilding views identify themselves.
+                    wgpui_scope_dyn!(format!(
+                        "view rebuild ({}): {}",
+                        if dependency_invalidated {
+                            "dependency changed"
+                        } else if stale_range.is_some() {
+                            "stale range"
+                        } else {
+                            "dirty/bounds/first"
+                        },
+                        self.type_name
+                    ));
 
                     // Rebuilding this view normally forces every cached view
                     // nested inside it to rebuild too. See
@@ -374,6 +394,7 @@ impl Element for AnyView {
                             // request_layout, so this is the one place where
                             // `frame: render` nests under `frame: prepaint`.
                             let _frame_render = crate::render_stats::scope("frame: render");
+                            wgpui_scope_dyn!(format!("render {}", self.type_name));
                             (self.render)(self, window, cx)
                         };
                         {
@@ -499,6 +520,7 @@ impl IntoElement for AnyView {
 pub struct AnyWeakView {
     entity: AnyWeakEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
+    type_name: &'static str,
 }
 
 impl AnyWeakView {
@@ -509,6 +531,7 @@ impl AnyWeakView {
             entity,
             render: self.render,
             cached_style: None,
+            type_name: self.type_name,
         })
     }
 }
@@ -518,6 +541,7 @@ impl<V: 'static + Render> From<WeakEntity<V>> for AnyWeakView {
         AnyWeakView {
             entity: view.into(),
             render: any_view::render::<V>,
+            type_name: std::any::type_name::<V>(),
         }
     }
 }

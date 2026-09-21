@@ -226,7 +226,26 @@ impl<'a, T: 'static> Context<'a, T> {
     }
 
     /// Tell GPUI that this entity has changed and observers of it should be notified.
+    #[track_caller]
     pub fn notify(&mut self) {
+        // Marker span naming the entity type and the exact `cx.notify()` call
+        // site. Each notify dirties every ancestor view, so the chatty call
+        // sites are what to look for behind constant cached-view rebuilds.
+        if crate::render_stats::external_enabled() {
+            let location = std::panic::Location::caller();
+            crate::render_stats::external_record_if_slow(
+                Some(std::time::Instant::now()),
+                std::time::Duration::ZERO,
+                || {
+                    format!(
+                        "notify {} @ {}:{}",
+                        std::any::type_name::<T>(),
+                        location.file(),
+                        location.line()
+                    )
+                },
+            );
+        }
         self.app.notify(self.entity_state.entity_id);
     }
 

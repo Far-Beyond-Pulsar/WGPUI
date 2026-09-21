@@ -143,6 +143,14 @@ pub struct ScopeHook {
     /// Open a span named `name`. The returned guard closes it on drop. It must
     /// be `Send` because a [`Scope`] may be moved across threads with its owner.
     pub begin: fn(&'static str) -> Box<dyn Send>,
+    /// Like `begin` for a name built at runtime (a task's spawn location, a
+    /// view's type). Only called while `enabled()`, so the allocation is free
+    /// when the embedder is not recording.
+    pub begin_owned: fn(String) -> Box<dyn Send>,
+    /// Record a span that already finished, `elapsed` ago, at the current
+    /// nesting depth. Lets hot per-item sites time themselves with one clock
+    /// read and only emit a span when the item was slow.
+    pub record_elapsed: fn(String, Duration),
 }
 
 static SCOPE_HOOK: std::sync::OnceLock<ScopeHook> = std::sync::OnceLock::new();
@@ -161,6 +169,56 @@ pub fn external_scope(name: &'static str) -> Option<Box<dyn Send>> {
         return None;
     }
     Some((hook.begin)(name))
+}
+
+/// Whether the embedder profiler is recording. One relaxed load; check before
+/// doing any work (clock reads, name formatting) that only feeds spans.
+#[inline]
+pub fn external_enabled() -> bool {
+    SCOPE_HOOK.get().is_some_and(|hook| (hook.enabled)())
+}
+
+/// Open an embedder span whose name is built lazily. The closure runs only while
+/// the embedder is recording.
+#[inline]
+pub fn external_scope_with(name: impl FnOnce() -> String) -> Option<Box<dyn Send>> {
+    let hook = SCOPE_HOOK.get()?;
+    if !(hook.enabled)() {
+        return None;
+    }
+    Some((hook.begin_owned)(name()))
+}
+
+/// Emit a finished span only if it took at least `min`. `start` should come from
+/// `Instant::now()` taken only when [`external_enabled`] (pass `None` otherwise).
+#[inline]
+pub fn external_record_if_slow(start: Option<Instant>, min: Duration, name: impl FnOnce() -> String) {
+    let Some(start) = start else { return };
+    let elapsed = start.elapsed();
+    if elapsed < min {
+        return;
+    }
+    if let Some(hook) = SCOPE_HOOK.get() {
+        (hook.record_elapsed)(name(), elapsed);
+    }
+}
+
+/// Zero-duration marker naming a caller: `what @ file:line`. Pair with
+/// `#[track_caller]` on the function being observed to learn who invoked it.
+#[inline]
+pub fn external_caller_marker(what: &'static str, location: &'static std::panic::Location<'static>) {
+    if !external_enabled() {
+        return;
+    }
+    external_record_if_slow(Some(Instant::now()), Duration::ZERO, || {
+        format!("{what} @ {}:{}", location.file(), location.line())
+    });
+}
+
+/// Clock read for [`external_record_if_slow`], skipped when not recording.
+#[inline]
+pub fn external_timer() -> Option<Instant> {
+    external_enabled().then(Instant::now)
 }
 
 /// RAII timer. Records on drop.

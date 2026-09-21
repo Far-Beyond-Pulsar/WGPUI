@@ -19,6 +19,14 @@ macro_rules! wgpui_scope {
     };
 }
 
+/// Scope with a runtime-built name (`format!`-style expression). The expression
+/// is evaluated only while the embedder profiler is recording.
+macro_rules! wgpui_scope_dyn {
+    ($name:expr) => {
+        let _wgpui_external_scope = $crate::render_stats::external_scope_with(|| $name);
+    };
+}
+
 #[macro_use]
 mod action;
 mod app;
