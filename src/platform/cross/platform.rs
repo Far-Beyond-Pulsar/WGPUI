@@ -1200,7 +1200,10 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        wgpui_scope!("Main: about_to_wait");
+        // Explicit guard (dropped before the idle span opens below): the idle span
+        // outlives this function, so both being live on the profiler's LIFO
+        // stack at once made their names swap.
+        let about_to_wait_scope = crate::render_stats::external_scope("Main: about_to_wait");
         self.set_active_context(event_loop);
 
         self.drain_main_queue();
@@ -1257,6 +1260,8 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         self.clear_active_context();
 
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next_wake.into()));
+
+        drop(about_to_wait_scope);
 
         // From here until `new_events` the thread is parked in the OS waiting for
         // an event or the WaitUntil deadline. Making that visible is what tells

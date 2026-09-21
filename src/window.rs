@@ -2016,6 +2016,10 @@ impl Window {
 
                 // Keep presenting the current scene for 1 extra second since the
                 // last input to prevent the display from underclocking the refresh rate.
+                // `draw` sets this and only `present` clears it, so `true` here
+                // means a scene was built (e.g. by the forced draw in
+                // `dispatch_key_event`) that has not been rendered yet.
+                let scene_unpresented = needs_present.get();
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
                     || (active.get()
@@ -2053,7 +2057,20 @@ impl Window {
                     // Fast path: framebuffer already updated by surface blit, just present it
                     wgpui_scope!("wgpui: present-only frame (no draw)");
                     handle
-                        .update(&mut cx, |_, window, _| window.present_framebuffer_only())
+                        .update(&mut cx, |_, window, _| {
+                            if scene_unpresented {
+                                // The framebuffer is stale: a scene was drawn but
+                                // never presented, and that clears the dirty flag
+                                // this branch is chosen by. Blitting the old
+                                // framebuffer would drop the new scene and leave
+                                // any external surface (the Helio viewport) unpromoted
+                                // until something else dirtied the window, which
+                                // stalled the render thread on its consumer timeout.
+                                window.present();
+                            } else {
+                                window.present_framebuffer_only();
+                            }
+                        })
                         .log_err();
                 } else {
                     // A redraw request that found nothing dirty and needed no
