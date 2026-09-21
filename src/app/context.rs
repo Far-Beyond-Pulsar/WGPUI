@@ -238,10 +238,11 @@ impl<'a, T: 'static> Context<'a, T> {
                 std::time::Duration::ZERO,
                 || {
                     format!(
-                        "notify {} @ {}:{}",
+                        "notify {} @ {}:{} #{}",
                         std::any::type_name::<T>(),
                         location.file(),
-                        location.line()
+                        location.line(),
+                        self.entity_state.entity_id.as_u64()
                     )
                 },
             );
