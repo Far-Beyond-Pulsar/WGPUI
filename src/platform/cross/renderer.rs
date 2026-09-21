@@ -2252,6 +2252,11 @@ pub struct WgpuRenderer {
     context: Arc<WgpuContext>,
     surface: ManuallyDrop<wgpu::Surface<'static>>,
     surface_configuration: wgpu::SurfaceConfiguration,
+    /// The present mode chosen at startup (vsync `Fifo` unless overridden by env).
+    default_present_mode: wgpu::PresentMode,
+    /// Best non-vsync mode this surface supports, used while the frame-rate cap is
+    /// lifted for a profiling recording. `None` if the surface offers neither.
+    uncapped_present_mode: Option<wgpu::PresentMode>,
     atlas_sampler: wgpu::Sampler,
     surface_sampler: wgpu::Sampler,
     atlas: Arc<WgpuAtlas>,
@@ -2406,6 +2411,10 @@ impl WgpuRenderer {
             _ => crate::PresentMode::Other,
         });
 
+        let uncapped_present_mode = [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox]
+            .into_iter()
+            .find(|mode| surface_capabilities.present_modes.contains(mode));
+
         let surface_configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
@@ -2524,6 +2533,8 @@ impl WgpuRenderer {
             context: context.clone(),
             surface: ManuallyDrop::new(surface),
             surface_configuration,
+            default_present_mode: present_mode,
+            uncapped_present_mode,
             atlas,
             atlas_sampler,
             surface_sampler,
@@ -3001,6 +3012,7 @@ impl WgpuRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         wgpui_scope!("wgpui: renderer draw");
+        self.sync_present_mode();
         log::trace!("Renderer::draw: starting frame");
 
         let mut command_encoder =
@@ -4908,6 +4920,27 @@ impl WgpuRenderer {
         // NOTE: Fast blit already presented to swapchain, so this is a no-op
         // When we implement persistent framebuffer properly, this will blit framebuffer → swapchain
         log::trace!("Present framebuffer only (no compositor) - fast blit already presented");
+    }
+
+    /// Follow the process-wide "uncapped presentation" switch (see
+    /// `render_stats::set_uncapped_presentation`): swap vsync `Fifo` for the best
+    /// non-vsync mode the surface supports while a profiling recording has the
+    /// frame-rate cap lifted, and back afterwards. A no-op unless it changed.
+    fn sync_present_mode(&mut self) {
+        let want = if crate::render_stats::uncapped_presentation() {
+            self.uncapped_present_mode.unwrap_or(self.default_present_mode)
+        } else {
+            self.default_present_mode
+        };
+        if want != self.surface_configuration.present_mode {
+            log::info!(
+                "present mode {:?} -> {:?}",
+                self.surface_configuration.present_mode,
+                want
+            );
+            self.surface_configuration.present_mode = want;
+            self.reconfigure_surface();
+        }
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {

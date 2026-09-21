@@ -567,3 +567,19 @@ mod tests {
         assert!(drained.timers.is_empty());
     }
 }
+
+static UNCAPPED_PRESENTATION: AtomicBool = AtomicBool::new(false);
+
+/// Lift (or restore) the presentation cap process-wide. While set, each window's
+/// renderer switches its swapchain from vsync (`Fifo`) to the best non-vsync
+/// present mode the surface supports, so presentation is no longer limited to the
+/// display refresh rate. Used by the profiler's "uncap frame rate" recording option.
+pub fn set_uncapped_presentation(uncapped: bool) {
+    UNCAPPED_PRESENTATION.store(uncapped, Ordering::Relaxed);
+}
+
+/// Whether the presentation cap is currently lifted.
+#[inline]
+pub fn uncapped_presentation() -> bool {
+    UNCAPPED_PRESENTATION.load(Ordering::Relaxed)
+}
