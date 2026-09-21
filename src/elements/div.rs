@@ -3580,11 +3580,17 @@ impl Interactivity {
                 .clicked_state
                 .get_or_insert_with(Default::default)
                 .clone();
+            // The pressed/released `:active` style is read by this element's own
+            // view, so only that view needs to repaint. `window.refresh()` here
+            // discarded every cached view in the window on each press and each
+            // release of any element with an active style (a ~10-19 ms rebuild
+            // of the whole editor, twice per click).
+            let owner_view = window.current_view();
             if active_state.borrow().is_clicked() {
-                window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture {
                         *active_state.borrow_mut() = ElementClickedState::default();
-                        window.refresh();
+                        cx.notify(owner_view);
                     }
                 });
             } else {
@@ -3593,7 +3599,7 @@ impl Interactivity {
                     .as_ref()
                     .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
                 let hitbox = hitbox.clone();
-                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
+                window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble && !window.default_prevented() {
                         let group_hovered = active_group_hitbox
                             .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
@@ -3603,7 +3609,7 @@ impl Interactivity {
                                 group: group_hovered,
                                 element: element_hovered,
                             };
-                            window.refresh();
+                            cx.notify(owner_view);
                         }
                     }
                 });

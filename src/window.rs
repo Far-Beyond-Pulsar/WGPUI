@@ -791,6 +791,26 @@ impl WindowInvalidator {
         self.inner.borrow().dirty
     }
 
+    /// Whether the *only* reason a frame is pending is a window-scope
+    /// `DISPLAY` invalidation -- what [`Window::refresh_buffers`] requests when an
+    /// external surface (the Helio viewport) has a new texture.
+    ///
+    /// Exact by construction: every path that sets `dirty` also records an axis,
+    /// a view or a layer, so requiring all of those to be empty (or
+    /// `DISPLAY`-only) means nothing else asked for this frame, including
+    /// invalidations deferred from inside a draw.
+    pub fn is_display_only(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.dirty
+            && inner.draw_phase == DrawPhase::None
+            && !inner.window_axes.is_empty()
+            && Invalidation::DISPLAY.contains(inner.window_axes)
+            && inner.dirty_views.is_empty()
+            && inner.dirty_layers.is_empty()
+            && inner.deferred_notifies.is_empty()
+            && inner.deferred_window_axes.is_empty()
+    }
+
     pub fn set_dirty(&self, dirty: bool) {
         let mut inner = self.inner.borrow_mut();
         inner.dirty = dirty;
@@ -2036,6 +2056,14 @@ impl Window {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
+                                // Viewport-only frame: nothing in the scene changed, so
+                                // re-present it rather than rebuilding it. Never on a
+                                // forced render (that bypasses every cache on purpose).
+                                if !request_frame_options.force_render
+                                    && window.present_previous_scene_if_display_only(cx)
+                                {
+                                    return;
+                                }
                                 if request_frame_options.force_render {
                                     // Bypass cached view reuse so we don't replay stale
                                     // atlas tile references after a GPU device recovery.
@@ -3534,6 +3562,65 @@ impl Window {
             self.invalidated_entities.insert(entity);
         }
         self.invalidator.replace_views(views);
+    }
+
+    /// Handle a frame whose only change is a new texture in an external surface,
+    /// by re-presenting the previous scene instead of rebuilding it.
+    ///
+    /// `Window::draw` always walks the tree (layout, prepaint, paint, scene
+    /// finish -- ~3 ms of a ~4.4 ms UI frame in the editor), even when the only
+    /// pending invalidation is the `DISPLAY`-only one from
+    /// [`Window::refresh_buffers`]. Nothing in the scene changed in that case:
+    /// the renderer promotes the newest surface texture while drawing the scene's
+    /// `Surfaces` batch (`swap_ready_display_if_new`), so drawing the *same*
+    /// scene again shows the new frame, with every overlay and the draw order
+    /// exactly as before.
+    ///
+    /// Returns `true` if the frame was handled (and presented); `false` means the
+    /// caller must do a normal `draw` + `present`. Disable with
+    /// `WGPUI_DISPLAY_ONLY_FRAMES=0`.
+    pub(crate) fn present_previous_scene_if_display_only(&mut self, cx: &mut App) -> bool {
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("WGPUI_DISPLAY_ONLY_FRAMES")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        });
+        // Nothing drawn yet, an inspector that needs fresh element info, or a
+        // mode that skips drawing: always take the normal path.
+        if !*ENABLED
+            || self.layer_frame == 0
+            || self.inspector.is_some()
+            || cx.mode.skip_drawing()
+            || !self.invalidator.is_display_only()
+        {
+            return false;
+        }
+
+        // The renderer posts slab re-record requests (atlas eviction under a
+        // resident layer) that only a real draw can answer. Fold them in exactly
+        // as `draw` would and let the normal path run.
+        if crate::scene_pack::slabs_enabled() {
+            let requests = self.platform_window.take_slab_rerecord_requests();
+            if !requests.is_empty() {
+                for layer_key in requests {
+                    if self.layers.contains_key(&layer_key) {
+                        self.invalidator
+                            .invalidate_layer(layer_key, Invalidation::all());
+                    } else {
+                        self.slab_tokens.remove(&layer_key);
+                    }
+                }
+                return false;
+            }
+        }
+
+        wgpui_scope!("wgpui: display-only frame (re-present previous scene)");
+        crate::render_stats::count("window: display-only frame (scene re-presented)");
+        // Answer the request: what `draw` does at its start.
+        self.invalidator.take_window_axes();
+        self.invalidator.set_dirty(false);
+        self.present();
+        true
     }
 
     fn present(&self) {
@@ -7268,7 +7355,13 @@ impl Window {
     }
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
-        if self.invalidator.is_dirty() {
+        // The forced draw exists so key handling sees an up-to-date dispatch
+        // tree. A display-only dirty state (a new external-surface texture, the
+        // Helio viewport's per-frame request) changes no tree, so there is
+        // nothing to catch up on: leave it pending for the normal frame. Forcing
+        // the draw anyway turned every modifier-key press that landed on a
+        // viewport frame into a 20+ ms synchronous draw.
+        if self.invalidator.is_dirty() && !self.invalidator.is_display_only() {
             // A key event forces a full synchronous draw when the window is
             // dirty, on top of the frame the loop would draw anyway.
             wgpui_scope!("wgpui: dispatch_key_event forced draw (window dirty)");
@@ -14519,5 +14612,143 @@ mod test {
                 );
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod display_only_predicate_tests {
+    use super::*;
+
+    /// The invalidator alone decides whether a frame may skip the tree walk, so
+    /// every other kind of pending work must defeat it.
+    #[test]
+    fn only_a_pure_display_invalidation_qualifies() {
+        let inv = WindowInvalidator::new();
+        // Fresh window: dirty (first frame) but with no axis recorded.
+        assert!(!inv.is_display_only(), "first frame has no display axis");
+
+        inv.take_window_axes();
+        inv.set_dirty(false);
+        assert!(!inv.is_display_only(), "clean window");
+
+        // What `refresh_buffers` records.
+        inv.invalidate_window(Invalidation::DISPLAY);
+        assert!(inv.is_display_only(), "refresh_buffers alone qualifies");
+
+        // A full refresh (layout/hit) must take the normal path.
+        inv.invalidate_window(Invalidation::all());
+        assert!(!inv.is_display_only(), "full refresh does not qualify");
+
+        inv.take_window_axes();
+        inv.set_dirty(false);
+        inv.invalidate_window(Invalidation::DISPLAY);
+        assert!(inv.is_display_only());
+
+        // Any layer invalidation on top of it defeats it.
+        inv.invalidate_layer(LayerKey(7), Invalidation::DISPLAY);
+        assert!(!inv.is_display_only(), "a dirty layer needs a real draw");
+
+        // Answering the request (what the draw does) clears the state again.
+        inv.take_layer_axes();
+        inv.take_window_axes();
+        inv.set_dirty(false);
+        assert!(!inv.is_display_only());
+    }
+
+    #[test]
+    fn an_entity_notify_in_the_same_frame_defeats_it() {
+        let inv = WindowInvalidator::new();
+        inv.take_window_axes();
+        inv.set_dirty(false);
+        inv.invalidate_window(Invalidation::DISPLAY);
+        assert!(inv.is_display_only());
+        // A dirty view is recorded exactly as `invalidate_entity` does.
+        inv.inner.borrow_mut().dirty_views.insert(EntityId::from(slotmap::KeyData::from_ffi(1)));
+        assert!(!inv.is_display_only(), "a dirty view needs a real draw");
+    }
+}
+
+#[cfg(test)]
+mod display_only_frame_tests {
+    use crate::{TestAppContext, Window, prelude::*, px, size};
+
+    struct CountingView {
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl crate::Render for CountingView {
+        fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl crate::IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            crate::Empty
+        }
+    }
+
+    /// `refresh_buffers` alone is answered by re-presenting the last scene: no
+    /// tree walk, the request is consumed, and nothing is left dirty. Any other
+    /// invalidation on top of it must fall through to a real draw.
+    #[gpui::test]
+    fn refresh_buffers_reuses_the_scene_but_anything_else_draws(cx: &mut TestAppContext) {
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let view_renders = renders.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| CountingView {
+            renders: view_renders,
+        });
+
+        // One real draw so there is a scene to re-present.
+        // Untyped handle: a typed `update` leases the root view, which `draw` needs.
+        let any: crate::AnyWindowHandle = window.into();
+        any
+            .update(cx, |_, w, cx| {
+                w.draw(cx).clear();
+                w.present();
+            })
+            .unwrap();
+        let after_first_draw = renders.get();
+        assert!(after_first_draw > 0);
+
+        any
+            .update(cx, |_, w, cx| {
+                // Clean window: nothing to do, must not claim the frame.
+                assert!(!w.present_previous_scene_if_display_only(cx));
+
+                // The Helio viewport's request: display only.
+                w.refresh_buffers();
+                assert!(
+                    w.present_previous_scene_if_display_only(cx),
+                    "a pure refresh_buffers frame must be re-presented"
+                );
+                assert!(!w.invalidator.is_dirty(), "the request must be consumed");
+                assert!(!w.needs_present.get(), "and the scene presented");
+
+                // A full refresh (layout/hit axes) needs a real draw.
+                w.refresh_buffers();
+                w.refresh();
+                assert!(
+                    !w.present_previous_scene_if_display_only(cx),
+                    "a full refresh must not be treated as display-only"
+                );
+                // Left pending for the real draw that follows.
+                assert!(w.invalidator.is_dirty());
+                w.draw(cx).clear();
+                w.present();
+            })
+            .unwrap();
+        let after_refresh = renders.get();
+        assert!(
+            after_refresh > after_first_draw,
+            "the full refresh must have re-rendered the view"
+        );
+
+        // The skipped frame itself never walked the tree.
+        any
+            .update(cx, |_, w, cx| {
+                w.refresh_buffers();
+                assert!(w.present_previous_scene_if_display_only(cx));
+            })
+            .unwrap();
+        assert_eq!(
+            renders.get(),
+            after_refresh,
+            "a display-only frame must not re-render any view"
+        );
     }
 }
