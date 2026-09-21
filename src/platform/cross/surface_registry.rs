@@ -75,6 +75,14 @@ impl SurfaceRegistry {
         }
     }
 
+    /// Lock the shared surface table. Every render thread and the UI-thread
+    /// compositor contend on this one mutex, so the acquisition is recorded as
+    /// its own span: a long one means another thread held the table.
+    fn lock_surfaces(&self) -> std::sync::MutexGuard<'_, HashMap<SurfaceId, TripleBuffer>> {
+        wgpui_scope!("wgpui: wait surface registry lock");
+        self.surfaces.lock().unwrap()
+    }
+
     /// Create a new triple-buffered surface. Returns its `SurfaceId`.
     pub fn create(
         &self,
@@ -85,7 +93,7 @@ impl SurfaceRegistry {
     ) -> SurfaceId {
         let id = SurfaceId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let tb = Self::create_triple_buffer(device, width, height, format);
-        self.surfaces.lock().unwrap().insert(id, tb);
+        self.lock_surfaces().insert(id, tb);
         id
     }
 
@@ -99,7 +107,7 @@ impl SurfaceRegistry {
     ///
     /// Returns immediately without blocking.
     pub fn swap_rendering_ready(&self, id: SurfaceId, submission_idx: wgpu::SubmissionIndex) {
-        if let Some(tb) = self.surfaces.lock().unwrap().get(&id) {
+        if let Some(tb) = self.lock_surfaces().get(&id) {
             let current = tb.state.load(Ordering::Acquire);
             let (rendering, ready, display) = TripleBuffer::unpack_state(current);
 
@@ -139,7 +147,7 @@ impl SurfaceRegistry {
     /// DEPRECATED: Use swap_rendering_ready() with SubmissionIndex for proper GPU sync.
     /// This method exists for backward compatibility only.
     pub fn swap_rendering_ready_no_sync(&self, id: SurfaceId) {
-        if let Some(tb) = self.surfaces.lock().unwrap().get(&id) {
+        if let Some(tb) = self.lock_surfaces().get(&id) {
             let mut current = tb.state.load(Ordering::Acquire);
             loop {
                 let (rendering, ready, display) = TripleBuffer::unpack_state(current);
@@ -167,7 +175,7 @@ impl SurfaceRegistry {
     /// Returns `true` if a swap occurred, `false` if GPU work is incomplete (compositor
     /// should reuse the current display buffer).
     pub fn swap_ready_display(&self, _device: &wgpu::Device, id: SurfaceId) -> bool {
-        if let Some(tb) = self.surfaces.lock().unwrap().get(&id) {
+        if let Some(tb) = self.lock_surfaces().get(&id) {
             // Atomic swap: ready ↔ display
             // NOTE: We do NOT call device.poll() here because:
             // 1. The render thread owns the device and is actively using it
@@ -202,7 +210,7 @@ impl SurfaceRegistry {
 
     /// Get the rendering buffer's `TextureView` (what external code renders into).
     pub fn back_view(&self, id: SurfaceId) -> Option<wgpu::TextureView> {
-        let surfaces = self.surfaces.lock().unwrap();
+        let surfaces = self.lock_surfaces();
         surfaces.get(&id).map(|tb| {
             let (rendering, _, _) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
             tb.views[rendering as usize].clone()
@@ -211,7 +219,7 @@ impl SurfaceRegistry {
 
     /// Get the display buffer's `TextureView` (what the compositor reads from).
     pub fn front_view(&self, id: SurfaceId) -> Option<wgpu::TextureView> {
-        let surfaces = self.surfaces.lock().unwrap();
+        let surfaces = self.lock_surfaces();
         surfaces.get(&id).map(|tb| {
             let (_, _, display) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
             tb.views[display as usize].clone()
@@ -225,7 +233,7 @@ impl SurfaceRegistry {
         &self,
         id: SurfaceId,
     ) -> Option<(wgpu::TextureView, (u32, u32))> {
-        let surfaces = self.surfaces.lock().unwrap();
+        let surfaces = self.lock_surfaces();
         surfaces.get(&id).map(|tb| {
             let (rendering, _, _) = TripleBuffer::unpack_state(tb.state.load(Ordering::Acquire));
             (tb.views[rendering as usize].clone(), (tb.width, tb.height))
@@ -241,7 +249,7 @@ impl SurfaceRegistry {
     /// Also skips resize if compositor is actively using the buffers (redraw_pending).
     /// Returns `true` if the resize completed, `false` if it was skipped due to active composition.
     pub fn resize(&self, device: &wgpu::Device, id: SurfaceId, width: u32, height: u32) -> bool {
-        let mut surfaces = self.surfaces.lock().unwrap();
+        let mut surfaces = self.lock_surfaces();
         if let Some(tb) = surfaces.get_mut(&id) {
             if tb.width == width && tb.height == height {
                 return true;
@@ -270,13 +278,13 @@ impl SurfaceRegistry {
 
     /// Get the current size of a surface.
     pub fn size(&self, id: SurfaceId) -> Option<(u32, u32)> {
-        let surfaces = self.surfaces.lock().unwrap();
+        let surfaces = self.lock_surfaces();
         surfaces.get(&id).map(|tb| (tb.width, tb.height))
     }
 
     /// Get the texture format for a surface.
     pub fn format(&self, id: SurfaceId) -> Option<wgpu::TextureFormat> {
-        let surfaces = self.surfaces.lock().unwrap();
+        let surfaces = self.lock_surfaces();
         surfaces.get(&id).map(|tb| tb.format)
     }
 
@@ -306,13 +314,13 @@ impl SurfaceRegistry {
 
     /// Remove a surface from the registry.
     pub fn remove(&self, id: SurfaceId) {
-        self.surfaces.lock().unwrap().remove(&id);
+        self.lock_surfaces().remove(&id);
     }
 
     /// Set the redraw pending flag, returning the previous value.
     /// Used by present() to coalesce multiple redraw requests.
     pub fn set_redraw_pending(&self, id: SurfaceId) -> bool {
-        if let Some(tb) = self.surfaces.lock().unwrap().get(&id) {
+        if let Some(tb) = self.lock_surfaces().get(&id) {
             tb.redraw_pending.swap(true, Ordering::Relaxed)
         } else {
             false
@@ -322,7 +330,7 @@ impl SurfaceRegistry {
     /// Clear the redraw pending flag.
     /// Called by the compositor after consuming a frame.
     pub fn clear_redraw_pending(&self, id: SurfaceId) {
-        if let Some(tb) = self.surfaces.lock().unwrap().get(&id) {
+        if let Some(tb) = self.lock_surfaces().get(&id) {
             tb.redraw_pending.store(false, Ordering::Relaxed);
         }
     }
@@ -330,7 +338,7 @@ impl SurfaceRegistry {
     /// Get all surfaces that have pending redraws.
     /// Used by the fast blit path to check which surfaces need updating.
     pub fn get_pending_surfaces(&self) -> Vec<SurfaceId> {
-        let surfaces = self.surfaces.lock().unwrap();
+        let surfaces = self.lock_surfaces();
         surfaces
             .iter()
             .filter(|(_, tb)| tb.redraw_pending.load(Ordering::Relaxed))
@@ -372,7 +380,7 @@ impl SurfaceRegistry {
     /// buffer swap, and the generation store are atomic with respect to the
     /// producer's `swap_rendering_ready*`.
     pub fn swap_ready_display_if_new(&self, id: SurfaceId) -> bool {
-        if let Some(tb) = self.surfaces.lock().unwrap().get(&id) {
+        if let Some(tb) = self.lock_surfaces().get(&id) {
             let current_gen = tb.frame_generation.load(Ordering::Acquire);
             let last = tb.last_composited_generation.load(Ordering::Acquire);
             if !Self::should_composite_swap(current_gen, last) {

@@ -130,28 +130,84 @@ pub fn add(name: &'static str, amount: u64) {
     REGISTRY.bump_counter(name, amount);
 }
 
+/// Bridge to an embedder's span profiler (the engine's flamegraph).
+///
+/// wgpui cannot depend on the engine's profiler crate, and the crates.io
+/// `profiling` crate it does link is a separate instance with its own global
+/// state, so nothing recorded through it can ever reach the engine flamegraph.
+/// The embedder installs this once at startup; every [`scope`] (and
+/// [`external_scope`]) then also opens an embedder span for the same interval.
+pub struct ScopeHook {
+    /// Cheap check (one relaxed atomic load) for whether the embedder wants spans.
+    pub enabled: fn() -> bool,
+    /// Open a span named `name`. The returned guard closes it on drop. It must
+    /// be `Send` because a [`Scope`] may be moved across threads with its owner.
+    pub begin: fn(&'static str) -> Box<dyn Send>,
+}
+
+static SCOPE_HOOK: std::sync::OnceLock<ScopeHook> = std::sync::OnceLock::new();
+
+/// Install the embedder span bridge. Only the first call takes effect.
+pub fn set_scope_hook(hook: ScopeHook) {
+    let _ = SCOPE_HOOK.set(hook);
+}
+
+/// Open an embedder span only (no stats timer). `None` when no hook is
+/// installed or the embedder is not recording.
+#[inline]
+pub fn external_scope(name: &'static str) -> Option<Box<dyn Send>> {
+    let hook = SCOPE_HOOK.get()?;
+    if !(hook.enabled)() {
+        return None;
+    }
+    Some((hook.begin)(name))
+}
+
 /// RAII timer. Records on drop.
 pub struct Scope {
     name: &'static str,
-    start: Instant,
+    /// `Some` only when stats are enabled, so a flamegraph-only scope does not
+    /// pollute the once-per-second stats dump.
+    start: Option<Instant>,
+    /// Closes the embedder span when the scope ends.
+    _external: Option<Box<dyn Send>>,
 }
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        record(self.name, self.start.elapsed());
+        if let Some(start) = self.start {
+            record(self.name, start.elapsed());
+        }
     }
 }
 
-/// Start a scoped timer. Returns `None` when instrumentation is disabled, so the
-/// whole thing costs one atomic load.
+/// Start a scoped timer. Returns `None` when both the stats dump and the
+/// embedder profiler are disabled, so the idle cost is two atomic loads.
 #[inline]
 pub fn scope(name: &'static str) -> Option<Scope> {
+    let stats = enabled();
+    let external = external_scope(name);
+    if !stats && external.is_none() {
+        return None;
+    }
+    Some(Scope {
+        name,
+        start: stats.then(Instant::now),
+        _external: external,
+    })
+}
+
+/// Like [`scope`] but never opens an embedder span. For sites that run once per
+/// element, where a span each would flood the flamegraph.
+#[inline]
+pub fn scope_stats_only(name: &'static str) -> Option<Scope> {
     if !enabled() {
         return None;
     }
     Some(Scope {
         name,
-        start: Instant::now(),
+        start: Some(Instant::now()),
+        _external: None,
     })
 }
 

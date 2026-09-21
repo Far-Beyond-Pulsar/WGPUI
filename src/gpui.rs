@@ -9,6 +9,16 @@
 
 extern crate self as gpui;
 
+/// Frame-stage scope: feeds both the crates.io `profiling` frontend (Tracy) and
+/// the embedder span profiler installed via `render_stats::set_scope_hook`.
+/// Textually before every `mod`, so all modules below can use it.
+macro_rules! wgpui_scope {
+    ($name:literal) => {
+        profiling::scope!($name);
+        let _wgpui_external_scope = $crate::render_stats::external_scope($name);
+    };
+}
+
 #[macro_use]
 mod action;
 mod app;

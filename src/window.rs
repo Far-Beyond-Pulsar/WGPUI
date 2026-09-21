@@ -270,7 +270,7 @@ fn pack_layer_at_record(
     items: &[LayerItem],
     origin: [f32; 2],
 ) -> Option<Result<Arc<RecordedSlabPack>, FallbackReason>> {
-    profiling::scope!("wgpui: pack layer at record");
+    wgpui_scope!("wgpui: pack layer at record");
     if let Some(reason) = first_unsupported_kind(items) {
         crate::scene_pack::report_rejection(reason);
         return Some(Err(reason));
@@ -3220,7 +3220,7 @@ impl Window {
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     pub fn draw<'app>(&mut self, cx: &'app mut App) -> ArenaClearNeeded<'app> {
-        profiling::scope!("wgpui: draw");
+        wgpui_scope!("wgpui: draw");
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
@@ -3442,7 +3442,7 @@ impl Window {
     /// Turn everything recorded since the last draw into the per-draw state the
     /// element walk reads: window-scope axes, and the entity-scope dirty sets.
     fn apply_invalidations(&mut self) {
-        profiling::scope!("wgpui: apply_invalidations");
+        wgpui_scope!("wgpui: apply_invalidations");
         self.window_invalidation = self.invalidator.take_window_axes();
 
         // Layer-scope requests mark exactly the layer they name — no ancestor
@@ -3478,7 +3478,7 @@ impl Window {
     }
 
     fn present(&self) {
-        profiling::scope!("wgpui: present");
+        wgpui_scope!("wgpui: present");
         #[cfg(feature = "flamegraph")]
         let _present_span = crate::enter_span(
             crate::SpanName::Static("Window::present"),
@@ -3499,7 +3499,7 @@ impl Window {
 
     /// Present only the cached framebuffer (fast path - no compositor)
     fn present_framebuffer_only(&self) {
-        profiling::scope!("wgpui: present_framebuffer_only");
+        wgpui_scope!("wgpui: present_framebuffer_only");
         #[cfg(feature = "flamegraph")]
         let _present_span = crate::enter_span(
             crate::SpanName::Static("Window::present_framebuffer_only"),
@@ -3553,7 +3553,7 @@ impl Window {
         // `prepaint_as_root` split into its two halves so layout and prepaint can
         // be timed apart; the pair is exactly what that method does.
         {
-            profiling::scope!("wgpui: layout");
+            wgpui_scope!("wgpui: layout");
             let _t = crate::render_stats::scope("frame: layout");
             root_element.layout_as_root(root_size.into(), self, cx);
         }
@@ -3569,7 +3569,7 @@ impl Window {
         let mut active_drag_element;
         let mut tooltip_element;
         {
-            profiling::scope!("wgpui: prepaint");
+            wgpui_scope!("wgpui: prepaint");
             let prepaint_timer = crate::render_stats::scope("frame: prepaint");
             root_element.prepaint_at(Point::default(), self, cx);
 
@@ -3614,7 +3614,7 @@ impl Window {
         }
 
         // Now actually paint the elements.
-        profiling::scope!("wgpui: paint");
+        wgpui_scope!("wgpui: paint");
         let paint_timer = crate::render_stats::scope("frame: paint");
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
@@ -4896,7 +4896,7 @@ impl Window {
         policy: LayerPolicy,
         f: impl FnOnce(&mut Window) -> R,
     ) -> R {
-        profiling::scope!("wgpui: record layer");
+        wgpui_scope!("wgpui: record layer");
         crate::render_stats::count("layer: re-rendered");
         let scaled_bounds = cache_key.bounds.scale(cache_key.scale_factor);
         let paint_start = self.paint_index();
@@ -5175,7 +5175,7 @@ impl Window {
     /// packing rejection takes the legacy replay path for the whole layer,
     /// which is correct rebuild behaviour, not an error.
     fn composite_layer(&mut self, key: LayerKey) {
-        profiling::scope!("wgpui: layer composite");
+        wgpui_scope!("wgpui: layer composite");
         crate::render_stats::count("layer: composited");
         let _t = crate::render_stats::scope("layer: composite");
         let frame = self.layer_frame;
@@ -5228,7 +5228,7 @@ impl Window {
         frame: u64,
         scale_factor: f32,
     ) -> bool {
-        profiling::scope!("wgpui: slab splice");
+        wgpui_scope!("wgpui: slab splice");
         // A texture-retained layer's pack is relative to its TEXTURE origin
         // (#96), so splicing it as a plain span would draw it offset by the
         // margin. Its composites go through the surface path instead — the
@@ -5499,7 +5499,7 @@ impl Window {
     /// only from the record path — the record frame's inline primitives are
     /// the visible output; these spans are the texture's.
     fn emit_layer_texture_render(&mut self, key: LayerKey, frame: u64) {
-        profiling::scope!("wgpui: layer texture render");
+        wgpui_scope!("wgpui: layer texture render");
         let scale_factor = self.scale_factor();
         let Some((scaled_texture_bounds, origin, pack, target)) =
             self.layers.get(&key).and_then(|layer| {
@@ -5656,7 +5656,7 @@ impl Window {
     /// [`Layer::instances`]): instances are owned by layers and die with them,
     /// via `Layer::drop_content` below.
     fn evict_stale_layers(&mut self) {
-        profiling::scope!("wgpui: evict_stale_layers");
+        wgpui_scope!("wgpui: evict_stale_layers");
         let frame = self.layer_frame;
         let mut dropped_content = 0usize;
         let mut dropped_records = 0usize;
@@ -6933,6 +6933,7 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        wgpui_scope!("wgpui: dispatch_event");
         #[cfg(feature = "flamegraph")]
         crate::record_input_event_dispatched();
         self.last_input_timestamp.set(Instant::now());

@@ -2476,7 +2476,7 @@ fn prepaint_reconciled_child(
                 .prepaint_range
                 .clone();
             crate::render_stats::count("instance: reused");
-            let _t = crate::render_stats::scope("instance: reuse");
+            let _t = crate::render_stats::scope_stats_only("instance: reuse");
             window.reuse_prepaint(range.clone());
             // `on_frame` effects must keep firing every frame regardless of
             // reconciliation, for exactly the reason phase 3 introduced them
@@ -2515,7 +2515,7 @@ fn prepaint_reconciled_child(
                 crate::render_stats::count("instance: rebuilt (stale range)")
             }
         }
-        let _t = crate::render_stats::scope("instance: rebuild");
+        let _t = crate::render_stats::scope_stats_only("instance: rebuild");
         let prepaint_start = window.prepaint_index();
         let (_, accessed_entities) = cx.detect_accessed_entities(|cx| {
             child.prepaint(window, cx);

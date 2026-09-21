@@ -127,7 +127,7 @@ impl PlatformAtlas for WgpuAtlas {
                 Ok(Some(tile.clone()))
             }
             None => Ok({
-                profiling::scope!("new tile");
+                wgpui_scope!("new tile");
                 #[cfg(feature = "flamegraph")]
                 crate::record_atlas_cache_miss();
 

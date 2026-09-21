@@ -125,6 +125,14 @@ impl WgpuSurfaceHandle {
         self.inner.gpu_submit_lock.read()
     }
 
+    /// Non-blocking variant for UI paint callbacks. A paint callback must
+    /// never wait behind surface reconfiguration: both can be driven by the
+    /// compositor, and waiting here can self-deadlock the window. Skipping
+    /// this paint is safe because the next invalidation will retry it.
+    pub fn try_submit_guard(&self) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        self.inner.gpu_submit_lock.try_read()
+    }
+
     /// Get a `TextureView` of the back buffer for use as a render target.
     /// Render into this, then call [`present()`](Self::present).
     pub fn back_buffer_view(&self) -> Option<wgpu::TextureView> {

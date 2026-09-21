@@ -2583,7 +2583,14 @@ impl WgpuRenderer {
     ///
     /// All `Surface::configure` calls in this renderer must go through here.
     fn reconfigure_surface(&self) {
-        let _exclusive = self.context.gpu_submit_lock.write();
+        wgpui_scope!("wgpui: reconfigure_surface");
+        let _exclusive = {
+            // Blocks until every render thread's `submit_guard` read guard is
+            // released, so a long wait here is a render thread mid-frame.
+            wgpui_scope!("wgpui: wait gpu_submit_lock (write)");
+            self.context.gpu_submit_lock.write()
+        };
+        wgpui_scope!("wgpui: Surface::configure");
         self.surface
             .configure(&self.context.device, &self.surface_configuration);
     }
@@ -2710,7 +2717,7 @@ impl WgpuRenderer {
     /// `write_buffer`s; a dirty layer uploads exactly its own slab ranges.
     /// Runs before the render pass so the pass below only draws.
     fn resolve_slab_spans(&mut self, scene: &Scene) {
-        profiling::scope!("wgpui: slab sync");
+        wgpui_scope!("wgpui: slab sync");
         let pages_by_layer = collect_referenced_pages_by_layer(scene);
         let mut planned_layers = FxHashSet::default();
         let mut uploads_required = FxHashSet::default();
@@ -2993,7 +3000,7 @@ impl WgpuRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
-        profiling::scope!("wgpui: renderer draw");
+        wgpui_scope!("wgpui: renderer draw");
         log::trace!("Renderer::draw: starting frame");
 
         let mut command_encoder =
@@ -3116,7 +3123,7 @@ impl WgpuRenderer {
         // cost for legacy (unspliced) content only; clean slabbed layers
         // contribute nothing.
         {
-            profiling::scope!("wgpui: gpu upload");
+            wgpui_scope!("wgpui: gpu upload");
             let gpu_upload_timer = crate::render_stats::scope("frame: gpu upload");
 
             let color_adjustments = ColorAdjustments {
@@ -3298,7 +3305,9 @@ impl WgpuRenderer {
         // reconfigure and retry once; if the second attempt also fails we
         // simply drop this frame.
         let surface_texture = {
-            match self.surface.get_current_texture() {
+            wgpui_scope!("wgpui: acquire swapchain image");
+            let acquired = self.surface.get_current_texture();
+            match acquired {
                 CurrentSurfaceTexture::Success(t)
                 | CurrentSurfaceTexture::Suboptimal(t) => t,
                 CurrentSurfaceTexture::Outdated
@@ -4638,9 +4647,15 @@ impl WgpuRenderer {
         });
 
         log::trace!("Renderer::draw: submitting command buffer");
-        self.context.queue.submit(Some(command_encoder.finish()));
+        {
+            wgpui_scope!("wgpui: queue.submit (draw)");
+            self.context.queue.submit(Some(command_encoder.finish()));
+        }
         log::trace!("Renderer::draw: presenting surface");
-        self.context.queue.present(surface_texture);
+        {
+            wgpui_scope!("wgpui: queue.present (draw)");
+            self.context.queue.present(surface_texture);
+        }
 
         // Start the async readback now that the resolve/copy commands above
         // have actually been submitted to the queue.
@@ -4717,7 +4732,11 @@ impl WgpuRenderer {
         }
 
         // Acquire swapchain (handle retryable surface errors the same as regular draw).
-        let surface_texture = match self.surface.get_current_texture() {
+        let acquired = {
+            wgpui_scope!("wgpui: acquire swapchain image (fast blit)");
+            self.surface.get_current_texture()
+        };
+        let surface_texture = match acquired {
             CurrentSurfaceTexture::Success(t)
             | CurrentSurfaceTexture::Suboptimal(t) => t,
             CurrentSurfaceTexture::Outdated
@@ -4855,8 +4874,14 @@ impl WgpuRenderer {
             }
         }
 
-        self.context.queue.submit(Some(encoder.finish()));
-        self.context.queue.present(surface_texture);
+        {
+            wgpui_scope!("wgpui: queue.submit (fast blit)");
+            self.context.queue.submit(Some(encoder.finish()));
+        }
+        {
+            wgpui_scope!("wgpui: queue.present (fast blit)");
+            self.context.queue.present(surface_texture);
+        }
 
         // Clear redraw flags only for surfaces that presented fresh frames.
         for surface_id in pending_surfaces {
@@ -5108,7 +5133,7 @@ fn flush_slab_run_with_state(
     state: &mut PassBindState,
     globals_bind_group: &wgpu::BindGroup,
 ) {
-    profiling::scope!("wgpui: flush slab runs");
+    wgpui_scope!("wgpui: flush slab runs");
     let dynamic_offsets = [(transform_slot as u64 * transform_slot_stride) as u32];
     let transform_id = BoundGroupId::LayerTransform(dynamic_offsets[0]);
     let range_base = slabs.slab(run.kind).base + run.start;
