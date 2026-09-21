@@ -1244,6 +1244,9 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 .is_none_or(|last| now.duration_since(last) >= IDLE_POLL_INTERVAL);
             if due {
                 window.0.state.last_idle_redraw_requested_at.set(Some(now));
+                // Suspected hidden cost: `about_to_wait` totalled ~20% of the UI
+                // thread with no children, and this OS call is the only real work.
+                wgpui_scope!("Main: about_to_wait request_redraw (OS call)");
                 window.window().request_redraw();
             } else {
                 let last = window.0.state.last_idle_redraw_requested_at.get().unwrap();
