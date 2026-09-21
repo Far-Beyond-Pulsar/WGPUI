@@ -209,6 +209,28 @@ impl WgpuSurfaceHandle {
             .swap_rendering_ready(self.inner.surface_id, submission_index);
     }
 
+    /// Wake the UI thread so it runs a frame now, without marking this surface as
+    /// having a pending direct-blit redraw.
+    ///
+    /// Pair with [`present_synced_silent`](Self::present_synced_silent): the silent
+    /// present publishes the texture but, on its own, leaves the event loop asleep
+    /// until its next idle poll (4 ms), so a published frame waited a variable time
+    /// before the UI thread even looked at it, and two Helio frames could land
+    /// inside one UI frame. This wakes the loop immediately.
+    ///
+    /// Unlike [`present_synced`](Self::present_synced) this does **not** call
+    /// `set_redraw_pending`, so the resulting redraw takes the normal path (the
+    /// per-frame pump sees the new frame and refreshes) rather than attempting the
+    /// fast direct blit, and a missed blit can never force a full `Window::refresh`.
+    /// Redraw requests coalesce, so calling this every frame is cheap.
+    pub fn request_frame(&self) {
+        if let Some(winit) = &self.inner.winit_window {
+            winit.request_redraw();
+        } else {
+            (self.inner.present_trigger)();
+        }
+    }
+
     /// Present the rendered frame without GPU synchronization (deprecated).
     ///
     /// **DEPRECATED**: Use [`present_synced()`](Self::present_synced) instead for proper
