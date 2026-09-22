@@ -1766,18 +1766,17 @@ impl App {
     /// Exposed so a DLL-loaded plugin can enter the *same* scope the host
     /// already established for this draw, using the `&mut App` it's handed
     /// across the FFI boundary: `ElementArenaScope::enter(cx.element_arena())`.
-    /// Without this, plugin-compiled code calling `div()`/`AnyElement::new`
-    /// checks its own, separately-linked copy of the
-    /// `CURRENT_ELEMENT_ARENA` thread-local — which the host's
-    /// `ElementArenaScope::enter` call (itself host-compiled) can only ever
-    /// set on the host's own copy — so plugin element construction silently
-    /// falls back to the private per-DLL `ELEMENT_ARENA` thread-local, which
-    /// nothing outside that DLL ever resets. Every element built by plugin
-    /// code then permanently occupies a freshly grown 1 MiB arena chunk for
-    /// the rest of the process's life: a real, unbounded memory leak that
-    /// scales with elements-constructed-per-frame, confirmed via per-callsite
-    /// allocation tracking (see the `plugin-leak-demo` repro, and
-    /// Pulsar-Native issue #261).
+    /// Plugin-compiled code calling `div()`/`AnyElement::new` checks its own,
+    /// separately-linked copy of the `CURRENT_ELEMENT_ARENA` thread-local —
+    /// which the host's `ElementArenaScope::enter` call (itself host-compiled)
+    /// can only ever set on the host's own copy. Without an explicit
+    /// `ElementArenaScope::enter`, element construction is now a hard error
+    /// instead of silently falling back to a private per-DLL arena: that
+    /// fallback grew a fresh 1 MiB chunk per element, nothing ever cleared it,
+    /// and it was a real, unbounded memory leak scaling with
+    /// elements-constructed-per-frame, confirmed via per-callsite allocation
+    /// tracking (see the `plugin-leak-demo` repro, and Pulsar-Native issue
+    /// #261).
     pub fn element_arena(&self) -> &RefCell<Arena> {
         &self.element_arena
     }

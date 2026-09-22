@@ -926,29 +926,50 @@ slotmap::new_key_type! {
 }
 
 thread_local! {
-    /// Fallback arena used when no app-specific arena is active.
-    /// In production, each window draw sets CURRENT_ELEMENT_ARENA to the app's arena.
-    pub(crate) static ELEMENT_ARENA: RefCell<Arena> = RefCell::new(Arena::new(1024 * 1024));
-
     /// Points to the current App's element arena during draw operations.
     /// This allows multiple test Apps to have isolated arenas, preventing
     /// cross-session corruption when the scheduler interleaves their tasks.
     static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
 }
 
-/// Allocates an element in the current arena. Uses the app-specific arena if one
-/// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
+/// Allocates an element in the currently active element arena.
+///
+/// There is deliberately no thread-local fallback arena: plugin-compiled code
+/// links its own separate copy of this crate (and therefore its own copies of
+/// these thread-locals), so `AnyElement::new` from such a copy must first enter
+/// the host's scope via [`ElementArenaScope::enter`] with the `App` handed
+/// across the FFI boundary. A private per-DLL fallback arena was the
+/// unbounded memory leak in Pulsar-Native issue #261 — every element built
+/// without an active scope grew a fresh 1 MiB bump chunk that nothing ever
+/// cleared. So constructing an element with no active arena is now a hard
+/// error, not a silent leak.
+#[track_caller]
 pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
-    CURRENT_ELEMENT_ARENA.with(|current| {
-        if let Some(arena_ptr) = current.get() {
-            // SAFETY: The pointer is valid for the duration of the draw operation
-            // that set it, and we're being called during that same draw.
-            let arena_cell = unsafe { &*arena_ptr };
-            f(&mut arena_cell.borrow_mut())
-        } else {
-            ELEMENT_ARENA.with_borrow_mut(f)
-        }
-    })
+    CURRENT_ELEMENT_ARENA
+        .with(|current| {
+            current.get().map(|arena_ptr| {
+                // SAFETY: The pointer is valid for the duration of the draw operation
+                // that called `ElementArenaScope::enter`, and we're being called
+                // during that same draw scope.
+                let arena_cell = unsafe { &*arena_ptr };
+                f(&mut arena_cell.borrow_mut())
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "element arena not active: `AnyElement` was constructed outside of \
+                 an `ElementArenaScope` on thread {:?}. Enter one first (host code: \
+                 `ElementArenaScope::enter(cx.element_arena())` at the top of \
+                 `Window::draw`; DLL plugin code: call \
+                 `ElementArenaScope::enter(cx.element_arena())` with the `App` \
+                 handed across the FFI boundary before building elements). This \
+                 used to silently fall back to a per-thread arena that leaked \
+                 one 1 MiB chunk per element (Pulsar-Native issue #261).\n\
+                 Construction callsite:\n{}",
+                std::thread::current().name().map(|n| n.to_string()).unwrap_or("<unnamed>".into()),
+                std::backtrace::Backtrace::force_capture(),
+            )
+        })
 }
 
 /// RAII guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw operation.
@@ -956,7 +977,7 @@ pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
 ///
 /// `pub` (not `pub(crate)`) so that DLL-loaded plugin code — which links its
 /// own separate copy of this crate, and therefore has its own separate copy
-/// of the `CURRENT_ELEMENT_ARENA`/`ELEMENT_ARENA` thread-locals — can enter
+/// of the `CURRENT_ELEMENT_ARENA` thread-local — can enter
 /// the *host's* already-correct scope using the `App` reference it's handed
 /// across the FFI boundary: `ElementArenaScope::enter(cx.element_arena())`.
 /// See `App::element_arena`'s doc comment for the full leak this closes.
@@ -1254,6 +1275,22 @@ pub(crate) fn type_name_hash<T: 'static>() -> u64 {
 pub(crate) fn action_name_hash<T: crate::Action>() -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     T::name_for_type().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Cross-DLL discriminator for a *dispatched action instance*, computed directly from its
+/// `name()` rather than via `ActionRegistry::discriminator_for_type`.
+///
+/// `ActionRegistry` is built once, at `App` startup, from `inventory::iter` — which only sees
+/// actions statically linked into the host binary at that point. An action type defined inside
+/// a plugin loaded later via `libloading` (e.g. `actions!(script_editor, [SaveCurrentFile, ..])`
+/// in a DLL plugin) is never in that registry, so `discriminator_for_type` panics with "action
+/// type not registered" the moment such an action is dispatched — which happens as soon as the
+/// plugin's own keybindings fire. `Action::name()` is a plain per-instance trait method with no
+/// registry dependency, so hashing it directly works for host and plugin actions alike.
+fn action_instance_discriminator(action: &dyn Action) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    action.name().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -7700,7 +7737,6 @@ impl Window {
     ) {
         // Named by action so a slow keybinding/menu command is attributable.
         wgpui_scope_dyn!(format!("wgpui: dispatch action {}", action.name()));
-        let action_registry = cx.actions.clone();
         let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
 
         // Capture phase for global actions.
@@ -7731,10 +7767,10 @@ impl Window {
         }
 
         // Capture phase for window actions.
+        let action_disc = action_instance_discriminator(action);
         for node_id in &dispatch_path {
             let node = self.rendered_frame.dispatch_tree.node(*node_id);
             let action_type_id = action.as_any().type_id();
-            let action_disc = action_registry.discriminator_for_type(&action_type_id);
             for DispatchActionListener {
                 action_type,
                 action_discriminator,
@@ -7756,7 +7792,6 @@ impl Window {
         for node_id in dispatch_path.iter().rev() {
             let node = self.rendered_frame.dispatch_tree.node(*node_id);
             let action_type_id = action.as_any().type_id();
-            let action_disc = action_registry.discriminator_for_type(&action_type_id);
             for DispatchActionListener {
                 action_type,
                 action_discriminator,

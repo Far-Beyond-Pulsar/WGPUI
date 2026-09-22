@@ -34,7 +34,7 @@
 use crate::{
     App, ArenaBox, AvailableSpace, Bounds, ContentMask, Context, DispatchNodeId, DrawPhase, ElementId,
     FocusHandle, InspectorElementId, LayoutId, Pixels, Point, ReconcileKey, SharedString, Size, Style,
-    Window, util::FluentBuilder, with_element_arena,
+    Window, util::FluentBuilder, with_element_arena, ElementArenaScope,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -294,6 +294,12 @@ impl<C: RenderOnce> Element for Component<C> {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         window.with_global_id(ElementId::Name(type_name::<C>().into()), |_, window| {
+            // `C::render` may run in a separate gpui copy (a plugin DLL)
+            // whose own arena thread-local the host's draw scope cannot
+            // reach. `cx` is the App handed across the boundary, so its
+            // arena is the host's; scoping here covers construction in
+            // either copy. See `ElementArenaScope`'s doc comment.
+            let _arena_scope = ElementArenaScope::enter(cx.element_arena());
             let mut element = self
                 .component
                 .take()
