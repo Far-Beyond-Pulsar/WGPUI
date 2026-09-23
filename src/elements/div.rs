@@ -1412,6 +1412,7 @@ pub fn div() -> Div {
         prepaint_listener: None,
         on_frame: None,
         image_cache: None,
+        accessibility_label: None,
     }
 }
 
@@ -1422,9 +1423,16 @@ pub struct Div {
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
     on_frame: Option<FrameEffectCallback>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
+    accessibility_label: Option<Box<SharedString>>,
 }
 
 impl Div {
+    /// Preserve the label for accessibility metadata readers.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.accessibility_label = Some(Box::new(label.into()));
+        self
+    }
+
     /// Add a listener to be called when the children of this `Div` are prepainted.
     /// This allows you to store the [`Bounds`] of the children for later use.
     pub fn on_children_prepainted(
@@ -1591,6 +1599,12 @@ impl ParentElement for Div {
 impl Element for Div {
     type RequestLayoutState = DivFrameState;
     type PrepaintState = DivPrepaintState;
+
+    fn write_a11y_info(&self, node: &mut crate::accesskit::Node) {
+        if let Some(label) = &self.accessibility_label {
+            node.set_label(label.as_str());
+        }
+    }
 
     fn id(&self) -> Option<ElementId> {
         self.interactivity.element_id.clone()
@@ -4177,6 +4191,14 @@ pub struct Stateful<E> {
     pub(crate) element: E,
 }
 
+impl Stateful<Div> {
+    /// Preserve the label on the wrapped div.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.element = self.element.aria_label(label);
+        self
+    }
+}
+
 impl<E> Styled for Stateful<E>
 where
     E: Styled,
@@ -4208,6 +4230,14 @@ where
 {
     type RequestLayoutState = E::RequestLayoutState;
     type PrepaintState = E::PrepaintState;
+
+    fn a11y_role(&self) -> Option<crate::Role> {
+        self.element.a11y_role()
+    }
+
+    fn write_a11y_info(&self, node: &mut crate::accesskit::Node) {
+        self.element.write_a11y_info(node);
+    }
 
     fn id(&self) -> Option<ElementId> {
         self.element.id()
