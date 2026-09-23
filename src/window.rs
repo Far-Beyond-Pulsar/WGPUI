@@ -7270,6 +7270,10 @@ impl Window {
                 type_name_hash::<ScrollWheelEvent>()
             } else if any_mouse_event.is::<MouseExitEvent>() {
                 type_name_hash::<MouseExitEvent>()
+            } else if any_mouse_event.is::<crate::LongPressEvent>() {
+                type_name_hash::<crate::LongPressEvent>()
+            } else if any_mouse_event.is::<crate::TouchDragEvent>() {
+                type_name_hash::<crate::TouchDragEvent>()
             } else {
                 0
             };
