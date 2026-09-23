@@ -6934,6 +6934,19 @@ impl Window {
         }
     }
 
+    /// Marks an editor as the owner of an active synthesized long-press.
+    ///
+    /// The cross-platform backend currently routes long-press gestures to the
+    /// element that registered the listener, so ownership is implicit. These
+    /// compatibility methods keep higher-level controls independent from that
+    /// backend detail.
+    pub fn capture_long_press<T: 'static>(&mut self, _entity: &Entity<T>) {}
+
+    /// Returns whether the element may continue handling its long-press.
+    pub fn has_long_press_capture<T: 'static>(&self, _entity: &Entity<T>) -> bool {
+        true
+    }
+
     /// Register a mouse event listener on the window for the next frame. The type of event
     /// is determined by the first parameter of the given listener. When the next frame is rendered
     /// the listener will be cleared.
@@ -7187,6 +7200,14 @@ impl Window {
                 self.mouse_position = scroll_wheel.position;
                 self.modifiers = scroll_wheel.modifiers;
                 PlatformInput::ScrollWheel(scroll_wheel)
+            }
+            PlatformInput::LongPress(long_press) => {
+                self.mouse_position = long_press.position;
+                PlatformInput::LongPress(long_press)
+            }
+            PlatformInput::TouchDrag(touch_drag) => {
+                self.mouse_position = touch_drag.position;
+                PlatformInput::TouchDrag(touch_drag)
             }
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
