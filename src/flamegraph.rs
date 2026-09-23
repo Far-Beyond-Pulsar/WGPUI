@@ -105,6 +105,11 @@ pub(crate) fn hash_global_element_id(id: &crate::GlobalElementId) -> u64 {
 pub struct ThreadKey(u64);
 
 impl ThreadKey {
+    /// Creates a thread key from a stored capture value.
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
     fn current() -> Self {
         let mut hasher = DefaultHasher::new();
         std::thread::current().id().hash(&mut hasher);
