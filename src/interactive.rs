@@ -82,7 +82,7 @@ impl Deref for ModifiersChangedEvent {
 
 /// The phase of a touch motion event.
 /// Based on the winit enum of the same name.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TouchPhase {
     /// The touch started.
     Started,
@@ -91,6 +91,8 @@ pub enum TouchPhase {
     Moved,
     /// The touch phase has ended
     Ended,
+    /// The gesture was cancelled by the platform or a competing pointer.
+    Cancelled,
 }
 
 /// A mouse down event from the platform
@@ -204,6 +206,14 @@ pub struct LongPressEvent {
     pub position: crate::Point<crate::Pixels>,
 }
 
+impl Sealed for LongPressEvent {}
+impl InputEvent for LongPressEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::LongPress(self)
+    }
+}
+impl MouseEvent for LongPressEvent {}
+
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct TouchDragEvent {
@@ -211,6 +221,14 @@ pub struct TouchDragEvent {
     pub start_position: crate::Point<crate::Pixels>,
     pub position: crate::Point<crate::Pixels>,
 }
+
+impl Sealed for TouchDragEvent {}
+impl InputEvent for TouchDragEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::TouchDrag(self)
+    }
+}
+impl MouseEvent for TouchDragEvent {}
 
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,6 +626,10 @@ pub enum PlatformInput {
     MouseExited(MouseExitEvent),
     /// The scroll wheel was used.
     ScrollWheel(ScrollWheelEvent),
+    /// A synthesized long-press gesture.
+    LongPress(LongPressEvent),
+    /// A synthesized touch-drag gesture.
+    TouchDrag(TouchDragEvent),
     /// Files were dragged and dropped onto the window.
     FileDrop(FileDropEvent),
 }
@@ -623,6 +645,8 @@ impl PlatformInput {
             PlatformInput::MouseMove(event) => Some(event),
             PlatformInput::MouseExited(event) => Some(event),
             PlatformInput::ScrollWheel(event) => Some(event),
+            PlatformInput::LongPress(event) => Some(event),
+            PlatformInput::TouchDrag(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
         }
     }
@@ -637,6 +661,8 @@ impl PlatformInput {
             PlatformInput::MouseMove(_) => None,
             PlatformInput::MouseExited(_) => None,
             PlatformInput::ScrollWheel(_) => None,
+            PlatformInput::LongPress(_) => None,
+            PlatformInput::TouchDrag(_) => None,
             PlatformInput::FileDrop(_) => None,
         }
     }
