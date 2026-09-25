@@ -411,6 +411,7 @@ struct SurfaceParams {
     content_mask: Bounds,
     color_conversion: u32,
     _pad: [u32; 3],
+    _tail_pad: [u32; 4],
 }
 
 impl Quad {
@@ -4335,6 +4336,7 @@ impl WgpuRenderer {
                                             Some(crate::SurfaceColorConversion::LinearToSrgb)
                                         )),
                                         _pad: [0; 3],
+                                        _tail_pad: [0; 4],
                                     };
 
                                     // Cache bounds for fast surface blitting
@@ -4495,6 +4497,7 @@ impl WgpuRenderer {
                                     },
                                     color_conversion: 0,
                                     _pad: [0; 3],
+                                    _tail_pad: [0; 4],
                                 };
 
                                 let params_buffer = self.context.device.create_buffer_init(
@@ -4860,6 +4863,7 @@ impl WgpuRenderer {
                         Some(crate::SurfaceColorConversion::LinearToSrgb)
                     )),
                     _pad: [0; 3],
+                    _tail_pad: [0; 4],
                 };
 
                 let params_buffer =
