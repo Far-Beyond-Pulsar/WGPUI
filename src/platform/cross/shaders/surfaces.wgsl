@@ -12,6 +12,8 @@ struct Bounds {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    color_conversion: u32,
+    _pad: vec3<u32>,
 }
 
 struct SurfaceVarying {
@@ -47,16 +49,29 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
     return out;
 }
 
-// `t_surface` is sampled from an sRGB-format texture, so `textureSample` below
-// auto-decodes sRGB -> linear. The swapchain is non-sRGB (see renderer.rs), so
-// writing linear values keeps blending correct and lets the display handle the
-// final gamma curve.
+// When requested, `t_surface` is sampled from an sRGB-format texture, so
+// `textureSample` auto-decodes sRGB -> linear. WGPUI's swapchain is
+// intentionally non-sRGB (see renderer.rs), so that path encodes the linear
+// RGB again before writing. Legacy surfaces leave the sampled value unchanged.
+fn linear_to_srgb(linear: vec3<f32>) -> vec3<f32> {
+    let cutoff = linear < vec3<f32>(0.0031308);
+    let higher = vec3<f32>(1.055) * pow(linear, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    let lower = linear * vec3<f32>(12.92);
+    return select(higher, lower, cutoff);
+}
+
+fn linear_to_srgba(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(linear_to_srgb(color.rgb), color.a);
+}
+
 @fragment
 fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
     let inside = !any(input.clip_distances < vec4<f32>(0.0));
     let color = textureSample(t_surface, s_surface, input.tex_coord);
     let alpha = color.a;
     let multiplier = select(1.0, alpha, globals.premultiplied_alpha != 0u);
-    let result = vec4<f32>(color.rgb * multiplier, alpha);
+    let linear_result = vec4<f32>(color.rgb * multiplier, alpha);
+    let result = select(linear_result, linear_to_srgba(linear_result),
+        params.color_conversion != 0u);
     return select(vec4<f32>(0.0), result, inside);
 }

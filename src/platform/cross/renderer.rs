@@ -409,6 +409,8 @@ impl Bounds {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    color_conversion: u32,
+    _pad: [u32; 3],
 }
 
 impl Quad {
@@ -4326,6 +4328,13 @@ impl WgpuRenderer {
                                                 surface.content_mask.bounds.size.height.0,
                                             ],
                                         },
+                                        color_conversion: u32::from(matches!(
+                                            self.context
+                                                .surface_registry
+                                                .color_conversion(*surface_id),
+                                            Some(crate::SurfaceColorConversion::LinearToSrgb)
+                                        )),
+                                        _pad: [0; 3],
                                     };
 
                                     // Cache bounds for fast surface blitting
@@ -4484,6 +4493,8 @@ impl WgpuRenderer {
                                             surface.content_mask.bounds.size.height.0,
                                         ],
                                     },
+                                    color_conversion: 0,
+                                    _pad: [0; 3],
                                 };
 
                                 let params_buffer = self.context.device.create_buffer_init(
@@ -4842,6 +4853,13 @@ impl WgpuRenderer {
                         origin: [content_mask.origin.x.0, content_mask.origin.y.0],
                         size: [content_mask.size.width.0, content_mask.size.height.0],
                     },
+                    color_conversion: u32::from(matches!(
+                        self.context
+                            .surface_registry
+                            .color_conversion(*surface_id),
+                        Some(crate::SurfaceColorConversion::LinearToSrgb)
+                    )),
+                    _pad: [0; 3],
                 };
 
                 let params_buffer =

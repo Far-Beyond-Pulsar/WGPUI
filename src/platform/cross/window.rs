@@ -513,9 +513,30 @@ impl PlatformWindow for CrossWindow {
         height: u32,
         format: wgpu::TextureFormat,
     ) -> Option<WgpuSurfaceHandle> {
+        self.create_wgpu_surface_with_color_conversion(
+            width,
+            height,
+            format,
+            crate::SurfaceColorConversion::None,
+        )
+    }
+
+    fn create_wgpu_surface_with_color_conversion(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        color_conversion: crate::SurfaceColorConversion,
+    ) -> Option<WgpuSurfaceHandle> {
         let ctx = &self.0.wgpu_context;
         let registry = ctx.surface_registry.clone();
-        let surface_id = registry.create(&ctx.device, width, height, format);
+        let surface_id = registry.create_with_color_conversion(
+            &ctx.device,
+            width,
+            height,
+            format,
+            color_conversion,
+        );
 
         // Build the present trigger: sends a CrossEvent to wake the event loop
         // and request a redraw for this window.
@@ -540,6 +561,7 @@ impl PlatformWindow for CrossWindow {
             width,
             height,
             format,
+            color_conversion,
         ))
     }
 

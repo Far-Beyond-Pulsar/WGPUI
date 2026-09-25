@@ -9,6 +9,18 @@ use crate::{
     platform::cross::surface_registry::{SurfaceId, SurfaceRegistry},
 };
 
+/// Color conversion applied while compositing an external WGPU surface.
+///
+/// The default surface API uses [`Self::None`] for backwards compatibility.
+/// Consumers rendering linear color data into an sRGB surface can opt into
+/// [`Self::LinearToSrgb`] when the GPUI window target is non-sRGB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SurfaceColorConversion {
+    #[default]
+    None,
+    LinearToSrgb,
+}
+
 /// Inner state shared across clones of `WgpuSurfaceHandle`.
 /// When the last clone is dropped, the surface is removed from the registry.
 struct WgpuSurfaceHandleInner {
@@ -29,6 +41,7 @@ struct WgpuSurfaceHandleInner {
     deferred_resize: Mutex<Option<(u32, u32)>>,
     is_resizing: AtomicBool,
     format: wgpu::TextureFormat,
+    color_conversion: SurfaceColorConversion,
 }
 
 impl Drop for WgpuSurfaceHandleInner {
@@ -69,6 +82,7 @@ impl WgpuSurfaceHandle {
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
+        color_conversion: SurfaceColorConversion,
     ) -> Self {
         Self {
             inner: Arc::new(WgpuSurfaceHandleInner {
@@ -84,6 +98,7 @@ impl WgpuSurfaceHandle {
                 deferred_resize: Mutex::new(None),
                 is_resizing: AtomicBool::new(false),
                 format,
+                color_conversion,
             }),
         }
     }
@@ -296,6 +311,11 @@ impl WgpuSurfaceHandle {
     /// The texture format used by this surface's buffers.
     pub fn format(&self) -> wgpu::TextureFormat {
         self.inner.format
+    }
+
+    /// Color conversion requested for this surface during GPUI composition.
+    pub fn color_conversion(&self) -> SurfaceColorConversion {
+        self.inner.color_conversion
     }
 
     /// Returns true if a resize is pending, deferred, or currently in progress.

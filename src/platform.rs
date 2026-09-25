@@ -479,6 +479,19 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// Create an external WGPU surface with an explicit compositor color
+    /// conversion. The default implementation preserves the legacy surface
+    /// behavior for platforms that do not implement the extended API.
+    fn create_wgpu_surface_with_color_conversion(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        _color_conversion: crate::SurfaceColorConversion,
+    ) -> Option<crate::WgpuSurfaceHandle> {
+        self.create_wgpu_surface(width, height, format)
+    }
+
     /// Current GPU memory footprint of this window's renderer (Phase 3 of the
     /// profiling epic, issue #59). Default `None` for platforms/backends that
     /// don't use the WGPU renderer, matching `create_wgpu_surface`'s

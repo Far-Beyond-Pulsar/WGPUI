@@ -41,6 +41,7 @@ struct TripleBuffer {
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
+    color_conversion: crate::SurfaceColorConversion,
 }
 
 impl TripleBuffer {
@@ -91,10 +92,35 @@ impl SurfaceRegistry {
         height: u32,
         format: wgpu::TextureFormat,
     ) -> SurfaceId {
+        self.create_with_color_conversion(
+            device,
+            width,
+            height,
+            format,
+            crate::SurfaceColorConversion::None,
+        )
+    }
+
+    /// Create a surface and associate its compositor color conversion mode.
+    pub fn create_with_color_conversion(
+        &self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        color_conversion: crate::SurfaceColorConversion,
+    ) -> SurfaceId {
         let id = SurfaceId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let tb = Self::create_triple_buffer(device, width, height, format);
+        let mut tb = Self::create_triple_buffer(device, width, height, format);
+        tb.color_conversion = color_conversion;
         self.lock_surfaces().insert(id, tb);
         id
+    }
+
+    /// Get the compositor color conversion mode for a surface.
+    pub fn color_conversion(&self, id: SurfaceId) -> Option<crate::SurfaceColorConversion> {
+        let surfaces = self.lock_surfaces();
+        surfaces.get(&id).map(|tb| tb.color_conversion)
     }
 
     /// Atomically swap rendering and ready buffers (called by external thread after rendering).
@@ -270,6 +296,8 @@ impl SurfaceRegistry {
 
             // Now safe to recreate textures
             let new_tb = Self::create_triple_buffer(device, width, height, tb.format);
+            let mut new_tb = new_tb;
+            new_tb.color_conversion = tb.color_conversion;
             *tb = new_tb;
             return true;
         }
@@ -519,6 +547,7 @@ impl SurfaceRegistry {
             width: w,
             height: h,
             format,
+            color_conversion: crate::SurfaceColorConversion::None,
         }
     }
 }

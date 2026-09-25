@@ -6423,6 +6423,21 @@ impl Window {
             .create_wgpu_surface(width, height, format)
     }
 
+    /// Create an external WGPU surface with an explicit compositor color
+    /// conversion. Existing callers should continue using
+    /// [`Self::create_wgpu_surface`] unless their renderer needs conversion at
+    /// the GPUI compositor boundary.
+    pub fn create_wgpu_surface_with_color_conversion(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        color_conversion: crate::SurfaceColorConversion,
+    ) -> Option<crate::WgpuSurfaceHandle> {
+        self.platform_window
+            .create_wgpu_surface_with_color_conversion(width, height, format, color_conversion)
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {
