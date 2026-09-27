@@ -1,6 +1,6 @@
 //! CPU-side flamegraph capture engine (Phase 1 of the profiling epic, see issue #57).
 //!
-//! This module owns the data model, per-thread span recorder, capture session
+//! This module owns the data model, sharded span recorder, capture session
 //! lifecycle, and binary trace export. It absorbs and replaces the old
 //! `profiler.rs`, whose flat merge-by-location buffer could not represent
 //! call-stack nesting; `CpuSpan::depth` fixes that by recording stack position
@@ -11,21 +11,19 @@
 //! (non-wgpu) types defined here: `GpuSpan`, `GpuPassKind`, `GpuClockCalibration`.
 
 use std::{
-    cell::{LazyCell, RefCell},
     collections::{HashMap, VecDeque},
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{Hash, Hasher},
     io::Write,
     sync::{
-        Arc, Weak,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
-    thread::ThreadId,
     time::SystemTime,
 };
+use crate::shared_runtime::{ThreadTable, ThreadValue};
 use crate::time_ext::Instant;
 
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
 // The data model below derives `Serialize` only, not `Deserialize`, for most
 // types. Several fields hold `&'static str` (`SpanName::Static`,
@@ -99,8 +97,9 @@ pub(crate) fn hash_global_element_id(id: &crate::GlobalElementId) -> u64 {
     hasher.finish()
 }
 
-/// A hashed, serde-friendly stand-in for `std::thread::ThreadId`, which does
-/// not implement `Serialize`/`Deserialize` itself.
+/// The OS id of the thread that recorded a span. Used instead of
+/// `std::thread::ThreadId`, which is not serializable and differs between
+/// statically-linked copies of `std` for the same thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct ThreadKey(u64);
 
@@ -111,9 +110,7 @@ impl ThreadKey {
     }
 
     fn current() -> Self {
-        let mut hasher = DefaultHasher::new();
-        std::thread::current().id().hash(&mut hasher);
-        ThreadKey(hasher.finish())
+        ThreadKey(crate::shared_runtime::current_thread_key())
     }
 }
 
@@ -411,7 +408,7 @@ pub struct EventCounters {
 /// timer, so it can be queried through [`Capture::counter_summary`].
 ///
 /// Attribution note: draw-call/atlas/event work is tallied into a
-/// thread-local accumulator (see `FRAME_COUNTERS` below) that is drained into
+/// global accumulator (see `FRAME_COUNTERS` below) that is drained into
 /// whichever `FrameCapture` closes next, mirroring the single-foreground-
 /// thread assumption `CaptureState::last_opened_frame_index` already
 /// documents. `EventCounters` in particular can include work that happened
@@ -908,8 +905,7 @@ impl CaptureState {
         };
         let frame_end_ns = self.now_ns();
 
-        let cpu_spans = drain_current_thread_spans();
-        collect_other_thread_spans_into(&self.pending_background_spans);
+        let cpu_spans = drain_completed_spans(&self.pending_background_spans);
         let background_spans = {
             let mut pending = self.pending_background_spans.lock();
             let taken = std::mem::take(&mut *pending);
@@ -957,104 +953,91 @@ struct PendingSpan {
     element: Option<ElementAttribution>,
     start: Instant,
     depth: u16,
+    thread_key: u64,
 }
 
-// Per-thread completed-span budget, mirroring `profiler.rs`'s flat 20MB
-// budget but scoped per-thread and smaller, since frame-count ring-buffering
-// on `Capture` is now the primary bound and this buffer is just a bridge
-// until the next `close_frame_cpu_side` drains it.
-const THREAD_SPAN_BUDGET_BYTES: usize = 2 * 1024 * 1024;
-const MAX_THREAD_SPANS: usize = THREAD_SPAN_BUDGET_BYTES / core::mem::size_of::<CpuSpan>();
+// Completed-span budget per shard, mirroring `profiler.rs`'s flat 20MB budget
+// but split across shards and smaller, since frame-count ring-buffering on
+// `Capture` is now the primary bound and this buffer is just a bridge until
+// the next `close_frame_cpu_side` drains it.
+const SPAN_SHARD_BUDGET_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SHARD_SPANS: usize = SPAN_SHARD_BUDGET_BYTES / core::mem::size_of::<CpuSpan>();
+const SPAN_SHARDS: usize = 16;
 
-type ThreadSpans = circular_buffer::CircularBuffer<MAX_THREAD_SPANS, CpuSpan>;
-type GuardedThreadRecorder = spin::Mutex<ThreadRecorder>;
+type ShardSpans = circular_buffer::CircularBuffer<MAX_SHARD_SPANS, CpuSpan>;
 
-struct ThreadRecorder {
-    thread_id: ThreadId,
-    completed: Box<ThreadSpans>,
+/// Completed spans, sharded by thread rather than kept per thread so that no
+/// thread-local (and no cleanup at thread exit) is needed. Each span carries
+/// its `ThreadKey`, which is how `drain_completed_spans` tells the frame
+/// thread's spans apart from background spans that share its shard.
+static COMPLETED_SPANS: [spin::Mutex<Option<Box<ShardSpans>>>; SPAN_SHARDS] =
+    [const { spin::Mutex::new(None) }; SPAN_SHARDS];
+
+fn span_shard(thread_key: u64) -> &'static spin::Mutex<Option<Box<ShardSpans>>> {
+    let index = (thread_key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize % SPAN_SHARDS;
+    &COMPLETED_SPANS[index]
 }
 
-struct GlobalThreadRecorderEntry {
-    thread_id: ThreadId,
-    recorder: Weak<GuardedThreadRecorder>,
+fn allocated_span_shards() -> u64 {
+    COMPLETED_SPANS
+        .iter()
+        .filter(|shard| shard.lock().is_some())
+        .count() as u64
 }
 
-static GLOBAL_THREAD_RECORDERS: spin::Mutex<Vec<GlobalThreadRecorderEntry>> = spin::Mutex::new(Vec::new());
+struct SpanDepth(AtomicU32);
 
-impl Drop for ThreadRecorder {
-    fn drop(&mut self) {
-        let mut recorders = GLOBAL_THREAD_RECORDERS.lock();
-        if let Some(index) = recorders.iter().position(|entry| entry.thread_id == self.thread_id) {
-            recorders.swap_remove(index);
-        }
-    }
+impl ThreadValue for SpanDepth {
+    const EMPTY: Self = Self(AtomicU32::new(0));
 }
 
-thread_local! {
-    static SPAN_STACK: RefCell<SmallVec<[PendingSpan; 32]>> = RefCell::new(SmallVec::new());
-    static THREAD_RECORDER: LazyCell<Arc<GuardedThreadRecorder>> = LazyCell::new(register_thread_recorder);
-}
+/// Each thread's current span nesting depth, keyed by OS thread id instead of
+/// a `thread_local!`. A thread's slot is released whenever its depth returns
+/// to zero, so exited threads don't accumulate.
+static SPAN_DEPTHS: ThreadTable<SpanDepth, 256> = ThreadTable::new();
 
-fn register_thread_recorder() -> Arc<GuardedThreadRecorder> {
-    let thread_id = std::thread::current().id();
-    let recorder = Arc::new(spin::Mutex::new(ThreadRecorder {
-        thread_id,
-        completed: ThreadSpans::boxed(),
-    }));
-    GLOBAL_THREAD_RECORDERS.lock().push(GlobalThreadRecorderEntry {
-        thread_id,
-        recorder: Arc::downgrade(&recorder),
-    });
-    recorder
-}
-
-fn drain_current_thread_spans() -> Vec<CpuSpan> {
-    THREAD_RECORDER.with(|recorder| {
-        let mut recorder = recorder.lock();
-        let (first, second) = recorder.completed.as_slices();
-        let mut spans = Vec::with_capacity(first.len() + second.len());
-        spans.extend_from_slice(first);
-        spans.extend_from_slice(second);
-        recorder.completed.clear();
-        spans
-    })
-}
-
-fn collect_other_thread_spans_into(pending: &parking_lot::Mutex<Vec<CpuSpan>>) {
-    let current_thread_id = std::thread::current().id();
-    let recorders = GLOBAL_THREAD_RECORDERS.lock();
-    let mut pending = pending.lock();
-    for entry in recorders.iter() {
-        if entry.thread_id == current_thread_id {
-            continue;
-        }
-        let Some(recorder) = entry.recorder.upgrade() else {
+/// Drain every completed span: the calling thread's own spans are returned,
+/// every other thread's are appended to `background`.
+fn drain_completed_spans(background: &parking_lot::Mutex<Vec<CpuSpan>>) -> Vec<CpuSpan> {
+    let current_thread = ThreadKey::current();
+    let mut own = Vec::new();
+    let mut background = background.lock();
+    for shard in &COMPLETED_SPANS {
+        let mut shard = shard.lock();
+        let Some(spans) = shard.as_mut() else {
             continue;
         };
-        let mut recorder = recorder.lock();
-        let (first, second) = recorder.completed.as_slices();
-        pending.extend_from_slice(first);
-        pending.extend_from_slice(second);
-        recorder.completed.clear();
+        for span in spans.iter() {
+            if span.thread_id == current_thread {
+                own.push(*span);
+            } else {
+                background.push(*span);
+            }
+        }
+        spans.clear();
     }
+    own
 }
 
 /// RAII guard returned by [`enter_span`]. Dropping it closes the span. When
 /// capture is disabled at the time `enter_span` was called, this is a no-op
 /// guard that costs nothing to construct or drop.
 pub struct SpanGuard {
-    handle: Option<()>,
+    pending: Option<PendingSpan>,
 }
 
 impl Drop for SpanGuard {
     fn drop(&mut self) {
-        if self.handle.take().is_none() {
-            return;
-        }
-        let completed = SPAN_STACK.with(|stack| stack.borrow_mut().pop());
-        let Some(pending) = completed else {
+        let Some(pending) = self.pending.take() else {
             return;
         };
+        if let Some(depth) = SPAN_DEPTHS.find(pending.thread_key) {
+            let remaining = depth.0.load(Ordering::Relaxed).saturating_sub(1);
+            depth.0.store(remaining, Ordering::Relaxed);
+            if remaining == 0 && pending.thread_key == crate::shared_runtime::current_thread_key() {
+                SPAN_DEPTHS.release(pending.thread_key);
+            }
+        }
         let Some(anchor) = active_capture_anchor() else {
             return;
         };
@@ -1071,13 +1054,14 @@ impl Drop for SpanGuard {
             depth: pending.depth,
             start_ns,
             duration_ns,
-            thread_id: ThreadKey::current(),
+            thread_id: ThreadKey(pending.thread_key),
             element: pending.element,
         };
 
-        THREAD_RECORDER.with(|recorder| {
-            recorder.lock().completed.push_back(span);
-        });
+        span_shard(pending.thread_key)
+            .lock()
+            .get_or_insert_with(ShardSpans::boxed)
+            .push_back(span);
     }
 }
 
@@ -1096,26 +1080,28 @@ pub(crate) fn capture_anchor() -> Option<Instant> {
 ///
 /// When capture is disabled, this does a single `Ordering::Relaxed` atomic
 /// load and returns immediately without touching `Instant::now()`, the
-/// thread-local span stack, or allocating — the entire cost of instrumenting
+/// per-thread span depth, or allocating — the entire cost of instrumenting
 /// a call site in a flamegraph-enabled-but-idle build.
 pub fn enter_span(name: SpanName, category: SpanCategory, element: Option<ElementAttribution>) -> SpanGuard {
     if !capture_enabled() {
-        return SpanGuard { handle: None };
+        return SpanGuard { pending: None };
     }
 
-    SPAN_STACK.with(|stack| {
-        let mut stack = stack.borrow_mut();
-        let depth = stack.len().min(u16::MAX as usize) as u16;
-        stack.push(PendingSpan {
+    let thread_key = crate::shared_runtime::current_thread_key();
+    let depth = SPAN_DEPTHS.find_or_claim(thread_key);
+    let current_depth = depth.0.load(Ordering::Relaxed);
+    depth.0.store(current_depth.saturating_add(1), Ordering::Relaxed);
+
+    SpanGuard {
+        pending: Some(PendingSpan {
             name,
             category,
             element,
             start: Instant::now(),
-            depth,
-        });
-    });
-
-    SpanGuard { handle: Some(()) }
+            depth: current_depth.min(u16::MAX as u32) as u16,
+            thread_key,
+        }),
+    }
 }
 
 /// Open a CPU span with a category of [`SpanCategory::UserDefined`] and no
@@ -1134,24 +1120,25 @@ macro_rules! flamegraph_span {
 // ---------------------------------------------------------------------------
 // Phase 2: aggregate frame counters (issue #58).
 //
-// Draw-call/atlas/event counts are tallied into a thread-local accumulator
+// Draw-call/atlas/event counts are tallied into a global accumulator
 // rather than threaded through call sites as return values, for the same
 // reason `flamegraph_gpu` correlates GPU spans to a frame index via
 // `current_gpu_correlation_frame_index` instead of a parameter threaded
 // through `PlatformWindow::draw`: the call sites (`WgpuRenderer::draw`'s
 // `PrimitiveBatch` match arms, `WgpuAtlas::get_or_insert_with`,
 // `Window::dispatch_event`, `App::notify`) have no natural way to reach the
-// currently-open `FrameCapture`, and all of them run on GPUI's single
-// foreground thread (AGENTS.md), so a thread-local is sufficient and avoids
-// plumbing a capture handle through every one of them.
-thread_local! {
-    static FRAME_COUNTERS: RefCell<FrameCounters> = RefCell::new(FrameCounters::default());
+// currently-open `FrameCapture`. Capture itself is process-global
+// (`ACTIVE_CAPTURE`), so a global accumulator loses nothing over the
+// thread-local this used to be, and it is only locked while capturing.
+static FRAME_COUNTERS: spin::Mutex<Option<FrameCounters>> = spin::Mutex::new(None);
+
+fn with_frame_counters(update: impl FnOnce(&mut FrameCounters)) {
+    update(FRAME_COUNTERS.lock().get_or_insert_with(FrameCounters::default));
 }
 
-/// Take and reset the calling thread's accumulated counters. Called once per
-/// `close_frame`, from the same foreground thread that opened the frame.
+/// Take and reset the accumulated counters. Called once per `close_frame`.
 fn take_frame_counters() -> FrameCounters {
-    FRAME_COUNTERS.with(|counters| counters.take())
+    FRAME_COUNTERS.lock().take().unwrap_or_default()
 }
 
 /// Tally one `RenderPass::draw` call for `kind`, contributing `primitives`
@@ -1164,7 +1151,7 @@ pub(crate) fn record_draw_call(kind: DrawCallKind, primitives: u32) {
     if !capture_enabled() {
         return;
     }
-    FRAME_COUNTERS.with(|counters| counters.borrow_mut().draw_calls.get_mut(kind).record(primitives));
+    with_frame_counters(|counters| counters.draw_calls.get_mut(kind).record(primitives));
 }
 
 /// Tally a new atlas tile allocation (`get_or_insert_with` cache miss that
@@ -1173,7 +1160,7 @@ pub(crate) fn record_atlas_tile_allocated() {
     if !capture_enabled() {
         return;
     }
-    FRAME_COUNTERS.with(|counters| counters.borrow_mut().atlas.tiles_allocated += 1);
+    with_frame_counters(|counters| counters.atlas.tiles_allocated += 1);
 }
 
 /// Tally an atlas tile eviction (`PlatformAtlas::remove`).
@@ -1181,7 +1168,7 @@ pub(crate) fn record_atlas_tile_evicted() {
     if !capture_enabled() {
         return;
     }
-    FRAME_COUNTERS.with(|counters| counters.borrow_mut().atlas.tiles_evicted += 1);
+    with_frame_counters(|counters| counters.atlas.tiles_evicted += 1);
 }
 
 /// Tally an atlas `get_or_insert_with` call that found an existing tile.
@@ -1189,7 +1176,7 @@ pub(crate) fn record_atlas_cache_hit() {
     if !capture_enabled() {
         return;
     }
-    FRAME_COUNTERS.with(|counters| counters.borrow_mut().atlas.cache_hits += 1);
+    with_frame_counters(|counters| counters.atlas.cache_hits += 1);
 }
 
 /// Tally an atlas `get_or_insert_with` call that did not find an existing
@@ -1198,7 +1185,7 @@ pub(crate) fn record_atlas_cache_miss() {
     if !capture_enabled() {
         return;
     }
-    FRAME_COUNTERS.with(|counters| counters.borrow_mut().atlas.cache_misses += 1);
+    with_frame_counters(|counters| counters.atlas.cache_misses += 1);
 }
 
 /// Tally a `Window::dispatch_event` call.
@@ -1206,7 +1193,7 @@ pub(crate) fn record_input_event_dispatched() {
     if !capture_enabled() {
         return;
     }
-    FRAME_COUNTERS.with(|counters| counters.borrow_mut().events.input_events_dispatched += 1);
+    with_frame_counters(|counters| counters.events.input_events_dispatched += 1);
 }
 
 /// Tally an `App::notify` call.
@@ -1214,7 +1201,7 @@ pub(crate) fn record_notify_call() {
     if !capture_enabled() {
         return;
     }
-    FRAME_COUNTERS.with(|counters| counters.borrow_mut().events.notify_calls += 1);
+    with_frame_counters(|counters| counters.events.notify_calls += 1);
 }
 
 /// Tally an entity marked dirty via `WindowInvalidator::invalidate`.
@@ -1222,13 +1209,13 @@ pub(crate) fn record_entity_invalidated() {
     if !capture_enabled() {
         return;
     }
-    FRAME_COUNTERS.with(|counters| counters.borrow_mut().events.entities_invalidated += 1);
+    with_frame_counters(|counters| counters.events.entities_invalidated += 1);
 }
 
 /// Tally one `Window::on_request_frame` invocation as either a full
 /// compositor draw or a fast, no-compositor present-only frame. Session-wide
 /// (see `Capture::full_draw_frame_count`'s doc comment for why), so this
-/// updates `CaptureState` directly rather than the thread-local per-frame
+/// updates `CaptureState` directly rather than the per-frame
 /// accumulator.
 pub(crate) fn record_frame_pacing(is_full_draw: bool) {
     if !capture_enabled() {
@@ -1690,15 +1677,15 @@ impl GpuMemorySnapshot {
 }
 
 /// The flamegraph capture engine's own live CPU memory footprint: every
-/// thread's completed-span ring buffer capacity (`THREAD_SPAN_BUDGET_BYTES`
-/// each, for every thread that has ever recorded a span), plus -- if a
+/// allocated completed-span shard's ring buffer capacity
+/// (`SPAN_SHARD_BUDGET_BYTES` each; a shard is allocated the first time a
+/// thread hashing to it records a span), plus -- if a
 /// capture is currently running -- the frames its ring buffer is holding and
 /// any background spans awaiting the next frame close. Cheap: no allocation,
 /// just reading `Vec`/`VecDeque` lengths already held behind locks this
 /// module takes elsewhere. Used by [`MemorySnapshot::capture_engine_bytes`].
 pub(crate) fn capture_engine_memory_usage() -> u64 {
-    let thread_recorder_bytes =
-        (GLOBAL_THREAD_RECORDERS.lock().len() as u64) * (THREAD_SPAN_BUDGET_BYTES as u64);
+    let span_shard_bytes = allocated_span_shards() * (SPAN_SHARD_BUDGET_BYTES as u64);
 
     let active_capture_bytes = ACTIVE_CAPTURE.lock().as_ref().map_or(0, |state| {
         let pending_bytes = (state.pending_background_spans.lock().len() as u64)
@@ -1707,7 +1694,7 @@ pub(crate) fn capture_engine_memory_usage() -> u64 {
         pending_bytes + frames_bytes
     });
 
-    thread_recorder_bytes + active_capture_bytes
+    span_shard_bytes + active_capture_bytes
 }
 
 /// Approximate heap bytes held by one [`FrameCapture`]'s span vectors, plus a
@@ -2171,6 +2158,7 @@ mod tests {
         let handle = start_capture(CaptureOptions {
             max_frames: 8,
             capture_gpu: false,
+            capture_screenshots: false,
         })
         .expect("no other capture should be active in this test process at this point");
 
@@ -2293,7 +2281,7 @@ mod tests {
         // after `stop()` below.
         assert!(
             capture_engine_memory_usage() > 0,
-            "engine footprint should be nonzero with frames still buffered and a thread-local span recorder live"
+            "engine footprint should be nonzero with frames still buffered and a span shard live"
         );
 
         // The capture's own retained bytes should equal the sum of each
@@ -2324,6 +2312,7 @@ mod tests {
         let empty_handle = start_capture(CaptureOptions {
             max_frames: 8,
             capture_gpu: false,
+            capture_screenshots: false,
         })
         .expect("the capture above was already stopped, so starting a new one here should succeed");
         let empty_capture = empty_handle.stop();
@@ -2332,14 +2321,14 @@ mod tests {
 
         // Now that every capture from this test is stopped, `ACTIVE_CAPTURE`
         // is empty, so the engine's live footprint should be nothing but
-        // this thread's own completed-span recorder -- still allocated,
-        // since a thread keeps its ring buffer for its whole lifetime once
-        // first used, which is exactly why this is cheap and safe to call
-        // with no capture running at all.
-        let recorder_count = GLOBAL_THREAD_RECORDERS.lock().len() as u64;
+        // the completed-span shards -- still allocated, since a shard keeps
+        // its ring buffer for the process lifetime once first used, which is
+        // exactly why this is cheap and safe to call with no capture running
+        // at all.
+        assert!(allocated_span_shards() > 0);
         assert_eq!(
             capture_engine_memory_usage(),
-            recorder_count * (THREAD_SPAN_BUDGET_BYTES as u64)
+            allocated_span_shards() * (SPAN_SHARD_BUDGET_BYTES as u64)
         );
     }
 

@@ -1763,20 +1763,10 @@ impl App {
     /// points [`crate::window::with_element_arena`] at for the duration of
     /// a draw.
     ///
-    /// Exposed so a DLL-loaded plugin can enter the *same* scope the host
-    /// already established for this draw, using the `&mut App` it's handed
-    /// across the FFI boundary: `ElementArenaScope::enter(cx.element_arena())`.
-    /// Plugin-compiled code calling `div()`/`AnyElement::new` checks its own,
-    /// separately-linked copy of the `CURRENT_ELEMENT_ARENA` thread-local —
-    /// which the host's `ElementArenaScope::enter` call (itself host-compiled)
-    /// can only ever set on the host's own copy. Without an explicit
-    /// `ElementArenaScope::enter`, element construction is now a hard error
-    /// instead of silently falling back to a private per-DLL arena: that
-    /// fallback grew a fresh 1 MiB chunk per element, nothing ever cleared it,
-    /// and it was a real, unbounded memory leak scaling with
-    /// elements-constructed-per-frame, confirmed via per-callsite allocation
-    /// tracking (see the `plugin-leak-demo` repro, and Pulsar-Native issue
-    /// #261).
+    /// The active arena is recorded in the process-wide shared runtime, so
+    /// plugin DLLs (which link their own copy of this crate) see the scope the
+    /// host entered in `Window::draw` without entering one themselves. See
+    /// [`crate::shared_runtime`].
     pub fn element_arena(&self) -> &RefCell<Arena> {
         &self.element_arena
     }

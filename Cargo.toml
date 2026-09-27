@@ -162,6 +162,7 @@ backtrace = "0.3"
 helio = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "04a38328c6d1329272072ade89d07098737df6b8" }
 helio-default-graphs = { git = "https://github.com/Far-Beyond-Pulsar/Helio", rev = "04a38328c6d1329272072ade89d07098737df6b8" }
 glam = "0.33"
+libloading = "0.8"
 env_logger = "0.11"
 collections = { package = "gpui_collections", version = "0.2.2", features = [
     "test-support",

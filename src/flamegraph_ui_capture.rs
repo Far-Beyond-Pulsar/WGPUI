@@ -82,13 +82,13 @@
 
 use std::{
     any::type_name,
-    cell::RefCell,
     collections::HashMap,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use serde::Serialize;
 
+use crate::shared_runtime::current_thread_key;
 use crate::{Background, Bounds, Element, Fill, GlobalElementId, Hsla, Pixels, ScaledPixels, Scene, Style, TextColor};
 
 /// Logical-pixel bounds, decoupled from the crate's internal `Bounds<Pixels>`
@@ -465,7 +465,7 @@ static UI_TREE_CAPTURE_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// right now (between `maybe_begin_capture` and `finish_capture`/an
 /// [`ActiveUiTreeCapture`] guard drop). Checked by every
 /// `Drawable::prepaint`/`Interactivity::paint` call site before touching the
-/// thread-local recorder, mirroring `capture_enabled()`'s (`flamegraph.rs`)
+/// recorder, mirroring `capture_enabled()`'s (`flamegraph.rs`)
 /// single-relaxed-atomic-load zero-overhead-when-idle discipline.
 static UI_TREE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -527,13 +527,41 @@ impl UiTreeRecorderState {
     }
 }
 
-thread_local! {
-    static UI_TREE_RECORDER: RefCell<Option<UiTreeRecorderState>> = const { RefCell::new(None) };
+struct OwnedUiTreeRecorder {
+    thread_key: u64,
+    state: UiTreeRecorderState,
+}
+
+/// The in-progress recording, tagged with the OS id of the thread that is
+/// drawing. A static rather than a `thread_local!`; the recording functions
+/// ignore it on any other thread, so another thread drawing at the same time
+/// (for example a parallel test's app) doesn't mix its elements in.
+static UI_TREE_RECORDER: spin::Mutex<Option<OwnedUiTreeRecorder>> = spin::Mutex::new(None);
+
+fn with_recorder(update: impl FnOnce(&mut UiTreeRecorderState)) {
+    let mut recorder = UI_TREE_RECORDER.lock();
+    if let Some(recorder) = recorder.as_mut()
+        && recorder.thread_key == current_thread_key()
+    {
+        update(&mut recorder.state);
+    }
+}
+
+fn take_recorder() -> Option<UiTreeRecorderState> {
+    let mut recorder = UI_TREE_RECORDER.lock();
+    if recorder
+        .as_ref()
+        .is_some_and(|recorder| recorder.thread_key == current_thread_key())
+    {
+        recorder.take().map(|recorder| recorder.state)
+    } else {
+        None
+    }
 }
 
 /// RAII handle for an in-progress UI-tree capture recording, returned by
 /// [`maybe_begin_capture`] and consumed by [`finish_capture`]. Its `Drop`
-/// impl always clears `UI_TREE_CAPTURE_ACTIVE` and discards the thread-local
+/// impl always clears `UI_TREE_CAPTURE_ACTIVE` and discards this thread's
 /// recorder, so a panic unwinding through `Window::draw_roots` (between
 /// `maybe_begin_capture` and the normal `finish_capture` call) can't leave
 /// the "actively recording" flag stuck true for the rest of the process --
@@ -546,9 +574,7 @@ pub(crate) struct ActiveUiTreeCapture {
 impl Drop for ActiveUiTreeCapture {
     fn drop(&mut self) {
         UI_TREE_CAPTURE_ACTIVE.store(false, Ordering::Release);
-        UI_TREE_RECORDER.with(|recorder| {
-            recorder.borrow_mut().take();
-        });
+        drop(take_recorder());
     }
 }
 
@@ -560,8 +586,9 @@ pub(crate) fn maybe_begin_capture(window_id: u64) -> Option<ActiveUiTreeCapture>
     if !take_ui_tree_capture_request() {
         return None;
     }
-    UI_TREE_RECORDER.with(|recorder| {
-        *recorder.borrow_mut() = Some(UiTreeRecorderState::new(window_id));
+    *UI_TREE_RECORDER.lock() = Some(OwnedUiTreeRecorder {
+        thread_key: current_thread_key(),
+        state: UiTreeRecorderState::new(window_id),
     });
     UI_TREE_CAPTURE_ACTIVE.store(true, Ordering::Release);
     Some(ActiveUiTreeCapture { _private: () })
@@ -572,7 +599,7 @@ pub(crate) fn maybe_begin_capture(window_id: u64) -> Option<ActiveUiTreeCapture>
 /// `next_frame.scene` has been sorted (`Frame::finish`), consuming the
 /// [`ActiveUiTreeCapture`] guard [`maybe_begin_capture`] returned.
 pub(crate) fn finish_capture(_guard: ActiveUiTreeCapture, scene: &Scene, scale_factor: f32) {
-    let state = UI_TREE_RECORDER.with(|recorder| recorder.borrow_mut().take());
+    let state = take_recorder();
     UI_TREE_CAPTURE_ACTIVE.store(false, Ordering::Release);
 
     let Some(state) = state else {
@@ -612,17 +639,13 @@ impl Drop for UiTreeCaptureGuard {
         if !self.active {
             return;
         }
-        UI_TREE_RECORDER.with(|recorder| {
-            if let Some(state) = recorder.borrow_mut().as_mut() {
-                state.depth = state.depth.saturating_sub(1);
-            }
-        });
+        with_recorder(|state| state.depth = state.depth.saturating_sub(1));
     }
 }
 
 /// Record one element's tree-structure entry during `Drawable::prepaint`
 /// (`element.rs`), if a UI-tree capture is actively recording. Returns a
-/// no-op guard immediately (no thread-local access at all) when no capture
+/// no-op guard immediately (no recorder access at all) when no capture
 /// is active, matching `enter_span`'s (Phase 1) zero-overhead-when-idle
 /// discipline.
 pub(crate) fn record_element_prepaint<E: Element>(
@@ -633,19 +656,17 @@ pub(crate) fn record_element_prepaint<E: Element>(
         return UiTreeCaptureGuard { active: false };
     }
 
-    UI_TREE_RECORDER.with(|recorder| {
-        if let Some(state) = recorder.borrow_mut().as_mut() {
-            let depth = state.depth;
-            let global_id_hash = global_id.map(crate::hash_global_element_id).unwrap_or(0);
-            state.nodes.push(UiElementNode {
-                type_name: type_name::<E>(),
-                global_id_hash,
-                depth,
-                bounds: logical_bounds(bounds),
-                style: None,
-            });
-            state.depth = state.depth.saturating_add(1);
-        }
+    with_recorder(|state| {
+        let depth = state.depth;
+        let global_id_hash = global_id.map(crate::hash_global_element_id).unwrap_or(0);
+        state.nodes.push(UiElementNode {
+            type_name: type_name::<E>(),
+            global_id_hash,
+            depth,
+            bounds: logical_bounds(bounds),
+            style: None,
+        });
+        state.depth = state.depth.saturating_add(1);
     });
 
     UiTreeCaptureGuard { active: true }
@@ -668,10 +689,8 @@ pub(crate) fn record_element_style(global_id: Option<&GlobalElementId>, style: &
     }
 
     let snapshot = UiStyleSnapshot::from_style(style);
-    UI_TREE_RECORDER.with(|recorder| {
-        if let Some(state) = recorder.borrow_mut().as_mut() {
-            state.pending_styles.insert(hash, snapshot);
-        }
+    with_recorder(|state| {
+        state.pending_styles.insert(hash, snapshot);
     });
 }
 

@@ -1355,6 +1355,7 @@ mod tests {
         let handle = flamegraph::start_capture(flamegraph::CaptureOptions {
             max_frames: 8,
             capture_gpu: true,
+            capture_screenshots: false,
         })
         .expect("no other capture should be active in this test process");
 

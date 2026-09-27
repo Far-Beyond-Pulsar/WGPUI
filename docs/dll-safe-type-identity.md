@@ -1,6 +1,11 @@
 # Cross-DLL State Safety for the Plugin Boundary
 
-Status: proposal.
+Status: §2.2 (ambient state) is implemented, differently from what is
+proposed below: instead of OS TLS slots, every copy of the crate shares one
+`#[repr(C)]` runtime (`src/shared_runtime.rs`) found through an OS-level
+rendezvous, and the crate contains no `thread_local!` at all. See
+"Implemented: the shared runtime" at the end of this document. §2.1
+(`PortableTypeId`) is still a proposal.
 
 This proposes eliminating an entire class of bug we've hit twice in one
 debugging session (script-editor-plugin crashes, 2026-09-22) and will keep
@@ -373,3 +378,68 @@ big-bang PR.
    document/proposal once this lands — it's a different problem (registry
    completeness, not type identity) that this work makes tractable but
    doesn't itself solve.
+
+---
+
+## Implemented: the shared runtime
+
+§2.2's OS TLS slot was replaced by something stronger, because the thread
+local pointer was not the only thing wrong with the arena across copies:
+
+- `Arena::alloc` is generic, so it runs in the plugin's copy. It grew chunks
+  and pushed to its `Vec` with the *plugin's* global allocator, and the
+  host's `Drop` freed them with the *host's* (the engine installs a
+  `TrackingAllocator`; plugins use the system default).
+- `ArenaBox` carried an `Rc<Cell<bool>>`: a Rust-layout, heap-allocated
+  refcount crossing the boundary on every element.
+- Destructors are function pointers into whichever copy allocated the value;
+  clearing after that plugin unloaded jumped into unmapped code.
+- A panic in a plugin destructor unwinding into host frames is a foreign
+  exception to the host's `std` and aborts.
+- `std::thread::ThreadId` comes from a counter in each copy of `std`, so the
+  executor's "local task polled/dropped from another thread" assertion could
+  fire when a task crossed the boundary.
+
+`src/shared_runtime.rs` holds one `#[repr(C)]` block per process, allocated
+from the OS heap and never freed, with no pointers into any copy's code:
+
+- **Rendezvous.** Windows: a named file mapping keyed by process id, whose
+  page holds an atomically published pointer (race-free). Unix: a pid-tagged
+  environment variable (the host creates the runtime from `App::new`, before
+  any plugin loads). wasm: a plain static. Copies built against a different
+  `ABI_VERSION` or struct layout refuse to share and panic with a message.
+- **Thread table.** Lock-free, cache-line-padded, keyed by OS thread id.
+  Holds each thread's active element arena; `ElementArenaScope` claims the
+  slot and releases it when the outermost scope ends. Replaces
+  `CURRENT_ELEMENT_ARENA`, so plugin code sees the host's `Window::draw`
+  scope without entering one.
+- **Module table.** Each copy attaches on first use and detaches from a
+  `ctor::dtor` when its image unloads. Arena values record the module that
+  allocated them; values whose module is gone are skipped at clear time and
+  counted as orphans instead of being called.
+- **Arena.** `RawArena` headers, chunks and destructor records all live in
+  OS memory and are shared by every copy. `ArenaBox` validates against the
+  arena's generation counter (headers are pooled, never freed). Destructors
+  are `extern "C"` shims that catch panics in the copy that raised them; the
+  clearing copy re-raises one panic after running every destructor.
+- **Stats.** `gpui::shared_runtime::stats()` reports live arenas, chunks,
+  bytes, allocations, orphans, attached modules and active threads,
+  identically from every copy.
+
+The remaining `thread_local!`s were removed too: the platform's active
+event-loop context and idle span became fields, and the flamegraph's span
+stack, recorders, frame counters and UI-tree recorder became sharded or
+thread-keyed statics.
+
+`tests/dll_boundary.rs` builds `tests/dll_fixture` (a cdylib with its own
+copy of gpui) and checks, with a tagged allocator in each binary that aborts
+on any cross-binary free: plugin elements landing in host arenas without a
+plugin scope, exact heap equality over thousands of frames, hundreds of
+load/unload cycles with no runtime, heap or handle growth, two plugin copies
+at once, unloading with live elements, destructor panics, construction
+outside a scope, per-thread isolation across eight threads, plugin-owned
+arenas nested in host scopes, and a randomized stress run with reloads.
+
+The explicit `ElementArenaScope::enter(cx.element_arena())` calls added in
+other crates for #261 (`plugin_editor_api/src/editor_element.rs`,
+`wgpui-component/.../dock/panel.rs`) are now redundant and can be removed.

@@ -71,6 +71,7 @@ mod queue;
 pub mod render_stats;
 mod scene;
 mod scene_pack;
+pub mod shared_runtime;
 mod shared_string;
 mod shared_uri;
 mod style;
@@ -111,10 +112,8 @@ pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
 pub(crate) use arena::*;
-// `Arena` itself (only `Arena` — `ArenaBox` etc. stay crate-internal) needs
-// to be nameable from outside this crate so DLL-loaded plugin code can call
-// `ElementArenaScope::enter(cx.element_arena())`, which takes `&RefCell<Arena>`.
-// See `App::element_arena`'s doc comment.
+// `Arena` itself (only `Arena` — `ArenaBox` etc. stay crate-internal) is
+// public because `ElementArenaScope::enter` takes `&RefCell<Arena>`.
 pub use arena::Arena;
 pub use asset_cache::*;
 pub use assets::*;

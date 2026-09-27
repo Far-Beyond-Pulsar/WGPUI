@@ -294,11 +294,9 @@ impl<C: RenderOnce> Element for Component<C> {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         window.with_global_id(ElementId::Name(type_name::<C>().into()), |_, window| {
-            // `C::render` may run in a separate gpui copy (a plugin DLL)
-            // whose own arena thread-local the host's draw scope cannot
-            // reach. `cx` is the App handed across the boundary, so its
-            // arena is the host's; scoping here covers construction in
-            // either copy. See `ElementArenaScope`'s doc comment.
+            // Redundant inside `Window::draw`, whose scope is already visible
+            // to every gpui copy, including plugin DLLs; kept so rendering a
+            // component always targets this `App`'s arena.
             let _arena_scope = ElementArenaScope::enter(cx.element_arena());
             let mut element = self
                 .component

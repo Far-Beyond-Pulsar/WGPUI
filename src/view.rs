@@ -44,13 +44,10 @@ impl<V: Render> Element for Entity<V> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        // `view.render(...)` runs in whatever gpui copy compiled this view.
-        // For a plugin DLL that is a separate copy whose own
-        // `CURRENT_ELEMENT_ARENA` thread-local is untouched by the host's
-        // `Window::draw` scope. Enter the scope from the `App` we hold so
-        // `AnyElement::new` in that copy finds an active arena (the host's —
-        // `cx` is the host's App handed across the FFI boundary). Nesting is
-        // free: `ElementArenaScope` restores the previous pointer on drop.
+        // Redundant inside `Window::draw`, whose scope is already visible to
+        // every gpui copy, including plugin DLLs; kept so rendering a view
+        // always targets this `App`'s arena. Nesting is free:
+        // `ElementArenaScope` restores the previous arena on drop.
         let _arena_scope = ElementArenaScope::enter(cx.element_arena());
         let mut element = self.update(cx, |view, cx| view.render(window, cx).into_any_element());
         let layout_id = window.with_rendered_view(self.entity_id(), |window| {
@@ -254,12 +251,7 @@ impl Element for AnyView {
                     (layout_id, None)
                 }
                 _ => {
-                    // Same rationale as `Entity<V>::request_layout`: the render
-                    // closure may be compiled into a separate gpui copy (a
-                    // plugin DLL) whose own arena thread-local the host's draw
-                    // scope cannot reach. `cx` is the App handed across the
-                    // boundary, so its arena is the host's — scoping here
-                    // covers element construction in either copy.
+                    // Same rationale as `Entity<V>::request_layout`.
                     let _arena_scope = ElementArenaScope::enter(cx.element_arena());
                     let mut element = {
                         let _t = crate::render_stats::scope("frame: render");

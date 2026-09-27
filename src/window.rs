@@ -9,6 +9,8 @@ use crate::scene_pack::{
 use crate::time_ext::Instant;
 use crate::util::post_inc;
 use crate::util::{ResultExt, measure};
+use crate::arena::RawArena;
+use crate::shared_runtime::{self, ThreadAmbient};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds, BoxShadow,
@@ -50,12 +52,13 @@ use std::{
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
     marker::PhantomData,
-    mem,
+    mem::{self, ManuallyDrop},
+    ptr::NonNull,
     ops::{DerefMut, Range},
     rc::Rc,
     sync::{
         Arc, Weak,
-        atomic::{AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicUsize, Ordering, Ordering::SeqCst},
     },
     time::Duration,
 };
@@ -925,83 +928,81 @@ slotmap::new_key_type! {
     pub struct FocusId;
 }
 
-thread_local! {
-    /// Points to the current App's element arena during draw operations.
-    /// This allows multiple test Apps to have isolated arenas, preventing
-    /// cross-session corruption when the scheduler interleaves their tasks.
-    static CURRENT_ELEMENT_ARENA: Cell<Option<*const RefCell<Arena>>> = const { Cell::new(None) };
-}
-
-/// Allocates an element in the currently active element arena.
+/// Allocates an element in the calling thread's active element arena.
 ///
-/// There is deliberately no thread-local fallback arena: plugin-compiled code
-/// links its own separate copy of this crate (and therefore its own copies of
-/// these thread-locals), so `AnyElement::new` from such a copy must first enter
-/// the host's scope via [`ElementArenaScope::enter`] with the `App` handed
-/// across the FFI boundary. A private per-DLL fallback arena was the
-/// unbounded memory leak in Pulsar-Native issue #261 — every element built
-/// without an active scope grew a fresh 1 MiB bump chunk that nothing ever
-/// cleared. So constructing an element with no active arena is now a hard
-/// error, not a silent leak.
+/// The active arena is recorded in the process-wide shared runtime, keyed by
+/// OS thread id, rather than in a `thread_local!`: this crate is statically
+/// linked into the host and into every plugin DLL, and each copy would get
+/// its own thread-local, so plugin code would never see the arena the host
+/// entered in `Window::draw`. See [`crate::shared_runtime`].
+///
+/// Constructing an element with no active arena is a hard error rather than
+/// a fallback to some private arena: such a fallback would never be cleared,
+/// which was the unbounded leak in Pulsar-Native issue #261.
 #[track_caller]
 pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
-    CURRENT_ELEMENT_ARENA
-        .with(|current| {
-            current.get().map(|arena_ptr| {
-                // SAFETY: The pointer is valid for the duration of the draw operation
-                // that called `ElementArenaScope::enter`, and we're being called
-                // during that same draw scope.
-                let arena_cell = unsafe { &*arena_ptr };
-                f(&mut arena_cell.borrow_mut())
-            })
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "element arena not active: `AnyElement` was constructed outside of \
-                 an `ElementArenaScope` on thread {:?}. Enter one first (host code: \
-                 `ElementArenaScope::enter(cx.element_arena())` at the top of \
-                 `Window::draw`; DLL plugin code: call \
-                 `ElementArenaScope::enter(cx.element_arena())` with the `App` \
-                 handed across the FFI boundary before building elements). This \
-                 used to silently fall back to a per-thread arena that leaked \
-                 one 1 MiB chunk per element (Pulsar-Native issue #261).\n\
-                 Construction callsite:\n{}",
-                std::thread::current().name().map(|n| n.to_string()).unwrap_or("<unnamed>".into()),
-                std::backtrace::Backtrace::force_capture(),
-            )
-        })
+    let active = shared_runtime::runtime()
+        .threads
+        .find(shared_runtime::current_thread_key())
+        .and_then(|ambient| NonNull::new(ambient.element_arena.load(Ordering::Relaxed)));
+    let Some(raw) = active else {
+        panic!(
+            "element arena not active: `AnyElement` was constructed outside of an \
+             `ElementArenaScope` on thread {:?}. Elements can only be built while a window \
+             is drawing (or inside `ElementArenaScope::enter`).\nConstruction callsite:\n{}",
+            std::thread::current()
+                .name()
+                .map(|name| name.to_string())
+                .unwrap_or("<unnamed>".into()),
+            std::backtrace::Backtrace::force_capture(),
+        )
+    };
+    // SAFETY: the arena stays alive for as long as the `ElementArenaScope`
+    // that published it, and we are inside that scope on its thread.
+    let mut arena = ManuallyDrop::new(unsafe { Arena::borrow_raw(raw) });
+    f(&mut arena)
 }
 
-/// RAII guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw operation.
-/// When dropped, restores the previous arena (supporting nested draws).
+/// RAII guard that makes an arena the calling thread's active element arena
+/// for its lifetime, restoring the previously active one on drop (so scopes
+/// nest).
 ///
-/// `pub` (not `pub(crate)`) so that DLL-loaded plugin code — which links its
-/// own separate copy of this crate, and therefore has its own separate copy
-/// of the `CURRENT_ELEMENT_ARENA` thread-local — can enter
-/// the *host's* already-correct scope using the `App` reference it's handed
-/// across the FFI boundary: `ElementArenaScope::enter(cx.element_arena())`.
-/// See `App::element_arena`'s doc comment for the full leak this closes.
+/// The active arena is shared by every copy of this crate in the process, so
+/// the scope `Window::draw` enters is visible to plugin-compiled code without
+/// the plugin entering one itself. Entering a scope for the arena that is
+/// already active is harmless.
 pub struct ElementArenaScope {
-    previous: Option<*const RefCell<Arena>>,
+    ambient: &'static ThreadAmbient,
+    thread_key: u64,
+    previous: *mut RawArena,
 }
 
 impl ElementArenaScope {
     /// Enter a scope where element allocations use the given arena.
     pub fn enter(arena: &RefCell<Arena>) -> Self {
-        let previous = CURRENT_ELEMENT_ARENA.with(|current| {
-            let prev = current.get();
-            current.set(Some(arena as *const RefCell<Arena>));
-            prev
-        });
-        Self { previous }
+        let raw = arena.borrow().raw();
+        let thread_key = shared_runtime::current_thread_key();
+        let ambient = shared_runtime::runtime().threads.find_or_claim(thread_key);
+        let previous = ambient.element_arena.swap(raw.as_ptr(), Ordering::Relaxed);
+        Self {
+            ambient,
+            thread_key,
+            previous,
+        }
     }
 }
 
 impl Drop for ElementArenaScope {
     fn drop(&mut self) {
-        CURRENT_ELEMENT_ARENA.with(|current| {
-            current.set(self.previous);
-        });
+        self.ambient
+            .element_arena
+            .store(self.previous, Ordering::Relaxed);
+        if self.previous.is_null() {
+            // Outermost scope on this thread: hand the slot back so exited
+            // threads don't accumulate in the table, and so a new thread that
+            // is given this OS thread id later starts with no active arena.
+            shared_runtime::runtime().threads.release(self.thread_key);
+        }
     }
 }
 

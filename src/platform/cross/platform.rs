@@ -50,17 +50,19 @@ use crate::time_ext::Instant;
 use std::{fs::{self, OpenOptions}, net::{TcpListener, TcpStream}, thread};
 use winit::event_loop::ActiveEventLoop;
 
-thread_local! {
-    static ACTIVE_CONTEXT: Cell<Option<(*const ActiveEventLoop, *mut AppState)>> = Cell::new(None);
-}
+/// The winit event loop and `AppState` for the callback currently running on
+/// the event-loop thread. Shared between `CrossPlatform` (which needs it to
+/// answer `Platform` calls made from inside callbacks) and `AppState` (which
+/// sets it around each callback).
+type ActiveContext = Rc<Cell<Option<(*const ActiveEventLoop, *mut AppState)>>>;
 
-// Helper to access the context
-fn with_active_context<R>(f: impl FnOnce(&ActiveEventLoop, &mut AppState) -> R) -> Option<R> {
-    ACTIVE_CONTEXT.with(|storage| {
-        let (loop_ptr, app_ptr) = storage.get()?;
-        // SAFETY: We strictly manage these pointers during winit callbacks
-        unsafe { Some(f(&*loop_ptr, &mut *app_ptr)) }
-    })
+fn with_active_context<R>(
+    active_context: &ActiveContext,
+    f: impl FnOnce(&ActiveEventLoop, &mut AppState) -> R,
+) -> Option<R> {
+    let (loop_ptr, app_ptr) = active_context.get()?;
+    // SAFETY: We strictly manage these pointers during winit callbacks
+    unsafe { Some(f(&*loop_ptr, &mut *app_ptr)) }
 }
 
 pub(crate) struct CrossPlatform {
@@ -77,6 +79,7 @@ pub(crate) struct CrossPlatform {
     dock_menu: RefCell<Vec<crate::OwnedMenuItem>>,
     #[cfg(not(target_family = "wasm"))]
     single_instance: RefCell<Option<SingleInstanceRuntime>>,
+    active_context: ActiveContext,
 }
 
 #[derive(Default)]
@@ -87,12 +90,6 @@ struct PlatformCallbacks {
     on_app_menu_action: Cell<Option<Box<dyn FnMut(&dyn crate::Action)>>>,
     on_will_open_app_menu: Cell<Option<Box<dyn FnMut()>>>,
     on_validate_app_menu_command: Cell<Option<Box<dyn FnMut(&dyn crate::Action) -> bool>>>,
-}
-
-thread_local! {
-    /// Open span covering the time the event loop is blocked in the OS waiting
-    /// for its next event (from the end of `about_to_wait` to `new_events`).
-    static IDLE_SCOPE: std::cell::RefCell<Option<Box<dyn Send>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Static span name for a window event, so the loop can attribute time per kind.
@@ -129,6 +126,10 @@ struct AppState {
     active_window_id: Cell<Option<winit::window::WindowId>>,
     hovered_window_id: Cell<Option<winit::window::WindowId>>,
     hovered_external_paths: Vec<PathBuf>,
+    active_context: ActiveContext,
+    /// Open span covering the time the event loop is blocked in the OS waiting
+    /// for its next event (from the end of `about_to_wait` to `new_events`).
+    idle_scope: Option<Box<dyn Send>>,
     pending_releases:
         FxHashMap<winit::window::WindowId, HashSet<MouseButton>>,
     #[cfg(target_family = "wasm")]
@@ -204,6 +205,7 @@ impl CrossPlatform {
             dock_menu: RefCell::new(Vec::new()),
             #[cfg(not(target_family = "wasm"))]
             single_instance: RefCell::new(None),
+            active_context: Rc::new(Cell::new(None)),
         })
     }
 
@@ -379,6 +381,8 @@ impl Platform for CrossPlatform {
             hovered_window_id: Cell::new(None),
             hovered_external_paths: Vec::new(),
             pending_releases: FxHashMap::default(),
+            active_context: self.active_context.clone(),
+            idle_scope: None,
             wgpu_context: self.wgpu_context.clone(),
             wgpu_options: WgpuOptions {
                 additional_features: self.wgpu_options.additional_features,
@@ -406,6 +410,8 @@ impl Platform for CrossPlatform {
             hovered_window_id: Cell::new(None),
             hovered_external_paths: Vec::new(),
             pending_releases: FxHashMap::default(),
+            active_context: self.active_context.clone(),
+            idle_scope: None,
         };
 
         #[cfg(target_family = "wasm")]
@@ -424,7 +430,7 @@ impl Platform for CrossPlatform {
         // NOTE(mdeand): The event loop will exit when all windows are closed and there are no
         // NOTE(mdeand): more events to process. For an explicit quit, we rely on winit's exit
         // NOTE(mdeand): mechanism via the ActiveEventLoop.
-        with_active_context(|event_loop, _| {
+        with_active_context(&self.active_context, |event_loop, _| {
             event_loop.exit();
         });
     }
@@ -459,7 +465,7 @@ impl Platform for CrossPlatform {
 
     fn activate(&self, ignoring_other_apps: bool) {
         activate_native_app(ignoring_other_apps);
-        with_active_context(|_, app_state| {
+        with_active_context(&self.active_context, |_, app_state| {
             for window in app_state.windows.values() {
                 window.window().set_visible(true);
             }
@@ -479,7 +485,7 @@ impl Platform for CrossPlatform {
 
     fn hide(&self) {
         hide_native_app();
-        with_active_context(|_, app_state| {
+        with_active_context(&self.active_context, |_, app_state| {
             for window in app_state.windows.values() {
                 window.window().set_visible(false);
             }
@@ -495,11 +501,11 @@ impl Platform for CrossPlatform {
     }
 
     fn displays(&self) -> Vec<Rc<dyn crate::PlatformDisplay>> {
-        with_active_context(|event_loop, _| collect_displays(event_loop).0).unwrap_or_default()
+        with_active_context(&self.active_context, |event_loop, _| collect_displays(event_loop).0).unwrap_or_default()
     }
 
     fn primary_display(&self) -> Option<Rc<dyn crate::PlatformDisplay>> {
-        with_active_context(|event_loop, _| {
+        with_active_context(&self.active_context, |event_loop, _| {
             let (displays, primary_id) = collect_displays(event_loop);
             primary_id.and_then(|primary_id| {
                 displays
@@ -511,7 +517,7 @@ impl Platform for CrossPlatform {
     }
 
     fn active_window(&self) -> Option<crate::AnyWindowHandle> {
-        with_active_context(|_, app_state| {
+        with_active_context(&self.active_context, |_, app_state| {
             app_state
                 .active_window_id
                 .get()
@@ -530,7 +536,7 @@ impl Platform for CrossPlatform {
             self.event_loop_proxy.clone(),
         );
 
-        let success = with_active_context(|event_loop, app_state| {
+        let success = with_active_context(&self.active_context, |event_loop, app_state| {
             let bounds = options.bounds;
             let use_client_decorations = matches!(
                 options.window_decorations,
@@ -876,7 +882,7 @@ impl Platform for CrossPlatform {
             crate::CursorStyle::ContextualMenu => CursorIcon::ContextMenu,
             crate::CursorStyle::OperationNotAllowed => CursorIcon::NotAllowed,
             crate::CursorStyle::None => {
-                with_active_context(|_, app_state| {
+                with_active_context(&self.active_context, |_, app_state| {
                     if let Some(wid) = app_state.hovered_window_id.get() {
                         if let Some(window) = app_state.windows.get(&wid) {
                             window.window().set_cursor_visible(false);
@@ -886,7 +892,7 @@ impl Platform for CrossPlatform {
                 return;
             }
         };
-        with_active_context(|_, app_state| {
+        with_active_context(&self.active_context, |_, app_state| {
             if let Some(wid) = app_state.hovered_window_id.get() {
                 if let Some(window) = app_state.windows.get(&wid) {
                     window.window().set_cursor_visible(true);
@@ -976,11 +982,13 @@ impl Platform for CrossPlatform {
 
 impl AppState {
     fn set_active_context(&mut self, event_loop: &ActiveEventLoop) {
-        ACTIVE_CONTEXT.with(|s| s.set(Some((event_loop as *const _, self as *mut _))));
+        let app_state = self as *mut AppState;
+        self.active_context
+            .set(Some((event_loop as *const _, app_state)));
     }
 
     fn clear_active_context(&self) {
-        ACTIVE_CONTEXT.with(|s| s.set(None));
+        self.active_context.set(None);
     }
 
     fn synthesize_device_mouse_up(
@@ -1037,7 +1045,7 @@ impl AppState {
 impl winit::application::ApplicationHandler<CrossEvent> for AppState {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
         // Ends the OS-wait span opened at the end of the previous `about_to_wait`.
-        IDLE_SCOPE.with(|idle| drop(idle.borrow_mut().take()));
+        drop(self.idle_scope.take());
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: CrossEvent) {
@@ -1266,10 +1274,8 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         // From here until `new_events` the thread is parked in the OS waiting for
         // an event or the WaitUntil deadline. Making that visible is what tells
         // "the UI thread was busy" apart from "the UI thread was asleep".
-        IDLE_SCOPE.with(|idle| {
-            *idle.borrow_mut() =
-                crate::render_stats::external_scope("Main: event loop idle (waiting for OS event)");
-        });
+        self.idle_scope =
+            crate::render_stats::external_scope("Main: event loop idle (waiting for OS event)");
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {}

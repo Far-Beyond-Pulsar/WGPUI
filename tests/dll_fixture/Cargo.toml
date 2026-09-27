@@ -1,0 +1,16 @@
+[package]
+name = "gpui_dll_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "A plugin-shaped cdylib that links its own copy of gpui, loaded by tests/dll_boundary.rs"
+
+[lib]
+crate-type = ["cdylib"]
+path = "dll_fixture.rs"
+
+[dependencies]
+gpui = { package = "gpui-ce", path = "../.." }
+
+# Built on its own by the test, never as part of any workspace.
+[workspace]

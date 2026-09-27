@@ -17,7 +17,6 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    thread::{self, ThreadId},
     time::Duration,
 };
 use crate::time_ext::Instant;
@@ -774,17 +773,19 @@ where
     S: async_task::Schedule<M> + Send + Sync + 'static,
     M: 'static,
 {
+    // The OS thread id rather than `std::thread::ThreadId`: `ThreadId`s come
+    // from a counter inside each statically-linked copy of `std`, so the host
+    // and a plugin DLL assign different ids to the same thread, and a task
+    // spawned in one and polled or dropped from the other would trip these
+    // assertions. It also needs no thread-local, so it still works while the
+    // thread's TLS is being torn down.
     #[inline]
-    fn thread_id() -> ThreadId {
-        std::thread_local! {
-            static ID: ThreadId = thread::current().id();
-        }
-        ID.try_with(|id| *id)
-            .unwrap_or_else(|_| thread::current().id())
+    fn thread_id() -> u64 {
+        crate::shared_runtime::current_thread_key()
     }
 
     struct Checked<F> {
-        id: ThreadId,
+        id: u64,
         inner: ManuallyDrop<F>,
         location: &'static Location<'static>,
     }
