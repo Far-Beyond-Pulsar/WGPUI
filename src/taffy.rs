@@ -187,6 +187,13 @@ impl TaffyLayoutEngine {
 
         for id in &orphaned {
             crate::render_stats::count("taffy: nodes swept");
+            // taffy's `remove` leaves the node's context (its measure
+            // closure, and everything that captures, such as a text
+            // element's shaped lines) in the tree until another node happens
+            // to reuse the slot, so drop it explicitly first.
+            if self.taffy.get_node_context((*id).into()).is_some() {
+                self.taffy.set_node_context((*id).into(), None).ok();
+            }
             // A miss here would mean `live_nodes` disagreed with `taffy`
             // itself — defensive, not expected; `.ok()` rather than
             // `.expect(...)` keeps a bookkeeping bug a silent leak-of-one
@@ -650,5 +657,34 @@ impl From<Size<Pixels>> for Size<AvailableSpace> {
             width: AvailableSpace::Definite(size.width),
             height: AvailableSpace::Definite(size.height),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::{Style, px};
+
+    #[test]
+    fn sweeping_a_measured_node_drops_its_measure_closure() {
+        let captured = Rc::new(());
+        let mut engine = TaffyLayoutEngine::new();
+        engine.request_measured_layout(Style::default(), px(16.), 1., {
+            let captured = captured.clone();
+            move |_, _, _, _| {
+                let _keep_alive = &captured;
+                Size::default()
+            }
+        });
+        engine.end_frame();
+        assert_eq!(Rc::strong_count(&captured), 2, "a touched node keeps its closure");
+
+        // Not touched this frame, so swept: whatever its measure closure
+        // captured (a text element's shaped lines, in practice) must go with it.
+        engine.end_frame();
+        assert_eq!(engine.live_node_count(), 0);
+        assert_eq!(Rc::strong_count(&captured), 1, "the swept node's closure was retained");
     }
 }
