@@ -3623,11 +3623,15 @@ impl Window {
                 .map(|v| v != "0")
                 .unwrap_or(true)
         });
+        #[cfg(any(feature = "inspector", debug_assertions))]
+        let inspector_open = self.inspector.is_some();
+        #[cfg(not(any(feature = "inspector", debug_assertions)))]
+        let inspector_open = false;
         // Nothing drawn yet, an inspector that needs fresh element info, or a
         // mode that skips drawing: always take the normal path.
         if !*ENABLED
             || self.layer_frame == 0
-            || self.inspector.is_some()
+            || inspector_open
             || cx.mode.skip_drawing()
             || !self.invalidator.is_display_only()
         {
