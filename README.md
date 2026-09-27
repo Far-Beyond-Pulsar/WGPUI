@@ -25,8 +25,8 @@ gpui-ce = { git = "https://github.com/Far-Beyond-Pulsar/wgpui", features = ["tes
 Imports use the `gpui` crate name as normal:
 
 ```rust
-use gpui-ce::prelude::*;
-use gpui-ce::{App, Application, Context, Render, Window, div, px};
+use gpui::prelude::*;
+use gpui::{App, Application, Context, Render, Window, div, px};
 ```
 
 ---
@@ -46,7 +46,7 @@ wgpu device/context around WGPUI, ensure you request the same feature set.
 ## Hello World
 
 ```rust
-use gpui-ce::{
+use gpui::{
     App, Application, Bounds, Context, SharedString, Window,
     WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
