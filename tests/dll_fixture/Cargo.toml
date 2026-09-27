@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 path = "dll_fixture.rs"
 
 [dependencies]
-gpui = { package = "gpui-ce", path = "../.." }
+gpui = { package = "gpui-ce", path = "../..", features = ["test-support"] }
 
 # Built on its own by the test, never as part of any workspace.
 [workspace]

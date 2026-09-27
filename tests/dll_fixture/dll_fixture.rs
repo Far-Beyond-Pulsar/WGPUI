@@ -9,6 +9,8 @@
 //! Every export catches panics and reports them as a status code, since a
 //! panic unwinding out of an `extern "C"` function into the host aborts.
 
+#[path = "../support/content_rng.rs"]
+mod content_rng;
 #[path = "../support/tagged_allocator.rs"]
 mod tagged_allocator;
 
@@ -18,10 +20,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use content_rng::ContentRng;
 use gpui::{
-    AnyElement, App, Arena, Bounds, Element, ElementArenaScope, ElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, SharedString, Styled, Window,
-    div,
+    AnyElement, AnyView, App, AppContext, Arena, Bounds, Context, Element, ElementArenaScope,
+    ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels,
+    Render, SharedString, Styled, Window, div, prelude::*, px, rgb,
 };
 
 #[global_allocator]
@@ -206,4 +209,183 @@ pub unsafe extern "C" fn fixture_run_own_frames(
         }
         unsafe { allocations_per_frame.write(last) };
     })
+}
+
+/// A plugin-owned view: its entity lives in the host `App`, and its
+/// `render`, listeners and element tree are all compiled into this DLL.
+///
+/// Everything it renders is generated from the seed the host last set with
+/// `fixture_set_panel_seed`, so the host decides when the panel shows novel
+/// content and when it shows a fixed, canonical frame.
+struct PluginPanel;
+
+static PANEL_SEED: AtomicU64 = AtomicU64::new(0);
+static PANEL_RENDERS: AtomicU64 = AtomicU64::new(0);
+static PANEL_CLICKS: AtomicU64 = AtomicU64::new(0);
+
+struct PanelRow {
+    id: ElementId,
+    selected: bool,
+    label: SharedString,
+    cells: Vec<SharedString>,
+}
+
+fn nested_chain(depth: usize, max_depth: usize, rng: &mut ContentRng) -> AnyElement {
+    if depth == max_depth {
+        return div()
+            .child(SharedString::from(rng.text(24)))
+            .into_any_element();
+    }
+    let id: ElementId = if rng.one_in(3) {
+        ("plugin-nest-fresh", rng.next()).into()
+    } else {
+        ("plugin-nest", depth).into()
+    };
+    div()
+        .id(id)
+        .pl(px(1.))
+        .border_1()
+        .border_color(rgb(0x3a3a3a))
+        .hover(|style| style.bg(rgb(0x2a2a2a)))
+        .child(nested_chain(depth + 1, max_depth, rng))
+        .into_any_element()
+}
+
+impl Render for PluginPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        PANEL_RENDERS.fetch_add(1, Ordering::SeqCst);
+        // Mixed with the entity id so several panels on screen differ.
+        let seed = PANEL_SEED.load(Ordering::SeqCst) ^ cx.entity_id().as_u64().rotate_left(32);
+        let mut rng = ContentRng::new(seed);
+        let header = SharedString::from(rng.text(40));
+        let nesting = rng.below(60) as usize;
+        let chain = nested_chain(0, nesting, &mut rng);
+        let rows: Vec<PanelRow> = (0..rng.below(250) as usize)
+            .map(|row| PanelRow {
+                // A quarter of rows get an id never seen before, so their
+                // element state must be created and then collected.
+                id: if rng.one_in(4) {
+                    ("plugin-row-fresh", rng.next()).into()
+                } else {
+                    ("plugin-row", row).into()
+                },
+                selected: rng.one_in(7),
+                label: SharedString::from(rng.text(16)),
+                cells: (0..rng.below(9))
+                    .map(|_| SharedString::from(rng.text(6)))
+                    .collect(),
+            })
+            .collect();
+
+        div()
+            .id("plugin-panel")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_y_scroll()
+            .bg(rgb(0x202020))
+            .text_color(rgb(0xe0e0e0))
+            .child(
+                div()
+                    .id("plugin-header")
+                    .h(px(20.))
+                    .hover(|style| style.bg(rgb(0x404040)))
+                    .child(header),
+            )
+            .child(chain)
+            .children(rows.into_iter().map(|row| {
+                div()
+                    .id(row.id)
+                    .flex()
+                    .flex_row()
+                    .gap(px(2.))
+                    .h(px(18.))
+                    .border_1()
+                    .border_color(rgb(0x505050))
+                    .when(row.selected, |row| row.bg(rgb(0x304060)))
+                    .hover(|style| style.bg(rgb(0x383838)))
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        PANEL_CLICKS.fetch_add(1, Ordering::SeqCst);
+                        cx.notify();
+                    }))
+                    .child(row.label)
+                    .children(
+                        row.cells
+                            .into_iter()
+                            .map(|cell| div().w(px(28.)).rounded_sm().child(cell)),
+                    )
+            }))
+    }
+}
+
+/// Create a plugin view inside the host's `App`.
+///
+/// # Safety
+/// `cx` must be the host's live `App`, and `out` valid for a write. Only
+/// sound when this DLL was built with the same gpui version, features and
+/// profile as the host, which is the contract real plugins live under too.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fixture_create_panel(cx: *mut App, out: *mut AnyView) -> u32 {
+    let cx = unsafe { &mut *cx };
+    guarded(|| {
+        let panel: AnyView = cx.new(|_| PluginPanel).into();
+        unsafe { out.write(panel) };
+    })
+}
+
+/// Sets the seed the panels generate their next render from.
+#[unsafe(no_mangle)]
+pub extern "C" fn fixture_set_panel_seed(seed: u64) {
+    PANEL_SEED.store(seed, Ordering::SeqCst);
+}
+
+/// How many times panels have rendered since this DLL was loaded.
+#[unsafe(no_mangle)]
+pub extern "C" fn fixture_panel_renders() -> u64 {
+    PANEL_RENDERS.load(Ordering::SeqCst)
+}
+
+/// How many clicks panel rows have handled since this DLL was loaded.
+#[unsafe(no_mangle)]
+pub extern "C" fn fixture_panel_clicks() -> u64 {
+    PANEL_CLICKS.load(Ordering::SeqCst)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fixture_set_strict_allocator(strict: bool) {
+    ALLOCATOR.set_strict(strict);
+}
+
+/// # Safety
+/// `out` must be valid for a write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fixture_ledger(out: *mut tagged_allocator::Ledger) {
+    unsafe { out.write(ALLOCATOR.ledger()) };
+}
+
+/// Copies the backtrace of this DLL's first cross free (if any) into
+/// `buffer`, returning its full length.
+///
+/// # Safety
+/// `buffer` must be valid for `capacity` bytes of writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fixture_first_foreign_free(buffer: *mut u8, capacity: usize) -> usize {
+    let Some(text) = ALLOCATOR.first_foreign_free() else {
+        return 0;
+    };
+    let copied = text.len().min(capacity);
+    unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), buffer, copied) };
+    text.len()
+}
+
+/// Copies this DLL's live-blocks-by-size histogram into `out`.
+///
+/// # Safety
+/// `out` must be valid for `len` writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fixture_size_histogram(out: *mut i64, len: usize) {
+    let mut histogram = [0i64; tagged_allocator::HISTOGRAM_LEN];
+    ALLOCATOR.size_histogram(&mut histogram);
+    let copied = len.min(histogram.len());
+    unsafe { std::ptr::copy_nonoverlapping(histogram.as_ptr(), out, copied) };
 }

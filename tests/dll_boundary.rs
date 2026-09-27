@@ -12,6 +12,8 @@
 //! different tag, so any cross-binary free aborts the process, and both
 //! heaps are compared byte-for-byte against their baselines.
 
+#[path = "support/fixture_build.rs"]
+mod fixture_build;
 #[path = "support/tagged_allocator.rs"]
 mod tagged_allocator;
 
@@ -19,13 +21,15 @@ use std::{
     cell::RefCell,
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
-    process::Command,
     sync::{
-        Arc, Barrier, Mutex, MutexGuard, OnceLock,
+        Arc, Barrier, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
 };
 
+#[cfg(windows)]
+use fixture_build::process_handle_count;
+use fixture_build::{fixture_copy_path, fixture_path, is_loaded};
 use gpui::{Arena, ElementArenaScope, shared_runtime};
 use libloading::Library;
 use tagged_allocator::{HOST_TAG, TaggedAllocator};
@@ -48,75 +52,6 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn fixture_path() -> &'static Path {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let target_dir = manifest_dir.join("target").join("dll-fixture");
-        let status = Command::new(option_env!("CARGO").unwrap_or("cargo"))
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(manifest_dir.join("tests").join("dll_fixture").join("Cargo.toml"))
-            .arg("--target-dir")
-            .arg(&target_dir)
-            .status()
-            .expect("failed to run cargo to build the DLL fixture");
-        assert!(status.success(), "building the DLL fixture failed");
-        target_dir
-            .join("debug")
-            .join(libloading::library_filename("gpui_dll_fixture"))
-    })
-}
-
-/// A second file with the same contents, so the OS maps it as a separate
-/// module with its own statics: a second, independent plugin copy of gpui.
-fn fixture_copy_path() -> &'static Path {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let original = fixture_path();
-        let copy = original.with_file_name(libloading::library_filename("gpui_dll_fixture_copy"));
-        std::fs::copy(original, &copy).expect("failed to copy the DLL fixture");
-        copy
-    })
-}
-
-#[cfg(windows)]
-fn is_loaded(path: &Path) -> bool {
-    match libloading::os::windows::Library::open_already_loaded(path) {
-        Ok(library) => {
-            library.close().expect("failed to release a probe handle");
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-#[cfg(unix)]
-fn is_loaded(path: &Path) -> bool {
-    use libloading::os::unix::{Library, RTLD_LAZY};
-    const RTLD_NOLOAD: std::ffi::c_int = if cfg!(target_os = "macos") { 0x10 } else { 0x4 };
-    match unsafe { Library::open(Some(path), RTLD_LAZY | RTLD_NOLOAD) } {
-        Ok(library) => {
-            library.close().expect("failed to release a probe handle");
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-#[cfg(windows)]
-fn process_handle_count() -> u32 {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> isize;
-        fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32;
-    }
-    let mut count = 0;
-    let succeeded = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
-    assert!(succeeded != 0, "GetProcessHandleCount failed");
-    count
 }
 
 struct Fixture {

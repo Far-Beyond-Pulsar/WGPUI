@@ -394,3 +394,8 @@ single_range_in_vec_init = "allow"
 too_many_arguments = "allow"
 large_enum_variant = "allow"
 nonminimal_bool = "allow"
+
+[[test]]
+name = "dll_ui_stress"
+path = "tests/dll_ui_stress.rs"
+required-features = ["test-support"]
