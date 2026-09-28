@@ -219,6 +219,7 @@ impl Element for VirtualList {
         self.scroll_handle
             .set_offset(point(px(0.0), logical_scroll));
 
+        let mut animation_changed = false;
         let visual_scroll = {
             let mut state = self.scroll_state.borrow_mut();
 
@@ -229,6 +230,7 @@ impl Element for VirtualList {
             // mid-draw, and this runs during prepaint. The animation frame is
             // deferred past the current draw and targets only this view.
             if state.smooth_scroll.update() {
+                animation_changed = true;
                 window.request_animation_frame();
                 cx.notify(window.current_view());
             }
@@ -320,7 +322,7 @@ impl Element for VirtualList {
             });
         });
 
-        self.base.interactivity().prepaint(
+        let hitbox = self.base.interactivity().prepaint(
             global_id,
             inspector_id,
             bounds,
@@ -331,7 +333,13 @@ impl Element for VirtualList {
             window,
             cx,
             |_style, _, hitbox, _, _| hitbox,
-        )
+        );
+        if animation_changed {
+            if let Some(hitbox) = &hitbox {
+                window.invalidate_scrolled_layer(hitbox);
+            }
+        }
+        hitbox
     }
 
     fn paint(

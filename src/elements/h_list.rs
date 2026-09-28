@@ -383,6 +383,9 @@ impl Element for HList {
                             // not being mid-draw, and this runs during prepaint.
                             window.request_animation_frame();
                             cx.notify(window.current_view());
+                            if let Some(hitbox) = &hitbox {
+                                window.invalidate_scrolled_layer(hitbox);
+                            }
                         }
                         visual_scroll_offset.x = scroll_state.smooth_scroll.current();
                     }

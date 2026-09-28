@@ -1239,6 +1239,9 @@ impl Element for List {
             let animating = state_inner.smooth_scroll.update();
 
             if animating {
+                if let Some(layer) = layer {
+                    window.request_layer_buffer_refill(layer);
+                }
                 window.request_animation_frame();
                 cx.notify(current_view);
             }
