@@ -274,8 +274,6 @@ pub(crate) struct Layer {
     /// styles are hover-sensitive, a layer under the pointer — or one that was
     /// under it last frame — simply re-renders.
     pub had_mouse: bool,
-    /// The cached view that records this layer, for `WGPUI_TRACE_VIEWS` output.
-    pub debug_label: Option<&'static str>,
     /// A conservative opaque coverage region in window coordinates.
     pub opaque_bounds: Option<Bounds<Pixels>>,
     /// Set when invalidated while visually occluded; content is rebuilt when revealed.
@@ -361,7 +359,6 @@ impl Layer {
             policy,
             last_visited: frame,
             had_mouse: false,
-            debug_label: None,
             opaque_bounds: None,
             deferred_dirty: false,
             poisoned_bounds: Vec::new(),

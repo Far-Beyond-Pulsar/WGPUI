@@ -202,25 +202,6 @@ impl Scene {
         self.layer_slab_spans.clear();
     }
 
-    /// Primitives this frame will draw so far: inline ones plus every
-    /// instance inside spliced slab spans, so an inline replay and a slab
-    /// composite of the same content count alike. `WGPUI_TRACE_VIEWS` only.
-    pub(crate) fn trace_output_len(&self) -> usize {
-        let inline = self
-            .paint_operations
-            .iter()
-            .filter(|operation| matches!(operation, PaintOperation::Primitive(_)))
-            .count();
-        let spliced: usize = self
-            .layer_slab_spans
-            .iter()
-            .filter(|span| span.texture.is_none())
-            .flat_map(|span| span.runs.iter())
-            .map(|run| run.count as usize)
-            .sum();
-        inline + spliced
-    }
-
     pub fn len(&self) -> usize {
         self.paint_operations.len()
     }

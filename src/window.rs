@@ -312,33 +312,7 @@ fn composite_layer_legacy(
         match item {
             LayerItem::Primitive(primitive) => scene.push_retained(primitive),
             LayerItem::Nested(nested) => {
-                if !crate::view::view_trace_enabled() {
-                    composite_layer_legacy(scene, layers, *nested, frame, scale_factor);
-                    continue;
-                }
-                let before = scene.trace_output_len();
-                let state = match layers.get(nested) {
-                    None => "MISSING (no layer record)",
-                    Some(layer) if !layer.has_content() => "EMPTY (content dropped)",
-                    Some(_) => "legacy replay",
-                };
-                let name = layers
-                    .get(nested)
-                    .and_then(|layer| layer.debug_label)
-                    .map(|label| label.rsplit("::").next().unwrap_or(label).to_string())
-                    .unwrap_or_else(|| format!("{nested:?}"));
-                let nested_bounds = layers.get(nested).map(|layer| layer.cache_key.bounds);
-                composite_layer_legacy(scene, layers, *nested, frame, scale_factor);
-                let emitted = scene.trace_output_len() - before;
-                eprintln!(
-                    "[view trace] draw {frame}     nested {name} at {nested_bounds:?} (inside {}): {state}, emitted {emitted}{}",
-                    layers
-                        .get(&key)
-                        .and_then(|layer| layer.debug_label)
-                        .map(|label| label.rsplit("::").next().unwrap_or(label))
-                        .unwrap_or("unlabelled layer"),
-                    if emitted == 0 { "  <-- NOTHING DRAWN" } else { "" },
-                );
+                composite_layer_legacy(scene, layers, *nested, frame, scale_factor)
             }
         }
     }
@@ -1826,9 +1800,6 @@ pub struct Window {
     /// counts draws this window performed, so a window that stops drawing stops
     /// ageing its layers.
     pub(crate) layer_frame: u64,
-    /// Label for the next `record_layer`, set by `AnyView::cached` so traced
-    /// output can name the view a layer belongs to.
-    pub(crate) next_layer_debug_label: Option<&'static str>,
     /// Content tokens handed to the renderer's slab registry: bumped every
     /// time a layer's items are replaced, read at composite time. A token the
     /// registry has not seen means "upload this layer's slab".
@@ -2386,7 +2357,6 @@ impl Window {
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             layers: FxHashMap::default(),
             layer_frame: 0,
-            next_layer_debug_label: None,
             slab_tokens: FxHashMap::default(),
             next_slab_token: 0,
             next_layer_id: 0,
@@ -3477,9 +3447,6 @@ impl Window {
             // for a skipped draw would evict a window's layers for not being
             // visited by a frame that never looked at anything.
             self.layer_frame = self.layer_frame.wrapping_add(1);
-            if crate::view::view_trace_enabled() {
-                eprintln!("[view trace] ---- draw {} ----", self.layer_frame);
-            }
             self.draw_roots(cx);
             self.evict_stale_layers();
 
@@ -5030,33 +4997,6 @@ impl Window {
         cx: &mut App,
         f: impl FnOnce(&mut Window, &mut App) -> R,
     ) -> Option<R> {
-        if !crate::view::view_trace_enabled() {
-            return self.with_retained_layer_untraced(global_id, bounds, policy, content_key, cx, f);
-        }
-        let before = self.scene_output_len();
-        let result = self.with_retained_layer_untraced(global_id, bounds, policy, content_key, cx, f);
-        let emitted = self.scene_output_len() - before;
-        let key = LayerKey::from_global_element_id(global_id);
-        eprintln!(
-            "[view trace] draw {}   layer {:?} at {:?}: {}, emitted {emitted}{}",
-            self.layer_frame,
-            key,
-            bounds,
-            if result.is_some() { "recorded" } else { "reused" },
-            if emitted == 0 { "  <-- NOTHING DRAWN" } else { "" },
-        );
-        result
-    }
-
-    fn with_retained_layer_untraced<R>(
-        &mut self,
-        global_id: &GlobalElementId,
-        bounds: Bounds<Pixels>,
-        policy: LayerPolicy,
-        content_key: Option<u64>,
-        cx: &mut App,
-        f: impl FnOnce(&mut Window, &mut App) -> R,
-    ) -> Option<R> {
         if !crate::layer::layers_enabled() {
             return Some(f(self, cx));
         }
@@ -5227,7 +5167,6 @@ impl Window {
         f: impl FnOnce(&mut Window) -> R,
     ) -> R {
         wgpui_scope!("wgpui: record layer");
-        let debug_label = self.next_layer_debug_label.take();
         crate::render_stats::count("layer: re-rendered");
         let scaled_bounds = cache_key.bounds.scale(cache_key.scale_factor);
         let paint_start = self.paint_index();
@@ -5262,9 +5201,6 @@ impl Window {
                 Layer::new(LayerId(id), policy, frame)
             });
             layer.opaque_bounds = None;
-            if let Some(label) = debug_label {
-                layer.debug_label = Some(label);
-            }
             layer.poisoned_bounds.clear();
         }
 
@@ -5405,13 +5341,6 @@ impl Window {
             .filter_map(|layer| layer.opaque_bounds)
             .collect::<Vec<_>>();
         crate::occlusion::fully_covered(bounds, &occluders)
-    }
-
-    /// How much has been put into the frame being drawn: inline paint
-    /// operations plus spliced slab spans. Only differences are meaningful;
-    /// used by the `WGPUI_TRACE_VIEWS` diagnostics.
-    pub(crate) fn scene_output_len(&self) -> usize {
-        self.next_frame.scene.trace_output_len()
     }
 
     /// Stamp a culled layer and everything nested in it as visited. A culled
@@ -6038,52 +5967,23 @@ impl Window {
     /// own representation independently — slabbed children splice spans into
     /// their own scope inside the parent's, legacy children replay inline.
     fn composite_nested_layer_for_slab(&mut self, nested: LayerKey, frame: u64, scale_factor: f32) {
-        let trace = crate::view::view_trace_enabled();
-        let before = self.scene_output_len();
         let exists = self
             .layers
             .get(&nested)
             .is_some_and(|layer| layer.has_content());
         if !exists {
             crate::render_stats::count("layer: nested reference missing");
-            if trace {
-                eprintln!(
-                    "[view trace] draw {}     nested {}: MISSING (no retained content)  <-- NOTHING DRAWN",
-                    self.layer_frame,
-                    self.layer_trace_name(nested),
-                );
-            }
             return;
         }
-        let path = if crate::scene_pack::slabs_enabled()
+        if crate::scene_pack::slabs_enabled()
             && !self.next_frame.scene.innermost_layer_is_recording()
             && self.try_composite_layer_into_scene_as_slab(nested, frame, scale_factor)
         {
-            "slab"
-        } else {
-            let scene = &mut self.next_frame.scene;
-            let layers = &mut self.layers;
-            composite_layer_legacy(scene, layers, nested, frame, scale_factor);
-            "legacy replay"
-        };
-        if trace {
-            let emitted = self.scene_output_len() - before;
-            let bounds = self.layers.get(&nested).map(|layer| layer.cache_key.bounds);
-            eprintln!(
-                "[view trace] draw {}     nested {} at {bounds:?}: {path}, emitted {emitted}{}",
-                self.layer_frame,
-                self.layer_trace_name(nested),
-                if emitted == 0 { "  <-- NOTHING DRAWN" } else { "" },
-            );
+            return;
         }
-    }
-
-    /// A layer's view name when a cached view recorded it, else its key.
-    fn layer_trace_name(&self, key: LayerKey) -> String {
-        match self.layers.get(&key).and_then(|layer| layer.debug_label) {
-            Some(label) => label.rsplit("::").next().unwrap_or(label).to_string(),
-            None => format!("{key:?}"),
-        }
+        let scene = &mut self.next_frame.scene;
+        let layers = &mut self.layers;
+        composite_layer_legacy(scene, layers, nested, frame, scale_factor);
     }
     /// Tint `bounds` by the layer's id, at full strength on a frame it
     /// re-rendered.
@@ -15870,8 +15770,8 @@ mod headless_layer_flicker {
                         .iter()
                         .map(|key| match window.layers.get(key) {
                             Some(layer) => format!(
-                                "{} (content: {}, needs: {:?}, texture: {}, packed: {})",
-                                window.layer_trace_name(*key),
+                                "{:?} (content: {}, needs: {:?}, texture: {}, packed: {})",
+                                key,
                                 layer.has_content(),
                                 layer.needs,
                                 layer.texture_retained,
@@ -16147,7 +16047,6 @@ mod headless_layer_flicker {
             return;
         }
         let Ok(context) = WgpuContext::new(&WgpuOptions::default()) else {
-            eprintln!("no GPU adapter; skipping headless layer flicker reproduction");
             return;
         };
         let context = Arc::new(context);
