@@ -14086,7 +14086,7 @@ mod test {
                 assert!(layer.buffer_anchored, "the refill anchored the buffer");
                 let viewport_bottom = px(300.).scale(this.scale_factor());
                 assert!(layer.items.iter().any(|item| {
-                    matches!(item, LayerItem::Primitive(primitive)
+                    matches!(item, crate::layer::LayerItem::Primitive(primitive)
                         if primitive.bounds().intersect(&primitive.content_mask().bounds).bottom()
                             > viewport_bottom)
                 }), "the buffer must contain painted rows below the viewport, not only an oversized texture");
@@ -14104,15 +14104,15 @@ mod test {
             let bounds = this.layers[&key].cache_key.bounds;
             let anchor = this.layers[&key].buffer_anchor;
             let offset = this.layers[&key].content_offset;
-            this.invalidator.set_phase(DrawPhase::Prepaint);
+            this.invalidator.set_phase(super::DrawPhase::Prepaint);
             this.with_layer_hitbox_scope(key, bounds, |this| {
-                let nested = Bounds::new(bounds.origin, size(px(100.), px(60.)));
+                let nested = crate::Bounds::new(bounds.origin, size(px(100.), px(60.)));
                 assert!(matches!(
-                    crate::elements::scroll_buffer::prepare_scroll_buffer(this, nested, point(px(0.), px(-120.))),
+                    crate::elements::scroll_buffer::prepare_scroll_buffer(this, nested, crate::point(px(0.), px(-120.))),
                     crate::elements::scroll_buffer::ScrollBufferFrame::Viewport
                 ));
             });
-            this.invalidator.set_phase(DrawPhase::None);
+            this.invalidator.set_phase(super::DrawPhase::None);
             assert_eq!(this.layers[&key].buffer_anchor, anchor);
             assert_eq!(this.layers[&key].content_offset, offset);
         }).expect("nested buffer ownership check");
