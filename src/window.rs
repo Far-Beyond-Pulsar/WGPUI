@@ -1733,7 +1733,7 @@ pub struct Window {
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
     display_id: Option<DisplayId>,
-    sprite_atlas: Arc<dyn PlatformAtlas>,
+    pub(crate) sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
     rem_size: Pixels,
     /// The stack of override values for the window's rem size.
@@ -1781,12 +1781,12 @@ pub struct Window {
     /// produces (including the draws `flush_effects` runs by itself in tests)
     /// and returns the renderer's slab re-record requests, which the next
     /// draw applies exactly where it applies a real platform window's.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) test_frame_sink:
         Option<Box<dyn FnMut(&crate::Scene) -> (Vec<LayerKey>, Vec<crate::AtlasTextureId>)>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) test_pending_rerecords: Vec<LayerKey>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) test_pending_dead_pages: Vec<crate::AtlasTextureId>,
     pub(crate) next_frame: Frame,
     /// Retained layers, addressed by a stable key rather than by an offset into
@@ -2348,11 +2348,11 @@ impl Window {
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_frame_sink: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_pending_rerecords: Vec::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_pending_dead_pages: Vec::new(),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             layers: FxHashMap::default(),
@@ -3518,7 +3518,7 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(sink) = self.test_frame_sink.as_mut() {
             let (keys, dead_pages) = sink(&self.rendered_frame.scene);
             self.test_pending_rerecords.extend(keys);
@@ -3613,7 +3613,7 @@ impl Window {
         let mut keys = self.platform_window.take_slab_rerecord_requests();
         #[allow(unused_mut)]
         let mut dead_pages = self.platform_window.take_dead_atlas_page_requests();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             keys.append(&mut self.test_pending_rerecords);
             dead_pages.append(&mut self.test_pending_dead_pages);
@@ -14102,6 +14102,92 @@ mod test {
         }
         out.sort();
         out
+    }
+
+    /// A panel re-records (it was notified) while one of its children is
+    /// unchanged and reused as an instance. That child contains a layer of its
+    /// own. The re-record frame must still draw the nested layer's content,
+    /// not just keep a reference to it: in the editor this frame is the last
+    /// real draw after an interaction, and idle viewport frames re-present it
+    /// until the next real draw.
+    #[gpui::test]
+    fn a_reused_instance_still_draws_its_nested_layer(cx: &mut TestAppContext) {
+        if layers_off() || !crate::instance::instances_enabled() {
+            return;
+        }
+        struct Panel {
+            revision: usize,
+        }
+        impl crate::Render for Panel {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        crate::div()
+                            .h(px(10.))
+                            .w(px(10. + (self.revision % 3) as f32 * 10.))
+                            .bg(crate::red()),
+                    )
+                    // Static styling, so it reconciles and is reused whenever
+                    // the panel re-records with it unchanged.
+                    .child(
+                        crate::div().w(px(200.)).h(px(200.)).child(
+                            crate::div()
+                                .id("body")
+                                .layer()
+                                .size_full()
+                                .bg(crate::blue())
+                                .child(crate::div().m(px(8.)).size(px(40.)).bg(crate::green())),
+                        ),
+                    )
+            }
+        }
+        struct Root {
+            panel: crate::Entity<Panel>,
+        }
+        impl crate::Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::div().size_full().child(
+                    crate::div().relative().left(px(300.)).top(px(100.)).w(px(220.)).h(px(260.)).child(
+                        crate::AnyView::from(self.panel.clone())
+                            .cached(crate::StyleRefinement::default().absolute().size_full()),
+                    ),
+                )
+            }
+        }
+        let window = cx.open_window(size(px(800.), px(600.)), |_, cx| Root {
+            panel: cx.new(|_| Panel { revision: 0 }),
+        });
+        cx.run_until_parked();
+        let any: crate::AnyWindowHandle = window.into();
+        let panel = window.update(cx, |root, _, _| root.panel.clone()).unwrap();
+        let frame = |cx: &mut TestAppContext, full: bool| -> Vec<String> {
+            any.update(cx, |_, window, cx| {
+                if full {
+                    window.refresh();
+                }
+                window.draw(cx).clear();
+                window.present();
+                drawn_quads(&window.rendered_frame.scene)
+            })
+            .unwrap()
+        };
+        frame(cx, true);
+        for revision in 1..6 {
+            panel.update(cx, |panel, cx| {
+                panel.revision = revision;
+                cx.notify();
+            });
+            let rerecorded = frame(cx, false);
+            let full = frame(cx, true);
+            let missing: Vec<_> = full.iter().filter(|quad| !rerecorded.contains(quad)).collect();
+            assert!(
+                missing.is_empty(),
+                "revision {revision}: the panel's re-record frame dropped {missing:#?}"
+            );
+        }
     }
 
     /// The level editor's properties panel, reduced: a cached panel view whose

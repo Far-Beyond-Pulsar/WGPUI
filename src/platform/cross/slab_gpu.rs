@@ -502,6 +502,40 @@ impl SlabRegistry {
         crate::render_stats::count(COUNTER_SPANS_SKIPPED_EVICTED);
     }
 
+    /// One line of residency state for a span of `key` carrying
+    /// `content_token` and `totals`, for frame snapshots.
+    pub fn describe_entry(
+        &self,
+        key: LayerKey,
+        content_token: u64,
+        totals: [u32; SlabKind::COUNT],
+    ) -> String {
+        let Some(entry) = self.entries.get(&key) else {
+            return "NO ENTRY (never uploaded, or reclaimed)".to_string();
+        };
+        let translate = self
+            .transforms
+            .values
+            .get(entry.transform_slot as usize)
+            .map(|value| value.translate);
+        format!(
+            "token {}{}, counts {:?}{}, uploaded {}, poisoned {}, awaiting re-record {}, \
+             last referenced frame {} (now {}), transform slot {} translate {:?}, slabs {:?}",
+            entry.content_token,
+            if entry.content_token == content_token { " (matches)" } else { " (STALE vs span)" },
+            entry.counts,
+            if entry.counts == totals { "" } else { " (MISMATCH vs span totals)" },
+            entry.uploaded_generation == Some(entry.slabs.generation),
+            entry.poisoned,
+            entry.awaiting_rerecord,
+            entry.last_referenced_frame,
+            self.frame,
+            entry.transform_slot,
+            translate,
+            entry.slabs,
+        )
+    }
+
     /// Whether spans for this key must not draw this frame (eviction pending).
     pub fn is_awaiting_rerecord(&self, key: LayerKey) -> bool {
         self.entries

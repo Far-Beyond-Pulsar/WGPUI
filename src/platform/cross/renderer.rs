@@ -2457,7 +2457,6 @@ impl WgpuRenderer {
     /// [`Self::read_back_frame`] returns. Cross-frame state (slab residency,
     /// transform slots, layer textures, the atlas) persists across draws the
     /// same way, which is what lets a test reproduce multi-frame bugs.
-    #[cfg(test)]
     pub(crate) fn new_headless(
         context: Arc<WgpuContext>,
         atlas: Arc<WgpuAtlas>,
@@ -2497,19 +2496,105 @@ impl WgpuRenderer {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn frame_size(&self) -> (u32, u32) {
         (self.surface_configuration.width, self.surface_configuration.height)
     }
 
     /// The last frame a headless renderer drew, as tightly packed RGBA8 rows.
-    #[cfg(test)]
     pub(crate) fn read_back_frame(&self) -> Vec<u8> {
         let Some(target) = self.headless_target.as_ref() else {
             return Vec::new();
         };
-        let width = self.surface_configuration.width;
-        let height = self.surface_configuration.height;
+        self.read_texture_rgba(target)
+    }
+
+    /// What this renderer last put on screen: the persistent framebuffer every
+    /// frame is composed in before it is copied to the swapchain.
+    pub(crate) fn read_back_presented(&self) -> Vec<u8> {
+        match (&self.headless_target, &self.persistent_framebuffer) {
+            (Some(target), _) => self.read_texture_rgba(target),
+            (None, Some(framebuffer)) => self.read_texture_rgba(framebuffer),
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// Draw `scene` with a brand-new renderer sharing this one's device and
+    /// atlas but none of its cross-frame state (slab residency, transform
+    /// slots, layer textures). Pixels it gets right that this renderer got
+    /// wrong point at that state.
+    pub(crate) fn render_scene_fresh(&self, scene: &Scene) -> Vec<u8> {
+        let (width, height) = self.frame_size();
+        let mut fresh = Self::new_headless(self.context.clone(), self.atlas.clone(), width, height);
+        fresh.draw(scene);
+        fresh.read_back_frame()
+    }
+
+    /// This renderer's view of every slab span and layer surface in `scene`:
+    /// whether each would draw, and the residency and transform state it
+    /// would draw from.
+    pub(crate) fn describe_scene_state(&self, scene: &Scene) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let mut described = FxHashSet::default();
+        writeln!(out, "slab spans in scene: {}", scene.layer_slab_spans.len()).ok();
+        for (index, span) in scene.layer_slab_spans.iter().enumerate() {
+            let instances: u32 = span.runs.iter().map(|run| run.count).sum();
+            writeln!(
+                out,
+                "  span {index}: layer {:?} order {} token {} runs {} instances {} origin {:?}{}",
+                span.key,
+                span.order(),
+                span.content_token,
+                span.runs.len(),
+                instances,
+                span.origin,
+                if span.texture.is_some() { " [texture bake]" } else { "" },
+            )
+            .ok();
+            if described.insert(span.key) {
+                writeln!(out, "    registry: {}", self.slab_registry.describe_entry(span.key, span.content_token, span.totals)).ok();
+            }
+            for run in &span.runs {
+                if let Some(texture_id) = run.texture_id {
+                    if self.atlas.try_texture_info(texture_id).is_none() {
+                        writeln!(out, "    run on DEAD atlas page {texture_id:?}").ok();
+                    }
+                }
+            }
+        }
+        for surface in &scene.surfaces {
+            if let crate::SurfaceContent::Layer(layer_id, key) = &surface.content {
+                writeln!(
+                    out,
+                    "layer surface {layer_id:?} ({key:?}) bounds {:?}: texture {}",
+                    surface.bounds,
+                    if self.layer_textures.contains_key(layer_id) { "present" } else { "MISSING" },
+                )
+                .ok();
+            }
+        }
+        writeln!(
+            out,
+            "inline primitives: {} quads, {} shadows, {} mono sprites, {} poly sprites, {} paths, {} surfaces",
+            scene.quads.len(),
+            scene.shadows.len(),
+            scene.monochrome_sprites.len(),
+            scene.polychrome_sprites.len(),
+            scene.paths.len(),
+            scene.surfaces.len(),
+        )
+        .ok();
+        writeln!(out, "pending re-record requests: {}", self.slab_registry.has_pending_requests()).ok();
+        out
+    }
+
+    fn read_texture_rgba(&self, target: &wgpu::Texture) -> Vec<u8> {
+        let width = target.width();
+        let height = target.height();
+        let swap_red_blue = matches!(
+            target.format(),
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
         let unpadded = width * 4;
         let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -2556,6 +2641,11 @@ impl WgpuRenderer {
         let mut pixels = Vec::with_capacity((unpadded * height) as usize);
         for row in mapped.chunks(padded as usize) {
             pixels.extend_from_slice(&row[..unpadded as usize]);
+        }
+        if swap_red_blue {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
         }
         pixels
     }

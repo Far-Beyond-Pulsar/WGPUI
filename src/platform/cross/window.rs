@@ -496,6 +496,18 @@ impl PlatformWindow for CrossWindow {
         }
     }
 
+    fn snapshot_frame(&self, scene: &crate::Scene) -> Option<crate::platform::FrameSnapshot> {
+        let renderer = self.0.renderer.get()?.borrow();
+        let (width, height) = renderer.frame_size();
+        Some(crate::platform::FrameSnapshot {
+            width,
+            height,
+            presented: renderer.read_back_presented(),
+            fresh: renderer.render_scene_fresh(scene),
+            renderer_report: renderer.describe_scene_state(scene),
+        })
+    }
+
     fn take_dead_atlas_page_requests(&mut self) -> Vec<crate::AtlasTextureId> {
         match self.0.renderer.get() {
             Some(renderer) => renderer.borrow_mut().take_dead_page_requests(),

@@ -83,6 +83,8 @@ mod tab_stop;
 mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
+#[cfg(all(any(test, feature = "test-support"), not(target_family = "wasm")))]
+pub mod headless;
 mod text_system;
 mod time_ext;
 mod util;
