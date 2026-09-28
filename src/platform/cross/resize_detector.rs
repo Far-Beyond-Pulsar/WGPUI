@@ -20,8 +20,10 @@ pub struct ResizeDetector {
     /// Deadline for the timer-based fallback (programmatic / non-mouse resizes).
     deadline: Cell<Option<Instant>>,
     /// Cached device_query state — cheap to call, avoids re-initializing each poll.
+    /// `None` on Linux without an X display (pure Wayland), where `DeviceState::new`
+    /// would panic; resizes then end on the idle deadline alone.
     #[cfg(not(target_family = "wasm"))]
-    device_state: DeviceState,
+    device_state: Option<DeviceState>,
 }
 
 /// Fallback idle period used when the resize wasn't driven by a held mouse button
@@ -33,8 +35,10 @@ impl ResizeDetector {
         Self {
             active: Cell::new(false),
             deadline: Cell::new(None),
-            #[cfg(not(target_family = "wasm"))]
-            device_state: DeviceState::new(),
+            #[cfg(target_os = "linux")]
+            device_state: DeviceState::checked_new(),
+            #[cfg(not(any(target_family = "wasm", target_os = "linux")))]
+            device_state: Some(DeviceState::new()),
         }
     }
 
@@ -55,9 +59,10 @@ impl ResizeDetector {
         // Poll the real global left-button state. If it's held the user is
         // still dragging the resize handle; keep deferring and push the
         // fallback deadline out so it doesn't fire during the drag.
-        let mouse = self.device_state.get_mouse();
         // button_pressed is 1-based; index 1 = left button.
-        let left_held = mouse.button_pressed.get(1).copied().unwrap_or(false);
+        let left_held = self.device_state.as_ref().is_some_and(|state| {
+            state.get_mouse().button_pressed.get(1).copied().unwrap_or(false)
+        });
 
         if left_held {
             self.deadline.set(Some(Instant::now() + IDLE_THRESHOLD));

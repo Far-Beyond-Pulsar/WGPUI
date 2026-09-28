@@ -29,10 +29,6 @@ struct WgpuSurfaceHandleInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     present_trigger: Arc<dyn Fn() + Send + Sync>,
-    /// Optional direct handle to the winit window.  Having an `Arc` lets
-    /// us call `request_redraw()` from another thread without touching the
-    /// event bus.
-    winit_window: Option<Arc<winit::window::Window>>,
     /// Device-level guard shared with the renderer. See
     /// `WgpuContext::gpu_submit_lock`'s doc comment for the full mechanism.
     gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
@@ -71,13 +67,25 @@ pub struct WgpuSurfaceHandle {
 }
 
 impl WgpuSurfaceHandle {
+    /// Ask the UI thread to redraw this surface's window.
+    ///
+    /// Always goes through the event-loop proxy (`present_trigger`), which the
+    /// UI thread turns into `request_redraw()` if the window still exists.
+    /// Render threads must not call `winit::Window::request_redraw()`
+    /// directly: on X11 it is `redraw_sender.send(..).unwrap()`, so once the
+    /// event loop has closed (shutdown, or the X connection dying) the next
+    /// frame panics the render thread with `EventLoopClosed`. The proxy send
+    /// just fails quietly in that case.
+    fn wake_ui_thread(&self) {
+        (self.inner.present_trigger)();
+    }
+
     pub(crate) fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,
         surface_id: SurfaceId,
         registry: Arc<SurfaceRegistry>,
         present_trigger: Arc<dyn Fn() + Send + Sync>,
-        winit_window: Option<Arc<winit::window::Window>>,
         gpu_submit_lock: Arc<parking_lot::RwLock<()>>,
         width: u32,
         height: u32,
@@ -91,7 +99,6 @@ impl WgpuSurfaceHandle {
                 device,
                 queue,
                 present_trigger,
-                winit_window,
                 gpu_submit_lock,
                 size: Mutex::new((width, height)),
                 pending_resize: Mutex::new(None),
@@ -198,11 +205,7 @@ impl WgpuSurfaceHandle {
             .registry
             .set_redraw_pending(self.inner.surface_id);
 
-        if let Some(winit) = &self.inner.winit_window {
-            winit.request_redraw();
-        } else {
-            (self.inner.present_trigger)();
-        }
+        self.wake_ui_thread();
 
         // Return immediately - no blocking
     }
@@ -239,11 +242,7 @@ impl WgpuSurfaceHandle {
     /// fast direct blit, and a missed blit can never force a full `Window::refresh`.
     /// Redraw requests coalesce, so calling this every frame is cheap.
     pub fn request_frame(&self) {
-        if let Some(winit) = &self.inner.winit_window {
-            winit.request_redraw();
-        } else {
-            (self.inner.present_trigger)();
-        }
+        self.wake_ui_thread();
     }
 
     /// Present the rendered frame without GPU synchronization (deprecated).
@@ -265,11 +264,7 @@ impl WgpuSurfaceHandle {
             .registry
             .set_redraw_pending(self.inner.surface_id);
 
-        if let Some(winit) = &self.inner.winit_window {
-            winit.request_redraw();
-        } else {
-            (self.inner.present_trigger)();
-        }
+        self.wake_ui_thread();
 
         // Return immediately - no blocking
     }
