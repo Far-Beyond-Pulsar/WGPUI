@@ -43,6 +43,23 @@ impl Default for SmoothScrollState {
 }
 
 impl SmoothScrollState {
+    /// Cancel pending motion after a reset, resize, or scrollbar drag.
+    pub fn snap_to(&mut self, offset: Pixels) {
+        self.visual_offset = offset;
+        self.target_offset = offset;
+        self.animating = false;
+        self.last_frame_time = None;
+    }
+
+    /// Keep both ends of an in-flight animation inside the current content.
+    pub fn clamp(&mut self, minimum: Pixels, maximum: Pixels) {
+        self.visual_offset = self.visual_offset.clamp(minimum, maximum);
+        self.target_offset = self.target_offset.clamp(minimum, maximum);
+        if self.visual_offset == self.target_offset {
+            self.animating = false;
+        }
+    }
+
     /// Sets the smooth scrolling mode.
     ///
     /// Disabling smooth scrolling immediately snaps the visual
@@ -61,6 +78,9 @@ impl SmoothScrollState {
     /// If smooth scrolling is enabled, animation toward the
     /// target begins automatically.
     pub fn set_target(&mut self, target: Pixels) {
+        if self.target_offset == target {
+            return;
+        }
         self.target_offset = target;
 
         if self.mode == SmoothScrollMode::Disabled {
@@ -103,6 +123,7 @@ impl SmoothScrollState {
 
         let factor = 1.0 - (1.0 - self.smoothing_factor).powf(dt * 60.0);
 
+        let previous = self.visual_offset;
         self.visual_offset.0 += (self.target_offset.0 - self.visual_offset.0) * factor;
 
         let remaining = (self.target_offset.0 - self.visual_offset.0).abs();
@@ -110,7 +131,7 @@ impl SmoothScrollState {
         if remaining < 0.5 {
             self.visual_offset = self.target_offset;
             self.animating = false;
-            return false;
+            return previous != self.visual_offset;
         }
 
         true

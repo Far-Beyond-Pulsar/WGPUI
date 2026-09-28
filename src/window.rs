@@ -80,6 +80,7 @@ pub(crate) enum SlabSegment {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PrepaintLayerBuffer {
     pub key: LayerKey,
+    pub bounds: Bounds<Pixels>,
     pub margin: Size<Pixels>,
     /// The scroll-space position the buffer was rendered at; opaque to the
     /// framework, meaningful to the element that set it.
@@ -6725,6 +6726,7 @@ impl Window {
             layer.content_key.is_none() && self.dirty_views.contains(&self.current_view());
         Some(PrepaintLayerBuffer {
             key,
+            bounds,
             margin,
             anchor: layer.buffer_anchor,
             content_offset: layer.content_offset,
@@ -6773,6 +6775,21 @@ impl Window {
     /// the shift never outruns the texture while the refill is in flight.
     pub(crate) fn request_layer_buffer_refill(&self, key: LayerKey) {
         self.invalidator.invalidate_layer(key, Invalidation::DISPLAY);
+    }
+
+    pub(crate) fn invalidate_scrolled_layer(&self, hitbox: &Hitbox) {
+        if let Some(key) = hitbox.layer {
+            if let Some(layer) = self.layers.get(&key) {
+                // A nested viewport moves only part of its enclosing texture.
+                // Shifting that whole texture would also move its siblings.
+                if !layer.policy.buffers_scroll()
+                    || hitbox.bounds.origin != Point::default()
+                    || hitbox.bounds.size != layer.cache_key.bounds.size
+                {
+                    self.request_layer_buffer_refill(key);
+                }
+            }
+        }
     }
 
     // A paint-time counterpart (`current_paint_layer`, reading
@@ -14067,6 +14084,12 @@ mod test {
                 let (key, layer) = this.layers.iter().next().expect("the layer exists");
                 assert!(layer.texture_retained, "a buffered layer rasterizes");
                 assert!(layer.buffer_anchored, "the refill anchored the buffer");
+                let viewport_bottom = px(300.).scale(this.scale_factor());
+                assert!(layer.items.iter().any(|item| {
+                    matches!(item, LayerItem::Primitive(primitive)
+                        if primitive.bounds().intersect(&primitive.content_mask().bounds).bottom()
+                            > viewport_bottom)
+                }), "the buffer must contain painted rows below the viewport, not only an oversized texture");
                 assert_eq!(
                     layer.texture_bounds.size.height,
                     px(300.) + px(50.) + px(50.),
@@ -14077,6 +14100,22 @@ mod test {
             .unwrap();
 
         let paints_before_scroll = paints.get();
+        window.update(cx, |_, this, _| {
+            let bounds = this.layers[&key].cache_key.bounds;
+            let anchor = this.layers[&key].buffer_anchor;
+            let offset = this.layers[&key].content_offset;
+            this.invalidator.set_phase(DrawPhase::Prepaint);
+            this.with_layer_hitbox_scope(key, bounds, |this| {
+                let nested = Bounds::new(bounds.origin, size(px(100.), px(60.)));
+                assert!(matches!(
+                    crate::elements::scroll_buffer::prepare_scroll_buffer(this, nested, point(px(0.), px(-120.))),
+                    crate::elements::scroll_buffer::ScrollBufferFrame::Viewport
+                ));
+            });
+            this.invalidator.set_phase(DrawPhase::None);
+            assert_eq!(this.layers[&key].buffer_anchor, anchor);
+            assert_eq!(this.layers[&key].content_offset, offset);
+        }).expect("nested buffer ownership check");
         let _ordering = TRANSFORM_STATS_ORDERING.lock();
         let refill_counter = "scroll: buffer refills";
         crate::render_stats::set_force_enabled(true);
