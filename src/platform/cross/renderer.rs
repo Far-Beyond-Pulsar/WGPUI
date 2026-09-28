@@ -2792,6 +2792,7 @@ impl WgpuRenderer {
                 self.slab_registry.set_layer_translate(span.key, span.origin);
             }
 
+            self.slab_registry.note_span_referenced(span.key);
             if let Some(pages) = pages_by_layer.get(&span.key) {
                 self.slab_registry.note_referenced_pages(span.key, pages.iter().copied());
             }
@@ -4800,6 +4801,32 @@ impl WgpuRenderer {
         let swapchain_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // An acquired swapchain image holds whatever was last drawn into that
+        // particular image (or nothing, on flip-discard swapchains), not the
+        // last presented frame. Start from the last full composite.
+        let Some(persistent_framebuffer) = self.persistent_framebuffer.as_ref() else {
+            return false;
+        };
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: persistent_framebuffer,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &surface_texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.surface_configuration.width,
+                height: self.surface_configuration.height,
+                depth_or_array_layers: 1,
+            },
+        );
 
         {
             // Only gets a timestamp span when a WgpuRenderer::draw-initiated

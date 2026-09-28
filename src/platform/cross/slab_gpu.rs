@@ -212,6 +212,11 @@ impl TransformTable {
     pub fn release(&mut self, key: LayerKey) {
         if let Some(slot) = self.slot_of.remove(&key) {
             self.values[slot as usize] = GpuLayerTransform::default();
+            // The GPU copy still holds the old owner's translate. Without this,
+            // a new owner whose translate equals the reset value (a texture
+            // bake's identity) compares equal, never writes, and draws at the
+            // previous layer's offset.
+            self.dirty.insert(slot);
             self.free_slots.push(slot);
         }
     }
@@ -446,6 +451,15 @@ impl SlabRegistry {
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.referenced_pages.clear();
             entry.referenced_pages.extend(pages);
+            entry.last_referenced_frame = self.frame;
+        }
+    }
+
+    /// Keep a layer drawn this frame out of idle GC. `note_referenced_pages`
+    /// only runs for spans that sample the atlas, so a quads-only layer drawn
+    /// every frame would otherwise be reclaimed and re-uploaded periodically.
+    pub fn note_span_referenced(&mut self, key: LayerKey) {
+        if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_referenced_frame = self.frame;
         }
     }
@@ -1146,6 +1160,16 @@ mod tests {
         let recycled = table.slot_for(OTHER);
         assert_eq!(recycled, first);
         assert_eq!(table.slot_value(recycled).translate, [0.0, 0.0]);
+
+        // The GPU copy still holds [12, -3]: a new owner at the identity
+        // translate (a texture bake) must still get it written.
+        table.set_translate(OTHER, [0.0, 0.0]);
+        let dirty = table.drain_dirty();
+        assert_eq!(
+            dirty,
+            vec![(recycled, GpuLayerTransform::default())],
+            "a recycled slot must be rewritten even when its new value equals the reset value"
+        );
     }
 
     // -----------------------------------------------------------------
