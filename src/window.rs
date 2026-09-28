@@ -4438,14 +4438,13 @@ impl Window {
     /// reaches the layer's item list. Margin content never bakes; the buffer
     /// covers only whatever happened to overlap the viewport at record time.
     ///
-    /// Replacing rather than intersecting is safe specifically here because
-    /// nothing this paints is displayed directly: the buffer's *composite*
-    /// re-clips to the layer's own visible rect regardless
-    /// (`paint_layer_texture_surface`'s `visible_bounds`), so painting the
-    /// margin band wide open during record can never leak a pixel past
-    /// whatever the ancestor's real clip is. Anywhere else, replacing would
-    /// be a correctness bug — use [`Self::with_content_mask`] for everything
-    /// that isn't this.
+    /// The record frame also draws these primitives inline, so the mask being
+    /// replaced stays in force as the scene's display clip: the widened mask
+    /// reaches the layer's captured items (and its texture), never the screen.
+    /// The texture composite re-clips to the layer's visible rect
+    /// (`paint_layer_texture_surface`'s `visible_bounds`). Anywhere else,
+    /// replacing would be a correctness bug — use [`Self::with_content_mask`]
+    /// for everything that isn't this.
     pub(crate) fn with_content_mask_unclamped<R>(
         &mut self,
         mask: Option<ContentMask<Pixels>>,
@@ -4453,9 +4452,12 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
+            let display_clip = self.content_mask().bounds.scale(self.scale_factor());
+            self.next_frame.scene.push_display_clip(display_clip);
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
+            self.next_frame.scene.pop_display_clip();
             result
         } else {
             f(self)
@@ -4985,6 +4987,7 @@ impl Window {
             self.reuse_paint_except_scene(&range);
             if self.is_layer_occluded(key) {
                 crate::render_stats::count("occlusion: layers culled");
+                self.mark_layer_subtree_visited(key);
                 if let Some(layer) = self.layers.get_mut(&key) {
                     layer.deferred_dirty = false;
                 }
@@ -5028,6 +5031,7 @@ impl Window {
             ).is_none()
         {
             crate::render_stats::count("occlusion: layers culled");
+            self.mark_layer_subtree_visited(key);
             crate::render_stats::count("occlusion: layers deferred-dirty");
             if let Some(layer) = self.layers.get_mut(&key) {
                 layer.deferred_dirty = true;
@@ -5262,6 +5266,29 @@ impl Window {
         crate::occlusion::fully_covered(bounds, &occluders)
     }
 
+    /// Stamp a culled layer and everything nested in it as visited. A culled
+    /// layer is still on screen logically; left unstamped it would be evicted
+    /// while hidden, and its parent's `Nested` references would composite
+    /// nothing once it is uncovered, or it would re-record for one visible
+    /// frame and be culled again, blinking about once a second.
+    fn mark_layer_subtree_visited(&mut self, key: LayerKey) {
+        let frame = self.layer_frame;
+        let mut pending = vec![key];
+        let mut seen = FxHashSet::default();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if let Some(layer) = self.layers.get_mut(&current) {
+                layer.last_visited = frame;
+                pending.extend(layer.items.iter().filter_map(|item| match item {
+                    LayerItem::Nested(child) => Some(*child),
+                    _ => None,
+                }));
+            }
+        }
+    }
+
     fn is_layer_occluded(&self, key: LayerKey) -> bool {
         if !crate::occlusion::enabled() {
             return false;
@@ -5284,14 +5311,24 @@ impl Window {
                 }));
             }
         }
-        // Check backdrop filter / filter group poisoning: any layer above the
-        // target with poisoned bounds that overlap the target's bounds prevents
-        // occlusion. The filter reads the pixels underneath it.
-        let target_id = target.id;
+        // "Above the target" is judged by last frame's paint order, not by
+        // `LayerId` (creation order: a background created after the panel on
+        // top of it would otherwise cull the panel). Every layer painted
+        // before the target this frame has already stamped `last_visited`
+        // with this frame; a layer still carrying last frame's stamp is one
+        // painted after the target last frame and not yet reached now. Layers
+        // not painted last frame (hidden, stale, evicted) never occlude, and a
+        // target that was not painted last frame has no stable order to judge.
+        let frame = self.layer_frame;
+        let painted_last_frame = |layer: &Layer| layer.last_visited.wrapping_add(1) == frame;
+        if !painted_last_frame(target) {
+            return false;
+        }
+        // Check backdrop filter / filter group poisoning: any layer with
+        // poisoned bounds that overlap the target's bounds prevents occlusion.
+        // The filter reads the pixels underneath it. Deliberately not filtered
+        // by order: over-reporting poison only costs a draw.
         for layer in self.layers.values() {
-            if layer.id <= target_id {
-                continue;
-            }
             for poisoned in &layer.poisoned_bounds {
                 let overlap = poisoned.intersect(&target.cache_key.bounds);
                 if overlap.size.width > Pixels::ZERO && overlap.size.height > Pixels::ZERO {
@@ -5305,11 +5342,23 @@ impl Window {
             .layers
             .iter()
             .filter(|(candidate, layer)| {
-                layer.id > target.id
+                painted_last_frame(layer)
+                    && layer.has_content()
+                    // A buffer's content scrolls under its bounds, and its
+                    // recorded opaque rect does not follow `content_offset`.
+                    && !layer.policy.buffers_scroll()
                     && !descendants.contains(candidate)
                     && !self.retained_layer_stack.contains(candidate)
             })
-            .filter_map(|(_, layer)| layer.opaque_bounds)
+            .filter_map(|(_, layer)| {
+                // An opaque descendant painted outside the layer's clip covers
+                // nothing on screen.
+                let visible = layer
+                    .opaque_bounds?
+                    .intersect(&layer.cache_key.bounds)
+                    .intersect(&layer.cache_key.content_mask.bounds);
+                (!visible.is_empty()).then_some(visible)
+            })
             .collect::<Vec<_>>();
         crate::occlusion::fully_covered(target.cache_key.bounds, &occluders)
     }
@@ -5522,6 +5571,7 @@ impl Window {
             self.reuse_paint_except_scene(&range);
             if self.is_layer_occluded(key) {
                 crate::render_stats::count("occlusion: layers culled");
+                self.mark_layer_subtree_visited(key);
                 if let Some(layer) = self.layers.get_mut(&key) {
                     layer.deferred_dirty = false;
                 }
@@ -5593,6 +5643,7 @@ impl Window {
         self.reuse_paint_except_scene(&range);
         if self.is_layer_occluded(key) {
             crate::render_stats::count("occlusion: layers culled");
+            self.mark_layer_subtree_visited(key);
             if let Some(layer) = self.layers.get_mut(&key) {
                 layer.deferred_dirty = false;
             }
@@ -13697,6 +13748,30 @@ mod test {
         !crate::layer::rasterization_enabled()
     }
 
+    /// A background created after the panel painted over it must not cull the
+    /// panel: `LayerId` is creation order, not paint order.
+    #[gpui::test]
+    fn a_layer_painted_underneath_never_occludes_by_creation_order(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() { return; }
+        let (window, _, _) = two_layer_occlusion_window(cx, false, false, false);
+        window.update(cx, |_, window, _| {
+            let mut by_id: Vec<_> = window.layers.iter().map(|(key, layer)| (layer.id, *key)).collect();
+            by_id.sort();
+            let (bg_id, bg_key) = by_id[0];
+            let (fg_id, fg_key) = by_id[1];
+            // Recreate the background after the foreground, as a remounted
+            // panel wrapper would be.
+            window.layers.get_mut(&bg_key).expect("background").id = fg_id;
+            window.layers.get_mut(&fg_key).expect("foreground").id = bg_id;
+            // Next draw, at the foreground's decision: the background has
+            // already painted this frame, beneath it.
+            window.layer_frame += 1;
+            window.layers.get_mut(&bg_key).expect("background").last_visited = window.layer_frame;
+            assert!(!window.is_layer_occluded(fg_key), "the background paints below the panel");
+            window.layer_frame -= 1;
+        }).expect("window update");
+    }
+
     #[gpui::test]
     fn occluded_panel_rebuilds_stale_text_ranges(cx: &mut TestAppContext) {
         if layers_off() || occlusion_off() { return; }
@@ -13705,7 +13780,11 @@ mod test {
         window.update(cx, |_, window, _| {
             let key = *window.layers.iter().min_by_key(|(_, layer)| layer.id)
                 .expect("background layer").0;
+            // Occlusion is judged against last frame's paint order, i.e. as
+            // seen from inside the next draw.
+            window.layer_frame += 1;
             assert!(window.is_layer_occluded(key));
+            window.layer_frame -= 1;
             let invalid = window.text_system.previous_frame_layout_extent().lines_index + 5;
             let layer = window.layers.get_mut(&key).expect("background layer");
             layer.paint_range.start.line_layout_index.lines_index = invalid;
