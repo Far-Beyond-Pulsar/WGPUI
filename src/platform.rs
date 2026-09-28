@@ -403,6 +403,13 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// window, not per process — and the stolen request would never be
     /// honored, leaving the owner's layers skipping draws indefinitely.
     /// Default empty for platforms without a slab-backed renderer.
+    /// Atlas pages the renderer found destroyed under content drawn without
+    /// a layer key. The window re-records the layers whose retained sprites
+    /// sit on them.
+    fn take_dead_atlas_page_requests(&mut self) -> Vec<crate::AtlasTextureId> {
+        Vec::new()
+    }
+
     fn take_slab_rerecord_requests(&mut self) -> Vec<crate::LayerKey> {
         Vec::new()
     }

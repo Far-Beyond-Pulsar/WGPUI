@@ -1858,6 +1858,11 @@ impl SlabGroupCache {
     /// from the cached one. Pages whose layers were poisoned by eviction stay
     /// in the map but are never bound: poisoned layers skip their draws before
     /// the texture check runs.
+    fn invalidate_sprite_pages(&mut self) {
+        self.pages.clear();
+        self.sprite_textures.clear();
+    }
+
     fn sync_sprite_pages(
         &mut self,
         device: &wgpu::Device,
@@ -1886,10 +1891,13 @@ impl SlabGroupCache {
         #[cfg(test)]
         let rebuilt = self.page_scratch.len() as u64;
         for &(texture_index, texture_kind) in &self.page_scratch {
-            let tex_info = atlas.get_texture_info(AtlasTextureId {
+            let Some(tex_info) = atlas.try_texture_info(AtlasTextureId {
                 index: texture_index,
                 kind: texture_kind,
-            });
+            }) else {
+                // Destroyed page: its spans are skipped and re-recorded.
+                continue;
+            };
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("slab_sprite_texture_bind_group"),
                 layout: &pipelines.sprites_bind_group_layout,
@@ -1906,6 +1914,13 @@ impl SlabGroupCache {
             });
             self.sprite_textures.insert((texture_index, texture_kind), group);
         }
+        // Remember only the pages that got a bind group. A page destroyed
+        // this frame is skipped above; recording it anyway made the next
+        // frame's identical page list look already bound, so once the atlas
+        // recycled that index every span on it was rejected as "page died"
+        // indefinitely, and its panel stayed blank.
+        self.page_scratch
+            .retain(|page| self.sprite_textures.contains_key(page));
         std::mem::swap(&mut self.pages, &mut self.page_scratch);
         #[cfg(test)]
         {
@@ -2005,7 +2020,9 @@ fn build_slab_draw_groups(
             index: texture_index,
             kind: texture_kind,
         };
-        let tex_info = atlas.get_texture_info(texture_id);
+        let Some(tex_info) = atlas.try_texture_info(texture_id) else {
+            continue;
+        };
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("slab_sprite_texture_bind_group"),
             layout: &pipelines.sprites_bind_group_layout,
@@ -2253,7 +2270,10 @@ fn create_filter_group_textures(
 
 pub struct WgpuRenderer {
     context: Arc<WgpuContext>,
-    surface: ManuallyDrop<wgpu::Surface<'static>>,
+    /// `None` for a headless renderer, which draws each frame into
+    /// `headless_target` instead of an acquired swapchain image.
+    surface: ManuallyDrop<Option<wgpu::Surface<'static>>>,
+    headless_target: Option<wgpu::Texture>,
     surface_configuration: wgpu::SurfaceConfiguration,
     /// The present mode chosen at startup (vsync `Fifo` unless overridden by env).
     default_present_mode: wgpu::PresentMode,
@@ -2418,6 +2438,141 @@ impl WgpuRenderer {
             .into_iter()
             .find(|mode| surface_capabilities.present_modes.contains(mode));
 
+        Ok(Self::with_surface(
+            context,
+            Some(surface),
+            atlas,
+            width,
+            height,
+            path_sample_count,
+            format,
+            alpha_mode,
+            present_mode,
+            uncapped_present_mode,
+        ))
+    }
+
+    /// A renderer with no window: every frame is drawn exactly as a windowed
+    /// frame would be, into an offscreen stand-in for the swapchain image that
+    /// [`Self::read_back_frame`] returns. Cross-frame state (slab residency,
+    /// transform slots, layer textures, the atlas) persists across draws the
+    /// same way, which is what lets a test reproduce multi-frame bugs.
+    #[cfg(test)]
+    pub(crate) fn new_headless(
+        context: Arc<WgpuContext>,
+        atlas: Arc<WgpuAtlas>,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let mut renderer = Self::with_surface(
+            context,
+            None,
+            atlas,
+            width,
+            height,
+            0,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::PresentMode::Fifo,
+            None,
+        );
+        renderer.headless_target = Some(renderer.create_headless_target());
+        renderer
+    }
+
+    fn create_headless_target(&self) -> wgpu::Texture {
+        self.context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("headless_frame"),
+            size: wgpu::Extent3d {
+                width: self.surface_configuration.width,
+                height: self.surface_configuration.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_configuration.format,
+            usage: self.surface_configuration.usage,
+            view_formats: &[],
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_size(&self) -> (u32, u32) {
+        (self.surface_configuration.width, self.surface_configuration.height)
+    }
+
+    /// The last frame a headless renderer drew, as tightly packed RGBA8 rows.
+    #[cfg(test)]
+    pub(crate) fn read_back_frame(&self) -> Vec<u8> {
+        let Some(target) = self.headless_target.as_ref() else {
+            return Vec::new();
+        };
+        let width = self.surface_configuration.width;
+        let height = self.surface_configuration.height;
+        let unpadded = width * 4;
+        let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = self.context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("headless_frame_readback"),
+            size: padded as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.context.queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        if let Err(error) = self.context.device.poll(wgpu::PollType::wait_indefinitely()) {
+            log::error!("headless readback poll failed: {error:?}");
+            return Vec::new();
+        }
+        let mapped = match slice.get_mapped_range() {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                log::error!("headless readback map failed: {error:?}");
+                return Vec::new();
+            }
+        };
+        let mut pixels = Vec::with_capacity((unpadded * height) as usize);
+        for row in mapped.chunks(padded as usize) {
+            pixels.extend_from_slice(&row[..unpadded as usize]);
+        }
+        pixels
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_surface(
+        context: Arc<WgpuContext>,
+        surface: Option<wgpu::Surface<'static>>,
+        atlas: Arc<WgpuAtlas>,
+        width: u32,
+        height: u32,
+        path_sample_count: u32,
+        format: wgpu::TextureFormat,
+        alpha_mode: wgpu::CompositeAlphaMode,
+        present_mode: wgpu::PresentMode,
+        uncapped_present_mode: Option<wgpu::PresentMode>,
+    ) -> Self {
         let surface_configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC
@@ -2532,9 +2687,10 @@ impl WgpuRenderer {
             context.device.limits().min_uniform_buffer_offset_alignment,
         );
 
-        Ok(Self {
+        Self {
             context: context.clone(),
             surface: ManuallyDrop::new(surface),
+            headless_target: None,
             surface_configuration,
             default_present_mode: present_mode,
             uncapped_present_mode,
@@ -2568,7 +2724,7 @@ impl WgpuRenderer {
             gpu_query_manager: parking_lot::Mutex::new(None),
             #[cfg(feature = "flamegraph")]
             deep_capture: parking_lot::Mutex::new(None),
-        })
+        }
     }
 
     /// Reserve a timestamp-write pair against the current flamegraph GPU
@@ -2605,8 +2761,9 @@ impl WgpuRenderer {
             self.context.gpu_submit_lock.write()
         };
         wgpui_scope!("wgpui: Surface::configure");
-        self.surface
-            .configure(&self.context.device, &self.surface_configuration);
+        if let Some(surface) = self.surface.as_ref() {
+            surface.configure(&self.context.device, &self.surface_configuration);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -2891,7 +3048,7 @@ impl WgpuRenderer {
             return;
         };
         if self.slab_registry.is_awaiting_rerecord(span.key) {
-            self.slab_registry.note_span_skipped_awaiting_rerecord();
+            self.slab_registry.skip_span_and_request_rerecord(span.key);
             return;
         }
         let Some(slabs) = self.slab_registry.entry_slabs(span.key) else {
@@ -2908,8 +3065,7 @@ impl WgpuRenderer {
                 if !groups.sprite_textures.contains_key(&key) {
                     // The atlas page died between resolution and draw; treat
                     // it exactly like eviction poisoning.
-                    self.slab_registry.request_rerecord([span.key]);
-                    self.slab_registry.note_span_skipped_awaiting_rerecord();
+                    self.slab_registry.skip_span_and_request_rerecord(span.key);
                     return;
                 }
             }
@@ -2961,7 +3117,7 @@ impl WgpuRenderer {
         globals_bind_group: &wgpu::BindGroup,
     ) {
         if self.slab_registry.is_awaiting_rerecord(span.key) {
-            self.slab_registry.note_span_skipped_awaiting_rerecord();
+            self.slab_registry.skip_span_and_request_rerecord(span.key);
             return;
         }
         let Some(slabs) = self.slab_registry.entry_slabs(span.key) else {
@@ -2978,8 +3134,7 @@ impl WgpuRenderer {
                 if !groups.sprite_textures.contains_key(&key) {
                     // The atlas page died between resolution and draw; treat
                     // it exactly like eviction poisoning.
-                    self.slab_registry.request_rerecord([span.key]);
-                    self.slab_registry.note_span_skipped_awaiting_rerecord();
+                    self.slab_registry.skip_span_and_request_rerecord(span.key);
                     return;
                 }
             }
@@ -3010,6 +3165,14 @@ impl WgpuRenderer {
     /// per-renderer on purpose: a process-global queue would let another
     /// window's draw consume them, and a request that never reaches its owner
     /// leaves that owner's poisoned layers skipping draws indefinitely.
+    pub fn take_dead_page_requests(&mut self) -> Vec<crate::AtlasTextureId> {
+        self.slab_registry.take_dead_page_requests()
+    }
+
+    pub fn has_pending_requests(&self) -> bool {
+        self.slab_registry.has_pending_requests()
+    }
+
     pub fn take_rerecord_requests(&mut self) -> Vec<crate::LayerKey> {
         self.slab_registry.take_rerecord_requests()
     }
@@ -3089,6 +3252,9 @@ impl WgpuRenderer {
         // then advisory compaction while the frame is otherwise idle.
         let evicted_pages = self.atlas.drain_destroyed_pages();
         if !evicted_pages.is_empty() {
+            // A destroyed page's index is recycled for a new texture; bind
+            // groups cached against the old one would keep sampling it.
+            self.slab_group_cache.invalidate_sprite_pages();
             let poisoned = self.slab_registry.poison_on_evicted_pages(&evicted_pages);
             if !poisoned.is_empty() {
                 self.slab_registry.request_rerecord(poisoned);
@@ -3320,10 +3486,13 @@ impl WgpuRenderer {
         // reported as `Outdated` or `Other`.  Rather than panicking we
         // reconfigure and retry once; if the second attempt also fails we
         // simply drop this frame.
-        let surface_texture = {
+        let (surface_texture, frame_texture) = match (self.surface.as_ref(), &self.headless_target) {
+            (None, Some(target)) => (None, target.clone()),
+            (None, None) => return,
+            (Some(surface), _) => {
             wgpui_scope!("wgpui: acquire swapchain image");
-            let acquired = self.surface.get_current_texture();
-            match acquired {
+            let acquired = surface.get_current_texture();
+            let surface_texture = match acquired {
                 CurrentSurfaceTexture::Success(t)
                 | CurrentSurfaceTexture::Suboptimal(t) => t,
                 CurrentSurfaceTexture::Outdated
@@ -3331,7 +3500,7 @@ impl WgpuRenderer {
                 | CurrentSurfaceTexture::Validation => {
                     // Reconfigure with the current known size and retry.
                     self.reconfigure_surface();
-                    match self.surface.get_current_texture() {
+                    match surface.get_current_texture() {
                         CurrentSurfaceTexture::Success(t)
                         | CurrentSurfaceTexture::Suboptimal(t) => t,
                         other => {
@@ -3351,6 +3520,9 @@ impl WgpuRenderer {
                     log::warn!("Skipping frame: swap chain acquire occluded");
                     return;
                 }
+            };
+            let frame_texture = surface_texture.texture.clone();
+            (Some(surface_texture), frame_texture)
             }
         };
 
@@ -3636,6 +3808,9 @@ impl WgpuRenderer {
                                 })
                             };
                             if !texture_ready {
+                                // The bake is skipped, so the layer's texture will be
+                                // missing or stale: it has to be rebuilt.
+                                self.slab_registry.request_rerecord([target.key]);
                                 pass = command_encoder.begin_render_pass(
                                     &wgpu::RenderPassDescriptor {
                                         label: Some("main"),
@@ -3867,7 +4042,13 @@ impl WgpuRenderer {
                         sprites,
                     } => {
                         let count = sprites.len() as u32;
-                        let tex_info = self.atlas.get_texture_info(texture_id);
+                        let Some(tex_info) = self.atlas.try_texture_info(texture_id) else {
+                            // A replayed sprite naming a page destroyed since it
+                            // was recorded: nothing valid to sample. Report the
+                            // page so the window rebuilds the layers drawing it.
+                            self.slab_registry.request_page_rerecord(texture_id);
+                            continue;
+                        };
 
                         let sprites_texture_bind_group =
                             self.context
@@ -3930,7 +4111,13 @@ impl WgpuRenderer {
                         sprites,
                     } => {
                         let count = sprites.len() as u32;
-                        let tex_info = self.atlas.get_texture_info(texture_id);
+                        let Some(tex_info) = self.atlas.try_texture_info(texture_id) else {
+                            // A replayed sprite naming a page destroyed since it
+                            // was recorded: nothing valid to sample. Report the
+                            // page so the window rebuilds the layers drawing it.
+                            self.slab_registry.request_page_rerecord(texture_id);
+                            continue;
+                        };
 
                         let sprites_texture_bind_group =
                             self.context
@@ -4021,14 +4208,14 @@ impl WgpuRenderer {
                         // Copy surface texture to backdrop_blur_texture for sampling
                         if let Some(ref blur_texture) = self.backdrop_blur_texture {
                             // Use actual surface texture size (may differ from configured size)
-                            let surface_size = surface_texture.texture.size();
+                            let surface_size = frame_texture.size();
 
                             // Only copy if sizes match (otherwise skip to avoid validation error)
                             if surface_size.width == blur_texture.width()
                                 && surface_size.height == blur_texture.height()
                             {
                                 command_encoder.copy_texture_to_texture(
-                                    surface_texture.texture.as_image_copy(),
+                                    frame_texture.as_image_copy(),
                                     blur_texture.as_image_copy(),
                                     surface_size,
                                 );
@@ -4044,8 +4231,7 @@ impl WgpuRenderer {
                         pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("main_resumed"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &surface_texture
-                                    .texture
+                                view: &frame_texture
                                     .create_view(&wgpu::TextureViewDescriptor::default()),
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Load,
@@ -4155,8 +4341,7 @@ impl WgpuRenderer {
                             // `group_textures[depth]`.
                             drop(pass);
 
-                            let surface_view = surface_texture
-                                .texture
+                            let surface_view = frame_texture
                                 .create_view(&wgpu::TextureViewDescriptor::default());
                             let parent_view: &wgpu::TextureView = match filter_stack.last() {
                                 Some((_, Some(parent_depth))) => &self.group_views[*parent_depth],
@@ -4457,7 +4642,7 @@ impl WgpuRenderer {
 
                                     seen_surfaces.push(*surface_id);
                                 }
-                            } else if let crate::SurfaceContent::Layer(layer_id) = &surface.content
+                            } else if let crate::SurfaceContent::Layer(layer_id, layer_key) = &surface.content
                             {
                                 // #96: composite a texture-retained layer's
                                 // persistent texture. The surface's bounds are
@@ -4466,9 +4651,12 @@ impl WgpuRenderer {
                                 // the layer's visible rect, so margin content
                                 // never paints outside the layer.
                                 let Some(entry) = self.layer_textures.get_mut(layer_id) else {
+                                    // Skipped content always comes with a re-record:
+                                    // nothing else is guaranteed to rebuild it.
+                                    self.slab_registry.request_rerecord([*layer_key]);
                                     log::trace!(
                                         "layer texture for {layer_id:?} missing at composite; \
-                                         waiting for the posted re-record"
+                                         re-record requested"
                                     );
                                     continue;
                                 };
@@ -4617,7 +4805,7 @@ impl WgpuRenderer {
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyTextureInfo {
-                    texture: &surface_texture.texture,
+                    texture: &frame_texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -4681,7 +4869,9 @@ impl WgpuRenderer {
         log::trace!("Renderer::draw: presenting surface");
         {
             wgpui_scope!("wgpui: queue.present (draw)");
-            self.context.queue.present(surface_texture);
+            if let Some(surface_texture) = surface_texture {
+                self.context.queue.present(surface_texture);
+            }
         }
 
         // Start the async readback now that the resolve/copy commands above
@@ -4713,6 +4903,9 @@ impl WgpuRenderer {
     /// Fast path: blit all visible surfaces in a single swapchain pass.
     /// Returns true if successful, false if compositor should run.
     pub fn blit_surfaces_direct(&self, pending_surfaces: &[SurfaceId]) -> bool {
+        let Some(surface) = self.surface.as_ref() else {
+            return false;
+        };
         if pending_surfaces.is_empty() {
             return false;
         }
@@ -4761,7 +4954,7 @@ impl WgpuRenderer {
         // Acquire swapchain (handle retryable surface errors the same as regular draw).
         let acquired = {
             wgpui_scope!("wgpui: acquire swapchain image (fast blit)");
-            self.surface.get_current_texture()
+            surface.get_current_texture()
         };
         let surface_texture = match acquired {
             CurrentSurfaceTexture::Success(t)
@@ -4770,7 +4963,7 @@ impl WgpuRenderer {
             | CurrentSurfaceTexture::Lost
             | CurrentSurfaceTexture::Validation => {
                 self.reconfigure_surface();
-                match self.surface.get_current_texture() {
+                match surface.get_current_texture() {
                     CurrentSurfaceTexture::Success(t)
                     | CurrentSurfaceTexture::Suboptimal(t) => t,
                     other => {
@@ -4996,6 +5189,9 @@ impl WgpuRenderer {
         self.surface_configuration.width = size.width.0 as u32;
         self.surface_configuration.height = size.height.0 as u32;
         self.reconfigure_surface();
+        if self.headless_target.is_some() {
+            self.headless_target = Some(self.create_headless_target());
+        }
 
         // Recreate persistent framebuffer at new size
         let persistent_framebuffer = self

@@ -202,6 +202,25 @@ impl Scene {
         self.layer_slab_spans.clear();
     }
 
+    /// Primitives this frame will draw so far: inline ones plus every
+    /// instance inside spliced slab spans, so an inline replay and a slab
+    /// composite of the same content count alike. `WGPUI_TRACE_VIEWS` only.
+    pub(crate) fn trace_output_len(&self) -> usize {
+        let inline = self
+            .paint_operations
+            .iter()
+            .filter(|operation| matches!(operation, PaintOperation::Primitive(_)))
+            .count();
+        let spliced: usize = self
+            .layer_slab_spans
+            .iter()
+            .filter(|span| span.texture.is_none())
+            .flat_map(|span| span.runs.iter())
+            .map(|run| run.count as usize)
+            .sum();
+        inline + spliced
+    }
+
     pub fn len(&self) -> usize {
         self.paint_operations.len()
     }
@@ -987,6 +1006,20 @@ fn split_batch_at<'a>(
     }
 }
 
+fn batch_is_empty(batch: &PrimitiveBatch<'_>) -> bool {
+    match batch {
+        PrimitiveBatch::Shadows(items) => items.is_empty(),
+        PrimitiveBatch::Quads(items) => items.is_empty(),
+        PrimitiveBatch::Paths(items) => items.is_empty(),
+        PrimitiveBatch::Underlines(items) => items.is_empty(),
+        PrimitiveBatch::MonochromeSprites { sprites, .. } => sprites.is_empty(),
+        PrimitiveBatch::PolychromeSprites { sprites, .. } => sprites.is_empty(),
+        PrimitiveBatch::Surfaces(items) => items.is_empty(),
+        PrimitiveBatch::BackdropFilters(items) => items.is_empty(),
+        PrimitiveBatch::FilterBoundary(_) => false,
+    }
+}
+
 impl<'a> FrameBatchIterator<'a> {
     fn batch_lead_order(batch: &PrimitiveBatch<'a>) -> Option<DrawOrder> {
         match batch {
@@ -1032,7 +1065,12 @@ impl<'a> Iterator for FrameBatchIterator<'a> {
                     // it never ties with surrounding content. When it lands
                     // strictly inside a same-kind batch, the batch splits
                     // around it so every element draws at its own position.
-                    let lead = Self::batch_lead_order(&batch);
+                    let lead = match batch {
+                        PrimitiveBatch::FilterBoundary(boundary) => {
+                            self.scene.filter_boundaries.get(boundary).map(|b| b.order)
+                        }
+                        _ => Self::batch_lead_order(&batch),
+                    };
                     if lead.is_none_or(|lead| lead >= span_order) {
                         self.next_span += 1;
                         self.pending = Some(batch);
@@ -1040,13 +1078,31 @@ impl<'a> Iterator for FrameBatchIterator<'a> {
                     }
                     let (head, tail) =
                         split_batch_at(batch, span_order, &self.scene.filter_boundaries);
-                    self.next_span += 1;
-                    self.queued.push_back(SceneBatch::LayerSlab(index));
-                    if let Some(tail) = tail {
-                        self.queued.push_back(SceneBatch::Primitives(tail));
-                    }
-                    if let Some(head) = head {
-                        return Some(SceneBatch::Primitives(head));
+                    match tail.filter(|tail| !batch_is_empty(tail)) {
+                        // The whole batch draws below the span, but so may the
+                        // next batch of another kind: the legacy iterator only
+                        // ends a batch where another kind's next element is
+                        // lower. The span waits for the next comparison.
+                        // Emitting it here drew later-ordered content (a
+                        // panel's image, the scrollbar over its own list)
+                        // underneath a composited layer on composite frames
+                        // only, so it blinked against record frames.
+                        None => {
+                            if let Some(head) = head {
+                                return Some(SceneBatch::Primitives(head));
+                            }
+                        }
+                        // Part of the batch is at or above the span, so every
+                        // other kind's remaining content is too: the span
+                        // goes exactly here.
+                        Some(tail) => {
+                            self.next_span += 1;
+                            self.queued.push_back(SceneBatch::LayerSlab(index));
+                            self.queued.push_back(SceneBatch::Primitives(tail));
+                            if let Some(head) = head.filter(|head| !batch_is_empty(head)) {
+                                return Some(SceneBatch::Primitives(head));
+                            }
+                        }
                     }
                 }
                 (Some(batch), None) => return Some(SceneBatch::Primitives(batch)),
@@ -1797,7 +1853,8 @@ pub(crate) enum SurfaceContent {
     /// samples it from its layer-texture cache; the surface's bounds select
     /// the sub-rect (the texture covers the layer's buffer extent) and the
     /// content mask clips to the layer's visible rect.
-    Layer(LayerId),
+    /// The key names the layer to re-record if its texture is missing.
+    Layer(LayerId, LayerKey),
 }
 
 /// Renderer-side target carried by a texture-retained layer's slab spans

@@ -115,6 +115,20 @@ fn nested_view_cache_enabled() -> bool {
     *ENABLED
 }
 
+/// `WGPUI_TRACE_VIEWS=1`: on every real draw, print each cached view's decision
+/// (rebuilt, composited, replayed) and how much it put into the scene, flagging
+/// a view that drew nothing. A panel missing from one draw's scene stays
+/// missing on screen until the next real draw, because display-only frames
+/// re-present that scene; this names the draw and the path that dropped it.
+///
+/// Read once, at first use.
+pub(crate) fn view_trace_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("WGPUI_TRACE_VIEWS").is_ok_and(|v| v == "1")
+    });
+    *ENABLED
+}
+
 /// Report the first cached-view reuse whose stored range had outlived the array
 /// it indexes, then stay quiet.
 ///
@@ -327,6 +341,15 @@ impl Element for AnyView {
                         && !window.dirty_views.contains(&self.entity_id())
                         && !dependency_invalidated
                         && window.view_cache_available()
+                        // The layer this view paints into may have been asked
+                        // to re-render (a renderer re-record request after
+                        // atlas eviction), or hold a nested layer that was.
+                        // Reusing would re-emit content the renderer refuses
+                        // to draw, leaving the panel blank until the view is
+                        // notified for some other reason.
+                        && !window.layer_subtree_needs_render(
+                            crate::LayerKey::from_global_element_id(global_id.unwrap()),
+                        )
                     {
                         crate::render_stats::count("view cache: reused");
                         let _t = crate::render_stats::scope("view cache: reuse_prepaint");
@@ -466,6 +489,8 @@ impl Element for AnyView {
                     let mut element_state = element_state.unwrap();
 
                     let paint_start = window.paint_index();
+                    let emitted_before = view_trace_enabled().then(|| window.scene_output_len());
+                    let mut decision = "rebuilt";
 
                     if let Some(element) = element {
                         // Paired with the prepaint path above.
@@ -474,6 +499,7 @@ impl Element for AnyView {
                             window.nested_view_cache_suppressed = true;
                         }
                         if layers_enabled {
+                            window.next_layer_debug_label = Some(self.type_name);
                             window.record_layer(
                                 layer_key,
                                 layer_cache_key,
@@ -491,9 +517,21 @@ impl Element for AnyView {
                         // view's element state outlives it. Falling back to the
                         // recorded scene range keeps that a slower frame rather
                         // than a missing panel.
+                        decision = "reused, composited";
                         if !window.try_composite_layer(layer_key) {
+                            decision = "reused, layer missing -> replayed recorded range";
                             window.replay_scene_range(&element_state.paint_range);
                         }
+                    }
+
+                    if let Some(before) = emitted_before {
+                        let emitted = window.scene_output_len() - before;
+                        eprintln!(
+                            "[view trace] draw {} {} at {bounds:?}: {decision}, emitted {emitted}{}",
+                            window.layer_frame,
+                            self.type_name,
+                            if emitted == 0 { "  <-- NOTHING DRAWN" } else { "" },
+                        );
                     }
 
                     let paint_end = window.paint_index();

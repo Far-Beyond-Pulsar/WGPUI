@@ -312,7 +312,33 @@ fn composite_layer_legacy(
         match item {
             LayerItem::Primitive(primitive) => scene.push_retained(primitive),
             LayerItem::Nested(nested) => {
-                composite_layer_legacy(scene, layers, *nested, frame, scale_factor)
+                if !crate::view::view_trace_enabled() {
+                    composite_layer_legacy(scene, layers, *nested, frame, scale_factor);
+                    continue;
+                }
+                let before = scene.trace_output_len();
+                let state = match layers.get(nested) {
+                    None => "MISSING (no layer record)",
+                    Some(layer) if !layer.has_content() => "EMPTY (content dropped)",
+                    Some(_) => "legacy replay",
+                };
+                let name = layers
+                    .get(nested)
+                    .and_then(|layer| layer.debug_label)
+                    .map(|label| label.rsplit("::").next().unwrap_or(label).to_string())
+                    .unwrap_or_else(|| format!("{nested:?}"));
+                let nested_bounds = layers.get(nested).map(|layer| layer.cache_key.bounds);
+                composite_layer_legacy(scene, layers, *nested, frame, scale_factor);
+                let emitted = scene.trace_output_len() - before;
+                eprintln!(
+                    "[view trace] draw {frame}     nested {name} at {nested_bounds:?} (inside {}): {state}, emitted {emitted}{}",
+                    layers
+                        .get(&key)
+                        .and_then(|layer| layer.debug_label)
+                        .map(|label| label.rsplit("::").next().unwrap_or(label))
+                        .unwrap_or("unlabelled layer"),
+                    if emitted == 0 { "  <-- NOTHING DRAWN" } else { "" },
+                );
             }
         }
     }
@@ -1777,6 +1803,17 @@ pub struct Window {
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
+    /// Test-only stand-in for presenting: receives every scene `draw`
+    /// produces (including the draws `flush_effects` runs by itself in tests)
+    /// and returns the renderer's slab re-record requests, which the next
+    /// draw applies exactly where it applies a real platform window's.
+    #[cfg(test)]
+    pub(crate) test_frame_sink:
+        Option<Box<dyn FnMut(&crate::Scene) -> (Vec<LayerKey>, Vec<crate::AtlasTextureId>)>>,
+    #[cfg(test)]
+    pub(crate) test_pending_rerecords: Vec<LayerKey>,
+    #[cfg(test)]
+    pub(crate) test_pending_dead_pages: Vec<crate::AtlasTextureId>,
     pub(crate) next_frame: Frame,
     /// Retained layers, addressed by a stable key rather than by an offset into
     /// a frame array.
@@ -1789,6 +1826,9 @@ pub struct Window {
     /// counts draws this window performed, so a window that stops drawing stops
     /// ageing its layers.
     pub(crate) layer_frame: u64,
+    /// Label for the next `record_layer`, set by `AnyView::cached` so traced
+    /// output can name the view a layer belongs to.
+    pub(crate) next_layer_debug_label: Option<&'static str>,
     /// Content tokens handed to the renderer's slab registry: bumped every
     /// time a layer's items are replaced, read at composite time. A token the
     /// registry has not seen means "upload this layer's slab".
@@ -2073,6 +2113,16 @@ impl Window {
                         .log_err();
                 }
 
+                // Content the renderer skipped last frame is waiting on a
+                // re-record, and the renderer scheduled this frame to deliver
+                // it. Routing here marks the window dirty so the check below
+                // draws; the draw rebuilds only the affected layers.
+                handle
+                    .update(&mut cx, |_, window, _| {
+                        window.route_renderer_requests();
+                    })
+                    .log_err();
+
                 // Keep presenting the current scene for 1 extra second since the
                 // last input to prevent the display from underclocking the refresh rate.
                 // `draw` sets this and only `present` clears it, so `true` here
@@ -2327,9 +2377,16 @@ impl Window {
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            #[cfg(test)]
+            test_frame_sink: None,
+            #[cfg(test)]
+            test_pending_rerecords: Vec::new(),
+            #[cfg(test)]
+            test_pending_dead_pages: Vec::new(),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             layers: FxHashMap::default(),
             layer_frame: 0,
+            next_layer_debug_label: None,
             slab_tokens: FxHashMap::default(),
             next_slab_token: 0,
             next_layer_id: 0,
@@ -3362,8 +3419,6 @@ impl Window {
             None,
         );
 
-        self.apply_invalidations();
-
         // Slab-driven re-records (spec #94): the renderer discovers atlas
         // evictions under resident layers at frame start and posts them here.
         // Draining before draw_roots is what makes invalidation-before-draw
@@ -3375,16 +3430,13 @@ impl Window {
         // window, so another window's draw would consume them without being
         // able to act on them, and this window's poisoned layers would then
         // skip draws until something unrelated invalidated them.
-        if crate::scene_pack::slabs_enabled() {
-            for layer_key in self.platform_window.take_slab_rerecord_requests() {
-                if self.layers.contains_key(&layer_key) {
-                    self.invalidator
-                        .invalidate_layer(layer_key, Invalidation::all());
-                } else {
-                    self.slab_tokens.remove(&layer_key);
-                }
-            }
-        }
+        self.route_renderer_requests();
+
+        // After the re-record requests above: `invalidate_layer` only queues,
+        // and this is what turns the queue into `layer.needs`. Applied first,
+        // a request missed the draw that received it -- the poisoned layer
+        // stayed blank until some later, unrelated draw applied it.
+        self.apply_invalidations();
 
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -3425,6 +3477,9 @@ impl Window {
             // for a skipped draw would evict a window's layers for not being
             // visited by a frame that never looked at anything.
             self.layer_frame = self.layer_frame.wrapping_add(1);
+            if crate::view::view_trace_enabled() {
+                eprintln!("[view trace] ---- draw {} ----", self.layer_frame);
+            }
             self.draw_roots(cx);
             self.evict_stale_layers();
 
@@ -3496,6 +3551,12 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        #[cfg(test)]
+        if let Some(sink) = self.test_frame_sink.as_mut() {
+            let (keys, dead_pages) = sink(&self.rendered_frame.scene);
+            self.test_pending_rerecords.extend(keys);
+            self.test_pending_dead_pages.extend(dead_pages);
+        }
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
@@ -3567,6 +3628,65 @@ impl Window {
 
     /// Turn everything recorded since the last draw into the per-draw state the
     /// element walk reads: window-scope axes, and the entity-scope dirty sets.
+    /// Turn every pending renderer request into a layer invalidation, marking
+    /// the window dirty. Returns whether there were any.
+    ///
+    /// The renderer never skips content without posting a request (see
+    /// `SlabRegistry::skip_span_and_request_rerecord`), and a request is only
+    /// answered by a draw that re-records the named layers. So every frame
+    /// decision runs this first -- the platform frame callback, the
+    /// display-only shortcut and `draw` itself -- and a pending request always
+    /// becomes a real draw. Only the affected layers rebuild; nothing here
+    /// refreshes the window.
+    pub(crate) fn route_renderer_requests(&mut self) -> bool {
+        if !crate::scene_pack::slabs_enabled() {
+            return false;
+        }
+        #[allow(unused_mut)]
+        let mut keys = self.platform_window.take_slab_rerecord_requests();
+        #[allow(unused_mut)]
+        let mut dead_pages = self.platform_window.take_dead_atlas_page_requests();
+        #[cfg(test)]
+        {
+            keys.append(&mut self.test_pending_rerecords);
+            dead_pages.append(&mut self.test_pending_dead_pages);
+        }
+        if keys.is_empty() && dead_pages.is_empty() {
+            return false;
+        }
+
+        // Content drawn without a layer key (sprites replayed inline) names
+        // only its page: rebuild exactly the layers retaining sprites on it.
+        if !dead_pages.is_empty() {
+            let on_dead_page = |texture_id: &crate::AtlasTextureId| dead_pages.contains(texture_id);
+            keys.extend(self.layers.iter().filter_map(|(key, layer)| {
+                layer
+                    .items
+                    .iter()
+                    .any(|item| match item {
+                        LayerItem::Primitive(crate::scene::Primitive::MonochromeSprite(sprite)) => {
+                            on_dead_page(&sprite.tile.texture_id)
+                        }
+                        LayerItem::Primitive(crate::scene::Primitive::PolychromeSprite(sprite)) => {
+                            on_dead_page(&sprite.tile.texture_id)
+                        }
+                        _ => false,
+                    })
+                    .then_some(*key)
+            }));
+        }
+
+        for layer_key in keys {
+            if self.layers.contains_key(&layer_key) {
+                self.invalidator
+                    .invalidate_layer(layer_key, Invalidation::all());
+            } else {
+                self.slab_tokens.remove(&layer_key);
+            }
+        }
+        true
+    }
+
     fn apply_invalidations(&mut self) {
         wgpui_scope!("wgpui: apply_invalidations");
         self.window_invalidation = self.invalidator.take_window_axes();
@@ -3642,19 +3762,8 @@ impl Window {
         // The renderer posts slab re-record requests (atlas eviction under a
         // resident layer) that only a real draw can answer. Fold them in exactly
         // as `draw` would and let the normal path run.
-        if crate::scene_pack::slabs_enabled() {
-            let requests = self.platform_window.take_slab_rerecord_requests();
-            if !requests.is_empty() {
-                for layer_key in requests {
-                    if self.layers.contains_key(&layer_key) {
-                        self.invalidator
-                            .invalidate_layer(layer_key, Invalidation::all());
-                    } else {
-                        self.slab_tokens.remove(&layer_key);
-                    }
-                }
-                return false;
-            }
+        if self.route_renderer_requests() {
+            return false;
         }
 
         wgpui_scope!("wgpui: display-only frame (re-present previous scene)");
@@ -4862,6 +4971,7 @@ impl Window {
             && (pointer_exempt || (!layer.had_mouse && !mouse_inside))
             && !view_rebuilt
             && self.view_cache_available()
+            && !self.nested_layer_needs_render(layer)
             && !self.accessed_entity_invalidated(&layer.accessed_entities)
             // The paint range is an absolute offset into last frame's
             // arrays. It is validated for the same reason
@@ -4912,6 +5022,33 @@ impl Window {
     /// The list is deliberately conservative: every entry is a way a layer
     /// could otherwise show last frame's pixels for this frame's state.
     pub(crate) fn with_retained_layer<R>(
+        &mut self,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        policy: LayerPolicy,
+        content_key: Option<u64>,
+        cx: &mut App,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        if !crate::view::view_trace_enabled() {
+            return self.with_retained_layer_untraced(global_id, bounds, policy, content_key, cx, f);
+        }
+        let before = self.scene_output_len();
+        let result = self.with_retained_layer_untraced(global_id, bounds, policy, content_key, cx, f);
+        let emitted = self.scene_output_len() - before;
+        let key = LayerKey::from_global_element_id(global_id);
+        eprintln!(
+            "[view trace] draw {}   layer {:?} at {:?}: {}, emitted {emitted}{}",
+            self.layer_frame,
+            key,
+            bounds,
+            if result.is_some() { "recorded" } else { "reused" },
+            if emitted == 0 { "  <-- NOTHING DRAWN" } else { "" },
+        );
+        result
+    }
+
+    fn with_retained_layer_untraced<R>(
         &mut self,
         global_id: &GlobalElementId,
         bounds: Bounds<Pixels>,
@@ -5090,6 +5227,7 @@ impl Window {
         f: impl FnOnce(&mut Window) -> R,
     ) -> R {
         wgpui_scope!("wgpui: record layer");
+        let debug_label = self.next_layer_debug_label.take();
         crate::render_stats::count("layer: re-rendered");
         let scaled_bounds = cache_key.bounds.scale(cache_key.scale_factor);
         let paint_start = self.paint_index();
@@ -5124,6 +5262,9 @@ impl Window {
                 Layer::new(LayerId(id), policy, frame)
             });
             layer.opaque_bounds = None;
+            if let Some(label) = debug_label {
+                layer.debug_label = Some(label);
+            }
             layer.poisoned_bounds.clear();
         }
 
@@ -5266,6 +5407,13 @@ impl Window {
         crate::occlusion::fully_covered(bounds, &occluders)
     }
 
+    /// How much has been put into the frame being drawn: inline paint
+    /// operations plus spliced slab spans. Only differences are meaningful;
+    /// used by the `WGPUI_TRACE_VIEWS` diagnostics.
+    pub(crate) fn scene_output_len(&self) -> usize {
+        self.next_frame.scene.trace_output_len()
+    }
+
     /// Stamp a culled layer and everything nested in it as visited. A culled
     /// layer is still on screen logically; left unstamped it would be evicted
     /// while hidden, and its parent's `Nested` references would composite
@@ -5287,6 +5435,58 @@ impl Window {
                 }));
             }
         }
+    }
+
+    /// Whether a layer nested anywhere inside `layer` has to re-render, which
+    /// only happens when its ancestors re-run the element code that reaches it.
+    ///
+    /// Layer-scope invalidations mark exactly the layer they name, but a nested
+    /// layer's element code runs only when its parent records. A clean parent
+    /// that composited anyway would re-emit the child's stale content: a
+    /// renderer re-record request (atlas eviction poisoned the child, whose
+    /// spans are then skipped, drawing nothing) or a nested scroll refill would
+    /// go unanswered until something unrelated rebuilt the parent. A child
+    /// that lost its content is the same hole. Deliberately ignores
+    /// `deferred_dirty`, which is an occluded child keeping its old content on
+    /// purpose.
+    fn nested_layer_needs_render(&self, layer: &Layer) -> bool {
+        let mut pending: Vec<LayerKey> = layer
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                LayerItem::Nested(child) => Some(*child),
+                _ => None,
+            })
+            .collect();
+        let mut seen = FxHashSet::default();
+        while let Some(key) = pending.pop() {
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(child) = self.layers.get(&key) else {
+                return true;
+            };
+            if !child.needs.is_empty() || !child.has_content() {
+                return true;
+            }
+            pending.extend(child.items.iter().filter_map(|item| match item {
+                LayerItem::Nested(grandchild) => Some(*grandchild),
+                _ => None,
+            }));
+        }
+        false
+    }
+
+    /// Whether the layer `key` or anything nested in it has a pending
+    /// re-render, for callers that decide reuse outside
+    /// [`Self::layer_reuse_conditions`] (`AnyView::cached`).
+    pub(crate) fn layer_subtree_needs_render(&self, key: LayerKey) -> bool {
+        if !crate::layer::layers_enabled() {
+            return false;
+        }
+        self.layers
+            .get(&key)
+            .is_some_and(|layer| !layer.needs.is_empty() || self.nested_layer_needs_render(layer))
     }
 
     fn is_layer_occluded(&self, key: LayerKey) -> bool {
@@ -5829,7 +6029,7 @@ impl Window {
             content_mask: crate::ContentMask {
                 bounds: visible_bounds.scale(scale_factor),
             },
-            content: SurfaceContent::Layer(layer_id),
+            content: SurfaceContent::Layer(layer_id, key),
         });
         self.next_frame.scene.end_layer();
     }
@@ -5838,23 +6038,52 @@ impl Window {
     /// own representation independently — slabbed children splice spans into
     /// their own scope inside the parent's, legacy children replay inline.
     fn composite_nested_layer_for_slab(&mut self, nested: LayerKey, frame: u64, scale_factor: f32) {
+        let trace = crate::view::view_trace_enabled();
+        let before = self.scene_output_len();
         let exists = self
             .layers
             .get(&nested)
             .is_some_and(|layer| layer.has_content());
         if !exists {
             crate::render_stats::count("layer: nested reference missing");
+            if trace {
+                eprintln!(
+                    "[view trace] draw {}     nested {}: MISSING (no retained content)  <-- NOTHING DRAWN",
+                    self.layer_frame,
+                    self.layer_trace_name(nested),
+                );
+            }
             return;
         }
-        if crate::scene_pack::slabs_enabled()
+        let path = if crate::scene_pack::slabs_enabled()
             && !self.next_frame.scene.innermost_layer_is_recording()
             && self.try_composite_layer_into_scene_as_slab(nested, frame, scale_factor)
         {
-            return;
+            "slab"
+        } else {
+            let scene = &mut self.next_frame.scene;
+            let layers = &mut self.layers;
+            composite_layer_legacy(scene, layers, nested, frame, scale_factor);
+            "legacy replay"
+        };
+        if trace {
+            let emitted = self.scene_output_len() - before;
+            let bounds = self.layers.get(&nested).map(|layer| layer.cache_key.bounds);
+            eprintln!(
+                "[view trace] draw {}     nested {} at {bounds:?}: {path}, emitted {emitted}{}",
+                self.layer_frame,
+                self.layer_trace_name(nested),
+                if emitted == 0 { "  <-- NOTHING DRAWN" } else { "" },
+            );
         }
-        let scene = &mut self.next_frame.scene;
-        let layers = &mut self.layers;
-        composite_layer_legacy(scene, layers, nested, frame, scale_factor);
+    }
+
+    /// A layer's view name when a cached view recorded it, else its key.
+    fn layer_trace_name(&self, key: LayerKey) -> String {
+        match self.layers.get(&key).and_then(|layer| layer.debug_label) {
+            Some(label) => label.rsplit("::").next().unwrap_or(label).to_string(),
+            None => format!("{key:?}"),
+        }
     }
     /// Tint `bounds` by the layer's id, at full strength on a frame it
     /// re-rendered.
@@ -13841,6 +14070,274 @@ mod test {
         }
     }
 
+    /// A layer split into several stretches by a nested layer uploads its
+    /// stretches concatenated in scene order, while each stretch's runs were
+    /// offset in recording order. The two must agree on a composite frame, or
+    /// the renderer draws one stretch's instances from another's bytes.
+    #[gpui::test]
+    fn multi_stretch_layer_uploads_in_the_order_its_runs_were_offset(cx: &mut TestAppContext) {
+        if layers_off() || !crate::scene_pack::slabs_enabled() {
+            return;
+        }
+        struct SplitPanel;
+        impl crate::Render for SplitPanel {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::div().size_full().child(
+                    crate::div()
+                        .id("panel")
+                        .layer_keyed(0u64)
+                        .absolute()
+                        .left(px(100.))
+                        .top(px(100.))
+                        .size(px(300.))
+                        .flex()
+                        .flex_col()
+                        .child(crate::div().h(px(40.)).w_full().bg(crate::red()))
+                        .child(
+                            crate::div()
+                                .id("nested")
+                                .layer_keyed(0u64)
+                                .h(px(100.))
+                                .w_full()
+                                .bg(crate::green()),
+                        )
+                        .child(crate::div().h(px(40.)).w(px(120.)).bg(crate::blue()))
+                        .child(crate::div().h(px(40.)).w(px(60.)).bg(crate::yellow())),
+                )
+            }
+        }
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| SplitPanel);
+        cx.run_until_parked();
+        let any: crate::AnyWindowHandle = window.into();
+        for _ in 0..3 {
+            any.update(cx, |_, window, cx| {
+                window.refresh_buffers();
+                window.draw(cx).clear();
+                window.present();
+            })
+            .unwrap();
+        }
+        any.update(cx, |_, window, _| {
+            let parent = window
+                .layers
+                .iter()
+                .find(|(_, layer)| {
+                    layer.items.iter().any(|item| matches!(item, crate::layer::LayerItem::Nested(_)))
+                })
+                .map(|(key, _)| *key)
+                .expect("parent layer");
+            let spans: Vec<_> = window
+                .rendered_frame
+                .scene
+                .layer_slab_spans
+                .iter()
+                .filter(|span| span.key == parent && span.texture.is_none())
+                .collect();
+            assert!(spans.len() >= 2, "the nested layer must split the parent into stretches, got {}", spans.len());
+            let mut uploaded = 0u32;
+            let mut seen = collections::FxHashSet::default();
+            for span in spans {
+                if !seen.insert(std::sync::Arc::as_ptr(&span.packed)) {
+                    continue;
+                }
+                let quads = span.packed.quads.len() as u32;
+                for run in span.runs.iter().filter(|run| run.kind == crate::platform::cross::slab::SlabKind::Quads) {
+                    assert!(
+                        run.start >= uploaded && run.start + run.count <= uploaded + quads,
+                        "run {}..{} reads outside this stretch's bytes at {}..{}",
+                        run.start,
+                        run.start + run.count,
+                        uploaded,
+                        uploaded + quads
+                    );
+                }
+                uploaded += quads;
+            }
+        })
+        .unwrap();
+    }
+
+    /// Every quad the renderer would draw for `scene`, in window space, as
+    /// (visible rect, color) keys. Slab spans are resolved the way the
+    /// renderer resolves them: each layer's stretches concatenated in scene
+    /// order (`collect_layer_upload_bytes`), each run sliced out of that at
+    /// its layer-wide `start`, then translated by the span's origin.
+    fn drawn_quads(scene: &crate::Scene) -> Vec<String> {
+        let describe = |quad: &crate::scene::Quad, dx: f32, dy: f32| {
+            let visible = quad.bounds.intersect(&quad.content_mask.bounds);
+            if visible.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "{:.1},{:.1} {:.1}x{:.1} {:?}",
+                visible.origin.x.0 + dx,
+                visible.origin.y.0 + dy,
+                visible.size.width.0,
+                visible.size.height.0,
+                quad.background.solid
+            ))
+        };
+        let mut out: Vec<String> = scene.quads.iter().filter_map(|quad| describe(quad, 0., 0.)).collect();
+        let mut uploads: collections::FxHashMap<crate::LayerKey, Vec<crate::scene::Quad>> = collections::FxHashMap::default();
+        let mut seen = collections::FxHashSet::default();
+        for span in &scene.layer_slab_spans {
+            if seen.insert((span.key, std::sync::Arc::as_ptr(&span.packed))) {
+                uploads.entry(span.key).or_default().extend(span.packed.quads.iter().cloned());
+            }
+        }
+        for span in scene.layer_slab_spans.iter().filter(|span| span.texture.is_none()) {
+            let upload = &uploads[&span.key];
+            for run in span
+                .runs
+                .iter()
+                .filter(|run| run.kind == crate::platform::cross::slab::SlabKind::Quads)
+            {
+                let range = run.start as usize..(run.start + run.count) as usize;
+                let Some(quads) = upload.get(range.clone()) else {
+                    out.push(format!("OUT OF RANGE {range:?} of {}", upload.len()));
+                    continue;
+                };
+                out.extend(quads.iter().filter_map(|quad| describe(quad, span.origin[0], span.origin[1])));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The level editor's properties panel, reduced: a cached panel view whose
+    /// scrolling body (auto-layered) holds child section views, next to a
+    /// sibling view that updates on its own. When only the sibling updates,
+    /// the panel composites from retained data, and that must draw exactly
+    /// what a full re-render draws.
+    #[gpui::test]
+    fn a_composited_panel_draws_what_a_full_render_draws(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        struct Section {
+            index: usize,
+        }
+        impl crate::Render for Section {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let shade = 0.2 + self.index as f32 * 0.1;
+                crate::div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .p(px(6.))
+                    .bg(crate::hsla(0.6, 0.3, shade, 1.0))
+                    .child(crate::div().h(px(18.)).w(px(140.)).bg(crate::red()))
+                    .children((0..4).map(|row| {
+                        crate::div()
+                            .flex()
+                            .h(px(22.))
+                            .child(crate::div().w(px(60.)).h_full().bg(crate::green()))
+                            .child(crate::div().w(px(40. + row as f32 * 10.)).h_full().bg(crate::blue()))
+                    }))
+            }
+        }
+        struct Panel {
+            sections: Vec<crate::Entity<Section>>,
+            scroll: crate::ScrollHandle,
+        }
+        impl crate::Render for Panel {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .bg(crate::white())
+                    .child(crate::div().h(px(30.)).w_full().bg(crate::black()))
+                    .child(
+                        crate::div().flex_1().overflow_hidden().child(
+                            crate::div()
+                                .id("properties-scroll")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll)
+                                .child(
+                                    crate::div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(8.))
+                                        .p(px(8.))
+                                        .children(self.sections.iter().cloned()),
+                                ),
+                        ),
+                    )
+            }
+        }
+        struct Sibling {
+            ticks: usize,
+        }
+        impl crate::Render for Sibling {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::div()
+                    .size_full()
+                    .bg(crate::yellow())
+                    .child(crate::div().h(px(10.)).w(px(10. + (self.ticks % 7) as f32 * 5.)).bg(crate::red()))
+            }
+        }
+        struct Root {
+            panel: crate::Entity<Panel>,
+            sibling: crate::Entity<Sibling>,
+        }
+        impl crate::Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::div()
+                    .size_full()
+                    .flex()
+                    .child(crate::div().w(px(300.)).h_full().child(self.sibling.clone()))
+                    .child(
+                        crate::div().relative().w(px(320.)).h_full().child(
+                            crate::AnyView::from(self.panel.clone())
+                                .cached(crate::StyleRefinement::default().absolute().size_full()),
+                        ),
+                    )
+            }
+        }
+
+        let window = cx.open_window(size(px(800.), px(600.)), |_, cx| {
+            let sections = (0..6).map(|index| cx.new(|_| Section { index })).collect();
+            Root {
+                panel: cx.new(|_| Panel { sections, scroll: crate::ScrollHandle::new() }),
+                sibling: cx.new(|_| Sibling { ticks: 0 }),
+            }
+        });
+        cx.run_until_parked();
+        let any: crate::AnyWindowHandle = window.into();
+        let sibling = window.update(cx, |root, _, _| root.sibling.clone()).unwrap();
+        let frame = |cx: &mut TestAppContext, full: bool| -> Vec<String> {
+            any.update(cx, |_, window, cx| {
+                if full {
+                    window.refresh();
+                }
+                window.draw(cx).clear();
+                window.present();
+                drawn_quads(&window.rendered_frame.scene)
+            })
+            .unwrap()
+        };
+        let truth = frame(cx, true);
+        assert!(!truth.is_empty());
+        for tick in 0..12 {
+            sibling.update(cx, |sibling, cx| {
+                sibling.ticks += 1;
+                cx.notify();
+            });
+            let composited = frame(cx, false);
+            let spans = any.update(cx, |_, window, _| window.rendered_frame.scene.layer_slab_spans.len()).unwrap();
+            assert!(spans > 0, "tick {tick}: the panel must composite from slabs, not re-record");
+            let full = frame(cx, true);
+            let missing: Vec<_> = full.iter().filter(|q| !composited.contains(q)).collect();
+            let extra: Vec<_> = composited.iter().filter(|q| !full.contains(q)).collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "tick {tick}: composited frame differs from a full render\nmissing: {missing:#?}\nextra: {extra:#?}"
+            );
+        }
+    }
+
     /// A layer holding three canvases; the rasterize threshold is shared so a
     /// test can move it through the real render path.
     struct RasterizedView {
@@ -13984,14 +14481,14 @@ mod test {
                         || scene
                             .surfaces
                             .iter()
-                            .any(|surface| matches!(surface.content, crate::scene::SurfaceContent::Layer(_))),
+                            .any(|surface| matches!(surface.content, crate::scene::SurfaceContent::Layer(..))),
                     "the composite frame must carry the layer surface"
                 );
                 let layer_surfaces = scene
                     .surfaces
                     .iter()
                     .filter(|surface| {
-                        matches!(surface.content, crate::scene::SurfaceContent::Layer(_))
+                        matches!(surface.content, crate::scene::SurfaceContent::Layer(..))
                     })
                     .count();
                 assert_eq!(
@@ -14070,7 +14567,7 @@ mod test {
                     .surfaces
                     .iter()
                     .filter(|surface| {
-                        matches!(surface.content, crate::scene::SurfaceContent::Layer(_))
+                        matches!(surface.content, crate::scene::SurfaceContent::Layer(..))
                     })
                     .count();
                 assert_eq!(
@@ -14948,5 +15445,808 @@ mod display_only_frame_tests {
             after_refresh,
             "a display-only frame must not re-render any view"
         );
+    }
+}
+
+/// Headless GPU reproduction of retained-layer flicker.
+///
+/// Two identical windows are driven through the same sequence of steps.
+/// Window `live` behaves like the editor: layers composite from retained data,
+/// and every scene it draws (including the draws `flush_effects` runs on its
+/// own) goes to one long-lived renderer, so slab residency, transform slots,
+/// layer textures and the atlas carry across frames exactly as on screen, and
+/// the renderer's re-record requests flow back the way a real window's do.
+/// Window `truth` is fully re-rendered after every step. After each step the
+/// last frame `live` presented must match `truth`, including when that scene is
+/// presented again on idle frames. The first mismatch is a reproduced flicker,
+/// written to `target/layer-flicker/` as `live.png`, `truth.png` and
+/// `diff.png`.
+///
+/// Skips when no GPU adapter is available.
+#[cfg(test)]
+mod headless_layer_flicker {
+    use crate::platform::cross::{
+        atlas::WgpuAtlas,
+        render_context::{WgpuContext, WgpuOptions},
+        renderer::WgpuRenderer,
+    };
+    use crate::{
+        AnyView, AnyWindowHandle, AppContext as _, Context, Entity, InteractiveElement as _,
+        IntoElement, ParentElement as _, Render, ScrollHandle, StatefulInteractiveElement as _,
+        Styled as _, TestAppContext, Window, div, hsla, point, px, size,
+    };
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        sync::Arc,
+    };
+
+    const LOGICAL_WIDTH: f32 = 400.;
+    const LOGICAL_HEIGHT: f32 = 300.;
+    /// Enough that the scroll content crosses `LayerPolicy::rasterize_above`
+    /// (256 items) and is retained as a texture, like a real properties panel.
+    const SECTION_COUNT: usize = 12;
+    const SECTION_ROWS: usize = 12;
+
+    struct Section {
+        index: usize,
+        revision: usize,
+        glyphs: usize,
+    }
+    impl Render for Section {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let shade = 0.2 + self.index as f32 * 0.05;
+            let glyphs = self.glyphs;
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .p(px(4.))
+                .bg(hsla(0.6, 0.3, shade, 1.0))
+                .child(div().h(px(10.)).w(px(60. + (self.revision % 5) as f32 * 8.)).bg(crate::red()))
+                .children((0..SECTION_ROWS).map(|row| {
+                    // Dense, glyph-sized cells: a real panel crosses the
+                    // rasterize threshold on its text alone.
+                    div().flex().gap(px(1.)).h(px(6.)).children((0..glyphs).map(move |cell| {
+                        div()
+                            .w(px(10.))
+                            .h_full()
+                            .bg(if (cell + row) % 3 == 0 { crate::green() } else { crate::blue() })
+                    }))
+                }))
+        }
+    }
+
+    /// The level editor's properties panel and the inspector panes share one
+    /// construction: `div().flex_1().overflow_hidden()` around
+    /// wgpui-component's `div().size_full().scrollable(Vertical)`. This is that
+    /// `Scrollable` element's tree, reproduced without the component crate: a
+    /// tracked scroll div (auto-layered) and an absolutely positioned
+    /// scrollbar overlay that paints inside `paint_layer`, notifies its view
+    /// when the offset moves, and keeps requesting animation frames while its
+    /// thumb fades out.
+    struct Panel {
+        sections: Vec<Entity<Section>>,
+        scroll: ScrollHandle,
+        fade_frames: Rc<Cell<usize>>,
+        last_scroll_offset: Rc<Cell<crate::Point<crate::Pixels>>>,
+        header_image: Arc<crate::RenderImage>,
+    }
+    impl Render for Panel {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let scroll = self.scroll.clone();
+            let fade_frames = self.fade_frames.clone();
+            let last_scroll_offset = self.last_scroll_offset.clone();
+            let scrollbar = crate::canvas(
+                |_, _, _| (),
+                move |bounds, _, window, cx| {
+                    if scroll.offset() != last_scroll_offset.get() {
+                        last_scroll_offset.set(scroll.offset());
+                        cx.notify(window.current_view());
+                    }
+                    let remaining = fade_frames.get();
+                    let opacity = if remaining > 0 { remaining as f32 / 20. } else { 0.3 };
+                    let thumb = crate::Bounds::new(
+                        point(bounds.right() - px(8.), bounds.top() + px(4.) - scroll.offset().y / 4.),
+                        size(px(6.), px(40.)),
+                    );
+                    window.paint_layer(bounds, |window| {
+                        window.paint_quad(crate::fill(thumb, crate::hsla(0., 0., 0.1, opacity)));
+                    });
+                    if remaining > 0 {
+                        window.request_animation_frame();
+                    }
+                },
+            )
+            .size_full();
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .bg(crate::white())
+                .child(
+                    div()
+                        .h(px(16.))
+                        .w_full()
+                        .bg(crate::black())
+                        .child(crate::img(crate::ImageSource::Render(self.header_image.clone())).size(px(12.))),
+                )
+                .child(
+                    div().flex_1().overflow_hidden().child(
+                        div()
+                            .relative()
+                            .size_full()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .id("scrollable-None")
+                                    .track_scroll(&self.scroll)
+                                    .overflow_scroll()
+                                    .relative()
+                                    .size_full()
+                                    .child(
+                                        div().child(
+                                            div()
+                                                .size_full()
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(4.))
+                                                .p(px(4.))
+                                                .children(self.sections.iter().cloned()),
+                                        ),
+                                    ),
+                            )
+                            .child(div().absolute().top_0().left_0().right_0().bottom_0().child(scrollbar)),
+                    ),
+                )
+        }
+    }
+
+    struct Sibling {
+        ticks: usize,
+        image: Option<Arc<crate::RenderImage>>,
+    }
+    impl Render for Sibling {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(crate::yellow())
+                .child(div().h(px(10.)).w(px(10. + (self.ticks % 7) as f32 * 5.)).bg(crate::red()))
+                .children(
+                    self.image
+                        .clone()
+                        .map(|image| crate::img(crate::ImageSource::Render(image)).size(px(12.))),
+                )
+        }
+    }
+
+    /// A small solid image; every call is a distinct `RenderImage`, so each
+    /// one takes its own tile in the window's polychrome atlas pages.
+    fn solid_image(red: u8, green: u8, blue: u8) -> Arc<crate::RenderImage> {
+        Arc::new(crate::RenderImage::new([image::Frame::new(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([blue, green, red, 255]),
+        ))]))
+    }
+
+    /// Stands in for the Helio viewport: its layer holds a surface primitive,
+    /// which slabs cannot pack, so it composites through the legacy replay
+    /// while its sibling layers splice as slab spans. The surface id is never
+    /// registered, so both renderers draw nothing for it.
+    struct ViewportLike;
+    impl Render for ViewportLike {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(crate::hsla(0.55, 0.4, 0.3, 1.0))
+                .child(div().m(px(6.)).w(px(40.)).h(px(20.)).bg(crate::green()))
+                .child(
+                    crate::canvas(
+                        |_, _, _| (),
+                        |bounds, _, window, _| {
+                            window.paint_wgpu_surface(
+                                bounds,
+                                crate::platform::cross::surface_registry::SurfaceId(u64::MAX),
+                            );
+                        },
+                    )
+                    .w(px(120.))
+                    .h(px(40.)),
+                )
+        }
+    }
+
+    /// The editor's cached root (`LevelEditorPanel`): its children are sibling
+    /// cached layers (viewport, another view, the properties panel with its own
+    /// nested body), and when nothing inside it changed the whole editor
+    /// composites from this layer -- some siblings as slab spans, the viewport
+    /// through the legacy replay.
+    struct Shell {
+        panel: Entity<Panel>,
+        sibling: Entity<Sibling>,
+        viewport: Entity<ViewportLike>,
+    }
+    impl Render for Shell {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let cached = || crate::StyleRefinement::default().size_full();
+            div()
+                .size_full()
+                // Content under the panels, like the dock backgrounds: a
+                // composite must still draw above it.
+                .bg(crate::hsla(0.0, 0.0, 0.5, 1.0))
+                .flex()
+                .child(
+                    div()
+                        .w(px(200.))
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(div().h(px(100.)).w_full().child(AnyView::from(self.viewport.clone()).cached(cached())))
+                        .child(div().flex_1().w_full().child(AnyView::from(self.sibling.clone()).cached(cached()))),
+                )
+                .child(
+                    div().relative().w(px(200.)).h_full().child(
+                        AnyView::from(self.panel.clone())
+                            .cached(crate::StyleRefinement::default().absolute().size_full()),
+                    ),
+                )
+        }
+    }
+
+    struct Root {
+        panel: Entity<Panel>,
+        sibling: Entity<Sibling>,
+        shell: Entity<Shell>,
+    }
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                AnyView::from(self.shell.clone())
+                    .cached(crate::StyleRefinement::default().size_full()),
+            )
+        }
+    }
+
+    struct Editor {
+        handle: AnyWindowHandle,
+        root: crate::WindowHandle<Root>,
+        renderer: Rc<RefCell<WgpuRenderer>>,
+        presented: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl Editor {
+        fn open(cx: &mut TestAppContext, context: &Arc<WgpuContext>, glyphs_per_row: usize) -> Self {
+            let root = cx.open_window(size(px(LOGICAL_WIDTH), px(LOGICAL_HEIGHT)), |_, cx| {
+                let sections = (0..SECTION_COUNT)
+                    .map(|index| cx.new(|_| Section { index, revision: 0, glyphs: glyphs_per_row }))
+                    .collect();
+                let panel = cx.new(|_| Panel {
+                    fade_frames: Rc::new(Cell::new(0)),
+                    last_scroll_offset: Rc::new(Cell::new(crate::Point::default())),
+                    header_image: solid_image(40, 200, 90),
+                    sections,
+                    scroll: ScrollHandle::new(),
+                });
+                let sibling = cx.new(|_| Sibling { ticks: 0, image: None });
+                let viewport = cx.new(|_| ViewportLike);
+                let shell = cx.new(|_| Shell {
+                    panel: panel.clone(),
+                    sibling: sibling.clone(),
+                    viewport,
+                });
+                Root {
+                    panel,
+                    sibling,
+                    shell,
+                }
+            });
+            let handle: AnyWindowHandle = root.into();
+            let (width, height) = handle
+                .update(cx, |_, window, _| {
+                    let device = window.viewport_size().scale(window.scale_factor());
+                    (device.width.0.round() as u32, device.height.0.round() as u32)
+                })
+                .expect("window update");
+            let atlas = Arc::new(WgpuAtlas::new(context.clone()));
+            let renderer = Rc::new(RefCell::new(WgpuRenderer::new_headless(
+                context.clone(),
+                atlas.clone(),
+                width,
+                height,
+            )));
+            let presented = Rc::new(RefCell::new(Vec::new()));
+            handle
+                .update(cx, |_, window, _| {
+                    let renderer = renderer.clone();
+                    let presented = presented.clone();
+                    window.sprite_atlas = atlas.clone();
+                    window.test_frame_sink = Some(Box::new(move |scene| {
+                        let mut renderer = renderer.borrow_mut();
+                        assert_draw_order(scene);
+                        renderer.draw(scene);
+                        *presented.borrow_mut() = renderer.read_back_frame();
+                        (renderer.take_rerecord_requests(), renderer.take_dead_page_requests())
+                    }));
+                    window.refresh();
+                })
+                .expect("window update");
+            cx.run_until_parked();
+            let editor = Editor {
+                handle,
+                root,
+                renderer,
+                presented,
+            };
+            // A second full render: scroll containers measure themselves on
+            // their first frame, so the first recording can differ from any
+            // later render of the same state. Both windows start settled.
+            editor.draw(cx, true);
+            cx.run_until_parked();
+            editor
+        }
+
+        /// Draw now, the way a platform frame does. `full` bypasses every
+        /// retained layer and view cache.
+        fn draw(&self, cx: &mut TestAppContext, full: bool) {
+            self.handle
+                .update(cx, |_, window, cx| {
+                    if full {
+                        window.refresh();
+                    }
+                    window.refresh_buffers();
+                    window.draw(cx).clear();
+                })
+                .expect("window update");
+        }
+
+        /// An idle frame where only the Helio viewport texture changed:
+        /// `refresh_buffers`, then exactly the platform frame callback's
+        /// decision -- renderer requests routed first, the previous scene
+        /// re-presented when nothing else is pending, a real draw otherwise.
+        fn represent(&self, cx: &mut TestAppContext) -> Vec<u8> {
+            let needs_draw = self
+                .handle
+                .update(cx, |_, window, cx| {
+                    window.route_renderer_requests();
+                    window.refresh_buffers();
+                    if !window.present_previous_scene_if_display_only(cx) {
+                        return true;
+                    }
+                    let mut renderer = self.renderer.borrow_mut();
+                    renderer.draw(&window.rendered_frame.scene);
+                    window.test_pending_rerecords.extend(renderer.take_rerecord_requests());
+                    window.test_pending_dead_pages.extend(renderer.take_dead_page_requests());
+                    *self.presented.borrow_mut() = renderer.read_back_frame();
+                    false
+                })
+                .expect("window update");
+            if needs_draw {
+                self.draw(cx, false);
+                cx.run_until_parked();
+            }
+            self.presented.borrow().clone()
+        }
+
+        /// The renderer's wake-up with nothing else happening: a frame whose
+        /// renderer posted requests schedules another, and the frame callback
+        /// routes them and draws. Every request must make the window dirty (or
+        /// nothing would redraw) and the affected layers must rebuild within a
+        /// couple of frames. Returns how many wake frames it took.
+        fn settle(&self, cx: &mut TestAppContext, label: &str) -> usize {
+            for wakes in 0..3 {
+                let pending = self
+                    .handle
+                    .update(cx, |_, window, _| {
+                        !window.test_pending_rerecords.is_empty()
+                            || !window.test_pending_dead_pages.is_empty()
+                    })
+                    .expect("window update");
+                if !pending {
+                    return wakes;
+                }
+                let dirty = self
+                    .handle
+                    .update(cx, |_, window, _| {
+                        window.route_renderer_requests();
+                        window.invalidator.is_dirty()
+                    })
+                    .expect("window update");
+                assert!(
+                    dirty,
+                    "renderer requests were pending but routing them left the window clean: \
+                     the skipped content would stay blank until an unrelated redraw"
+                );
+                self.handle
+                    .update(cx, |_, window, cx| window.draw(cx).clear())
+                    .expect("window update");
+                cx.run_until_parked();
+            }
+            let pending = self
+                .handle
+                .update(cx, |_, window, _| {
+                    window
+                        .test_pending_rerecords
+                        .iter()
+                        .map(|key| match window.layers.get(key) {
+                            Some(layer) => format!(
+                                "{} (content: {}, needs: {:?}, texture: {}, packed: {})",
+                                window.layer_trace_name(*key),
+                                layer.has_content(),
+                                layer.needs,
+                                layer.texture_retained,
+                                match &layer.packed {
+                                    Some(Ok(_)) => "slab",
+                                    Some(Err(_)) => "fell back",
+                                    None => "none",
+                                },
+                            ),
+                            None => format!("{key:?} (no layer record)"),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .expect("window update");
+            panic!(
+                "{label}: renderer requests were still pending after 3 wake frames, the layers never \n                 rebuilt: {pending:#?}"
+            );
+        }
+
+        fn size(&self) -> (u32, u32) {
+            self.renderer.borrow().frame_size()
+        }
+    }
+
+    /// Walk the scene's draw stream exactly as the renderer does and require
+    /// draw orders never to go backwards between one batch or slab span and
+    /// the next: whatever resolves to a higher order must also draw later.
+    fn assert_draw_order(scene: &crate::Scene) {
+        use crate::scene::{PrimitiveBatch, SceneBatch};
+        fn range<T>(items: &[T], order: impl Fn(&T) -> u32) -> Option<(u32, u32)> {
+            let first = order(items.first()?);
+            let last = items.iter().map(&order).max()?;
+            Some((first, last))
+        }
+        let mut previous: Option<(u32, String)> = None;
+        for (position, batch) in scene.frame_batches().enumerate() {
+            let (first, last, what) = match &batch {
+                SceneBatch::LayerSlab(index) => {
+                    let span = &scene.layer_slab_spans[*index];
+                    (span.order(), span.order(), format!("slab span {index} of {:?}", span.key))
+                }
+                SceneBatch::Primitives(batch) => {
+                    let (name, range) = match batch {
+                        PrimitiveBatch::Quads(items) => ("quads", range(items, |item| item.order)),
+                        PrimitiveBatch::Shadows(items) => ("shadows", range(items, |item| item.order)),
+                        PrimitiveBatch::Underlines(items) => ("underlines", range(items, |item| item.order)),
+                        PrimitiveBatch::MonochromeSprites { sprites, .. } => {
+                            ("mono sprites", range(sprites, |item| item.order))
+                        }
+                        PrimitiveBatch::PolychromeSprites { sprites, .. } => {
+                            ("poly sprites", range(sprites, |item| item.order))
+                        }
+                        PrimitiveBatch::Surfaces(items) => ("surfaces", range(items, |item| item.order)),
+                        _ => continue,
+                    };
+                    let Some((first, last)) = range else {
+                        continue;
+                    };
+                    (first, last, format!("{name} batch at orders {first}..={last}"))
+                }
+            };
+            if let Some((previous_last, previous_what)) = &previous {
+                assert!(
+                    first >= *previous_last,
+                    "draw stream out of order at item {position}: {what} (order {first}) draws after \
+                     {previous_what}, which reached order {previous_last}"
+                );
+            }
+            previous = Some((last, what));
+        }
+    }
+
+    fn compare(live: &[u8], truth: &[u8], width: u32, height: u32, label: &str) {
+        assert_eq!(live.len(), truth.len(), "{label}: frame sizes differ");
+        let mut differing = 0usize;
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0, 0);
+        let mut diff = vec![0u8; live.len()];
+        for (index, (a, b)) in live.chunks(4).zip(truth.chunks(4)).enumerate() {
+            let delta = a.iter().zip(b).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+            if delta > 3 {
+                differing += 1;
+                let (x, y) = (index as u32 % width, index as u32 / width);
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                diff[index * 4..index * 4 + 4].copy_from_slice(&[255, 0, 255, 255]);
+            } else {
+                diff[index * 4..index * 4 + 4].copy_from_slice(&[b[0] / 3, b[1] / 3, b[2] / 3, 255]);
+            }
+        }
+        if differing == 0 {
+            return;
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/layer-flicker");
+        let saved = std::fs::create_dir_all(&dir).is_ok()
+            && [("live.png", live), ("truth.png", truth), ("diff.png", &diff[..])]
+                .iter()
+                .all(|(name, pixels)| {
+                    image::RgbaImage::from_raw(width, height, pixels.to_vec())
+                        .is_some_and(|image| image.save(dir.join(name)).is_ok())
+                });
+        let first = ((min_y * width + min_x) * 4) as usize;
+        panic!(
+            "{label}: {differing} pixels differ from a full render, in device rect \
+             ({min_x},{min_y})..=({max_x},{max_y}); at its first corner live={:?} truth={:?}{}",
+            &live[first..first + 4],
+            &truth[first..first + 4],
+            if saved {
+                format!("; images in {}", dir.display())
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    enum Step {
+        Pointer(bool),
+        SiblingUpdate,
+        SectionUpdate(usize),
+        Scroll(f32),
+        IdleDraw,
+        AnimationFrame,
+        ShowSiblingImage,
+        DropSiblingImage,
+        DropPanelImage,
+        LongInteraction(usize),
+    }
+
+    fn apply(cx: &mut TestAppContext, editors: [&Editor; 2], step: &Step) {
+        for editor in editors {
+            match step {
+                Step::Pointer(in_panel) => {
+                    let position = if *in_panel {
+                        point(px(300.), px(150.))
+                    } else {
+                        point(px(100.), px(150.))
+                    };
+                    cx.test_window(editor.handle).simulate_input(
+                        crate::InputEvent::to_platform_input(crate::MouseMoveEvent {
+                            position,
+                            modifiers: crate::Modifiers::default(),
+                            pressed_button: None,
+                        }),
+                    );
+                }
+                Step::SiblingUpdate => editor
+                    .root
+                    .update(cx, |root, _, cx| {
+                        root.sibling.update(cx, |sibling, cx| {
+                            sibling.ticks += 1;
+                            cx.notify();
+                        })
+                    })
+                    .expect("window update"),
+                Step::SectionUpdate(index) => editor
+                    .root
+                    .update(cx, |root, _, cx| {
+                        let section = root.panel.read(cx).sections[*index].clone();
+                        section.update(cx, |section, cx| {
+                            section.revision += 1;
+                            cx.notify();
+                        })
+                    })
+                    .expect("window update"),
+                Step::Scroll(offset) => editor
+                    .root
+                    .update(cx, |root, _, cx| {
+                        let panel = root.panel.read(cx);
+                        panel.scroll.set_offset(point(px(0.), px(*offset)));
+                        panel.fade_frames.set(20);
+                        root.panel.update(cx, |_, cx| cx.notify());
+                    })
+                    .expect("window update"),
+                Step::IdleDraw => editor.draw(cx, false),
+                Step::ShowSiblingImage => editor
+                    .root
+                    .update(cx, |root, _, cx| {
+                        root.sibling.update(cx, |sibling, cx| {
+                            sibling.image = Some(solid_image(200, 40, 40));
+                            cx.notify();
+                        })
+                    })
+                    .expect("window update"),
+                Step::LongInteraction(frames) => {
+                    for _ in 0..*frames {
+                        editor
+                            .root
+                            .update(cx, |root, _, cx| root.shell.update(cx, |_, cx| cx.notify()))
+                            .expect("window update");
+                        cx.run_until_parked();
+                        for _ in 0..4 {
+                            editor.represent(cx);
+                        }
+                    }
+                }
+                Step::DropPanelImage => {
+                    // An image cache evicting an image the panel still shows:
+                    // a composited panel never touches its images during paint.
+                    // The page it sat on is destroyed, so the renderer poisons
+                    // the panel's layer. That costs one frame; the next draw
+                    // must rebuild the panel even though nothing notified it.
+                    let image = editor
+                        .root
+                        .update(cx, |root, _, cx| root.panel.read(cx).header_image.clone())
+                        .expect("window update");
+                    editor
+                        .handle
+                        .update(cx, |_, window, _| window.drop_image(image))
+                        .expect("window update")
+                        .expect("drop image");
+                    editor.draw(cx, false);
+                }
+                Step::DropSiblingImage => {
+                    let image = editor
+                        .root
+                        .update(cx, |root, _, cx| {
+                            root.sibling.update(cx, |sibling, cx| {
+                                cx.notify();
+                                sibling.image.take()
+                            })
+                        })
+                        .expect("window update");
+                    if let Some(image) = image {
+                        editor
+                            .handle
+                            .update(cx, |_, window, _| window.drop_image(image))
+                            .expect("window update")
+                            .expect("drop image");
+                    }
+                }
+                Step::AnimationFrame => {
+                    // Time passes: the fade advances by one frame in both
+                    // windows no matter how often either painted.
+                    editor
+                        .root
+                        .update(cx, |root, _, cx| {
+                            let fade = &root.panel.read(cx).fade_frames;
+                            fade.set(fade.get().saturating_sub(1));
+                        })
+                        .expect("window update");
+                    // What the platform frame loop does first on every frame.
+                    editor
+                        .handle
+                        .update(cx, |_, window, cx| {
+                            for callback in window.next_frame_callbacks.take() {
+                                callback(window, cx);
+                            }
+                        })
+                        .expect("window update");
+                }
+            }
+        }
+        cx.run_until_parked();
+    }
+
+    /// A body light enough to stay primitive-retained, spliced as slab spans
+    /// inside the composited root -- the properties panel in the level editor.
+    #[crate::test]
+    fn retained_layers_draw_what_a_full_render_draws_across_frames(cx: &mut TestAppContext) {
+        run_flicker_scenario(cx, 2);
+    }
+
+    /// A body dense enough to be retained as a texture (every glyph of a real
+    /// panel is an item), composited through the legacy replay.
+    #[crate::test]
+    fn texture_retained_bodies_draw_what_a_full_render_draws_across_frames(cx: &mut TestAppContext) {
+        run_flicker_scenario(cx, 14);
+    }
+
+    fn run_flicker_scenario(cx: &mut TestAppContext, glyphs_per_row: usize) {
+        if !crate::layer::layers_enabled() {
+            return;
+        }
+        let Ok(context) = WgpuContext::new(&WgpuOptions::default()) else {
+            eprintln!("no GPU adapter; skipping headless layer flicker reproduction");
+            return;
+        };
+        let context = Arc::new(context);
+        let live = Editor::open(cx, &context, glyphs_per_row);
+        let truth = Editor::open(cx, &context, glyphs_per_row);
+        let (width, height) = live.size();
+
+        let mut steps = Vec::new();
+        for round in 0..4usize {
+            steps.push(Step::Pointer(round % 2 == 1));
+            // A right-click drag: the root rebuilds every frame for seconds
+            // while the viewport re-presents in between, long enough for the
+            // renderer's idle slab GC (600 frames) to reclaim the panels that
+            // are only drawn through the legacy path meanwhile. The steps after
+            // it composite the root again.
+            if round < 2 {
+                steps.push(Step::LongInteraction(160));
+                steps.push(Step::IdleDraw);
+            }
+            // Another view shows an image on the panel's atlas page and then
+            // drops it (the image cache evicting, a color picker repainting),
+            // while the panel itself is clean and compositing.
+            steps.push(Step::ShowSiblingImage);
+            steps.push(Step::SiblingUpdate);
+            steps.push(Step::DropSiblingImage);
+            steps.push(Step::IdleDraw);
+            steps.push(Step::DropPanelImage);
+            steps.push(Step::IdleDraw);
+            steps.push(Step::IdleDraw);
+            steps.push(Step::SiblingUpdate);
+            steps.push(Step::IdleDraw);
+            steps.push(Step::SiblingUpdate);
+            steps.push(Step::SectionUpdate(round % SECTION_COUNT));
+            steps.push(Step::SiblingUpdate);
+            steps.push(Step::Scroll(-(round as f32 % 4.) * 40.));
+            steps.push(Step::SiblingUpdate);
+            steps.push(Step::IdleDraw);
+            // The scrollbar fade runs on animation frames, interleaved with
+            // updates elsewhere, as it does while the viewport renders.
+            for fade_frame in 0..12 {
+                steps.push(Step::AnimationFrame);
+                if fade_frame % 6 == 0 {
+                    steps.push(Step::SiblingUpdate);
+                }
+            }
+        }
+
+        for (index, step) in steps.iter().enumerate() {
+            let label = format!(
+                "step {index} ({})",
+                match step {
+                    Step::Pointer(true) => "pointer into panel".to_string(),
+                    Step::Pointer(false) => "pointer out of panel".to_string(),
+                    Step::SiblingUpdate => "sibling update".to_string(),
+                    Step::SectionUpdate(section) => format!("section {section} update"),
+                    Step::Scroll(offset) => format!("scroll to {offset}"),
+                    Step::IdleDraw => "idle draw".to_string(),
+                    Step::AnimationFrame => "animation frame".to_string(),
+                    Step::ShowSiblingImage => "sibling shows an image".to_string(),
+                    Step::DropSiblingImage => "sibling image dropped from the atlas".to_string(),
+                    Step::DropPanelImage => "panel image evicted behind the composited panel".to_string(),
+                    Step::LongInteraction(frames) => format!("{frames} frames of root rebuilds, as during a viewport drag"),
+                }
+            );
+            apply(cx, [&live, &truth], step);
+            truth.draw(cx, true);
+            cx.run_until_parked();
+
+            let truth_pixels = truth.presented.borrow().clone();
+            let live_pixels = live.presented.borrow().clone();
+            let distinct_colors = truth_pixels
+                .chunks(4)
+                .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+                .collect::<collections::FxHashSet<_>>()
+                .len();
+            assert!(
+                distinct_colors >= 6,
+                "{label}: the reference frame has only {distinct_colors} colors; the harness is not rendering"
+            );
+            // A destroyed atlas page under a retained layer costs exactly one
+            // frame (the renderer discovers it while drawing); anything else
+            // must be right on the frame it happens.
+            let page_destroyed = matches!(step, Step::DropPanelImage);
+            if !page_destroyed {
+                compare(&live_pixels, &truth_pixels, width, height, &label);
+            }
+            // Nothing else redraws: only the renderer's own wake-up may
+            // restore what it skipped.
+            let wakes = live.settle(cx, &label);
+            assert!(
+                page_destroyed || wakes == 0,
+                "{label}: the renderer skipped content ({wakes} wake frames) with no page destroyed"
+            );
+            let settled = live.presented.borrow().clone();
+            compare(&settled, &truth_pixels, width, height, &format!("{label}, after the renderer's wake-up"));
+            for represent_index in 0..3 {
+                let again = live.represent(cx);
+                compare(&again, &truth_pixels, width, height, &format!("{label}, idle re-present {represent_index}"));
+            }
+        }
     }
 }

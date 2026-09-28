@@ -481,7 +481,25 @@ impl PlatformWindow for CrossWindow {
 
     fn draw(&self, scene: &crate::Scene) {
         if let Some(renderer) = self.0.renderer.get() {
-            renderer.borrow_mut().draw(scene);
+            let requests_pending = {
+                let mut renderer = renderer.borrow_mut();
+                renderer.draw(scene);
+                renderer.has_pending_requests()
+            };
+            // Whatever the renderer skipped this frame is only restored by a
+            // draw that answers its re-record requests. Without scheduling one,
+            // a window with nothing else going on showed a blank panel until
+            // an unrelated redraw (the viewport's periodic full render, 2.5 s).
+            if requests_pending {
+                self.window().request_redraw();
+            }
+        }
+    }
+
+    fn take_dead_atlas_page_requests(&mut self) -> Vec<crate::AtlasTextureId> {
+        match self.0.renderer.get() {
+            Some(renderer) => renderer.borrow_mut().take_dead_page_requests(),
+            None => Vec::new(),
         }
     }
 
