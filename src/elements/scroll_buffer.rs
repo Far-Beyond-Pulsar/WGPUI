@@ -63,12 +63,18 @@ pub(crate) enum ScrollBufferFrame {
 /// reads the same frame state the paint-time decision will.
 pub(crate) fn prepare_scroll_buffer(
     window: &mut crate::Window,
+    viewport: crate::Bounds<Pixels>,
     scroll: Point<Pixels>,
 ) -> ScrollBufferFrame {
-        let Some(buffer) = window.prepaint_layer_buffer() else {
+    let Some(buffer) = window.prepaint_layer_buffer() else {
         return ScrollBufferFrame::Viewport;
     };
     let key: LayerKey = buffer.key;
+    // Only the viewport covering this layer can shift its texture. A nested
+    // list must not replace the ancestor's anchor or skip its own prepaint.
+    if viewport != buffer.bounds {
+        return ScrollBufferFrame::Viewport;
+    }
 
     // A refill re-renders the texture re-centred on the current scroll: the
     // content offset resets and the anchor moves with it.
@@ -134,6 +140,21 @@ pub(crate) fn inflate_for_buffer(
     crate::layer::inflate_bounds(bounds, margin)
 }
 
+/// Record the full buffer in both prepaint and paint. The texture composite
+/// clips it back to the viewport; the non-rasterized path must keep its mask.
+pub(crate) fn with_buffer_mask<R>(
+    window: &mut crate::Window,
+    mask: Option<crate::ContentMask<Pixels>>,
+    f: impl FnOnce(&mut crate::Window) -> R,
+) -> R {
+    if mask.is_some() && crate::layer::rasterization_enabled() && crate::scene_pack::slabs_enabled()
+    {
+        window.with_content_mask_unclamped(mask, f)
+    } else {
+        f(window)
+    }
+}
+
 // ---------------------------------------------------------------------
 // Layout containment for plain (non-virtualized) scroll containers (#96,
 // docs/scroll-free-by-default.md §0.-2).
@@ -192,7 +213,11 @@ impl ContainmentWindow {
     /// `viewport_height` and `margin_height` both come from the enclosing
     /// layer/scroll state exactly as the shift-frame protocol above already
     /// uses them.
-    pub(crate) fn new(scroll_offset_y: Pixels, viewport_height: Pixels, margin_height: Pixels) -> Self {
+    pub(crate) fn new(
+        scroll_offset_y: Pixels,
+        viewport_height: Pixels,
+        margin_height: Pixels,
+    ) -> Self {
         Self {
             window_top: -scroll_offset_y - margin_height,
             window_bottom: -scroll_offset_y + viewport_height + margin_height,

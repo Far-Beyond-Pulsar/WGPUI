@@ -122,6 +122,14 @@ pub(crate) struct Scene {
     /// recording buffer, so that an enclosing recorder still learns it was
     /// nested here and can replay it by reference next time.
     capture_stack: Vec<(LayerKey, Option<Vec<LayerItem>>)>,
+    /// A clip for what is drawn this frame that the recording layer does not
+    /// share (#96). An overscroll buffer's record pass paints margin rows under
+    /// a widened, ancestor-unclamped mask so they bake into its texture, but
+    /// the same primitives are also drawn inline on the record frame. Without
+    /// this they paint past the scroller's real viewport on record frames only,
+    /// and whatever sits next to the scroller flickers. Captured items keep the
+    /// widened mask; only the inline copy is clipped.
+    display_clip_stack: Vec<Bounds<ScaledPixels>>,
     pub(crate) shadows: Vec<Shadow>,
     pub(crate) backdrop_filters: Vec<BackdropFilter>,
     pub(crate) filter_boundaries: Vec<FilterBoundary>,
@@ -151,6 +159,7 @@ impl Default for Scene {
             }],
             clip_stack: Vec::new(),
             capture_stack: Vec::new(),
+            display_clip_stack: Vec::new(),
             shadows: Vec::new(),
             backdrop_filters: Vec::new(),
             filter_boundaries: Vec::new(),
@@ -180,6 +189,7 @@ impl Scene {
         });
         self.clip_stack.clear();
         self.capture_stack.clear();
+        self.display_clip_stack.clear();
         self.paths.clear();
         self.shadows.clear();
         self.backdrop_filters.clear();
@@ -565,12 +575,36 @@ impl Scene {
             path.id = PathId(self.paths.len());
         }
         count_primitive(&primitive);
-        self.push_to_array(&primitive);
         if let Some((_, Some(items))) = self.capture_stack.last_mut() {
             items.push(LayerItem::Primitive(primitive.clone()));
         }
+        if let Some(display_clip) = self.display_clip_stack.last().copied() {
+            let mask = primitive.content_mask_mut();
+            mask.bounds = mask.bounds.intersect(&display_clip);
+            let visible = primitive.bounds().intersect(&primitive.content_mask().bounds);
+            if visible.is_empty() && !is_filter_boundary {
+                // Margin-only content belongs to the layer's texture, not to
+                // this frame's screen.
+                return;
+            }
+        }
+        self.push_to_array(&primitive);
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
+    }
+
+    /// Clip what is drawn inline to `clip`, without narrowing what an enclosing
+    /// recording layer captures, until the matching [`Self::pop_display_clip`].
+    pub(crate) fn push_display_clip(&mut self, clip: Bounds<ScaledPixels>) {
+        let clip = match self.display_clip_stack.last() {
+            Some(outer) => clip.intersect(outer),
+            None => clip,
+        };
+        self.display_clip_stack.push(clip);
+    }
+
+    pub(crate) fn pop_display_clip(&mut self) {
+        self.display_clip_stack.pop();
     }
 
     /// Append `primitive` to the array for its kind, without touching its order.
@@ -953,6 +987,20 @@ fn split_batch_at<'a>(
     }
 }
 
+fn batch_is_empty(batch: &PrimitiveBatch<'_>) -> bool {
+    match batch {
+        PrimitiveBatch::Shadows(items) => items.is_empty(),
+        PrimitiveBatch::Quads(items) => items.is_empty(),
+        PrimitiveBatch::Paths(items) => items.is_empty(),
+        PrimitiveBatch::Underlines(items) => items.is_empty(),
+        PrimitiveBatch::MonochromeSprites { sprites, .. } => sprites.is_empty(),
+        PrimitiveBatch::PolychromeSprites { sprites, .. } => sprites.is_empty(),
+        PrimitiveBatch::Surfaces(items) => items.is_empty(),
+        PrimitiveBatch::BackdropFilters(items) => items.is_empty(),
+        PrimitiveBatch::FilterBoundary(_) => false,
+    }
+}
+
 impl<'a> FrameBatchIterator<'a> {
     fn batch_lead_order(batch: &PrimitiveBatch<'a>) -> Option<DrawOrder> {
         match batch {
@@ -998,7 +1046,12 @@ impl<'a> Iterator for FrameBatchIterator<'a> {
                     // it never ties with surrounding content. When it lands
                     // strictly inside a same-kind batch, the batch splits
                     // around it so every element draws at its own position.
-                    let lead = Self::batch_lead_order(&batch);
+                    let lead = match batch {
+                        PrimitiveBatch::FilterBoundary(boundary) => {
+                            self.scene.filter_boundaries.get(boundary).map(|b| b.order)
+                        }
+                        _ => Self::batch_lead_order(&batch),
+                    };
                     if lead.is_none_or(|lead| lead >= span_order) {
                         self.next_span += 1;
                         self.pending = Some(batch);
@@ -1006,13 +1059,31 @@ impl<'a> Iterator for FrameBatchIterator<'a> {
                     }
                     let (head, tail) =
                         split_batch_at(batch, span_order, &self.scene.filter_boundaries);
-                    self.next_span += 1;
-                    self.queued.push_back(SceneBatch::LayerSlab(index));
-                    if let Some(tail) = tail {
-                        self.queued.push_back(SceneBatch::Primitives(tail));
-                    }
-                    if let Some(head) = head {
-                        return Some(SceneBatch::Primitives(head));
+                    match tail.filter(|tail| !batch_is_empty(tail)) {
+                        // The whole batch draws below the span, but so may the
+                        // next batch of another kind: the legacy iterator only
+                        // ends a batch where another kind's next element is
+                        // lower. The span waits for the next comparison.
+                        // Emitting it here drew later-ordered content (a
+                        // panel's image, the scrollbar over its own list)
+                        // underneath a composited layer on composite frames
+                        // only, so it blinked against record frames.
+                        None => {
+                            if let Some(head) = head {
+                                return Some(SceneBatch::Primitives(head));
+                            }
+                        }
+                        // Part of the batch is at or above the span, so every
+                        // other kind's remaining content is too: the span
+                        // goes exactly here.
+                        Some(tail) => {
+                            self.next_span += 1;
+                            self.queued.push_back(SceneBatch::LayerSlab(index));
+                            self.queued.push_back(SceneBatch::Primitives(tail));
+                            if let Some(head) = head.filter(|head| !batch_is_empty(head)) {
+                                return Some(SceneBatch::Primitives(head));
+                            }
+                        }
                     }
                 }
                 (Some(batch), None) => return Some(SceneBatch::Primitives(batch)),
@@ -1140,6 +1211,20 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropFilter(filter) => &filter.content_mask,
             Primitive::FilterBoundary(boundary) => &boundary.content_mask,
+        }
+    }
+
+    fn content_mask_mut(&mut self) -> &mut ContentMask<ScaledPixels> {
+        match self {
+            Primitive::Shadow(shadow) => &mut shadow.content_mask,
+            Primitive::Quad(quad) => &mut quad.content_mask,
+            Primitive::Path(path) => &mut path.content_mask,
+            Primitive::Underline(underline) => &mut underline.content_mask,
+            Primitive::MonochromeSprite(sprite) => &mut sprite.content_mask,
+            Primitive::PolychromeSprite(sprite) => &mut sprite.content_mask,
+            Primitive::Surface(surface) => &mut surface.content_mask,
+            Primitive::BackdropFilter(filter) => &mut filter.content_mask,
+            Primitive::FilterBoundary(boundary) => &mut boundary.content_mask,
         }
     }
 }
@@ -1749,7 +1834,8 @@ pub(crate) enum SurfaceContent {
     /// samples it from its layer-texture cache; the surface's bounds select
     /// the sub-rect (the texture covers the layer's buffer extent) and the
     /// content mask clips to the layer's visible rect.
-    Layer(LayerId),
+    /// The key names the layer to re-record if its texture is missing.
+    Layer(LayerId, LayerKey),
 }
 
 /// Renderer-side target carried by a texture-retained layer's slab spans

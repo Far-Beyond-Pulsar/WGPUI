@@ -46,8 +46,16 @@ pub(crate) struct TestPrompts {
 
 impl TestPlatform {
     pub fn new(executor: BackgroundExecutor, foreground_executor: ForegroundExecutor) -> Rc<Self> {
-        let text_system = Arc::new(NoopTextSystem);
+        Self::with_text_system(executor, foreground_executor, Arc::new(NoopTextSystem))
+    }
 
+    /// A test platform that shapes and rasterizes real glyphs, for tests that
+    /// render through the GPU renderer (see `crate::headless`).
+    pub fn with_text_system(
+        executor: BackgroundExecutor,
+        foreground_executor: ForegroundExecutor,
+        text_system: Arc<dyn PlatformTextSystem>,
+    ) -> Rc<Self> {
         Rc::new_cyclic(|weak| TestPlatform {
             background_executor: executor,
             foreground_executor,

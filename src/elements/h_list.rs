@@ -6,10 +6,10 @@
 use super::ListHorizontalSizingBehavior;
 use crate::elements::smooth_scroll::SmoothScrollState;
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId,
-    GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
-    IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, px, size,
+    AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, GlobalElementId,
+    Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement, IsZero, LayoutId,
+    ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size, StyleRefinement, Styled,
+    Window, point, px, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
@@ -66,6 +66,7 @@ pub struct HList {
 
 /// Per-frame rendering state for an [`HList`].
 pub struct HListFrameState {
+    buffer_mask: Option<ContentMask<Pixels>>,
     items: SmallVec<[AnyElement; 32]>,
 }
 
@@ -182,7 +183,11 @@ impl Element for HList {
         let avg_width = if self.item_widths.is_empty() {
             px(120.)
         } else {
-            let sum: Pixels = self.item_widths.iter().copied().fold(Pixels::ZERO, |a, w| a + w);
+            let sum: Pixels = self
+                .item_widths
+                .iter()
+                .copied()
+                .fold(Pixels::ZERO, |a, w| a + w);
             px(sum.value() / self.item_widths.len() as f32)
         };
 
@@ -223,6 +228,7 @@ impl Element for HList {
         (
             layout_id,
             HListFrameState {
+                buffer_mask: None,
                 items: SmallVec::new(),
             },
         )
@@ -336,8 +342,7 @@ impl Element for HList {
                                 }
                             }
 
-                            let max_scroll_offset =
-                                (content_width - list_width).max(Pixels::ZERO);
+                            let max_scroll_offset = (content_width - list_width).max(Pixels::ZERO);
                             match strategy {
                                 HListScrollStrategy::Start => {
                                     updated_scroll_offset.x = -(item_left - offset_pixels)
@@ -348,8 +353,8 @@ impl Element for HList {
                                     let viewport_width = list_width - offset_pixels;
                                     let viewport_center = offset_pixels + viewport_width / 2.0;
                                     let target_scroll_left = item_center - viewport_center;
-                                    updated_scroll_offset.x = -target_scroll_left
-                                        .clamp(Pixels::ZERO, max_scroll_offset);
+                                    updated_scroll_offset.x =
+                                        -target_scroll_left.clamp(Pixels::ZERO, max_scroll_offset);
                                 }
                                 HListScrollStrategy::End => {
                                     updated_scroll_offset.x = -(item_right - list_width)
@@ -368,6 +373,7 @@ impl Element for HList {
                         scroll_state
                             .smooth_scroll
                             .set_target(logical_scroll_offset.x);
+                        scroll_state.smooth_scroll.clamp(max_scroll_offset.min(px(0.)), px(0.));
                         if applied_deferred_scroll {
                             scroll_state.smooth_scroll.visual_offset = logical_scroll_offset.x;
                             scroll_state.smooth_scroll.target_offset = logical_scroll_offset.x;
@@ -376,6 +382,10 @@ impl Element for HList {
                             // `refresh` would be a no-op here: it is guarded on
                             // not being mid-draw, and this runs during prepaint.
                             window.request_animation_frame();
+                            cx.notify(window.current_view());
+                            if let Some(hitbox) = &hitbox {
+                                window.invalidate_scrolled_layer(hitbox);
+                            }
                         }
                         visual_scroll_offset.x = scroll_state.smooth_scroll.current();
                     }
@@ -409,6 +419,7 @@ impl Element for HList {
                     // composites shifted; lay out the buffer range on refill.
                     let buffer_frame = super::scroll_buffer::prepare_scroll_buffer(
                         window,
+                        bounds,
                         point(visual_scroll_offset.x, Pixels::ZERO),
                     );
                     let buffer_margin = match buffer_frame {
@@ -464,31 +475,38 @@ impl Element for HList {
                             None => ContentMask { bounds },
                         };
                         let base_x = padded_bounds.origin.x + visual_scroll_offset.x;
+                        frame_state.buffer_mask = buffer_margin.map(|_| content_mask);
                         let base_y = padded_bounds.origin.y + visual_scroll_offset.y;
 
                         window.with_content_mask(Some(content_mask), |window| {
-                            let mut cum_offset = self.item_widths[..first_visible]
-                                .iter()
-                                .fold(Pixels::ZERO, |a, &w| a + w);
-                            for mut item in items {
-                                let item_origin = point(base_x + cum_offset, base_y);
-                                let available = size(
-                                    AvailableSpace::MaxContent,
-                                    AvailableSpace::Definite(padded_bounds.size.height),
-                                );
-                                let actual = item.layout_as_root(available, window, cx);
-                                let actual_w = actual.width.max(px(1.));
-                                item.prepaint_at(item_origin, window, cx);
-                                frame_state.items.push(item);
+                            super::scroll_buffer::with_buffer_mask(
+                                window,
+                                frame_state.buffer_mask,
+                                |window| {
+                                    let mut cum_offset = self.item_widths[..first_visible]
+                                        .iter()
+                                        .fold(Pixels::ZERO, |a, &w| a + w);
+                                    for mut item in items {
+                                        let item_origin = point(base_x + cum_offset, base_y);
+                                        let available = size(
+                                            AvailableSpace::MaxContent,
+                                            AvailableSpace::Definite(padded_bounds.size.height),
+                                        );
+                                        let actual = item.layout_as_root(available, window, cx);
+                                        let actual_w = actual.width.max(px(1.));
+                                        item.prepaint_at(item_origin, window, cx);
+                                        frame_state.items.push(item);
 
-                                // update stored width to match what actually rendered
-                                let idx = first_visible + frame_state.items.len() - 1;
-                                if idx < self.item_widths.len() {
-                                    self.item_widths[idx] = actual_w;
-                                }
+                                        // update stored width to match what actually rendered
+                                        let idx = first_visible + frame_state.items.len() - 1;
+                                        if idx < self.item_widths.len() {
+                                            self.item_widths[idx] = actual_w;
+                                        }
 
-                                cum_offset += actual_w;
-                            }
+                                        cum_offset += actual_w;
+                                    }
+                                },
+                            );
                         });
                     }
                 }
@@ -516,9 +534,15 @@ impl Element for HList {
             window,
             cx,
             |_, window, cx| {
-                for item in &mut request_layout.items {
-                    item.paint(window, cx);
-                }
+                super::scroll_buffer::with_buffer_mask(
+                    window,
+                    request_layout.buffer_mask,
+                    |window| {
+                        for item in &mut request_layout.items {
+                            item.paint(window, cx);
+                        }
+                    },
+                );
             },
         )
     }

@@ -70,6 +70,7 @@ pub struct UniformList {
 
 /// Frame state used by the [UniformList].
 pub struct UniformListFrameState {
+    buffer_mask: Option<ContentMask<Pixels>>,
     items: SmallVec<[AnyElement; 32]>,
     decorations: SmallVec<[AnyElement; 2]>,
 }
@@ -313,6 +314,7 @@ impl Element for UniformList {
         (
             layout_id,
             UniformListFrameState {
+                buffer_mask: None,
                 items: SmallVec::new(),
                 decorations: SmallVec::new(),
             },
@@ -475,6 +477,9 @@ impl Element for UniformList {
                         scroll_state
                             .smooth_scroll
                             .set_target(logical_scroll_offset.y);
+                        scroll_state
+                            .smooth_scroll
+                            .clamp(max_scroll_offset.min(Pixels::ZERO), Pixels::ZERO);
 
                         if applied_deferred_scroll {
                             scroll_state.smooth_scroll.visual_offset = logical_scroll_offset.y;
@@ -484,6 +489,10 @@ impl Element for UniformList {
                             // `refresh` would be a no-op here: it is guarded on
                             // not being mid-draw, and this runs during prepaint.
                             window.request_animation_frame();
+                            cx.notify(window.current_view());
+                            if let Some(hitbox) = &hitbox {
+                                window.invalidate_scrolled_layer(hitbox);
+                            }
                         }
 
                         visual_scroll_offset.y = scroll_state.smooth_scroll.current();
@@ -494,6 +503,7 @@ impl Element for UniformList {
                     // range on a refill.
                     let buffer_frame = super::scroll_buffer::prepare_scroll_buffer(
                         window,
+                        bounds,
                         point(Pixels::ZERO, visual_scroll_offset.y),
                     );
                     let (visible_range, buffer_mask) = match buffer_frame {
@@ -505,8 +515,7 @@ impl Element for UniformList {
                             let first = ((content_top - margin.height) / item_height)
                                 .floor()
                                 .max(0.0) as usize;
-                            let last = (((content_top + padded_bounds.size.height
-                                + margin.height)
+                            let last = (((content_top + padded_bounds.size.height + margin.height)
                                 / item_height)
                                 .ceil() as usize)
                                 .min(self.item_count);
@@ -519,10 +528,10 @@ impl Element for UniformList {
                             let first_visible_element_ix =
                                 (-(visual_scroll_offset.y + padding.top) / item_height).floor()
                                     as usize;
-                            let last_visible_element_ix = ((-visual_scroll_offset.y
-                                + padded_bounds.size.height)
-                                / item_height)
-                                .ceil() as usize;
+                            let last_visible_element_ix =
+                                ((-visual_scroll_offset.y + padded_bounds.size.height)
+                                    / item_height)
+                                    .ceil() as usize;
                             (
                                 first_visible_element_ix
                                     ..cmp::min(last_visible_element_ix, self.item_count),
@@ -541,53 +550,60 @@ impl Element for UniformList {
                         (self.render_items)(visible_range.clone(), window, cx)
                     };
 
+                    frame_state.buffer_mask = buffer_mask.map(|bounds| ContentMask { bounds });
                     let content_mask = buffer_mask
                         .map(|mask_bounds| ContentMask {
                             bounds: mask_bounds,
                         })
                         .unwrap_or(ContentMask { bounds });
                     window.with_content_mask(Some(content_mask), |window| {
-                        for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
-                            let item_origin = padded_bounds.origin
-                                + visual_scroll_offset
-                                + point(Pixels::ZERO, item_height * ix);
+                        super::scroll_buffer::with_buffer_mask(
+                            window,
+                            frame_state.buffer_mask,
+                            |window| {
+                                for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
+                                    let item_origin = padded_bounds.origin
+                                        + visual_scroll_offset
+                                        + point(Pixels::ZERO, item_height * ix);
 
-                            let available_width = if can_scroll_horizontally {
-                                padded_bounds.size.width + visual_scroll_offset.x.abs()
-                            } else {
-                                padded_bounds.size.width
-                            };
-                            let available_space = size(
-                                AvailableSpace::Definite(available_width),
-                                AvailableSpace::Definite(item_height),
-                            );
-                            item.layout_as_root(available_space, window, cx);
-                            item.prepaint_at(item_origin, window, cx);
-                            frame_state.items.push(item);
-                        }
+                                    let available_width = if can_scroll_horizontally {
+                                        padded_bounds.size.width + visual_scroll_offset.x.abs()
+                                    } else {
+                                        padded_bounds.size.width
+                                    };
+                                    let available_space = size(
+                                        AvailableSpace::Definite(available_width),
+                                        AvailableSpace::Definite(item_height),
+                                    );
+                                    item.layout_as_root(available_space, window, cx);
+                                    item.prepaint_at(item_origin, window, cx);
+                                    frame_state.items.push(item);
+                                }
 
-                        let bounds = Bounds::new(
-                            padded_bounds.origin + visual_scroll_offset,
-                            padded_bounds.size,
+                                let bounds = Bounds::new(
+                                    padded_bounds.origin + visual_scroll_offset,
+                                    padded_bounds.size,
+                                );
+                                for decoration in &self.decorations {
+                                    let mut decoration = decoration.as_ref().compute(
+                                        visible_range.clone(),
+                                        bounds,
+                                        visual_scroll_offset,
+                                        item_height,
+                                        self.item_count,
+                                        window,
+                                        cx,
+                                    );
+                                    let available_space = size(
+                                        AvailableSpace::Definite(bounds.size.width),
+                                        AvailableSpace::Definite(bounds.size.height),
+                                    );
+                                    decoration.layout_as_root(available_space, window, cx);
+                                    decoration.prepaint_at(bounds.origin, window, cx);
+                                    frame_state.decorations.push(decoration);
+                                }
+                            },
                         );
-                        for decoration in &self.decorations {
-                            let mut decoration = decoration.as_ref().compute(
-                                visible_range.clone(),
-                                bounds,
-                                visual_scroll_offset,
-                                item_height,
-                                self.item_count,
-                                window,
-                                cx,
-                            );
-                            let available_space = size(
-                                AvailableSpace::Definite(bounds.size.width),
-                                AvailableSpace::Definite(bounds.size.height),
-                            );
-                            decoration.layout_as_root(available_space, window, cx);
-                            decoration.prepaint_at(bounds.origin, window, cx);
-                            frame_state.decorations.push(decoration);
-                        }
                     });
                 }
 
@@ -614,12 +630,18 @@ impl Element for UniformList {
             window,
             cx,
             |_, window, cx| {
-                for item in &mut request_layout.items {
-                    item.paint(window, cx);
-                }
-                for decoration in &mut request_layout.decorations {
-                    decoration.paint(window, cx);
-                }
+                super::scroll_buffer::with_buffer_mask(
+                    window,
+                    request_layout.buffer_mask,
+                    |window| {
+                        for item in &mut request_layout.items {
+                            item.paint(window, cx);
+                        }
+                        for decoration in &mut request_layout.decorations {
+                            decoration.paint(window, cx);
+                        }
+                    },
+                );
             },
         )
     }

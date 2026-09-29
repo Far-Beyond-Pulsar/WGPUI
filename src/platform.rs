@@ -347,6 +347,15 @@ pub(crate) struct RequestFrameOptions {
     pub(crate) force_render: bool,
 }
 
+/// See [`PlatformWindow::snapshot_frame`]. Pixels are tightly packed RGBA8 rows.
+pub(crate) struct FrameSnapshot {
+    pub width: u32,
+    pub height: u32,
+    pub presented: Vec<u8>,
+    pub fresh: Vec<u8>,
+    pub renderer_report: String,
+}
+
 pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
@@ -403,6 +412,20 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// window, not per process — and the stolen request would never be
     /// honored, leaving the owner's layers skipping draws indefinitely.
     /// Default empty for platforms without a slab-backed renderer.
+    /// Frame snapshot (`WGPUI_FRAME_SNAPSHOT`): what the renderer last put on
+    /// screen, `scene` drawn by a renderer with no cross-frame state, and the
+    /// renderer's view of `scene`. `None` without a GPU renderer.
+    fn snapshot_frame(&self, _scene: &crate::Scene) -> Option<FrameSnapshot> {
+        None
+    }
+
+    /// Atlas pages the renderer found destroyed under content drawn without
+    /// a layer key. The window re-records the layers whose retained sprites
+    /// sit on them.
+    fn take_dead_atlas_page_requests(&mut self) -> Vec<crate::AtlasTextureId> {
+        Vec::new()
+    }
+
     fn take_slab_rerecord_requests(&mut self) -> Vec<crate::LayerKey> {
         Vec::new()
     }

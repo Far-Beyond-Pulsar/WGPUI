@@ -212,6 +212,11 @@ impl TransformTable {
     pub fn release(&mut self, key: LayerKey) {
         if let Some(slot) = self.slot_of.remove(&key) {
             self.values[slot as usize] = GpuLayerTransform::default();
+            // The GPU copy still holds the old owner's translate. Without this,
+            // a new owner whose translate equals the reset value (a texture
+            // bake's identity) compares equal, never writes, and draws at the
+            // previous layer's offset.
+            self.dirty.insert(slot);
             self.free_slots.push(slot);
         }
     }
@@ -286,6 +291,9 @@ pub(crate) struct SlabRegistry {
     /// draw paths; all of them run on the UI thread, so contention never
     /// happens — the lock exists for the borrow checker, not for threads.
     pending_rerecord: Mutex<Vec<LayerKey>>,
+    /// Dead atlas pages named by content drawn without a layer key; see
+    /// [`Self::request_page_rerecord`].
+    pending_dead_pages: Mutex<Vec<AtlasTextureId>>,
 }
 
 impl Default for SlabRegistry {
@@ -299,6 +307,7 @@ impl Default for SlabRegistry {
             zero_move_streak: 0,
             uploads_since_last_plan: 0,
             pending_rerecord: Mutex::new(Vec::new()),
+            pending_dead_pages: Mutex::new(Vec::new()),
         }
     }
 }
@@ -338,6 +347,26 @@ impl SlabRegistry {
     /// per window draw.
     pub fn take_rerecord_requests(&self) -> Vec<LayerKey> {
         std::mem::take(&mut self.pending_rerecord.lock())
+    }
+
+    /// Report an atlas page that retained content still names but that no
+    /// longer exists, for content drawn without a layer key (sprites replayed
+    /// inline). The owning window re-records exactly the layers whose retained
+    /// sprites sit on the page.
+    pub fn request_page_rerecord(&self, page: AtlasTextureId) {
+        self.pending_dead_pages.lock().push(page);
+    }
+
+    pub fn take_dead_page_requests(&self) -> Vec<AtlasTextureId> {
+        std::mem::take(&mut self.pending_dead_pages.lock())
+    }
+
+    /// Whether any request is waiting for the owning window. The platform
+    /// window schedules a redraw whenever this is true after a draw: content
+    /// the renderer skipped is only ever restored by a draw, so a request
+    /// without one leaves it blank until something unrelated redraws.
+    pub fn has_pending_requests(&self) -> bool {
+        !self.pending_rerecord.lock().is_empty() || !self.pending_dead_pages.lock().is_empty()
     }
 
     pub fn reject_upload(&mut self, key: LayerKey) {
@@ -450,12 +479,61 @@ impl SlabRegistry {
         }
     }
 
+    /// Keep a layer drawn this frame out of idle GC. `note_referenced_pages`
+    /// only runs for spans that sample the atlas, so a quads-only layer drawn
+    /// every frame would otherwise be reclaimed and re-uploaded periodically.
+    pub fn note_span_referenced(&mut self, key: LayerKey) {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_referenced_frame = self.frame;
+        }
+    }
+
     pub fn note_span_drawn_clean(&self) {
         crate::render_stats::count(COUNTER_SPANS_DRAWN_CLEAN);
     }
 
-    pub fn note_span_skipped_awaiting_rerecord(&self) {
+    /// Count a span that will not draw and ask for the layer to be rebuilt.
+    /// One call does both so a skip can never go unrequested: the original
+    /// request may already have been consumed by a draw that could not act
+    /// on it, and a skip with no request left blanks the layer until an
+    /// unrelated redraw.
+    pub fn skip_span_and_request_rerecord(&self, key: LayerKey) {
+        self.request_rerecord([key]);
         crate::render_stats::count(COUNTER_SPANS_SKIPPED_EVICTED);
+    }
+
+    /// One line of residency state for a span of `key` carrying
+    /// `content_token` and `totals`, for frame snapshots.
+    pub fn describe_entry(
+        &self,
+        key: LayerKey,
+        content_token: u64,
+        totals: [u32; SlabKind::COUNT],
+    ) -> String {
+        let Some(entry) = self.entries.get(&key) else {
+            return "NO ENTRY (never uploaded, or reclaimed)".to_string();
+        };
+        let translate = self
+            .transforms
+            .values
+            .get(entry.transform_slot as usize)
+            .map(|value| value.translate);
+        format!(
+            "token {}{}, counts {:?}{}, uploaded {}, poisoned {}, awaiting re-record {}, \
+             last referenced frame {} (now {}), transform slot {} translate {:?}, slabs {:?}",
+            entry.content_token,
+            if entry.content_token == content_token { " (matches)" } else { " (STALE vs span)" },
+            entry.counts,
+            if entry.counts == totals { "" } else { " (MISMATCH vs span totals)" },
+            entry.uploaded_generation == Some(entry.slabs.generation),
+            entry.poisoned,
+            entry.awaiting_rerecord,
+            entry.last_referenced_frame,
+            self.frame,
+            entry.transform_slot,
+            translate,
+            entry.slabs,
+        )
     }
 
     /// Whether spans for this key must not draw this frame (eviction pending).
@@ -1146,6 +1224,16 @@ mod tests {
         let recycled = table.slot_for(OTHER);
         assert_eq!(recycled, first);
         assert_eq!(table.slot_value(recycled).translate, [0.0, 0.0]);
+
+        // The GPU copy still holds [12, -3]: a new owner at the identity
+        // translate (a texture bake) must still get it written.
+        table.set_translate(OTHER, [0.0, 0.0]);
+        let dirty = table.drain_dirty();
+        assert_eq!(
+            dirty,
+            vec![(recycled, GpuLayerTransform::default())],
+            "a recycled slot must be rewritten even when its new value equals the reset value"
+        );
     }
 
     // -----------------------------------------------------------------
