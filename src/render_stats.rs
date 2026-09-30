@@ -1,8 +1,7 @@
 //! Frame-path instrumentation.
 //!
-//! Enable with `WGPUI_RENDER_STATS=1`. Once per second every accumulated timer
-//! and counter is dumped to stderr, so a slow frame can be attributed to a
-//! specific stage instead of guessed at.
+//! Enable timing and counters with `WGPUI_RENDER_STATS=1`. Accumulators are
+//! cleared once per second without printing to the console.
 //!
 //! Everything here compiles to an atomic load of `ENABLED` when disabled, so it
 //! is safe to leave the call sites in place.
@@ -225,7 +224,7 @@ pub fn external_timer() -> Option<Instant> {
 pub struct Scope {
     name: &'static str,
     /// `Some` only when stats are enabled, so a flamegraph-only scope does not
-    /// pollute the once-per-second stats dump.
+    /// collect aggregate stats when only flamegraph spans are requested.
     start: Option<Instant>,
     /// Closes the embedder span when the scope ends.
     _external: Option<Box<dyn Send>>,
@@ -239,7 +238,7 @@ impl Drop for Scope {
     }
 }
 
-/// Start a scoped timer. Returns `None` when both the stats dump and the
+/// Start a scoped timer. Returns `None` when both aggregate stats and the
 /// embedder profiler are disabled, so the idle cost is two atomic loads.
 #[inline]
 pub fn scope(name: &'static str) -> Option<Scope> {
@@ -269,7 +268,7 @@ pub fn scope_stats_only(name: &'static str) -> Option<Scope> {
     })
 }
 
-/// Call once per presented frame. Dumps and clears the accumulators every second.
+/// Call once per presented frame. Clears the accumulators every second.
 pub fn tick_frame() {
     if !enabled() {
         return;
@@ -294,68 +293,13 @@ pub fn tick_frame() {
 
     *REGISTRY.last_report.lock() = Instant::now();
 
-    // Unit tests force-enable instrumentation process-globally while sibling
-    // tests drive real draw paths concurrently. Letting this report fire in a
-    // unit-test binary would print to stderr mid-test and drain the shared
-    // accumulators out from under render_stats' own snapshot-based
-    // assertions, so test builds only age out the reporting window here.
+    // Tests inspect shared accumulators while sibling tests drive draw paths.
+    // Do not drain those samples before their snapshot assertions can read them.
     #[cfg(not(test))]
     {
-        let timers: Vec<(&'static str, Accum)> = {
-            let mut guard = REGISTRY.timers.lock();
-            std::mem::take(&mut *guard).into_iter().collect()
-        };
-        let counters: Vec<(&'static str, u64)> = {
-            let mut guard = REGISTRY.counters.lock();
-            std::mem::take(&mut *guard).into_iter().collect()
-        };
-        let frames = REGISTRY.frames.swap(0, Ordering::Relaxed);
-
-        let secs = elapsed.as_secs_f64();
-        let mut out = String::new();
-        out.push_str(&format!(
-            "\n=== WGPUI RENDER STATS ({:.2}s, {} frames, {:.1} fps) ===\n",
-            secs,
-            frames,
-            frames as f64 / secs
-        ));
-
-        if !timers.is_empty() {
-            out.push_str(&format!(
-                "{:<38} {:>7} {:>10} {:>10} {:>10}\n",
-                "stage", "n", "mean ms", "max ms", "total ms"
-            ));
-            // Worst max first: that is what a stall looks like.
-            let mut rows = timers;
-            rows.sort_by_key(|(_, a)| std::cmp::Reverse(a.max_ns));
-            for (name, a) in rows {
-                if a.count == 0 {
-                    continue;
-                }
-                out.push_str(&format!(
-                    "{:<38} {:>7} {:>10.3} {:>10.3} {:>10.2}\n",
-                    name,
-                    a.count,
-                    (a.total_ns as f64 / a.count as f64) / 1.0e6,
-                    a.max_ns as f64 / 1.0e6,
-                    a.total_ns as f64 / 1.0e6,
-                ));
-            }
-        }
-
-        if !counters.is_empty() {
-            out.push_str("--- counters ---\n");
-            for (name, v) in counters {
-                out.push_str(&format!(
-                    "{:<38} {:>7}  ({:.1}/s)\n",
-                    name,
-                    v,
-                    v as f64 / secs
-                ));
-            }
-        }
-
-        eprint!("{}", out);
+        REGISTRY.timers.lock().clear();
+        REGISTRY.counters.lock().clear();
+        REGISTRY.frames.store(0, Ordering::Relaxed);
     }
 
     REGISTRY.reporting.store(false, Ordering::Release);

@@ -2175,7 +2175,7 @@ impl Window {
                         .log_err();
                 }
 
-                // Drives the once-per-second dump for `WGPUI_RENDER_STATS=1`.
+                // Ages out aggregate stats for `WGPUI_RENDER_STATS=1`.
                 // Ticked per platform frame rather than per draw, so the
                 // "full draw" / "present only" counters above are meaningful
                 // relative to it.
