@@ -6909,7 +6909,11 @@ impl Window {
     /// Whether a view participated in the last completed frame, including
     /// replayed cached views. This does not imply it is unoccluded.
     pub fn was_view_rendered(&self, view_id: EntityId) -> bool {
-        self.rendered_frame.dispatch_tree.view_path_reversed(view_id).next().is_some()
+        self.rendered_frame
+            .dispatch_tree
+            .view_path_reversed(view_id)
+            .next()
+            .is_some()
     }
 
     pub(crate) fn with_rendered_view<R>(
