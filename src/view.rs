@@ -18,6 +18,29 @@ struct AnyViewState {
     accessed_entities: FxHashSet<EntityId>,
 }
 
+/// The content height an [`AnyView::cached_auto_height`] view was last measured
+/// at, kept in element state so it follows the view's place in the tree.
+#[derive(Clone, Copy)]
+struct RememberedViewHeight(Pixels);
+
+/// Read the remembered height without disturbing it. Also marks the state as
+/// used this frame, which is what keeps it from being swept.
+fn remembered_view_height(id: &GlobalElementId, window: &mut Window) -> Option<Pixels> {
+    let mut height = None;
+    window.with_element_state::<Option<RememberedViewHeight>, _>(id, |state, _| {
+        let state = state.flatten();
+        height = state.map(|state| state.0);
+        ((), state)
+    });
+    height
+}
+
+fn remember_view_height(id: &GlobalElementId, height: Pixels, window: &mut Window) {
+    window.with_element_state::<Option<RememberedViewHeight>, _>(id, |_, _| {
+        ((), Some(RememberedViewHeight(height)))
+    });
+}
+
 #[derive(Default)]
 struct ViewCacheKey {
     bounds: Bounds<Pixels>,
@@ -148,6 +171,14 @@ pub struct AnyView {
     entity: AnyEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
     cached_style: Option<Rc<StyleRefinement>>,
+    /// Whether the cached root size takes its height from the previous
+    /// frame's measured content rather than from `cached_style`. See
+    /// [`AnyView::cached_auto_height`].
+    auto_height: bool,
+    /// Set by `request_layout` each frame: this auto-height view had nothing
+    /// remembered yet and was rendered inline, so `paint` must not take the
+    /// cached path (there is no cached state for it to replay).
+    rendered_inline: bool,
     /// The concrete view type, for naming profiler spans. Static, so it costs
     /// one pointer-pair per view handle and nothing per frame.
     type_name: &'static str,
@@ -159,6 +190,8 @@ impl<V: Render> From<Entity<V>> for AnyView {
             entity: value.into_any(),
             render: any_view::render::<V>,
             cached_style: None,
+            auto_height: false,
+            rendered_inline: false,
             type_name: std::any::type_name::<V>(),
         }
     }
@@ -170,6 +203,41 @@ impl AnyView {
     /// The one exception is when [Window::refresh] is called, in which case caching is ignored.
     pub fn cached(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style.into());
+        self
+    }
+
+    /// [`Self::cached`] for a view whose height is decided by its content.
+    ///
+    /// A cached view is laid out as a childless leaf with `style` as its size,
+    /// so it can only be cached when the caller can name that size up front.
+    /// This variant instead measures the view and remembers the result: the
+    /// height of the cached node is the content height measured the last time
+    /// the view actually rebuilt, and `style` supplies everything else (usually
+    /// just the width, e.g. `w_full()`).
+    ///
+    /// Behaviour, in order of frames:
+    ///
+    /// - The first frame there is nothing remembered, so the view is rendered
+    ///   inline exactly like an uncached view and its resulting height is
+    ///   recorded.
+    /// - From then on it is cached. A notify on the view (or on anything it read)
+    ///   rebuilds only this view; its siblings reuse their previous layout,
+    ///   prepaint and paint.
+    /// - If a rebuild measures a different height than the one it was given, the
+    ///   new height is remembered and the view invalidates itself, so the
+    ///   ancestors re-lay-out with the correct size on the next frame. Content
+    ///   that changes height is therefore briefly one frame stale; content that
+    ///   keeps its height never is.
+    ///
+    /// The remembered height lives in element state keyed by the view's position
+    /// in the tree, so a view that moves to a different place in the tree starts
+    /// over with an inline frame instead of ever being given a wrong size.
+    ///
+    /// Intended for rows, cards and sections of inspector-like panels, where one
+    /// hover, caret blink or edit would otherwise rebuild a whole panel.
+    pub fn cached_auto_height(mut self, style: StyleRefinement) -> Self {
+        self.cached_style = Some(style.into());
+        self.auto_height = true;
         self
     }
 
@@ -191,6 +259,8 @@ impl AnyView {
                 entity,
                 render: self.render,
                 cached_style: self.cached_style,
+                auto_height: self.auto_height,
+                rendered_inline: false,
                 type_name: self.type_name,
             }),
         }
@@ -243,10 +313,21 @@ impl Element for AnyView {
         window.with_rendered_view(self.entity_id(), |window| {
             // Disable caching when inspecting so that mouse_hit_test has all hitboxes.
             let caching_disabled = window.is_inspector_picking(cx);
+            // An auto-height view has nothing to give its cached node until it
+            // has been measured once; until then it renders inline.
+            let remembered_height = if self.auto_height && !caching_disabled {
+                _id.and_then(|id| remembered_view_height(id, window))
+            } else {
+                None
+            };
+            self.rendered_inline = self.auto_height && remembered_height.is_none();
             match self.cached_style.as_ref() {
-                Some(style) if !caching_disabled => {
+                Some(style) if !caching_disabled && !self.rendered_inline => {
                     let mut root_style = Style::default();
                     root_style.refine(style);
+                    if let Some(height) = remembered_height {
+                        root_style.size.height = height.into();
+                    }
                     let layout_id = window.request_layout(root_style, None, cx);
                     (layout_id, None)
                 }
@@ -278,6 +359,14 @@ impl Element for AnyView {
         window.with_rendered_view(self.entity_id(), |window| {
             if let Some(mut element) = element.take() {
                 element.prepaint(window, cx);
+                // Rendered inline, so `bounds` is this view's real laid-out
+                // size. Remember it: from the next frame on the view caches.
+                if self.rendered_inline
+                    && self.cached_style.is_some()
+                    && let Some(id) = global_id
+                {
+                    remember_view_height(id, bounds.size.height, window);
+                }
                 return Some(element);
             }
 
@@ -395,7 +484,7 @@ impl Element for AnyView {
 
                     let prepaint_start = window.prepaint_index();
                     let _arena_scope = ElementArenaScope::enter(cx.element_arena());
-                    let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
+                    let ((mut element, measured_height), accessed_entities) = cx.detect_accessed_entities(|cx| {
                         // Split three ways: building the element tree is usually
                         // trivial next to laying it out and prepainting it, and
                         // conflating them hides which one to go after.
@@ -409,16 +498,40 @@ impl Element for AnyView {
                             wgpui_scope_dyn!(format!("render {}", self.type_name));
                             (self.render)(self, window, cx)
                         };
+                        let mut measured_height = None;
                         {
                             let _t = crate::render_stats::scope("  rebuild: layout");
-                            element.layout_as_root(bounds.size.into(), window, cx);
+                            if self.auto_height {
+                                // Measure the content at this width with the height
+                                // unconstrained, so a root that fills its parent
+                                // (`h_full`) reports its content rather than echoing
+                                // back the height it was given.
+                                let available = crate::size(
+                                    crate::AvailableSpace::Definite(bounds.size.width),
+                                    crate::AvailableSpace::MaxContent,
+                                );
+                                measured_height =
+                                    Some(element.layout_as_root(available, window, cx).height);
+                            } else {
+                                element.layout_as_root(bounds.size.into(), window, cx);
+                            }
                         }
                         {
                             let _t = crate::render_stats::scope("  rebuild: prepaint");
                             element.prepaint_at(bounds.origin, window, cx);
                         }
-                        element
+                        (element, measured_height)
                     });
+
+                    // A rebuild that measured a different height than the cached
+                    // node was given: remember the new one and invalidate, so the
+                    // ancestors lay out with it on the next frame.
+                    if let (Some(height), Some(id)) = (measured_height, global_id)
+                        && (height - bounds.size.height).abs() > crate::px(0.5)
+                    {
+                        remember_view_height(id, height, window);
+                        cx.notify(self.entity_id());
+                    }
 
                     let prepaint_end = window.prepaint_index();
                     window.nested_view_cache_suppressed = nested_cache_suppressed;
@@ -453,7 +566,7 @@ impl Element for AnyView {
     ) {
         window.with_rendered_view(self.entity_id(), |window| {
             let caching_disabled = window.is_inspector_picking(cx);
-            if self.cached_style.is_some() && !caching_disabled {
+            if self.cached_style.is_some() && !caching_disabled && !self.rendered_inline {
                 let global_id = global_id.unwrap();
                 // `cached` is a layer with a compat policy: every axis
                 // invalidated together, primitive-retained. The decision about
@@ -543,6 +656,8 @@ impl AnyWeakView {
             entity,
             render: self.render,
             cached_style: None,
+            auto_height: false,
+            rendered_inline: false,
             type_name: self.type_name,
         })
     }
