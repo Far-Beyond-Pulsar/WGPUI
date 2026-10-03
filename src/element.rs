@@ -294,6 +294,13 @@ impl<C: RenderOnce> Element for Component<C> {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         window.with_global_id(ElementId::Name(type_name::<C>().into()), |_, window| {
+            // Like the id'd elements counted in `Drawable::request_layout`,
+            // each component copies the whole id path once per phase.
+            crate::render_stats::count("frame: component global ids");
+            crate::render_stats::add(
+                "frame: component global ids, id stack depth (sum)",
+                window.element_id_stack.len() as u64,
+            );
             // Redundant inside `Window::draw`, whose scope is already visible
             // to every gpui copy, including plugin DLLs; kept so rendering a
             // component always targets this `App`'s arena.
@@ -498,6 +505,15 @@ impl<E: Element> Drawable<E> {
                 crate::render_stats::count_tagged("element: ", type_name::<E>());
                 let global_id = self.element.id().map(|element_id| {
                     window.element_id_stack.push(element_id);
+                    // Building a `GlobalElementId` copies the whole id path,
+                    // and every element-state lookup hashes it again, so the
+                    // per-element cost grows with tree depth. Mean depth is
+                    // `...id stack depth (sum)` / `...id'd elements`.
+                    crate::render_stats::count("frame: id'd elements");
+                    crate::render_stats::add(
+                        "frame: id'd elements, id stack depth (sum)",
+                        window.element_id_stack.len() as u64,
+                    );
                     GlobalElementId(Arc::from(&*window.element_id_stack))
                 });
 
