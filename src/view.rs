@@ -16,6 +16,10 @@ struct AnyViewState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// Set while an off-screen auto-height view skipped its prepaint. Its
+    /// recorded ranges then describe an older frame, so it must rebuild before
+    /// it can ever be reused or replayed again.
+    culled: bool,
 }
 
 /// The content height an [`AnyView::cached_auto_height`] view was last measured
@@ -408,8 +412,35 @@ impl Element for AnyView {
                         window.accessed_entity_invalidated(&state.accessed_entities)
                     });
 
+                    // An auto-height view entirely outside the clip (a row scrolled
+                    // out of an inspector) has nothing to show: skip rebuilding,
+                    // replaying and painting it. Its remembered height still
+                    // keeps the scroll extent right. It rebuilds when it comes
+                    // back into view.
+                    if self.auto_height
+                        && bounds.size.height > crate::px(0.)
+                        && !content_mask.bounds.intersects(&bounds)
+                    {
+                        crate::render_stats::count("view cache: culled (off-screen)");
+                        let empty_range = {
+                            let index = window.prepaint_index();
+                            index.clone()..index
+                        };
+                        let mut state = element_state.unwrap_or_else(|| AnyViewState {
+                            prepaint_range: empty_range.clone(),
+                            paint_range: PaintIndex::default()..PaintIndex::default(),
+                            cache_key: ViewCacheKey::default(),
+                            accessed_entities: FxHashSet::default(),
+                            culled: true,
+                        });
+                        state.culled = true;
+                        state.prepaint_range = empty_range;
+                        return (None, state);
+                    }
+
                     if let Some(mut element_state) = element_state
                         && stale_range.is_none()
+                        && !element_state.culled
                         && element_state.cache_key.bounds == bounds
                         && element_state.cache_key.content_mask == content_mask
                         && element_state.cache_key.text_style == text_style
@@ -547,6 +578,7 @@ impl Element for AnyView {
                                 content_mask,
                                 text_style,
                             },
+                            culled: false,
                         },
                     )
                 },
@@ -602,6 +634,12 @@ impl Element for AnyView {
                         }
                         window.nested_view_cache_suppressed = nested_cache_suppressed;
                     } else {
+                        if element_state.culled {
+                            // Off-screen and skipped in prepaint: nothing to replay.
+                            let paint_end = window.paint_index();
+                            element_state.paint_range = paint_start..paint_end;
+                            return ((), element_state);
+                        }
                         window.reuse_paint_except_scene(&element_state.paint_range);
                         // The layer can be gone even though prepaint committed
                         // to reusing — eviction is driven by draw age, and this
