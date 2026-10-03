@@ -6899,9 +6899,17 @@ impl Window {
     }
 
     /// Get the entity ID for the currently rendering view
+    ///
+    /// For checking a view between frames, use [`Self::was_view_rendered`].
     pub fn current_view(&self) -> EntityId {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.rendered_entity_stack.last().copied().unwrap()
+    }
+
+    /// Whether a view participated in the last completed frame, including
+    /// replayed cached views. This does not imply it is unoccluded.
+    pub fn was_view_rendered(&self, view_id: EntityId) -> bool {
+        self.rendered_frame.dispatch_tree.view_path_reversed(view_id).next().is_some()
     }
 
     pub(crate) fn with_rendered_view<R>(
