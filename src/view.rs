@@ -364,6 +364,10 @@ impl Element for AnyView {
                         // every frame, and the fix to make is at that call site
                         // rather than here.
                         crate::render_stats::count("view cache: rebuilt (dependency changed)");
+                        crate::render_stats::count_tagged(
+                            "view cache: rebuilt (dependency changed): ",
+                            self.type_name,
+                        );
                     }
                     let _t = crate::render_stats::scope("view cache: rebuild");
                     // Name the rebuilt view and why the cache missed, so the

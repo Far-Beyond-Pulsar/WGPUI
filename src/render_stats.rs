@@ -130,6 +130,54 @@ pub fn add(name: &'static str, amount: u64) {
     REGISTRY.bump_counter(name, amount);
 }
 
+/// Bump a counter whose name is `group` followed by a runtime `tag` (an
+/// element type, a notified entity type, a call site).
+///
+/// Counters are keyed by `&'static str`, so each distinct `(group, tag)` pair is
+/// formatted and leaked exactly once and cached; every later bump is one map
+/// lookup. Intended for small, bounded tag sets (type names, call sites), and
+/// only does any work while stats are enabled.
+pub fn count_tagged(group: &'static str, tag: &'static str) {
+    if !enabled() {
+        return;
+    }
+    static NAMES: LazyLock<Mutex<std::collections::HashMap<(usize, usize), &'static str>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    // Both halves are `'static`, so their addresses identify the string.
+    let key = (group.as_ptr() as usize, tag.as_ptr() as usize);
+    let name = *NAMES
+        .lock()
+        .entry(key)
+        .or_insert_with(|| Box::leak(format!("{group}{tag}").into_boxed_str()));
+    REGISTRY.bump_counter(name, 1);
+}
+
+/// Like [`count_tagged`], additionally naming a `#[track_caller]` call site:
+/// the counter is `"{group}{tag} @ {file}:{line}"`. Used to find which
+/// `cx.notify()` call keeps invalidating a view.
+pub fn count_site(
+    group: &'static str,
+    tag: &'static str,
+    location: &'static std::panic::Location<'static>,
+) {
+    if !enabled() {
+        return;
+    }
+    static NAMES: LazyLock<Mutex<std::collections::HashMap<(usize, usize, usize), &'static str>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let key = (
+        group.as_ptr() as usize,
+        tag.as_ptr() as usize,
+        location as *const _ as usize,
+    );
+    let name = *NAMES.lock().entry(key).or_insert_with(|| {
+        Box::leak(
+            format!("{group}{tag} @ {}:{}", location.file(), location.line()).into_boxed_str(),
+        )
+    });
+    REGISTRY.bump_counter(name, 1);
+}
+
 /// Bridge to an embedder's span profiler (the engine's flamegraph).
 ///
 /// wgpui cannot depend on the engine's profiler crate, and the crates.io
