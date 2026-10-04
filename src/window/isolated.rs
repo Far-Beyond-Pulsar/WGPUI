@@ -492,6 +492,7 @@ mod tests {
         for value in 1..=3 {
             set_value(cx, &leaf, value);
             assert_eq!(counts.painted.get(), value);
+            eprintln!("value {value}: mid={}", counts.mid_renders.get());
         }
         assert_eq!(counts.mid_renders.get(), mid, "an ancestor rendered");
     }
