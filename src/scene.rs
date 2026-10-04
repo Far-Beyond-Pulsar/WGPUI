@@ -329,6 +329,18 @@ impl Scene {
         self.end_layer_with_parent_reference(true)
     }
 
+    /// Re-register a nested layer whose paint walk was skipped by retained
+    /// instance replay. This reserves its entry order in the active parent
+    /// scope and records the nested reference, without replaying its content.
+    pub(crate) fn push_retained_nested_layer(
+        &mut self,
+        key: LayerKey,
+        bounds: Bounds<ScaledPixels>,
+    ) {
+        self.begin_layer(key, bounds, false);
+        let _ = self.end_layer();
+    }
+
     pub(crate) fn end_layer_texture_bake(&mut self) {
         // A bake is an offscreen side effect of recording the child, whose
         // visible layer reference was already captured by the parent.
@@ -2031,6 +2043,109 @@ mod tests {
             drawn,
             vec![100.0, 100.0, 60.0, 40.0],
             "the parent's background, then the nested layer, then the parent's border"
+        );
+    }
+
+    /// Reconciled children skip their paint walk. Re-registering their nested
+    /// layer reference must still reserve an entry order in the recording
+    /// parent's tree so later siblings stay above the nested layer on replay.
+    #[test]
+    fn a_reused_nested_layer_reserves_order_before_later_parent_primitives() {
+        let parent = LayerKey(30);
+        let child = LayerKey(31);
+        let area = |size: f32| Bounds {
+            origin: Point { x: sp(0.0), y: sp(0.0) },
+            size: Size { width: sp(size), height: sp(size) },
+        };
+
+        let mut child_recording = Scene::default();
+        child_recording.begin_layer(child, area(80.0), true);
+        child_recording.insert_primitive(quad_at(area(60.0)));
+        let child_items = child_recording.end_layer().expect("recorded child");
+
+        // The child's paint is skipped on this parent record, as it is for a
+        // reconciled ElementInstance. Opening and closing its scope reserves
+        // the same parent-local entry order without duplicating child content.
+        let mut recording = Scene::default();
+        recording.begin_layer(parent, area(100.0), true);
+        recording.insert_primitive(quad_at(area(100.0)));
+        recording.push_retained_nested_layer(child, area(80.0));
+        recording.insert_primitive(quad_at(area(40.0)));
+        let parent_items = recording.end_layer().expect("recorded parent");
+
+        let mut composite = Scene::default();
+        composite.begin_layer(parent, area(100.0), false);
+        for item in &parent_items {
+            match item {
+                LayerItem::Primitive(primitive) => composite.push_retained(primitive),
+                LayerItem::Nested(_) => {
+                    composite.begin_layer(child, area(80.0), false);
+                    for item in &child_items {
+                        if let LayerItem::Primitive(primitive) = item {
+                            composite.push_retained(primitive);
+                        }
+                    }
+                    let _ = composite.end_layer();
+                }
+            }
+        }
+        let _ = composite.end_layer();
+        composite.finish();
+
+        let drawn: Vec<f32> = composite
+            .quads
+            .iter()
+            .map(|quad| quad.bounds.size.width.0)
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![100.0, 60.0, 40.0],
+            "the nested layer must stay between the parent's background and border"
+        );
+    }
+
+    /// A retained instance keeps its geometry, but its old local order can be
+    /// stale when preceding siblings rebuild with different bounds this frame.
+    #[test]
+    fn replayed_instance_primitives_take_order_from_the_current_paint_walk() {
+        let area = |size: f32| Bounds {
+            origin: Point { x: sp(0.0), y: sp(0.0) },
+            size: Size { width: sp(size), height: sp(size) },
+        };
+
+        let mut old_recording = Scene::default();
+        old_recording.begin_layer(LayerKey(40), area(100.0), true);
+        old_recording.insert_primitive(quad_at(area(40.0)));
+        let retained = old_recording
+            .end_layer()
+            .expect("recorded instance")
+            .into_iter()
+            .find_map(|item| match item {
+                LayerItem::Primitive(primitive) => Some(primitive),
+                LayerItem::Nested(_) => None,
+            })
+            .expect("recorded primitive");
+
+        let mut current = Scene::default();
+        current.begin_layer(LayerKey(41), area(100.0), true);
+        current.insert_primitive(quad_at(area(100.0)));
+        current.insert_primitive(quad_at(area(80.0)));
+        current.insert_primitive(quad_at(area(60.0)));
+        // This is the retained-instance replay path. Recompute only its order
+        // against the current tree; keep the recorded geometry unchanged.
+        current.insert_primitive(retained);
+        let _ = current.end_layer();
+        current.finish();
+
+        let drawn: Vec<f32> = current
+            .quads
+            .iter()
+            .map(|quad| quad.bounds.size.width.0)
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![100.0, 80.0, 60.0, 40.0],
+            "a reused child must remain above siblings painted before it this frame"
         );
     }
 

@@ -6858,24 +6858,46 @@ impl Window {
     }
 
     /// Re-emit a reconciled `ElementInstance`'s retained items into the layer
-    /// currently being (re-)recorded, preserving the layer-local draw orders
-    /// they were recorded with (#92).
+    /// currently being (re-)recorded (#92).
     ///
     /// Mirrors `composite_layer`'s replay of a *whole* layer, at instance
-    /// granularity: a retained primitive goes through `Scene::push_retained`
-    /// (no `BoundsTree` insert, no re-derivation of z), and a nested `.layer()`
-    /// reference is re-registered as-is so the enclosing recorder still learns
-    /// it was nested here. Must only be called while a layer is actively
-    /// recording (`Scene::begin_layer(.., record: true)` open) — i.e. from
-    /// inside the same paint walk `current_paint_layer` reports as active —
+    /// granularity: a retained primitive goes through `Scene::insert_primitive`
+    /// so its order is resolved against this frame's sibling content, and a
+    /// nested `.layer()` reference reserves its parent-scope entry order while
+    /// the enclosing recorder learns it was nested here. The geometry is
+    /// retained, while its relative z position follows the current paint walk
+    /// because preceding siblings may have rebuilt. Must only be called while
+    /// a layer is actively recording (`Scene::begin_layer(.., record: true)`
+    /// open) — i.e. from inside the same paint walk `current_paint_layer`
+    /// reports as active —
     /// or the re-emitted items are silently dropped on the floor instead of
-    /// landing in the new capture, exactly as `push_retained`'s own
+    /// landing in the new capture, exactly as `insert_primitive`'s own
     /// capture-awareness requires.
     pub(crate) fn replay_instance_items(&mut self, items: &[LayerItem]) {
         for item in items {
             match item {
-                LayerItem::Primitive(primitive) => self.next_frame.scene.push_retained(primitive),
-                LayerItem::Nested(key) => self.next_frame.scene.push_captured_item(LayerItem::Nested(*key)),
+                LayerItem::Primitive(primitive) => {
+                    self.next_frame.scene.insert_primitive(primitive.clone())
+                }
+                LayerItem::Nested(key) => {
+                    // A reused child skips its nested layer's paint walk, but
+                    // the parent scope still needs the nested layer's entry
+                    // slot so following siblings receive the same relative
+                    // orders they would have received on a rebuild.
+                    let bounds = self
+                        .layers
+                        .get(key)
+                        .map(|layer| layer.cache_key.bounds.scale(self.scale_factor));
+                    if let Some(bounds) = bounds {
+                        self.next_frame
+                            .scene
+                            .push_retained_nested_layer(*key, bounds);
+                    } else {
+                        self.next_frame
+                            .scene
+                            .push_captured_item(LayerItem::Nested(*key));
+                    }
+                }
             }
         }
     }
