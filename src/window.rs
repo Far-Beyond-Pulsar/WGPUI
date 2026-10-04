@@ -3399,6 +3399,14 @@ impl Window {
                 if self.layers.contains_key(&layer_key) {
                     self.invalidator
                         .invalidate_layer(layer_key, Invalidation::all());
+                    // An isolation boundary is not visited by the walk when its
+                    // ancestors replay, so this draw's pre-pass has to see the
+                    // request now, not on the next draw.
+                    if self.isolated_views.values().any(|r| r.layer_key == layer_key)
+                        && let Some(layer) = self.layers.get_mut(&layer_key)
+                    {
+                        layer.needs |= Invalidation::all();
+                    }
                 } else {
                     self.slab_tokens.remove(&layer_key);
                 }

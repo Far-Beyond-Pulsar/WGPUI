@@ -127,7 +127,15 @@ impl Window {
             .isolated_views
             .iter()
             .filter(|(id, record)| {
-                self.dirty_views.contains(id) || self.accessed_entity_invalidated(&record.accessed)
+                self.dirty_views.contains(id)
+                    || self.accessed_entity_invalidated(&record.accessed)
+                    // The renderer asked for this layer to be recorded again (slab
+                    // eviction or overflow): nothing else would, while the walk
+                    // replays its ancestors.
+                    || self
+                        .layers
+                        .get(&record.layer_key)
+                        .is_some_and(|layer| !layer.needs.is_empty())
             })
             .map(|(id, _)| *id)
             .collect();
@@ -204,6 +212,9 @@ impl Window {
         );
         let saved_text = mem::replace(&mut self.text_style_stack, text_style_stack);
         let saved_mask = mem::replace(&mut self.content_mask_stack, vec![mask]);
+        // Opacity multiplies into every colour at paint time, so it has to be what
+        // the walk would have had.
+        let saved_opacity = mem::replace(&mut self.element_opacity, cache_key.opacity);
         let phase = self.invalidator.draw_phase();
 
         let _arena_scope = ElementArenaScope::enter(cx.element_arena());
@@ -242,6 +253,7 @@ impl Window {
         self.element_id_stack = saved_ids;
         self.text_style_stack = saved_text;
         self.content_mask_stack = saved_mask;
+        self.element_opacity = saved_opacity;
         mem::swap(&mut self.next_frame, &mut *scratch);
 
         // Element state the subtree used moved from the previous frame into the
@@ -303,7 +315,7 @@ mod tests {
             self.counts.leaf_renders.set(self.counts.leaf_renders.get() + 1);
             let value = self.value;
             let counts = self.counts.clone();
-            div().w_full().h(px(20.)).child(
+            div().w_full().h(px(20.)).bg(crate::red().opacity(0.3)).child(
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, _| {
@@ -335,6 +347,7 @@ mod tests {
             };
             div()
                 .size_full()
+                .child(canvas(|_, _, _| (), |bounds, _, window, _| window.paint_quad(fill(bounds, crate::red().opacity(0.5)))).absolute().top_0().left_0().w(px(100.)).h(px(100.)))
                 .child(if self.isolated { leaf.isolated() } else { leaf })
         }
     }
@@ -498,4 +511,5 @@ mod tests {
         }
         assert_eq!(counts.mid_renders.get(), mid, "an ancestor rendered");
     }
+
 }
