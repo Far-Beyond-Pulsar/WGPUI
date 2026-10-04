@@ -488,6 +488,9 @@ mod tests {
             return;
         }
         let (_window, leaf, counts) = tree_with(cx, true, true);
+        // The first change finds the view still rendered inline (it had no height to
+        // cache against yet) and goes the ordinary way; from then on it is a boundary.
+        set_value(cx, &leaf, 100);
         let mid = counts.mid_renders.get();
         for value in 1..=3 {
             set_value(cx, &leaf, value);
