@@ -409,10 +409,10 @@ fn build_packed_layer(items: &[LayerItem]) -> PackedLayer {
     packed.underlines.sort_by_key(|underline| underline.order);
     packed
         .mono_sprites
-        .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        .sort_by_key(|sprite| sprite.order);
     packed
         .poly_sprites
-        .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        .sort_by_key(|sprite| sprite.order);
 
     // Renumber after sorting so a path's dense local id equals its position
     // in this array (and therefore its slot in the vertex-stream prefix
