@@ -512,4 +512,274 @@ mod tests {
         assert_eq!(counts.mid_renders.get(), mid, "an ancestor rendered");
     }
 
+
+    struct NestedLeaf {
+        value: u32,
+    }
+
+    impl Render for NestedLeaf {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let value = self.value;
+            div()
+                .w_full()
+                .h(px(40.))
+                .bg(crate::red().opacity(0.3))
+                .child(
+                    div().id("inner").layer_keyed(0u64).w(px(30.)).h(px(20.)).child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                let _ = value;
+                                window.paint_quad(fill(bounds, blue()));
+                            },
+                        )
+                        .size_full(),
+                    ),
+                )
+        }
+    }
+
+    struct NestedMid {
+        leaf: Entity<NestedLeaf>,
+    }
+
+    impl Render for NestedMid {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        |bounds, _, window, _| {
+                            window.paint_quad(fill(bounds, crate::green().opacity(0.85)))
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(100.))
+                    .h(px(100.)),
+                )
+                .child(
+                    AnyView::from(self.leaf.clone())
+                        .cached(StyleRefinement::default().w(px(40.)).h(px(40.)))
+                        .isolated(),
+                )
+        }
+    }
+
+    struct NestedRoot {
+        mid: Entity<NestedMid>,
+    }
+
+    impl Render for NestedRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                AnyView::from(self.mid.clone())
+                    .cached(StyleRefinement::default().w(px(100.)).h(px(100.))),
+            )
+        }
+    }
+
+    fn dump_spans(cx: &mut TestAppContext, window: crate::AnyWindowHandle, label: &str) {
+        window
+            .update(cx, |_, window, _| {
+                eprintln!("== {label}");
+                let mut ids: Vec<(crate::LayerKey, u32)> =
+                    window.layers.iter().map(|(k, l)| (*k, l.id.0)).collect();
+                ids.sort_by_key(|(_, id)| *id);
+                for s in &window.rendered_frame.scene.layer_slab_spans {
+                    let id = ids.iter().find(|(k, _)| *k == s.key).map(|(_, i)| *i);
+                    eprintln!("  span layer={id:?} token={}", s.content_token);
+                }
+                for (k, id) in &ids {
+                    let l = &window.layers[k];
+                    let items: Vec<String> = l.items.iter().map(|i| match i {
+                        crate::layer::LayerItem::Nested(n) => format!("nested({:?})", window.layers.get(n).map(|l| l.id.0)),
+                        crate::layer::LayerItem::Primitive(p) => match p {
+                            crate::scene::Primitive::Quad(q) => format!("quad(o={:?},a={})", q.order, q.background.solid.a),
+                            _ => "prim".into(),
+                        },
+                    }).collect();
+                    eprintln!("  layer {id} tex={} items={:?}", l.texture_retained, items);
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn nested_layer_inside_isolated(cx: &mut TestAppContext) {
+        let leaf = cx.update(|cx| cx.new(|_| NestedLeaf { value: 0 }));
+        let mid = cx.update(|cx| cx.new(|_| NestedMid { leaf: leaf.clone() }));
+        let window = cx.open_window(size(px(400.), px(300.)), move |_, _| NestedRoot { mid });
+        cx.run_until_parked();
+        let window: crate::AnyWindowHandle = window.into();
+        for _ in 0..6 {
+            window.update(cx, |_, w, _| w.refresh_buffers()).unwrap();
+            cx.run_until_parked();
+        }
+        dump_spans(cx, window, "settled");
+        leaf.update(cx, |l, cx| { l.value = 1; cx.notify(); });
+        cx.run_until_parked();
+        dump_spans(cx, window, "after isolated update");
+        leaf.update(cx, |l, cx| { l.value = 2; cx.notify(); });
+        cx.run_until_parked();
+        dump_spans(cx, window, "after isolated update 2");
+    }
+
+    struct Sec {
+        value: u32,
+        quads: u32,
+    }
+
+    impl Render for Sec {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (value, quads) = (self.value, self.quads);
+            div().w_full().h(px(30.)).bg(crate::red().opacity(0.3)).child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let _ = value;
+                        for i in 0..quads {
+                            window.paint_quad(fill(
+                                crate::Bounds::new(
+                                    crate::point(bounds.origin.x + px(i as f32 * 0.2), bounds.origin.y),
+                                    size(px(0.1), px(5.)),
+                                ),
+                                blue(),
+                            ));
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    struct Panel {
+        secs: Vec<Entity<Sec>>,
+    }
+
+    impl Render for Panel {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut d = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_2()
+                .bg(crate::green().opacity(0.85));
+            for s in &self.secs {
+                d = d.child(
+                    AnyView::from(s.clone())
+                        .cached_auto_height(StyleRefinement::default().w_full().flex_shrink_0())
+                        .isolated(),
+                );
+            }
+            d
+        }
+    }
+
+    struct PanelRoot {
+        panel: Entity<Panel>,
+    }
+
+    impl Render for PanelRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div().w(px(200.)).child(
+                    AnyView::from(self.panel.clone())
+                        .cached_auto_height(StyleRefinement::default().w_full().flex_shrink_0()),
+                ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn panel_with_four_isolated_sections(cx: &mut TestAppContext) {
+        let secs: Vec<Entity<Sec>> = [5u32, 5, 5, 400]
+            .into_iter()
+            .map(|quads| cx.update(|cx| cx.new(|_| Sec { value: 0, quads })))
+            .collect();
+        let panel = cx.update(|cx| cx.new(|_| Panel { secs: secs.clone() }));
+        let window = cx.open_window(size(px(400.), px(300.)), move |_, _| PanelRoot { panel });
+        cx.run_until_parked();
+        let window: crate::AnyWindowHandle = window.into();
+        for _ in 0..6 {
+            window.update(cx, |_, w, _| w.refresh_buffers()).unwrap();
+            cx.run_until_parked();
+        }
+        dump_spans(cx, window, "settled");
+        for round in 1..=4 {
+            secs[0].update(cx, |s, cx| { s.value = round; cx.notify(); });
+            cx.run_until_parked();
+            dump_spans(cx, window, &format!("round {round}: notified section 0"));
+            if round % 2 == 0 {
+                secs[3].update(cx, |s, cx| { s.value = round; cx.notify(); });
+                cx.run_until_parked();
+                dump_spans(cx, window, &format!("round {round}: notified section 3"));
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Window {
+    /// A readable dump of the retained layers and the frame's slab spans, for
+    /// tests that need to see how a real view tree was layered: which layers
+    /// exist, how they nest, which are texture-backed, the local draw orders of
+    /// their items, and the order the spans reach the renderer in.
+    #[doc(hidden)]
+    pub fn debug_layer_report(&self) -> String {
+        use std::fmt::Write as _;
+        let mut ids: Vec<(LayerKey, u32)> = self.layers.iter().map(|(k, l)| (*k, l.id.0)).collect();
+        ids.sort_by_key(|(_, id)| *id);
+        let id_of = |key: &LayerKey| self.layers.get(key).map(|l| l.id.0);
+        let mut out = String::new();
+        for s in &self.rendered_frame.scene.layer_slab_spans {
+            let _ = writeln!(
+                out,
+                "  span layer={:?} token={}",
+                id_of(&s.key),
+                s.content_token,
+            );
+        }
+        let _ = writeln!(
+            out,
+            "  legacy: quads={} mono={} poly={} surfaces={}",
+            self.rendered_frame.scene.quads.len(),
+            self.rendered_frame.scene.monochrome_sprites.len(),
+            self.rendered_frame.scene.polychrome_sprites.len(),
+            self.rendered_frame.scene.surfaces.len(),
+        );
+        for (key, id) in &ids {
+            let layer = &self.layers[key];
+            let items: Vec<String> = layer
+                .items
+                .iter()
+                .map(|item| match item {
+                    LayerItem::Nested(n) => format!("nested({:?})", id_of(n)),
+                    LayerItem::Primitive(p) => match p {
+                        crate::scene::Primitive::Quad(q) => {
+                            format!("q{}a{:.2}", q.order, q.background.solid.a)
+                        }
+                        crate::scene::Primitive::MonochromeSprite(s) => format!("m{}", s.order),
+                        crate::scene::Primitive::Shadow(s) => format!("sh{}", s.order),
+                        _ => "p".to_string(),
+                    },
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "  layer {id} bounds={:?} tex={} needs={:?} opacity={} items({})={}",
+                layer.cache_key.bounds,
+                layer.texture_retained,
+                layer.needs,
+                layer.cache_key.opacity,
+                items.len(),
+                items.join(" ")
+            );
+        }
+        out
+    }
 }

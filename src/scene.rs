@@ -1972,6 +1972,65 @@ mod tests {
         ScaledPixels(value)
     }
 
+    /// A layer composited through the legacy path re-emits its primitives with the
+    /// local orders they were recorded with, without registering them in the
+    /// scope's bounds tree. A nested layer entering that scope must still land
+    /// above everything the parent re-emitted before it, and below what it
+    /// re-emits after.
+    #[test]
+    fn a_nested_layer_in_a_legacy_composite_sorts_between_its_parents_primitives() {
+        let parent = LayerKey(20);
+        let child = LayerKey(21);
+        let area = |size: f32| Bounds {
+            origin: Point { x: sp(0.0), y: sp(0.0) },
+            size: Size { width: sp(size), height: sp(size) },
+        };
+
+        // Recorded: the parent paints its background, the child paints over it,
+        // then the parent paints its border over both.
+        let mut recording = Scene::default();
+        recording.begin_layer(parent, area(100.0), true);
+        recording.insert_primitive(quad_at(area(100.0)));
+        recording.insert_primitive(quad_at(area(100.0)));
+        recording.begin_layer(child, area(80.0), true);
+        recording.insert_primitive(quad_at(area(60.0)));
+        let child_items = recording.end_layer().expect("recorded child");
+        recording.insert_primitive(quad_at(area(40.0)));
+        let parent_items = recording.end_layer().expect("recorded parent");
+
+        // Composited the legacy way.
+        let mut legacy = Scene::default();
+        legacy.begin_layer(parent, area(100.0), false);
+        for item in &parent_items {
+            match item {
+                LayerItem::Primitive(primitive) => legacy.push_retained(primitive),
+                LayerItem::Nested(_) => {
+                    legacy.begin_layer(child, area(80.0), false);
+                    for item in &child_items {
+                        if let LayerItem::Primitive(primitive) = item {
+                            legacy.push_retained(primitive);
+                        }
+                    }
+                    legacy.end_layer();
+                }
+            }
+        }
+        legacy.end_layer();
+        legacy.finish();
+
+        // Draw order is quad order after `finish`; sizes identify the quads.
+        let drawn: Vec<f32> = legacy
+            .quads
+            .iter()
+            .map(|quad| quad.bounds.size.width.0)
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![100.0, 100.0, 60.0, 40.0],
+            "the parent's background, then the nested layer, then the parent's border"
+        );
+    }
+
     /// All test primitives cover the same region so the bounds tree assigns strictly
     /// increasing orders in insertion order — making the expected batch order deterministic.
     fn full_bounds() -> Bounds<ScaledPixels> {
