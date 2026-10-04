@@ -382,8 +382,8 @@ mod tests {
         let window = cx.open_window(size(px(400.), px(300.)), move |_, _| Root { mid });
         cx.run_until_parked();
         let window: crate::AnyWindowHandle = window.into();
-        // Two quiet frames so every cached view has settled into its reuse path.
-        for _ in 0..2 {
+        // Quiet frames so every cached view has settled into its reuse path.
+        for _ in 0..6 {
             window.update(cx, |_, window, _| window.refresh_buffers()).unwrap();
             cx.run_until_parked();
         }
@@ -492,7 +492,6 @@ mod tests {
         for value in 1..=3 {
             set_value(cx, &leaf, value);
             assert_eq!(counts.painted.get(), value);
-            eprintln!("value {value}: mid={}", counts.mid_renders.get());
         }
         assert_eq!(counts.mid_renders.get(), mid, "an ancestor rendered");
     }
