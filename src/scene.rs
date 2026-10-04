@@ -354,15 +354,18 @@ impl Scene {
     /// Re-emit a retained primitive, keeping the layer-local order it was
     /// recorded with.
     ///
-    /// This is the saving the whole phase is for: no `BoundsTree` insert, and
-    /// no re-derivation of z from whatever else happens to be painted this
-    /// frame.
+    /// This preserves the layer-local z order from its recording. Registering
+    /// the retained bounds at that same order keeps later nested scopes and
+    /// primitives in this scope aware of what was replayed without deriving a
+    /// new z order from this frame's paint sequence.
     pub fn push_retained(&mut self, primitive: &Primitive) {
         let mut primitive = primitive.clone();
         let bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
         let order = self.note_order(primitive_order(&primitive), bounds);
+        let scope = self.active_scope();
+        self.scopes[scope].tree.insert_at_order(bounds, order);
         set_primitive_order(&mut primitive, order);
         // Path ids are indices into `self.paths`, so they mean nothing outside
         // the scene being built and have to be reassigned on every replay.
