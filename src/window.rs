@@ -65,6 +65,7 @@ use std::{
 use uuid::Uuid;
 
 mod prompts;
+mod isolated;
 
 /// One maximal run of a layer's own packable primitives, plus where nested
 /// layers sat between them.
@@ -1811,6 +1812,14 @@ pub struct Window {
     /// Lives for the duration of one draw, and is cleared alongside
     /// `dirty_views`.
     pub(crate) invalidated_entities: FxHashSet<EntityId>,
+    /// Isolation boundaries (`AnyView::isolated`) seen by the element walk.
+    pub(crate) isolated_views: FxHashMap<EntityId, isolated::IsolatedViewRecord>,
+    /// Isolated views already re-rendered in place this draw.
+    pub(crate) isolated_fresh: FxHashSet<EntityId>,
+    /// Isolated views whose next invalidation must reach their ancestors.
+    pub(crate) isolated_relayout: FxHashSet<EntityId>,
+    /// Reusable scratch frame for in-place re-renders.
+    pub(crate) isolated_scratch: Option<Box<Frame>>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -2338,6 +2347,10 @@ impl Window {
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
             invalidated_entities: FxHashSet::default(),
+            isolated_views: FxHashMap::default(),
+            isolated_fresh: FxHashSet::default(),
+            isolated_relayout: FxHashSet::default(),
+            isolated_scratch: None,
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -2447,6 +2460,13 @@ impl Window {
             .view_path_reversed(view_id)
         {
             if !self.dirty_views.insert(view_id) {
+                break;
+            }
+            // An isolation boundary ends the walk: what is above it does not change
+            // when it does. (Unless it asked to be laid out again.)
+            if self.isolated_views.contains_key(&view_id)
+                && !self.isolated_relayout.remove(&view_id)
+            {
                 break;
             }
         }
@@ -3424,6 +3444,7 @@ impl Window {
             // for a skipped draw would evict a window's layers for not being
             // visited by a frame that never looked at anything.
             self.layer_frame = self.layer_frame.wrapping_add(1);
+            self.rerecord_isolated_views(cx);
             self.draw_roots(cx);
             self.evict_stale_layers();
 
@@ -3449,6 +3470,7 @@ impl Window {
         }
         self.dirty_views.clear();
         self.invalidated_entities.clear();
+        self.isolated_fresh.clear();
         self.next_frame.window_active = self.active.get();
 
         // Register requested input handler with the platform window.
@@ -3553,6 +3575,12 @@ impl Window {
     fn record_entities_accessed(&mut self, cx: &mut App) {
         let mut entities_ref = cx.entities.accessed_entities.get_mut();
         let mut entities = mem::take(entities_ref.deref_mut());
+        // Isolated views keep their dependencies out of their ancestors' sets, but
+        // the window still has to know it displays them or a notify would find
+        // nothing to invalidate.
+        for record in self.isolated_views.values() {
+            entities.extend(record.accessed.iter().copied());
+        }
         let handle = self.handle;
         cx.record_entities_accessed(
             handle,

@@ -45,6 +45,34 @@ fn remember_view_height(id: &GlobalElementId, height: Pixels, window: &mut Windo
     });
 }
 
+/// Replace the dependency set a cached view stored when it last rebuilt. Used
+/// after an isolated view re-renders in place, so that its stored state names
+/// what it reads now and not what it read the last time the walk rebuilt it.
+pub(crate) fn refresh_view_dependencies(
+    id: &GlobalElementId,
+    accessed: FxHashSet<EntityId>,
+    window: &mut Window,
+) {
+    window.with_element_state::<AnyViewState, _>(id, |state, _| {
+        let state = state.map(|mut state| {
+            state.accessed_entities = accessed;
+            state
+        });
+        // No stored state means the view was never walked as a cache; there is
+        // nothing to refresh, and `with_element_state` needs a value back.
+        match state {
+            Some(state) => ((), state),
+            None => ((), AnyViewState {
+                prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
+                paint_range: PaintIndex::default()..PaintIndex::default(),
+                cache_key: ViewCacheKey::default(),
+                accessed_entities: FxHashSet::default(),
+                culled: true,
+            }),
+        }
+    });
+}
+
 #[derive(Default)]
 struct ViewCacheKey {
     bounds: Bounds<Pixels>,
@@ -179,6 +207,8 @@ pub struct AnyView {
     /// frame's measured content rather than from `cached_style`. See
     /// [`AnyView::cached_auto_height`].
     auto_height: bool,
+    /// See [`AnyView::isolated`].
+    isolated: bool,
     /// Set by `request_layout` each frame: this auto-height view had nothing
     /// remembered yet and was rendered inline, so `paint` must not take the
     /// cached path (there is no cached state for it to replay).
@@ -195,6 +225,7 @@ impl<V: Render> From<Entity<V>> for AnyView {
             render: any_view::render::<V>,
             cached_style: None,
             auto_height: false,
+            isolated: false,
             rendered_inline: false,
             type_name: std::any::type_name::<V>(),
         }
@@ -245,6 +276,52 @@ impl AnyView {
         self
     }
 
+    /// Make this cached view an *isolation boundary*: it refreshes by itself.
+    ///
+    /// A notify on an ordinary cached view dirties every view above it and
+    /// invalidates every cached ancestor whose dependency set (cumulative over
+    /// its subtree) contains the notified entity. A view that changes ten times
+    /// a second therefore rebuilds the panel, the dock and everything else
+    /// above it ten times a second.
+    ///
+    /// An isolated view is the exception. Its dependencies are its own: they are
+    /// not folded into its ancestors' sets, and an invalidation stops at it.
+    /// When it is invalidated, `Window::draw` re-renders just this view, in
+    /// place, into its own retained layer, before the element walk; the
+    /// ancestors then replay and composite the new content. Nothing above it
+    /// renders, lays out or prepaints.
+    ///
+    /// What that costs, and what it asks of the view:
+    ///
+    /// - It must be **display-only**. Its hitboxes, listeners, tooltips and
+    ///   focus handles are recorded when it is last visited by the walk, and are
+    ///   not refreshed by an in-place re-render.
+    /// - Its **size must not depend on what changes**. If a re-render measures a
+    ///   different height than the cached node was given, the view falls back to
+    ///   the ordinary path for that frame (ancestors included) so they can
+    ///   lay out again.
+    /// - Anything that makes in-place re-rendering unsafe (a window-wide layout
+    ///   or hit invalidation, a texture-retained layer, a layer that has
+    ///   no content yet) also falls back to the ordinary path. Isolation is
+    ///   never a reason for a view to be stale.
+    ///
+    /// Has no effect unless the view is also [`Self::cached`] or
+    /// [`Self::cached_auto_height`].
+    pub fn isolated(mut self) -> Self {
+        self.isolated = true;
+        self
+    }
+
+    /// Run this view's `render` and box the result.
+    pub(crate) fn render_element(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        (self.render)(self, window, cx)
+    }
+
+    /// Whether this view caches *and* asked to be an isolation boundary.
+    pub(crate) fn is_isolation_boundary(&self) -> bool {
+        self.isolated && self.cached_style.is_some()
+    }
+
     /// Convert this to a weak handle.
     pub fn downgrade(&self) -> AnyWeakView {
         AnyWeakView {
@@ -264,6 +341,7 @@ impl AnyView {
                 render: self.render,
                 cached_style: self.cached_style,
                 auto_height: self.auto_height,
+                isolated: self.isolated,
                 rendered_inline: false,
                 type_name: self.type_name,
             }),
@@ -410,6 +488,8 @@ impl Element for AnyView {
                     // one prepainted at all.
                     let dependency_invalidated = element_state.as_ref().is_some_and(|state| {
                         window.accessed_entity_invalidated(&state.accessed_entities)
+                            // Already re-rendered in place this frame, before the walk.
+                            && !window.isolated_view_is_fresh(self.entity_id())
                     });
 
                     // An auto-height view entirely outside the clip (a row scrolled
@@ -452,8 +532,23 @@ impl Element for AnyView {
                         let _t = crate::render_stats::scope("view cache: reuse_prepaint");
                         let prepaint_start = window.prepaint_index();
                         window.reuse_prepaint(element_state.prepaint_range.clone());
-                        cx.entities
-                            .extend_accessed(&element_state.accessed_entities);
+                        if self.is_isolation_boundary() {
+                            // Its dependencies stay its own; see `AnyView::isolated`.
+                            if let Some(id) = global_id {
+                                window.note_isolated_view(
+                                    self,
+                                    id,
+                                    bounds,
+                                    content_mask.clone(),
+                                    element_state.accessed_entities.clone(),
+                                    self.auto_height,
+                                    false,
+                                );
+                            }
+                        } else {
+                            cx.entities
+                                .extend_accessed(&element_state.accessed_entities);
+                        }
 
                         // `on_frame` effects still run on a cache hit — that is
                         // the whole point of the channel: side effects that must
@@ -515,7 +610,7 @@ impl Element for AnyView {
 
                     let prepaint_start = window.prepaint_index();
                     let _arena_scope = ElementArenaScope::enter(cx.element_arena());
-                    let ((mut element, measured_height), accessed_entities) = cx.detect_accessed_entities(|cx| {
+                    let ((mut element, measured_height), accessed_entities) = cx.detect_accessed_entities_with(!self.is_isolation_boundary(), |cx| {
                         // Split three ways: building the element tree is usually
                         // trivial next to laying it out and prepainting it, and
                         // conflating them hides which one to go after.
@@ -561,11 +656,30 @@ impl Element for AnyView {
                         && (height - bounds.size.height).abs() > crate::px(0.5)
                     {
                         remember_view_height(id, height, window);
+                        if self.is_isolation_boundary() {
+                            // The ancestors must lay out again, so this notify may
+                            // not stop at the isolation boundary.
+                            window.request_isolated_relayout(self.entity_id());
+                        }
                         cx.notify(self.entity_id());
                     }
 
                     let prepaint_end = window.prepaint_index();
                     window.nested_view_cache_suppressed = nested_cache_suppressed;
+
+                    if self.is_isolation_boundary()
+                        && let Some(id) = global_id
+                    {
+                        window.note_isolated_view(
+                            self,
+                            id,
+                            bounds,
+                            content_mask.clone(),
+                            accessed_entities.clone(),
+                            self.auto_height,
+                            true,
+                        );
+                    }
 
                     (
                         Some(element),
@@ -695,6 +809,7 @@ impl AnyWeakView {
             render: self.render,
             cached_style: None,
             auto_height: false,
+            isolated: false,
             rendered_inline: false,
             type_name: self.type_name,
         })
