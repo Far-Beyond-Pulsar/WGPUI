@@ -4,6 +4,7 @@ use std::sync::Arc;
 use super::surface_registry::SurfaceRegistry;
 
 /// Options for configuring the WGPU backend.
+#[derive(Clone, Copy)]
 pub struct WgpuOptions {
     /// Additional WGPU features to request when creating the device.
     /// These are OR'd with the features WGPUI itself requires.
@@ -12,6 +13,12 @@ pub struct WgpuOptions {
     /// Maximum number of frames the GPU can queue ahead before blocking.
     /// Higher values improve throughput at the cost of input latency.
     pub desired_maximum_frame_latency: u32,
+    /// Restrict adapter enumeration to the selected graphics backend.
+    pub backends: wgpu::Backends,
+    /// Adapter power/performance policy.
+    pub power_preference: wgpu::PowerPreference,
+    /// Explicit opt-in to wgpu's experimental ray-query feature.
+    pub hardware_ray_queries: bool,
 }
 
 impl Default for WgpuOptions {
@@ -19,6 +26,9 @@ impl Default for WgpuOptions {
         Self {
             additional_features: wgpu::Features::empty(),
             desired_maximum_frame_latency: 2,
+            backends: wgpu::Backends::all(),
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            hardware_ray_queries: false,
         }
     }
 }
@@ -80,7 +90,7 @@ pub struct WgpuContext {
 impl WgpuContext {
     pub fn new(options: &WgpuOptions) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: options.backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -108,7 +118,7 @@ impl WgpuContext {
 
             let required_features = wgpui_features | options.additional_features;
 
-            let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+            let adapters = pollster::block_on(instance.enumerate_adapters(options.backends));
 
             // On macOS, some features are optional — prefer adapters that expose them
             // but do not require them, since Metal may not advertise them on all hardware.
@@ -121,7 +131,17 @@ impl WgpuContext {
                 let adapter = adapters
                     .into_iter()
                     .filter(|adapter| adapter.features().contains(required_features))
-                    .max_by_key(|adapter| adapter.features().contains(optional_features))
+                    .max_by_key(|adapter| {
+                        let info = adapter.get_info();
+                        let type_rank = match (options.power_preference, info.device_type) {
+                            (wgpu::PowerPreference::HighPerformance, wgpu::DeviceType::DiscreteGpu) => 3,
+                            (wgpu::PowerPreference::LowPower, wgpu::DeviceType::IntegratedGpu) => 3,
+                            (_, wgpu::DeviceType::DiscreteGpu) => 2,
+                            (_, wgpu::DeviceType::IntegratedGpu) => 1,
+                            _ => 0,
+                        };
+                        (type_rank, adapter.features().contains(optional_features))
+                    })
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "No adapter available with required features: {:?}",
@@ -145,7 +165,14 @@ impl WgpuContext {
                     | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
                 let adapter = adapters
                     .into_iter()
-                    .find(|adapter| adapter.features().contains(required_features))
+                    .filter(|adapter| adapter.features().contains(required_features))
+                    .max_by_key(|adapter| match (options.power_preference, adapter.get_info().device_type) {
+                        (wgpu::PowerPreference::HighPerformance, wgpu::DeviceType::DiscreteGpu) => 3,
+                        (wgpu::PowerPreference::LowPower, wgpu::DeviceType::IntegratedGpu) => 3,
+                        (_, wgpu::DeviceType::DiscreteGpu) => 2,
+                        (_, wgpu::DeviceType::IntegratedGpu) => 1,
+                        _ => 0,
+                    })
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "No adapter available with required features: {:?}",
@@ -170,10 +197,27 @@ impl WgpuContext {
                 }
             };
 
+            let ray_queries_enabled = options.hardware_ray_queries
+                && adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+            if options.hardware_ray_queries && !ray_queries_enabled {
+                tracing::warn!("Hardware ray queries were requested but the selected adapter does not support them");
+            }
+            let device_features = if ray_queries_enabled {
+                device_features | wgpu::Features::EXPERIMENTAL_RAY_QUERY
+            } else {
+                device_features
+            };
             let (device, queue) =
                 pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                     label: None,
                     required_features: device_features,
+                    // The unsafe acknowledgement is reachable only through the
+                    // explicit, persisted experimental-feature opt-in above.
+                    experimental_features: if ray_queries_enabled {
+                        unsafe { wgpu::ExperimentalFeatures::enabled() }
+                    } else {
+                        wgpu::ExperimentalFeatures::disabled()
+                    },
                     required_limits: wgpu::Limits {
                         max_binding_array_elements_per_shader_stage: 512,
                         ..adapter.limits()
@@ -291,7 +335,7 @@ impl WgpuContext {
     #[cfg(target_family = "wasm")]
     pub async fn new_async(options: &WgpuOptions) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends: options.backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -302,7 +346,7 @@ impl WgpuContext {
 
         let required_features = wgpui_features | options.additional_features;
 
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        let adapters = instance.enumerate_adapters(options.backends).await;
 
         let adapter = adapters
             .into_iter()
@@ -314,12 +358,23 @@ impl WgpuContext {
                 )
             })?;
 
-        let device_features = required_features;
+        let ray_queries_enabled = options.hardware_ray_queries
+            && adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+        let device_features = if ray_queries_enabled {
+            required_features | wgpu::Features::EXPERIMENTAL_RAY_QUERY
+        } else {
+            required_features
+        };
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: device_features,
+                experimental_features: if ray_queries_enabled {
+                    unsafe { wgpu::ExperimentalFeatures::enabled() }
+                } else {
+                    wgpu::ExperimentalFeatures::disabled()
+                },
                 required_limits: wgpu::Limits {
                     max_binding_array_elements_per_shader_stage: 512,
                     ..adapter.limits()
