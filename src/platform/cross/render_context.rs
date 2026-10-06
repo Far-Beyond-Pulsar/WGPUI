@@ -134,7 +134,10 @@ impl WgpuContext {
                     .max_by_key(|adapter| {
                         let info = adapter.get_info();
                         let type_rank = match (options.power_preference, info.device_type) {
-                            (wgpu::PowerPreference::HighPerformance, wgpu::DeviceType::DiscreteGpu) => 3,
+                            (
+                                wgpu::PowerPreference::HighPerformance,
+                                wgpu::DeviceType::DiscreteGpu,
+                            ) => 3,
                             (wgpu::PowerPreference::LowPower, wgpu::DeviceType::IntegratedGpu) => 3,
                             (_, wgpu::DeviceType::DiscreteGpu) => 2,
                             (_, wgpu::DeviceType::IntegratedGpu) => 1,
@@ -166,12 +169,17 @@ impl WgpuContext {
                 let adapter = adapters
                     .into_iter()
                     .filter(|adapter| adapter.features().contains(required_features))
-                    .max_by_key(|adapter| match (options.power_preference, adapter.get_info().device_type) {
-                        (wgpu::PowerPreference::HighPerformance, wgpu::DeviceType::DiscreteGpu) => 3,
-                        (wgpu::PowerPreference::LowPower, wgpu::DeviceType::IntegratedGpu) => 3,
-                        (_, wgpu::DeviceType::DiscreteGpu) => 2,
-                        (_, wgpu::DeviceType::IntegratedGpu) => 1,
-                        _ => 0,
+                    .max_by_key(|adapter| {
+                        match (options.power_preference, adapter.get_info().device_type) {
+                            (
+                                wgpu::PowerPreference::HighPerformance,
+                                wgpu::DeviceType::DiscreteGpu,
+                            ) => 3,
+                            (wgpu::PowerPreference::LowPower, wgpu::DeviceType::IntegratedGpu) => 3,
+                            (_, wgpu::DeviceType::DiscreteGpu) => 2,
+                            (_, wgpu::DeviceType::IntegratedGpu) => 1,
+                            _ => 0,
+                        }
                     })
                     .ok_or_else(|| {
                         anyhow::anyhow!(
@@ -198,9 +206,13 @@ impl WgpuContext {
             };
 
             let ray_queries_enabled = options.hardware_ray_queries
-                && adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+                && adapter
+                    .features()
+                    .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
             if options.hardware_ray_queries && !ray_queries_enabled {
-                tracing::warn!("Hardware ray queries were requested but the selected adapter does not support them");
+                log::warn!(
+                    "Hardware ray queries were requested but the selected adapter does not support them"
+                );
             }
             let device_features = if ray_queries_enabled {
                 device_features | wgpu::Features::EXPERIMENTAL_RAY_QUERY
@@ -359,7 +371,9 @@ impl WgpuContext {
             })?;
 
         let ray_queries_enabled = options.hardware_ray_queries
-            && adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+            && adapter
+                .features()
+                .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
         let device_features = if ray_queries_enabled {
             required_features | wgpu::Features::EXPERIMENTAL_RAY_QUERY
         } else {

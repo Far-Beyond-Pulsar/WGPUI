@@ -28,6 +28,7 @@ fn device_button_to_gpui(button: u32) -> Option<MouseButton> {
         _ => None,
     }
 }
+use crate::time_ext::Instant;
 use anyhow::Result;
 #[cfg(not(target_family = "wasm"))]
 use arboard::Clipboard;
@@ -44,10 +45,13 @@ use std::{
     },
     time::Duration,
 };
-use crate::time_ext::Instant;
 
 #[cfg(not(target_family = "wasm"))]
-use std::{fs::{self, OpenOptions}, net::{TcpListener, TcpStream}, thread};
+use std::{
+    fs::{self, OpenOptions},
+    net::{TcpListener, TcpStream},
+    thread,
+};
 use winit::event_loop::ActiveEventLoop;
 
 /// The winit event loop and `AppState` for the callback currently running on
@@ -130,8 +134,7 @@ struct AppState {
     /// Open span covering the time the event loop is blocked in the OS waiting
     /// for its next event (from the end of `about_to_wait` to `new_events`).
     idle_scope: Option<Box<dyn Send>>,
-    pending_releases:
-        FxHashMap<winit::window::WindowId, HashSet<MouseButton>>,
+    pending_releases: FxHashMap<winit::window::WindowId, HashSet<MouseButton>>,
     #[cfg(target_family = "wasm")]
     wgpu_context: Arc<std::sync::OnceLock<Arc<WgpuContext>>>,
     #[cfg(target_family = "wasm")]
@@ -168,15 +171,15 @@ impl CrossPlatform {
             Arc::new(std::sync::OnceLock::new())
         } else {
             match WgpuContext::new(&wgpu_options) {
-            Ok(ctx) => {
-                let lock = Arc::new(std::sync::OnceLock::new());
-                lock.set(Arc::new(ctx)).ok();
-                lock
+                Ok(ctx) => {
+                    let lock = Arc::new(std::sync::OnceLock::new());
+                    lock.set(Arc::new(ctx)).ok();
+                    lock
+                }
+                // On WASM, WgpuContext::new returns an error (needs async init).
+                // The OnceLock stays empty; run() will fill it via spawn_local.
+                Err(_) => Arc::new(std::sync::OnceLock::new()),
             }
-            // On WASM, WgpuContext::new returns an error (needs async init).
-            // The OnceLock stays empty; run() will fill it via spawn_local.
-            Err(_) => Arc::new(std::sync::OnceLock::new()),
-        }
         };
 
         let (main_tx, main_rx) = PriorityQueueReceiver::new();
@@ -498,7 +501,10 @@ impl Platform for CrossPlatform {
     }
 
     fn displays(&self) -> Vec<Rc<dyn crate::PlatformDisplay>> {
-        with_active_context(&self.active_context, |event_loop, _| collect_displays(event_loop).0).unwrap_or_default()
+        with_active_context(&self.active_context, |event_loop, _| {
+            collect_displays(event_loop).0
+        })
+        .unwrap_or_default()
     }
 
     fn primary_display(&self) -> Option<Rc<dyn crate::PlatformDisplay>> {
@@ -529,7 +535,11 @@ impl Platform for CrossPlatform {
         options: crate::WindowParams,
     ) -> anyhow::Result<Box<dyn crate::PlatformWindow>> {
         let window = CrossWindow::new(
-            self.wgpu_context.as_ref().get().expect("WgpuContext not initialized").clone(),
+            self.wgpu_context
+                .as_ref()
+                .get()
+                .expect("WgpuContext not initialized")
+                .clone(),
             self.event_loop_proxy.clone(),
         );
 
@@ -671,59 +681,59 @@ impl Platform for CrossPlatform {
 
         #[cfg(not(target_family = "wasm"))]
         {
-        enum PickType {
-            File,
-            Folder,
-        }
-        // rfd does not support picking either/both files and directories. The gpui api is not clear on how various platforms should handle the options.
-        let pick_type = match (options.files, options.directories) {
-            (true, false) => PickType::File,
-            (false, true) => PickType::Folder,
-            _ => {
-                let _ = sender.send(Err(anyhow::anyhow!("CrossPlatform::prompt_for_paths must be configured to select either files or directories. \
-                          Platform does not support neither nor both being configured (must choose exactly one of them).")));
-                return receiver;
+            enum PickType {
+                File,
+                Folder,
             }
-        };
-
-        let mut dialog = rfd::AsyncFileDialog::new();
-
-        // Diverging from gpui implementation, where the prompt is the button. rfd doesnt support this and the gpui doesnt support an explicit title (unlike prompt_for_new_path).
-        // So we hijack the prompt to use it as the title.
-        dialog = match options.prompt {
-            Some(prompt) => dialog.set_title(prompt),
-            None => dialog.set_title(match pick_type {
-                PickType::File => "Open File",
-                PickType::Folder => "Open Folder",
-            }),
-        };
-
-        let task = self.foreground_executor().spawn(async move {
-            let selection = match options.multiple {
-                false => {
-                    let file_handle = match pick_type {
-                        PickType::File => dialog.pick_file().await,
-                        PickType::Folder => dialog.pick_folder().await,
-                    };
-                    file_handle.map(|handle| vec![handle])
-                }
-                true => match pick_type {
-                    PickType::File => dialog.pick_files().await,
-                    PickType::Folder => dialog.pick_folders().await,
-                },
-            };
-            let _ = match selection {
-                None => sender.send(Ok(None)),
-                Some(handles) => {
-                    let paths = handles
-                        .into_iter()
-                        .map(|handle| handle.path().to_owned())
-                        .collect();
-                    sender.send(Ok(Some(paths)))
+            // rfd does not support picking either/both files and directories. The gpui api is not clear on how various platforms should handle the options.
+            let pick_type = match (options.files, options.directories) {
+                (true, false) => PickType::File,
+                (false, true) => PickType::Folder,
+                _ => {
+                    let _ = sender.send(Err(anyhow::anyhow!("CrossPlatform::prompt_for_paths must be configured to select either files or directories. \
+                          Platform does not support neither nor both being configured (must choose exactly one of them).")));
+                    return receiver;
                 }
             };
-        });
-        task.detach();
+
+            let mut dialog = rfd::AsyncFileDialog::new();
+
+            // Diverging from gpui implementation, where the prompt is the button. rfd doesnt support this and the gpui doesnt support an explicit title (unlike prompt_for_new_path).
+            // So we hijack the prompt to use it as the title.
+            dialog = match options.prompt {
+                Some(prompt) => dialog.set_title(prompt),
+                None => dialog.set_title(match pick_type {
+                    PickType::File => "Open File",
+                    PickType::Folder => "Open Folder",
+                }),
+            };
+
+            let task = self.foreground_executor().spawn(async move {
+                let selection = match options.multiple {
+                    false => {
+                        let file_handle = match pick_type {
+                            PickType::File => dialog.pick_file().await,
+                            PickType::Folder => dialog.pick_folder().await,
+                        };
+                        file_handle.map(|handle| vec![handle])
+                    }
+                    true => match pick_type {
+                        PickType::File => dialog.pick_files().await,
+                        PickType::Folder => dialog.pick_folders().await,
+                    },
+                };
+                let _ = match selection {
+                    None => sender.send(Ok(None)),
+                    Some(handles) => {
+                        let paths = handles
+                            .into_iter()
+                            .map(|handle| handle.path().to_owned())
+                            .collect();
+                        sender.send(Ok(Some(paths)))
+                    }
+                };
+            });
+            task.detach();
         } // #[cfg(not(target_family = "wasm"))]
 
         receiver
@@ -738,18 +748,18 @@ impl Platform for CrossPlatform {
 
         #[cfg(not(target_family = "wasm"))]
         {
-        let mut dialog = rfd::AsyncFileDialog::new();
-        dialog = dialog.set_title("Save File");
-        dialog = dialog.set_directory(directory);
-        if let Some(file_name) = suggested_name {
-            dialog = dialog.set_file_name(file_name);
-        }
-        let task = self.foreground_executor().spawn(async move {
-            let selection = dialog.save_file().await;
-            let path = selection.map(|handle| handle.path().to_owned());
-            let _ = sender.send(Ok(path));
-        });
-        task.detach();
+            let mut dialog = rfd::AsyncFileDialog::new();
+            dialog = dialog.set_title("Save File");
+            dialog = dialog.set_directory(directory);
+            if let Some(file_name) = suggested_name {
+                dialog = dialog.set_file_name(file_name);
+            }
+            let task = self.foreground_executor().spawn(async move {
+                let selection = dialog.save_file().await;
+                let path = selection.map(|handle| handle.path().to_owned());
+                let _ = sender.send(Ok(path));
+            });
+            task.detach();
         }
 
         receiver
@@ -911,31 +921,35 @@ impl Platform for CrossPlatform {
     fn write_to_clipboard(&self, item: crate::ClipboardItem) {
         #[cfg(not(target_family = "wasm"))]
         {
-        let Some(text) = item.text() else {
-            log::warn!("write_to_clipboard currently supports text entries only on this platform");
-            return;
-        };
+            let Some(text) = item.text() else {
+                log::warn!(
+                    "write_to_clipboard currently supports text entries only on this platform"
+                );
+                return;
+            };
 
-        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
-            Ok(()) => {}
-            Err(error) => log::warn!("failed to write to clipboard: {error}"),
-        }
+            match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+                Ok(()) => {}
+                Err(error) => log::warn!("failed to write to clipboard: {error}"),
+            }
         }
     }
 
     fn read_from_clipboard(&self) -> Option<crate::ClipboardItem> {
         #[cfg(not(target_family = "wasm"))]
         {
-        match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
-            Ok(text) => Some(crate::ClipboardItem::new_string(text)),
-            Err(error) => {
-                log::warn!("failed to read from clipboard: {error}");
-                None
+            match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                Ok(text) => Some(crate::ClipboardItem::new_string(text)),
+                Err(error) => {
+                    log::warn!("failed to read from clipboard: {error}");
+                    None
+                }
             }
         }
-        }
         #[cfg(target_family = "wasm")]
-        { None }
+        {
+            None
+        }
     }
 
     fn write_credentials(
@@ -1005,12 +1019,13 @@ impl AppState {
                 modifiers,
                 click_count: self.click_state.current_count,
             });
-            window.0.state.callbacks.invoke_mut(
-                &window.0.state.callbacks.on_input,
-                |cb| {
+            window
+                .0
+                .state
+                .callbacks
+                .invoke_mut(&window.0.state.callbacks.on_input, |cb| {
                     cb(platform_event.clone());
-                },
-            );
+                });
         }
         self.clear_active_context();
     }
@@ -1059,7 +1074,9 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 // within a valid ActiveEventLoop context.
                 #[cfg(target_family = "wasm")]
                 if self.wgpu_context.as_ref().get().is_some() {
-                    web_sys::console::log_1(&"WGPUI: WGPU ready, calling on_finish_launching".into());
+                    web_sys::console::log_1(
+                        &"WGPUI: WGPU ready, calling on_finish_launching".into(),
+                    );
                     if let Some(cb) = self.on_finish_launching.take() {
                         cb();
                     } else if let Some(mut callback) = self.callbacks.on_reopen.take() {
@@ -1114,10 +1131,8 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     winit::event::ElementState::Pressed => {
                         // Synthesize release if a prior press is still pending
                         // (WindowEvent::MouseInput release was not delivered).
-                        let mouse_up_to_synthesize = self
-                            .hovered_window_id
-                            .get()
-                            .and_then(|window_id| {
+                        let mouse_up_to_synthesize =
+                            self.hovered_window_id.get().and_then(|window_id| {
                                 let pending = self.pending_releases.get_mut(&window_id)?;
                                 let removed = pending.remove(&mouse_button);
                                 if pending.is_empty() {
@@ -1143,14 +1158,13 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                                 if let Some(window) = self.windows.get(&window_id) {
                                     let position = window.0.state.mouse_position.get();
                                     let modifiers = self.current_modifiers;
-                                    let platform_event =
-                                        PlatformInput::MouseDown(MouseDownEvent {
-                                            button: mouse_button,
-                                            position,
-                                            modifiers,
-                                            click_count: 1,
-                                            first_mouse: false,
-                                        });
+                                    let platform_event = PlatformInput::MouseDown(MouseDownEvent {
+                                        button: mouse_button,
+                                        position,
+                                        modifiers,
+                                        click_count: 1,
+                                        first_mouse: false,
+                                    });
                                     window.0.state.callbacks.invoke_mut(
                                         &window.0.state.callbacks.on_input,
                                         |cb| {
@@ -1303,7 +1317,9 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     let wgpu_ctx = wgpu_ctx.clone();
                     let wgpu_opts_clone = wgpu_opts;
                     move || {
-                        web_sys::console::log_1(&"WGPUI: async WGPU init starting via setTimeout".into());
+                        web_sys::console::log_1(
+                            &"WGPUI: async WGPU init starting via setTimeout".into(),
+                        );
                         wasm_bindgen_futures::spawn_local(async move {
                             match WgpuContext::new_async(&wgpu_opts_clone).await {
                                 Ok(ctx) => {
@@ -1351,7 +1367,8 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
     ) {
         // One span per winit event, named by kind; everything the event causes
         // (input dispatch, resize, redraw) nests underneath.
-        let _window_event_scope = crate::render_stats::external_scope(window_event_span_name(&event));
+        let _window_event_scope =
+            crate::render_stats::external_scope(window_event_span_name(&event));
         self.set_active_context(event_loop);
 
         let Some(window) = self.windows.get(&window_id) else {
