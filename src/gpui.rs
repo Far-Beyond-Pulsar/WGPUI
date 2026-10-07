@@ -34,6 +34,7 @@ mod app;
 mod arena;
 mod asset_cache;
 mod assets;
+#[cfg(test)]
 mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.

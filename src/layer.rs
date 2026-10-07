@@ -20,9 +20,8 @@
 //! # What is retained in this phase
 //!
 //! Primitives, at layer granularity: a composited layer re-emits its recorded
-//! primitives with their recorded *layer-local* draw orders, which is what
-//! lets it skip both primitive emission and the per-primitive `BoundsTree`
-//! insert that dominates `Scene::insert_primitive`.
+//! primitives in their recorded paint sequence, which lets it skip element
+//! paint code. Packed spans additionally skip per-primitive frame emission.
 //!
 //! As of #92, a layer that *is* re-rendering can additionally reconcile at
 //! element granularity — see [`Layer::instances`] and [`crate::instance`] —
@@ -37,15 +36,15 @@
 //!
 //! # Ordering
 //!
-//! Each layer paints into its own ordering scope with its own `BoundsTree`
+//! Each layer paints into its own ordering scope with a sequential local order
 //! starting at zero (see [`crate::scene::Scene`]). Inter-layer ordering is
 //! decided by where the layer was entered in its parent's scope, and the
 //! composite step at `Scene::finish` maps every scope's local orders into a
 //! global order range reserved for it.
 //!
 //! **Order invalidation is per-layer, not per-primitive.** If any content in a
-//! layer changes bounds, that layer's tree re-inserts and its primitives
-//! re-sort; content in other layers is untouched. This implies a sizing rule
+//! layer changes, that layer's paint sequence is re-recorded; content in other
+//! layers is untouched. Bounds never decide stacking. This implies a sizing rule
 //! that is easy to get wrong: **layer boundaries should separate content by
 //! update frequency, not only by visual grouping.** A layer holding one
 //! 120Hz-animating element and a thousand static ones re-sorts all thousand

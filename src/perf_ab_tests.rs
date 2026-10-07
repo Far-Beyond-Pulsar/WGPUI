@@ -62,7 +62,7 @@ const STAGE_NAMES: &[&str] = &[
     "frame: layout",
     "frame: prepaint",
     "frame: paint",
-    "frame: bounds tree",
+    "frame: paint order",
     "frame: scene finish",
     "frame: render",
     "frame: text shaping",

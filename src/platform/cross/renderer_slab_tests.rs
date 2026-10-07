@@ -2164,6 +2164,55 @@ fn legacy_layer(scene: &mut Scene, spec: &LayerSpec) {
 }
 
 #[test]
+fn overflowing_cached_layers_match_fresh_pixels_across_frames() -> anyhow::Result<()> {
+    let mut harness = headless_harness().ok_or_else(|| anyhow::anyhow!("no wgpu adapter"))?;
+    let declared = rect(20., 20., 20., 20.);
+    let overflow = rect(100., 20., 80., 60.);
+    let sibling = rect(110., 30., 40., 40.);
+    let key = LayerKey(303);
+
+    for frame in 0..8 {
+        let spec = record_layer_items(key, declared, |scene| {
+            scene.insert_primitive(quad_solid(
+                overflow,
+                Hsla { h: (frame / 2) as f32 / 4., s: 1., l: 0.5, a: 0.8 },
+            ));
+        });
+        let overlay = quad_solid(sibling, Hsla { h: 0., s: 0., l: 1., a: 1. });
+        let mut fresh = Scene::default();
+        fresh.insert_primitive(background_quad());
+        fresh.begin_layer(key, declared, true);
+        for item in &spec.items {
+            if let crate::layer::LayerItem::Primitive(primitive) = item {
+                fresh.insert_primitive(primitive.clone());
+            }
+        }
+        fresh.end_layer();
+        fresh.insert_primitive(overlay.clone());
+        fresh.finish();
+        harness.upload_legacy_arrays(&fresh);
+        let expected = harness.render_and_read_back_mode(&fresh, None, true).0;
+        let probe = ((40 * WIDTH as usize + 120) * 4)..((40 * WIDTH as usize + 120) * 4 + 4);
+        assert_eq!(&expected[probe.clone()], &[255, 255, 255, 255]);
+
+        let mut cached = Scene::default();
+        cached.insert_primitive(background_quad());
+        cached.begin_layer(key, declared, false);
+        emit_span(&mut cached, &spec, frame / 2 + 1)?;
+        cached.end_layer();
+        cached.insert_primitive(overlay);
+        cached.finish();
+        let groups = harness.prepare_spans(&cached);
+        harness.upload_legacy_arrays(&cached);
+        let actual = harness.render_and_read_back_mode(&cached, Some(&groups), true).0;
+        let differing = expected.iter().zip(&actual).filter(|(a, b)| a != b).count();
+        assert_eq!(differing, 0, "frame {frame}: fresh and cached pixels differ");
+        assert_eq!(&actual[probe], &[255, 255, 255, 255]);
+    }
+    Ok(())
+}
+
+#[test]
 fn a_child_layer_that_re_records_alone_stays_above_its_parents_background() -> anyhow::Result<()> {
     let Some(mut harness) = headless_harness() else {
         eprintln!("skipping: no wgpu adapter");

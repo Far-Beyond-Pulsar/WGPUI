@@ -719,9 +719,9 @@ impl Element for AnyView {
                 // *whether* to reuse was made in prepaint by `AnyViewState`,
                 // which predates layers and reaches things layers cannot see
                 // yet (recorded bounds, text style, the dispatch subtree). The
-                // layer supplies only the retention — which is where the win
-                // is, because it replaces re-inserting every primitive into a
-                // `BoundsTree` with re-emitting orders that are already right.
+                // layer supplies the retained geometry; stacking is always
+                // resolved from the current tree, including when a cached
+                // subtree skips individual primitive emission through slabs.
                 let (layer_key, layer_cache_key) = window.layer_identity(global_id, bounds);
                 let layers_enabled = crate::layer::layers_enabled();
 

@@ -1205,10 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_order_ties_keep_insertion_order_within_a_kind() {
-        // Disjoint bounds reuse one order in the bounds tree, so these two
-        // quads tie and the stable sorts must keep insertion order on both
-        // sides.
+    fn disjoint_primitives_keep_paint_order_within_a_kind() {
         let mut scene = Scene::default();
         scene.begin_layer(LayerKey(1), rect(0., 0., 700., 700.), true);
         scene.insert_primitive(quad_marked(rect(0., 0., 40., 40.), 21));
@@ -1229,14 +1226,14 @@ mod tests {
                     marker: 22,
                 },
             ],
-            "the oracle itself must show insertion-order stability for ties"
+            "disjoint bounds must not change paint order"
         );
         assert_packing_matches_oracle(&items, &oracle);
     }
 
     #[test]
-    fn equal_order_sprite_ties_keep_insertion_order() {
-        // Same-order sprites retain paint order even when their atlas tile ids
+    fn sprites_keep_paint_order_independently_of_atlas_allocation() {
+        // Disjoint sprites retain paint order even when their atlas tile ids
         // are out of order; atlas allocation must not change their z position.
         let mut scene = Scene::default();
         scene.begin_layer(LayerKey(1), rect(0., 0., 700., 100.), true);
@@ -1274,7 +1271,7 @@ mod tests {
                     marker: 35,
                 },
             ],
-            "the oracle must preserve paint order within the tied order"
+            "the oracle must preserve sprite paint order"
         );
         assert_packing_matches_oracle(&items, &oracle);
     }
@@ -1283,8 +1280,8 @@ mod tests {
     fn sprite_runs_split_on_texture_change_like_the_batch_iterator() {
         let mut scene = Scene::default();
         scene.begin_layer(LayerKey(1), rect(0., 0., 700., 100.), true);
-        // Disjoint bounds tie the orders; ascending tiles keep the sort at
-        // insertion order, isolating texture changes as the only split cause.
+        // Consecutive sprite paint positions isolate texture changes as the
+        // only split cause.
         scene.insert_primitive(mono_sprite_marked(rect(0., 0., 20., 20.), 0, 1, 41));
         scene.insert_primitive(mono_sprite_marked(rect(30., 0., 20., 20.), 1, 2, 42));
         scene.insert_primitive(mono_sprite_marked(rect(60., 0., 20., 20.), 0, 3, 43));
@@ -1405,9 +1402,8 @@ mod tests {
             ]
         );
 
-        // At an EQUAL order (disjoint bounds), the legacy batch iterator's
-        // kind discriminants decide: shadows (discriminant 1) draw before
-        // quads (2) even though the quad was painted first.
+        // Disjoint bounds do not permit kind-based reordering: the packed and
+        // ordinary paths both preserve the original paint sequence.
         let mut tied = Scene::default();
         tied.begin_layer(LayerKey(2), rect(0., 0., 500., 100.), true);
         tied.insert_primitive(quad_marked(rect(0., 0., 40., 40.), 55));
@@ -1420,15 +1416,15 @@ mod tests {
             tied_oracle.iter().map(|slot| slot.entry()).collect::<Vec<_>>(),
             vec![
                 Entry {
-                    kind: SlabKind::Shadows,
-                    marker: 56,
-                },
-                Entry {
                     kind: SlabKind::Quads,
                     marker: 55,
                 },
+                Entry {
+                    kind: SlabKind::Shadows,
+                    marker: 56,
+                },
             ],
-            "at an equal order the shadow's lower kind discriminant draws first"
+            "paint order must not depend on primitive kind or overlap"
         );
         assert_packing_matches_oracle(&tied_items, &tied_oracle);
     }

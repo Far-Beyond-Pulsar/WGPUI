@@ -4340,11 +4340,10 @@ impl Window {
     /// Everything [`Self::reuse_paint`] replays except the scene.
     ///
     /// Split out because a retained layer is a better source for the scene half
-    /// than a recorded index range: it re-emits primitives with the draw orders
-    /// they already have, where `Scene::replay` pushes each one back through
-    /// `insert_primitive` and re-derives its order from a `BoundsTree` — the
-    /// per-primitive cost the whole retained model exists to remove. The other
-    /// arrays still travel by range until #97.
+    /// than a recorded index range: it can splice packed spans without
+    /// re-emitting individual primitives. Both paths take their stacking
+    /// position from the current paint sequence. The other arrays still travel
+    /// by range until #97.
     pub(crate) fn reuse_paint_except_scene(&mut self, range: &Range<PaintIndex>) {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
@@ -5915,12 +5914,11 @@ impl Window {
         }
     }
 
-    /// Creates a new painting layer for the specified bounds. A "layer" is a batch
-    /// of geometry that are non-overlapping and have the same draw order. This is typically used
-    /// for performance reasons.
+    /// Groups painting commands for replay while preserving their paint order.
+    /// Adjacent compatible primitives are batched by the finished scene.
     ///
-    /// Unrelated to [`Self::with_retained_layer`]: this is a clip-and-collapse
-    /// group within one frame, not a retained one across frames.
+    /// Unrelated to [`Self::with_retained_layer`]: this is a group within one
+    /// frame, not a retained one across frames.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {

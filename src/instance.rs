@@ -150,7 +150,7 @@ pub(crate) struct ElementInstance {
     /// references within its subtree), in paint order, carrying the
     /// layer-local draw orders they were recorded with. Replayed via
     /// `Window::replay_instance_items`, which re-emits each one through
-    /// `Scene::push_retained` — no `BoundsTree` insert, no re-derivation of z.
+    /// `Scene::insert_primitive`, assigning its current paint position.
     ///
     /// An owned `Vec` rather than a range into the owning layer's `items`
     /// (which the design doc's initial sketch used) so reuse never depends on

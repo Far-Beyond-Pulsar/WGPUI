@@ -14,7 +14,7 @@
 //!   scaled pixels because that is what recorded primitives carry.
 //!
 //! The instance-tier sweep works on the layer's own ordered item stream — the
-//! exact content its `BoundsTree` indexes. The transient occluder list it
+//! same sequence used for painting and packing. The transient occluder list it
 //! builds is derived from that stream, consumed within one record, and never
 //! stored, so there is no second spatial index to drift out of sync (#89).
 //!

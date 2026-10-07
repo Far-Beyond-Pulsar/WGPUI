@@ -28,7 +28,7 @@
 //!   `frame: prepaint` instead.
 //! - `frame: text shaping` is a subset of `frame: layout` (text measure
 //!   callbacks) plus `frame: prepaint` (line shaping for paint).
-//! - `frame: bounds tree` is a subset of `frame: paint`.
+//! - `frame: paint order` is a subset of `frame: paint`.
 //! - `frame: scene finish` and `frame: gpu upload` are outside all of the above.
 //!
 //! So the Phase 0 question — is building the element description cheap relative
