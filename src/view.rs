@@ -491,6 +491,10 @@ impl Element for AnyView {
                             // Already re-rendered in place this frame, before the walk.
                             && !window.isolated_view_is_fresh(self.entity_id())
                     });
+                    let layer_invalidated = crate::layer::layers_enabled()
+                        && window.cached_layer_invalidated(
+                            window.layer_identity(global_id.unwrap(), bounds).0,
+                        );
 
                     // An auto-height view entirely outside the clip (a row scrolled
                     // out of an inspector) has nothing to show: skip rebuilding,
@@ -526,6 +530,7 @@ impl Element for AnyView {
                         && element_state.cache_key.text_style == text_style
                         && !window.dirty_views.contains(&self.entity_id())
                         && !dependency_invalidated
+                        && !layer_invalidated
                         && window.view_cache_available()
                     {
                         crate::render_stats::count("view cache: reused");

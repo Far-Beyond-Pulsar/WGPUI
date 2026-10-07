@@ -465,6 +465,7 @@ impl Scene {
                     let local_order = self.next_order();
                     span.order_scope = scope;
                     span.local_order = local_order;
+                    self.paint_operations.push(PaintOperation::LayerSlab(span.clone()));
                     self.layer_slab_spans.push(span);
                 }
             }
@@ -708,8 +709,7 @@ pub(crate) enum SceneBatch<'a> {
 
 pub(crate) struct FrameBatchIterator<'a> {
     legacy: BatchIterator<'a>,
-    /// Head-of-line legacy batches waiting to be yielded, plus any tails
-    /// produced when a span splits a same-kind batch around its position.
+    /// Slab markers queued after splitting the pending primitive batch.
     queued: std::collections::VecDeque<SceneBatch<'a>>,
     pending: Option<PrimitiveBatch<'a>>,
     next_span: usize,
@@ -813,7 +813,7 @@ fn split_batch_at<'a>(
 }
 
 impl<'a> FrameBatchIterator<'a> {
-    fn batch_lead_order(batch: &PrimitiveBatch<'a>) -> Option<DrawOrder> {
+    fn batch_lead_order(&self, batch: &PrimitiveBatch<'a>) -> Option<DrawOrder> {
         match batch {
             PrimitiveBatch::Shadows(s) => s.first().map(|p| p.order),
             PrimitiveBatch::Quads(q) => q.first().map(|p| p.order),
@@ -823,7 +823,7 @@ impl<'a> FrameBatchIterator<'a> {
             PrimitiveBatch::PolychromeSprites { sprites, .. } => sprites.first().map(|p| p.order),
             PrimitiveBatch::Surfaces(s) => s.first().map(|p| p.order),
             PrimitiveBatch::BackdropFilters(f) => f.first().map(|p| p.order),
-            PrimitiveBatch::FilterBoundary(_) => None,
+            PrimitiveBatch::FilterBoundary(index) => self.scene.filter_boundaries.get(*index).map(|marker| marker.order),
         }
     }
 }
@@ -857,7 +857,7 @@ impl<'a> Iterator for FrameBatchIterator<'a> {
                     // it never ties with surrounding content. When it lands
                     // strictly inside a same-kind batch, the batch splits
                     // around it so every element draws at its own position.
-                    let lead = Self::batch_lead_order(&batch);
+                    let lead = self.batch_lead_order(&batch);
                     if lead.is_none_or(|lead| lead >= span_order) {
                         self.next_span += 1;
                         self.pending = Some(batch);
@@ -867,9 +867,7 @@ impl<'a> Iterator for FrameBatchIterator<'a> {
                         split_batch_at(batch, span_order, &self.scene.filter_boundaries);
                     self.next_span += 1;
                     self.queued.push_back(SceneBatch::LayerSlab(index));
-                    if let Some(tail) = tail {
-                        self.queued.push_back(SceneBatch::Primitives(tail));
-                    }
+                    self.pending = tail;
                     if let Some(head) = head {
                         return Some(SceneBatch::Primitives(head));
                     }
@@ -2768,6 +2766,64 @@ mod slab_splice_tests {
         assert_eq!(spliced_stream(&composite), legacy_stream(&recording));
     }
 
+    #[test]
+    fn multiple_slab_spans_split_the_same_primitive_batch_in_paint_order() {
+        let bounds = rect(0., 0., 40., 40.);
+        let mut scene = Scene::default();
+        for marker in 1..=9 {
+            if marker % 2 == 1 {
+                scene.insert_primitive(quad_marked(bounds, marker));
+                continue;
+            }
+            let key = LayerKey(marker as u64);
+            let mut source = Scene::default();
+            source.begin_layer(key, bounds, true);
+            source.insert_primitive(quad_marked(bounds, marker));
+            let items = source.end_layer().expect("recorded layer");
+            scene.begin_layer(key, bounds, false);
+            for segment in build_slab_segments(&items, [0.; 2]).expect("packable layer") {
+                if let crate::window::SlabSegment::Stretch(_, packed) = segment {
+                    let mut totals = [0; SlabKind::COUNT];
+                    totals[SlabKind::Quads.index()] = packed.quads.len() as u32;
+                    let runs = packed.runs.iter().map(|run| SlabRun {
+                        kind: run.kind, start: run.start, count: run.count, texture_id: run.texture_id,
+                    }).collect();
+                    scene.push_layer_slab_span(bounds, key, 1, [0.; 2], totals, runs, Arc::from(packed), None);
+                }
+            }
+            scene.end_layer();
+        }
+        scene.finish();
+        assert_eq!(spliced_stream(&scene), (1..=9).map(Entry::Quad).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cached_spans_stay_inside_their_filter_boundaries() {
+        let bounds = rect(0., 0., 40., 40.);
+        let marker = |is_start| FilterBoundary {
+            order: 0, bounds, content_mask: mask(), corner_radii: Corners::default(),
+            blur_radius: sp(4.), opacity: 1., is_start,
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(marker(true));
+        let packed = match crate::scene_pack::pack_layer_items(&[]) {
+            crate::scene_pack::PackOutcome::Packed(packed) => packed,
+            crate::scene_pack::PackOutcome::FellBack(reason) => panic!("empty pack rejected: {reason:?}"),
+        };
+        scene.push_layer_slab_span(bounds, LayerKey(999), 1, [0.; 2], [0; SlabKind::COUNT],
+            Vec::new(), Arc::from(packed), None);
+        scene.insert_primitive(marker(false));
+        scene.finish();
+        let sequence: Vec<_> = scene.frame_batches().map(|batch| match batch {
+            SceneBatch::LayerSlab(_) => "cached content",
+            SceneBatch::Primitives(PrimitiveBatch::FilterBoundary(index)) => {
+                if scene.filter_boundaries[index].is_start { "start" } else { "end" }
+            }
+            _ => panic!("unexpected primitive in filter regression"),
+        }).collect();
+        assert_eq!(sequence, vec!["start", "cached content", "end"]);
+    }
+
     /// Record one scene whose layers hold marked primitives, then composite
     /// it twice from the SAME captures: once through the legacy replay, once
     /// through the slab splice. Returns both finished scenes.
@@ -3047,6 +3103,15 @@ mod slab_splice_tests {
             replayed.layer_slab_spans[0].order() >= 1,
             "the re-reserved slot must resolve through the new scope layout"
         );
+
+        for frame in 2..=8 {
+            let mut next = Scene::default();
+            next.replay(0..replayed.len(), &replayed);
+            next.finish();
+            assert_eq!(next.slab_span_count(), 1,
+                "frame {frame}: cached scene replay must retain the slab for the next replay");
+            replayed = next;
+        }
 
         // And packing still rejects unsupported primitives through the same
         // window helper the composite hook uses.

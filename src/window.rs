@@ -2059,6 +2059,9 @@ impl Window {
             let last_input_timestamp = last_input_timestamp.clone();
             move |request_frame_options| {
                 wgpui_scope!("wgpui: on_request_frame");
+                handle.update(&mut cx, |_, window, _| {
+                    window.collect_slab_rerecord_requests();
+                }).log_err();
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
                     wgpui_scope_dyn!(format!(
@@ -3381,8 +3384,6 @@ impl Window {
             None,
         );
 
-        self.apply_invalidations();
-
         // Slab-driven re-records (spec #94): the renderer discovers atlas
         // evictions under resident layers at frame start and posts them here.
         // Draining before draw_roots is what makes invalidation-before-draw
@@ -3395,23 +3396,10 @@ impl Window {
         // able to act on them, and this window's poisoned layers would then
         // skip draws until something unrelated invalidated them.
         if crate::scene_pack::slabs_enabled() {
-            for layer_key in self.platform_window.take_slab_rerecord_requests() {
-                if self.layers.contains_key(&layer_key) {
-                    self.invalidator
-                        .invalidate_layer(layer_key, Invalidation::all());
-                    // An isolation boundary is not visited by the walk when its
-                    // ancestors replay, so this draw's pre-pass has to see the
-                    // request now, not on the next draw.
-                    if self.isolated_views.values().any(|r| r.layer_key == layer_key)
-                        && let Some(layer) = self.layers.get_mut(&layer_key)
-                    {
-                        layer.needs |= Invalidation::all();
-                    }
-                } else {
-                    self.slab_tokens.remove(&layer_key);
-                }
-            }
+            self.collect_slab_rerecord_requests();
         }
+
+        self.apply_invalidations();
 
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -3638,6 +3626,25 @@ impl Window {
         self.invalidator.replace_views(views);
     }
 
+    fn collect_slab_rerecord_requests(&mut self) -> bool {
+        if !crate::scene_pack::slabs_enabled() {
+            return false;
+        }
+        let requests = self.platform_window.take_slab_rerecord_requests();
+        let had_requests = !requests.is_empty();
+        for key in requests {
+            if self.layers.contains_key(&key) {
+                self.invalidator.invalidate_layer(key, Invalidation::all());
+            } else {
+                self.slab_tokens.remove(&key);
+                // A retained scene can still refer to a forgotten layer. Its
+                // old range cannot be trusted to rebuild fresh atlas handles.
+                self.invalidator.invalidate_window(Invalidation::all());
+            }
+        }
+        had_requests
+    }
+
     /// Handle a frame whose only change is a new texture in an external surface,
     /// by re-presenting the previous scene instead of rebuilding it.
     ///
@@ -3677,19 +3684,8 @@ impl Window {
         // The renderer posts slab re-record requests (atlas eviction under a
         // resident layer) that only a real draw can answer. Fold them in exactly
         // as `draw` would and let the normal path run.
-        if crate::scene_pack::slabs_enabled() {
-            let requests = self.platform_window.take_slab_rerecord_requests();
-            if !requests.is_empty() {
-                for layer_key in requests {
-                    if self.layers.contains_key(&layer_key) {
-                        self.invalidator
-                            .invalidate_layer(layer_key, Invalidation::all());
-                    } else {
-                        self.slab_tokens.remove(&layer_key);
-                    }
-                }
-                return false;
-            }
+        if self.collect_slab_rerecord_requests() {
+            return false;
         }
 
         wgpui_scope!("wgpui: display-only frame (re-present previous scene)");
@@ -5346,6 +5342,30 @@ impl Window {
             .filter_map(|(_, layer)| layer.opaque_bounds)
             .collect::<Vec<_>>();
         crate::occlusion::fully_covered(target.cache_key.bounds, &occluders)
+    }
+
+    pub(crate) fn cached_layer_invalidated(&self, key: LayerKey) -> bool {
+        let mut pending = vec![key];
+        let mut visited = FxHashSet::default();
+        while let Some(key) = pending.pop() {
+            if !visited.insert(key) {
+                continue;
+            }
+            if let Some(layer) = self.layers.get(&key) {
+                if !layer.needs.is_empty() || layer.deferred_dirty {
+                    return true;
+                }
+                // A cached ancestor must reach an invalid child before it can
+                // rebuild; replaying the ancestor would otherwise hide the request.
+                pending.extend(layer.items.iter().filter_map(|item| match item {
+                    LayerItem::Nested(child) => Some(*child),
+                    LayerItem::Primitive(_) => None,
+                }));
+            } else {
+                return true;
+            }
+        }
+        false
     }
 
     /// The [`LayerKey`] and cache key a layer rooted at `global_id` would have
@@ -9398,6 +9418,34 @@ mod test {
         }
     }
 
+    #[gpui::test]
+    fn layer_invalidation_rebuilds_a_cached_view(cx: &mut TestAppContext) {
+        assert!(!layers_off(), "this regression requires retained layers");
+        let (window, _leaf, leaf_renders, _) = cached_leaf_window(cx, false);
+        let before = leaf_renders.get();
+        window.update(cx, |_, this, _| {
+            let key = this.layers.keys().next().copied()
+                .expect("cached view must own a layer");
+            this.invalidator.invalidate_layer(key, Invalidation::all());
+        }).expect("test window must exist");
+        cx.run_until_parked();
+        assert!(leaf_renders.get() > before,
+            "a renderer re-record request must rebuild a clean cached view");
+    }
+
+    #[gpui::test]
+    fn a_forgotten_cached_layer_is_rebuilt_instead_of_replaying_old_handles(cx: &mut TestAppContext) {
+        assert!(!layers_off(), "this regression requires retained layers");
+        let (window, _leaf, leaf_renders, _) = cached_leaf_window(cx, false);
+        let before = leaf_renders.get();
+        window.update(cx, |_, this, _| {
+            this.layers.clear();
+            this.refresh_buffers();
+        }).expect("test window must exist");
+        cx.run_until_parked();
+        assert!(leaf_renders.get() > before, "forgotten cache must get fresh content");
+    }
+
     /// The same thing, repeated. One successful invalidation is not enough:
     /// the reuse path re-registers a view's dependencies from the *stored*
     /// set, so a set that lost the view's own id goes stale permanently after
@@ -9513,6 +9561,30 @@ mod test {
                 mid_renders.get() > mid_before,
                 "round {round}: notifying the middle cached view did nothing"
             );
+        }
+    }
+
+    #[gpui::test]
+    fn layer_invalidation_reaches_a_view_inside_cached_ancestors(cx: &mut TestAppContext) {
+        assert!(!layers_off(), "this regression requires retained layers");
+        let leaf_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mid_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let leaf = cx.update(|cx| cx.new(|_| CacheLeaf { renders: leaf_renders.clone() }));
+        let mid = cx.update(|cx| cx.new(|_| CacheMid {
+            leaf: leaf.clone(), renders: mid_renders.clone(),
+        }));
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| CacheNestedRoot { mid });
+        cx.run_until_parked();
+        for frame in 0..8 {
+            let before = leaf_renders.get();
+            window.update(cx, |_, this, _| {
+                let key = this.layers.iter().find(|(_, layer)| {
+                    !layer.items.iter().any(|item| matches!(item, crate::layer::LayerItem::Nested(_)))
+                }).map(|(key, _)| *key).expect("nested cached leaf must own a layer");
+                this.invalidator.invalidate_layer(key, Invalidation::all());
+            }).expect("test window must exist");
+            cx.run_until_parked();
+            assert!(leaf_renders.get() > before, "frame {frame}: invalid nested cache must rebuild");
         }
     }
 

@@ -23,8 +23,17 @@ jobs:
           libfontconfig-dev \
           libwayland-dev \
           libx11-xcb-dev \
-          libxkbcommon-x11-dev
+          libxkbcommon-x11-dev \
+          libvulkan1 \
+          mesa-vulkan-drivers \
+          vulkan-tools
+    - name: Check software Vulkan adapter
+      env:
+        XDG_RUNTIME_DIR: ${{ runner.temp }}
+      run: vulkaninfo --summary
     - name: Build
       run: cargo build --verbose --locked
     - name: Run tests
+      env:
+        XDG_RUNTIME_DIR: ${{ runner.temp }}
       run: cargo test --verbose --locked -- --test-threads=1

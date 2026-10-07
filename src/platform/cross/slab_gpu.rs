@@ -465,6 +465,14 @@ impl SlabRegistry {
             .is_some_and(|entry| entry.awaiting_rerecord)
     }
 
+    pub fn content_ready(&self, key: LayerKey, token: u64) -> bool {
+        self.entries.get(&key).is_some_and(|entry| {
+            !entry.poisoned && !entry.awaiting_rerecord
+                && entry.content_token == token
+                && entry.uploaded_generation == Some(entry.slabs.generation)
+        })
+    }
+
     /// Gate stale data while allowing a newly recorded layer to recover.
     pub fn is_awaiting_same_content(&self, key: LayerKey, content_token: u64) -> bool {
         self.entries.get(&key).is_some_and(|entry| {

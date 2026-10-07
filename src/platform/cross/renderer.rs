@@ -2157,6 +2157,26 @@ fn collect_layer_upload_bytes(
     }
 }
 
+fn slab_frame_ready(scene: &Scene, registry: &SlabRegistry) -> bool {
+    let mut ready = true;
+    for span in &scene.layer_slab_spans {
+        if !registry.content_ready(span.key, span.content_token) {
+            registry.request_rerecord([span.key]);
+            registry.note_span_skipped_awaiting_rerecord();
+            ready = false;
+        }
+    }
+    ready
+}
+
+fn restore_framebuffer(
+    encoder: &mut wgpu::CommandEncoder,
+    framebuffer: &wgpu::Texture,
+    target: &wgpu::Texture,
+) {
+    encoder.copy_texture_to_texture(framebuffer.as_image_copy(), target.as_image_copy(), framebuffer.size());
+}
+
 impl RenderingParameters {
     fn from_env() -> Self {
         use std::env;
@@ -3312,6 +3332,12 @@ impl WgpuRenderer {
             self.resolve_slab_spans(scene);
 
             drop(gpu_upload_timer);
+        }
+
+        // Keep the last complete frame on screen while invalid slab content
+        // is rebuilt. Presenting only the other layers would make panels blink.
+        if !slab_frame_ready(scene, &self.slab_registry) {
+            return;
         }
 
         // Acquire the next swapchain image.  On the first frame after window
@@ -4603,26 +4629,7 @@ impl WgpuRenderer {
 
         // Blit persistent framebuffer to swapchain
         if let Some(ref persistent_framebuffer) = self.persistent_framebuffer {
-            let extent = wgpu::Extent3d {
-                width: self.surface_configuration.width,
-                height: self.surface_configuration.height,
-                depth_or_array_layers: 1,
-            };
-            command_encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: persistent_framebuffer,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &surface_texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                extent,
-            );
+            restore_framebuffer(&mut command_encoder, persistent_framebuffer, &surface_texture.texture);
         }
 
         // Close out the GpuSubmitPresent bracket and record the resolve +
@@ -4715,6 +4722,9 @@ impl WgpuRenderer {
         if pending_surfaces.is_empty() {
             return false;
         }
+        let Some(framebuffer) = self.persistent_framebuffer.as_ref() else {
+            return false;
+        };
 
         let layout_version = self.layout_version.load(Ordering::Acquire);
         let mut visible_surfaces = {
@@ -4801,6 +4811,10 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Acquiring a swapchain image does not preserve the previously
+        // presented image. Restore the UI before updating only viewport pixels.
+        restore_framebuffer(&mut encoder, framebuffer, &surface_texture.texture);
+
         {
             // Only gets a timestamp span when a WgpuRenderer::draw-initiated
             // frame is still in its `Recording` state (see
@@ -4820,7 +4834,7 @@ impl WgpuRenderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &swapchain_view,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load, // Preserve existing swapchain content
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                     resolve_target: None,

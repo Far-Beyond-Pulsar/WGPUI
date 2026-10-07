@@ -35,6 +35,103 @@ fn repeated_layer_references_upload_each_packed_stretch_once() -> anyhow::Result
     Ok(())
 }
 
+#[test]
+fn incomplete_slab_frames_wait_for_every_layer_to_recover() -> anyhow::Result<()> {
+    const KEY_A: LayerKey = LayerKey(202);
+    const KEY_B: LayerKey = LayerKey(203);
+    let (_, mut scene) = build_multi_span_frames((0., 0.))?;
+    let mut registry = SlabRegistry::new();
+    assert!(!slab_frame_ready(&scene, &registry));
+    for span in &scene.layer_slab_spans {
+        registry.plan_sync(span.key, span.content_token, span.totals)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    }
+    assert!(slab_frame_ready(&scene, &registry));
+    for key in [KEY_A, KEY_B] {
+        registry.reject_upload(key);
+    }
+    assert!(!slab_frame_ready(&scene, &registry));
+    let requested = registry.take_rerecord_requests();
+    for key in [KEY_A, KEY_B] { assert!(requested.contains(&key)); }
+    for span in &mut scene.layer_slab_spans {
+        if span.key == KEY_A {
+            span.content_token += 1;
+            registry.plan_sync(span.key, span.content_token, span.totals)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        }
+    }
+    assert!(!slab_frame_ready(&scene, &registry), "one unrecovered panel must still hold presentation");
+    for span in &mut scene.layer_slab_spans {
+        if span.key == KEY_B {
+            span.content_token += 1;
+            registry.plan_sync(span.key, span.content_token, span.totals)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        }
+    }
+    assert!(slab_frame_ready(&scene, &registry));
+    registry.invalidate_all_residency();
+    assert!(!slab_frame_ready(&scene, &registry), "recreated buffers must not present old residency");
+    Ok(())
+}
+
+#[test]
+fn viewport_updates_restore_ui_on_fresh_presentation_images() -> anyhow::Result<()> {
+    let harness = headless_harness().ok_or_else(|| anyhow::anyhow!("no wgpu adapter"))?;
+    let device = &harness.context.device;
+    let queue = &harness.context.queue;
+    let extent = wgpu::Extent3d { width: WIDTH, height: HEIGHT, depth_or_array_layers: 1 };
+    let create = |label| device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label), size: extent, mip_level_count: 1, sample_count: 1,
+        dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let framebuffer = create("saved complete UI frame");
+    let pixels = vec![255u8; (WIDTH * HEIGHT * 4) as usize];
+    queue.write_texture(framebuffer.as_image_copy(), &pixels, wgpu::TexelCopyBufferLayout {
+        offset: 0, bytes_per_row: Some(WIDTH * 4), rows_per_image: Some(HEIGHT),
+    }, extent);
+    for frame in 0..8 {
+        let target = create("fresh presentation image");
+        let viewport = create("updated viewport pixels");
+        let value = frame * 20;
+        queue.write_texture(viewport.as_image_copy(), &vec![value; pixels.len()], wgpu::TexelCopyBufferLayout {
+            offset: 0, bytes_per_row: Some(WIDTH * 4), rows_per_image: Some(HEIGHT),
+        }, extent);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        restore_framebuffer(&mut encoder, &framebuffer, &target);
+        encoder.copy_texture_to_texture(viewport.as_image_copy(), wgpu::TexelCopyTextureInfo {
+            texture: &target, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 36, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        }, wgpu::Extent3d { height: HEIGHT - 36, ..extent });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("presentation image readback"), size: pixels.len() as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(target.as_image_copy(), wgpu::TexelCopyBufferInfo {
+            buffer: &staging, layout: wgpu::TexelCopyBufferLayout {
+                offset: 0, bytes_per_row: Some(WIDTH * 4), rows_per_image: Some(HEIGHT),
+            },
+        }, extent);
+        let submission = queue.submit(Some(encoder.finish()));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).expect("readback receiver remains alive");
+        });
+        device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission), timeout: Some(std::time::Duration::from_secs(20)),
+        })?;
+        receiver.recv_timeout(std::time::Duration::from_secs(1))??;
+        let actual = staging.slice(..).get_mapped_range()?;
+        let header_end = (WIDTH * 36 * 4) as usize;
+        assert_eq!(&actual[..header_end], &pixels[..header_end], "frame {frame}: UI must survive viewport updates");
+        assert!(actual[header_end..].iter().all(|byte| *byte == value));
+        drop(actual);
+        staging.unmap();
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Naga validation.
 // ---------------------------------------------------------------------
