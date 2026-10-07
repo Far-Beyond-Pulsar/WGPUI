@@ -5832,7 +5832,11 @@ impl Window {
             content_mask: crate::ContentMask {
                 bounds: visible_bounds.scale(scale_factor),
             },
-            content: SurfaceContent::Layer(layer_id),
+            content: SurfaceContent::Layer {
+                id: layer_id,
+                key,
+                content_token: self.slab_tokens.get(&key).copied().unwrap_or(0),
+            },
         });
         self.next_frame.scene.end_layer();
     }
@@ -14028,14 +14032,14 @@ mod test {
                         || scene
                             .surfaces
                             .iter()
-                            .any(|surface| matches!(surface.content, crate::scene::SurfaceContent::Layer(_))),
+                            .any(|surface| matches!(surface.content, crate::scene::SurfaceContent::Layer { .. })),
                     "the composite frame must carry the layer surface"
                 );
                 let layer_surfaces = scene
                     .surfaces
                     .iter()
                     .filter(|surface| {
-                        matches!(surface.content, crate::scene::SurfaceContent::Layer(_))
+                        matches!(surface.content, crate::scene::SurfaceContent::Layer { .. })
                     })
                     .count();
                 assert_eq!(
@@ -14114,7 +14118,7 @@ mod test {
                     .surfaces
                     .iter()
                     .filter(|surface| {
-                        matches!(surface.content, crate::scene::SurfaceContent::Layer(_))
+                        matches!(surface.content, crate::scene::SurfaceContent::Layer { .. })
                     })
                     .count();
                 assert_eq!(

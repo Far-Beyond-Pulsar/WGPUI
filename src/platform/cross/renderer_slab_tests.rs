@@ -75,6 +75,52 @@ fn incomplete_slab_frames_wait_for_every_layer_to_recover() -> anyhow::Result<()
 }
 
 #[test]
+fn missing_or_stale_layer_textures_wait_for_a_rebake() -> anyhow::Result<()> {
+    let key = LayerKey(202);
+    let id = crate::LayerId(7);
+    let bounds = rect(0., 0., 120., 80.);
+    let registry = SlabRegistry::new();
+    let mut textures = FxHashMap::default();
+    let mut scene = Scene::default();
+    scene.insert_primitive(crate::scene::PaintSurface {
+        order: 0,
+        bounds,
+        content_mask: mask(),
+        content: crate::SurfaceContent::Layer { id, key, content_token: 1 },
+    });
+    scene.finish();
+    assert!(slab_frame_ready(&scene, &registry), "texture-only frames carry no slabs to guard");
+    assert!(!layer_texture_frame_ready(&scene, &registry, |id| textures.get(&id).copied()));
+    assert!(registry.take_rerecord_requests().contains(&key));
+    textures.insert(id, (key, 1));
+    assert!(layer_texture_frame_ready(&scene, &registry, |id| textures.get(&id).copied()));
+    textures.clear();
+    assert!(!layer_texture_frame_ready(&scene, &registry, |id| textures.get(&id).copied()),
+        "resize or eviction must retain the complete frame until the panel recovers");
+    textures.insert(id, (key, 0));
+    assert!(!layer_texture_frame_ready(&scene, &registry, |id| textures.get(&id).copied()),
+        "a previous content generation is not a valid replacement");
+
+    let (_, baked) = build_multi_span_frames((0., 0.))?;
+    for mut span in baked.layer_slab_spans.into_iter().filter(|span| span.key == key) {
+        span.content_token = 1;
+        span.texture = Some(crate::scene::LayerTextureTarget {
+            layer_id: id, key, content_token: 1, texture_bounds: bounds,
+        });
+        scene.layer_slab_spans.push(span);
+    }
+    assert!(layer_texture_frame_ready(&scene, &registry, |id| textures.get(&id).copied()),
+        "a scheduled rebake supplies the new generation before presentation");
+    textures.insert(id, (LayerKey(999), 1));
+    assert!(!layer_texture_frame_ready(&scene, &registry, |id| textures.get(&id).copied()),
+        "a texture from another owner must never satisfy the surface");
+    textures.clear();
+    assert!(!layer_texture_frame_ready(&scene, &registry, |id| textures.get(&id).copied()),
+        "a bake cannot target a texture that has not been allocated");
+    Ok(())
+}
+
+#[test]
 fn viewport_updates_restore_ui_on_fresh_presentation_images() -> anyhow::Result<()> {
     let harness = headless_harness().ok_or_else(|| anyhow::anyhow!("no wgpu adapter"))?;
     let device = &harness.context.device;

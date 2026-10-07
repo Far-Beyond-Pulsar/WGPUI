@@ -1604,8 +1604,13 @@ pub(crate) enum SurfaceContent {
     /// A texture-retained layer's persistent texture (#96). The renderer
     /// samples it from its layer-texture cache; the surface's bounds select
     /// the sub-rect (the texture covers the layer's buffer extent) and the
-    /// content mask clips to the layer's visible rect.
-    Layer(LayerId),
+    /// content mask clips to the layer's visible rect. Owner and generation
+    /// let the renderer request a rebake before presenting missing content.
+    Layer {
+        id: LayerId,
+        key: LayerKey,
+        content_token: u64,
+    },
 }
 
 /// Renderer-side target carried by a texture-retained layer's slab spans

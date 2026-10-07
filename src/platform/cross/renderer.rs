@@ -2169,6 +2169,33 @@ fn slab_frame_ready(scene: &Scene, registry: &SlabRegistry) -> bool {
     ready
 }
 
+fn layer_texture_frame_ready(
+    scene: &Scene,
+    registry: &SlabRegistry,
+    texture_content: impl Fn(crate::LayerId) -> Option<(LayerKey, u64)>,
+) -> bool {
+    let mut ready = true;
+    for surface in &scene.surfaces {
+        let crate::SurfaceContent::Layer { id, key, content_token } = &surface.content else {
+            continue;
+        };
+        let has_content = texture_content(*id).is_some_and(|(cached_key, cached_token)| {
+            cached_key == *key && (cached_token == *content_token
+                || scene.layer_slab_spans.iter().any(|span| {
+                    span.texture.as_ref().is_some_and(|target| {
+                        target.layer_id == *id && target.key == *key
+                            && target.content_token == *content_token
+                    })
+                }))
+        });
+        if !has_content {
+            registry.request_rerecord([*key]);
+            ready = false;
+        }
+    }
+    ready
+}
+
 fn restore_framebuffer(
     encoder: &mut wgpu::CommandEncoder,
     framebuffer: &wgpu::Texture,
@@ -2363,6 +2390,14 @@ pub struct WgpuRenderer {
 }
 
 impl WgpuRenderer {
+    fn retained_frame_ready(&self, scene: &Scene) -> bool {
+        let slabs_ready = slab_frame_ready(scene, &self.slab_registry);
+        let textures_ready = layer_texture_frame_ready(scene, &self.slab_registry, |id| {
+            self.layer_textures.get(&id).map(|entry| (entry.key, entry.content_token))
+        });
+        slabs_ready && textures_ready
+    }
+
     pub fn new<WindowHandle>(
         context: Arc<WgpuContext>,
         window: WindowHandle,
@@ -3334,9 +3369,9 @@ impl WgpuRenderer {
             drop(gpu_upload_timer);
         }
 
-        // Keep the last complete frame on screen while invalid slab content
+        // Keep the last complete frame on screen while invalid cached content
         // is rebuilt. Presenting only the other layers would make panels blink.
-        if !slab_frame_ready(scene, &self.slab_registry) {
+        if !self.retained_frame_ready(scene) {
             return;
         }
 
@@ -4482,7 +4517,7 @@ impl WgpuRenderer {
 
                                     seen_surfaces.push(*surface_id);
                                 }
-                            } else if let crate::SurfaceContent::Layer(layer_id) = &surface.content
+                            } else if let crate::SurfaceContent::Layer { id: layer_id, .. } = &surface.content
                             {
                                 // #96: composite a texture-retained layer's
                                 // persistent texture. The surface's bounds are
