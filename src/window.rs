@@ -1530,6 +1530,15 @@ pub(crate) struct FrameEffect {
     pub(crate) geometry: ElementGeometry,
 }
 
+#[derive(Clone)]
+struct PrepaintLayerCoverage {
+    key: Option<LayerKey>,
+    bounds: Bounds<Pixels>,
+    opaque_bounds: Option<Bounds<Pixels>>,
+    poisoned_bounds: Option<Bounds<Pixels>>,
+    subtree_len: usize,
+}
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -1539,6 +1548,7 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    layer_coverage: Vec<PrepaintLayerCoverage>,
     /// `on_frame` effects registered this frame, in the order they ran.
     pub(crate) effects: Vec<FrameEffect>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
@@ -1569,6 +1579,7 @@ pub(crate) struct Frame {
 #[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
+    layer_coverage_index: usize,
     effects_index: usize,
     tooltips_index: usize,
     deferred_draws_index: usize,
@@ -1599,6 +1610,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            layer_coverage: Vec::new(),
             effects: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -1638,6 +1650,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.layer_coverage.clear();
         self.effects.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
@@ -4048,6 +4061,7 @@ impl Window {
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
+            layer_coverage_index: self.next_frame.layer_coverage.len(),
             effects_index: self.next_frame.effects.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
@@ -4093,7 +4107,7 @@ impl Window {
         // side), which left `reuse_paint` free to slice out of bounds on
         // exactly the fields nobody had thought about. If a field is added to
         // `PrepaintStateIndex` or `PaintIndex`, add it here.
-        let checks: [(&'static str, usize, usize, usize); 16] = [
+        let checks: [(&'static str, usize, usize, usize); 17] = [
             // (name, start, end, length of the array it indexes)
             (
                 "prepaint hitboxes",
@@ -4106,6 +4120,12 @@ impl Window {
                 prepaint.start.effects_index,
                 prepaint.end.effects_index,
                 frame.effects.len(),
+            ),
+            (
+                "prepaint layer coverage",
+                prepaint.start.layer_coverage_index,
+                prepaint.end.layer_coverage_index,
+                frame.layer_coverage.len(),
             ),
             (
                 "prepaint tooltip_requests",
@@ -4254,6 +4274,11 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        self.next_frame.layer_coverage.extend(
+            self.rendered_frame.layer_coverage
+                [range.start.layer_coverage_index..range.end.layer_coverage_index]
+                .iter().cloned(),
+        );
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -5296,52 +5321,81 @@ impl Window {
         if !crate::occlusion::enabled() {
             return false;
         }
-        let Some(target) = self.layers.get(&key) else {
+        // Retained records outlive their tree position and even their presence
+        // on screen. Only this frame's prepaint traversal can establish which
+        // opaque regions will actually paint above a layer.
+        let coverage = if matches!(
+            self.invalidator.draw_phase(),
+            DrawPhase::Paint | DrawPhase::Prepaint
+        ) {
+            &self.next_frame.layer_coverage
+        } else {
+            &self.rendered_frame.layer_coverage
+        };
+        let mut targets = coverage
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.key == Some(key));
+        let Some((index, target)) = targets.next() else {
             return false;
         };
-        // Descendants are drawn by this composite. Counting them as external
-        // occluders would skip the parent AND the content supposedly covering it.
-        let mut descendants = FxHashSet::default();
-        let mut pending = vec![key];
-        while let Some(parent) = pending.pop() {
-            if !descendants.insert(parent) {
-                continue;
-            }
-            if let Some(layer) = self.layers.get(&parent) {
-                pending.extend(layer.items.iter().filter_map(|item| match item {
-                    LayerItem::Nested(child) => Some(*child),
-                    _ => None,
-                }));
+        if targets.next().is_some() {
+            return false;
+        }
+        for poisoned in coverage.iter().filter_map(|entry| entry.poisoned_bounds) {
+            let overlap = poisoned.intersect(&target.bounds);
+            if overlap.size.width > Pixels::ZERO && overlap.size.height > Pixels::ZERO {
+                crate::render_stats::count("occlusion: poisoned by backdrop filter");
+                return false;
             }
         }
-        // Check backdrop filter / filter group poisoning: any layer above the
-        // target with poisoned bounds that overlap the target's bounds prevents
-        // occlusion. The filter reads the pixels underneath it.
-        let target_id = target.id;
-        for layer in self.layers.values() {
-            if layer.id <= target_id {
-                continue;
-            }
-            for poisoned in &layer.poisoned_bounds {
-                let overlap = poisoned.intersect(&target.cache_key.bounds);
-                if overlap.size.width > Pixels::ZERO && overlap.size.height > Pixels::ZERO {
-                    crate::render_stats::count("occlusion: poisoned by backdrop filter");
-                    return false;
-                }
-            }
-        }
-
-        let occluders = self
-            .layers
+        // A parent's children cannot hide that parent: skipping its composite
+        // would skip the very content used as proof of coverage.
+        let above = coverage
+            .get(index + target.subtree_len..)
+            .unwrap_or_default();
+        let occluders = above
             .iter()
-            .filter(|(candidate, layer)| {
-                layer.id > target.id
-                    && !descendants.contains(candidate)
-                    && !self.retained_layer_stack.contains(candidate)
-            })
-            .filter_map(|(_, layer)| layer.opaque_bounds)
+            .filter_map(|entry| entry.opaque_bounds)
             .collect::<Vec<_>>();
-        crate::occlusion::fully_covered(target.cache_key.bounds, &occluders)
+        crate::occlusion::fully_covered(target.bounds, &occluders)
+    }
+
+    pub(crate) fn record_prepaint_layer_style(
+        &mut self,
+        key: Option<LayerKey>,
+        bounds: Bounds<Pixels>,
+        style: &crate::Style,
+    ) {
+        if let Some(key) = key {
+            let opaque = if style.filter.is_empty() {
+                style
+                    .opaque_region(bounds, self.element_opacity())
+                    .map(|region| region.intersect(&self.content_mask().bounds))
+            } else {
+                None
+            };
+            if let Some(entry) = self
+                .next_frame
+                .layer_coverage
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.key == Some(key))
+            {
+                entry.opaque_bounds = opaque;
+            }
+        }
+        if !style.filter.is_empty() || !style.backdrop_filter.is_empty() {
+            let radius = crate::Filter::max_blur_radius(&style.filter)
+                .max(crate::Filter::max_blur_radius(&style.backdrop_filter));
+            self.next_frame.layer_coverage.push(PrepaintLayerCoverage {
+                key: None,
+                bounds,
+                opaque_bounds: None,
+                poisoned_bounds: Some(bounds.dilate(radius)),
+                subtree_len: 1,
+            });
+        }
     }
 
     pub(crate) fn cached_layer_invalidated(&self, key: LayerKey) -> bool {
@@ -6736,9 +6790,19 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_prepaint();
+        let index = self.next_frame.layer_coverage.len();
+        self.next_frame.layer_coverage.push(PrepaintLayerCoverage {
+            key: Some(key),
+            bounds,
+            opaque_bounds: None,
+            poisoned_bounds: None,
+            subtree_len: 1,
+        });
         self.hitbox_layer_stack.push((key, bounds.origin, bounds));
         let result = f(self);
         self.hitbox_layer_stack.pop();
+        self.next_frame.layer_coverage[index].subtree_len =
+            self.next_frame.layer_coverage.len() - index;
         result
     }
 
@@ -11391,13 +11455,7 @@ mod test {
         // under the foreground's opaque region.
         clean_frame(cx, window.into());
 
-        // Reveal: move the foreground off the background. The frame that
-        // moves the occluder still judges the background against its
-        // previous-frame coverage (paint order) — the documented cross-frame
-        // cost the record-path occluder tests also pin — so the reveal lands
-        // on the following clean frame, where the background must COMPOSITE
-        // (visited). Culling is what stale coverage would keep producing; it
-        // only stops if the foreground's opaque region moved away with it.
+        // Fresh prepaint coverage reveals the background on this same frame.
         move_fg(&window, cx, 300., 300.);
         assert_eq!(
             fg_paints.get(),
@@ -13014,6 +13072,151 @@ mod test {
         !crate::occlusion::enabled()
     }
 
+    struct ChangingPanelStack {
+        reverse: bool,
+        show_cover: bool,
+        cover_left: crate::Pixels,
+        cover_opacity: f32,
+    }
+
+    impl crate::Render for ChangingPanelStack {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let panel = crate::div()
+                .id("live-panel")
+                .layer_keyed(0u64)
+                .absolute()
+                .left(px(200.))
+                .top(px(200.))
+                .size(px(200.))
+                .bg(crate::green());
+            let cover = crate::div()
+                .id("temporary-cover")
+                .layer_keyed(self.cover_opacity.to_bits())
+                .absolute()
+                .left(self.cover_left)
+                .top(px(200.))
+                .size(px(200.))
+                .bg(crate::red())
+                .opacity(self.cover_opacity);
+            let root = crate::div().size_full();
+            if !self.show_cover {
+                root.child(panel)
+            } else if self.reverse {
+                root.child(cover).child(panel)
+            } else {
+                root.child(panel).child(cover)
+            }
+        }
+    }
+
+    fn changing_panel_window(cx: &mut TestAppContext) -> crate::WindowHandle<ChangingPanelStack> {
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| ChangingPanelStack {
+            reverse: false,
+            show_cover: true,
+            cover_left: px(200.),
+            cover_opacity: 1.,
+        });
+        cx.run_until_parked();
+        clean_frame(cx, window.into());
+        window
+    }
+
+    fn assert_live_panel_visible(
+        cx: &mut TestAppContext,
+        window: crate::WindowHandle<ChangingPanelStack>,
+    ) {
+        window
+            .update(cx, |_, window, _| {
+                let key = *window
+                    .layers
+                    .iter()
+                    .min_by_key(|(_, layer)| layer.id)
+                    .expect("live panel")
+                    .0;
+                assert!(
+                    !window.is_layer_occluded(key),
+                    "current visible panel must not be culled"
+                );
+                let scene = &window.rendered_frame.scene;
+                assert!(
+                    scene
+                        .quads
+                        .iter()
+                        .any(|quad| quad.background.solid == crate::green())
+                        || scene.layer_slab_spans.iter().any(|span| span.key == key)
+                        || scene
+                            .surfaces
+                            .iter()
+                            .any(|surface| matches!(surface.content,
+                    crate::scene::SurfaceContent::Layer { key: owner, .. } if owner == key)),
+                    "the visible panel must emit pixels on the first changed frame"
+                );
+            })
+            .expect("window update");
+    }
+
+    #[gpui::test]
+    fn removed_layers_cannot_hide_live_panels(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let window = changing_panel_window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.show_cover = false;
+                cx.notify();
+            })
+            .expect("remove cover");
+        cx.run_until_parked();
+        assert_live_panel_visible(cx, window);
+        for _ in 0..8 {
+            clean_frame(cx, window.into());
+            assert_live_panel_visible(cx, window);
+        }
+    }
+
+    #[gpui::test]
+    fn reordered_layers_use_current_paint_order_for_occlusion(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        let window = changing_panel_window(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.reverse = true;
+                cx.notify();
+            })
+            .expect("reorder panels");
+        cx.run_until_parked();
+        assert_live_panel_visible(cx, window);
+        for _ in 0..8 {
+            clean_frame(cx, window.into());
+            assert_live_panel_visible(cx, window);
+        }
+    }
+
+    #[gpui::test]
+    fn moving_or_fading_layers_reveal_panels_in_the_same_frame(cx: &mut TestAppContext) {
+        if layers_off() || occlusion_off() {
+            return;
+        }
+        for fade in [false, true] {
+            let window = changing_panel_window(cx);
+            window
+                .update(cx, |view, _, cx| {
+                    if fade {
+                        view.cover_opacity = 0.5;
+                    } else {
+                        view.cover_left = px(600.);
+                    }
+                    cx.notify();
+                })
+                .expect("reveal panel");
+            cx.run_until_parked();
+            assert_live_panel_visible(cx, window);
+        }
+    }
+
     fn two_layer_occlusion_window(
         cx: &mut TestAppContext,
         fg_rounded: bool,
@@ -13162,16 +13365,9 @@ mod test {
         window.update(cx, |_, _, cx| cx.notify()).unwrap();
         cx.run_until_parked();
 
-        // The frame that moves the occluder still judges the background
-        // against the foreground's previous-frame opaque region: layers are
-        // visited in paint order, so the background decides before the
-        // foreground has re-recorded its new geometry. Staying culled for
-        // exactly that frame is the documented cost of cross-frame occluder
-        // data; the invariant is that the layer comes back (next frame).
-        assert_eq!(
-            bg_paints.get(),
-            bg_painted_once,
-            "the frame that moves the occluder still sees last frame's coverage"
+        assert!(
+            bg_paints.get() > bg_painted_once,
+            "the background must rebuild in the same frame its cover moves away"
         );
 
         clean_frame(cx, window.into());

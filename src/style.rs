@@ -589,7 +589,7 @@ impl Style {
 
         let has_solid_background = self.background.as_ref().is_some_and(|fill| {
             fill.color()
-                .is_some_and(|color| !color.is_transparent() && color.tag == crate::BackgroundTag::Solid)
+                .is_some_and(|color| color.tag == crate::BackgroundTag::Solid && color.solid.a >= 1.0)
         });
         if !has_solid_background {
             return None;
@@ -1402,6 +1402,22 @@ mod tests {
     use super::*;
 
     use util_macros::perf;
+
+    #[test]
+    fn translucent_backgrounds_do_not_claim_opaque_coverage() {
+        let bounds = Bounds::new(
+            crate::point(px(0.), px(0.)),
+            crate::size(px(200.), px(200.)),
+        );
+        let mut style = Style {
+            background: Some(red().alpha(0.5).into()),
+            ..Style::default()
+        };
+        assert!(style.opaque_region(bounds, 1.).is_none());
+        style.background = Some(red().into());
+        assert_eq!(style.opaque_region(bounds, 1.), Some(bounds));
+        assert!(style.opaque_region(bounds, 0.5).is_none());
+    }
 
     #[perf]
     fn test_basic_highlight_style_combination() {

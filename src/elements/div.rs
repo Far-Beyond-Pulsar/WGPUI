@@ -1872,6 +1872,8 @@ impl Element for Div {
                         return hitbox;
                     }
 
+                    window.record_prepaint_layer_style(layer_key, bounds, style);
+
                     // Overscroll buffer (#96): a scroll container under a
                     // buffered layer joins the same protocol the virtualized
                     // lists use. When the enclosing texture-retained layer is
@@ -2890,7 +2892,9 @@ impl Interactivity {
 
                         let scroll_offset =
                             self.clamp_scroll_position(bounds, &style, window, cx);
-                        let result = f(&style, scroll_offset, hitbox, window, cx);
+                        let result = window.with_element_opacity(style.opacity, |window| {
+                            f(&style, scroll_offset, hitbox, window, cx)
+                        });
                         (result, element_state)
                     })
                 })
