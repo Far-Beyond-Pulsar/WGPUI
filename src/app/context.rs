@@ -247,6 +247,13 @@ impl<'a, T: 'static> Context<'a, T> {
                 },
             );
         }
+        if crate::render_stats::enabled() {
+            crate::render_stats::count_site(
+                "notify: ",
+                std::any::type_name::<T>(),
+                std::panic::Location::caller(),
+            );
+        }
         self.app.notify(self.entity_state.entity_id);
     }
 

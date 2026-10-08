@@ -400,19 +400,18 @@ fn build_packed_layer(items: &[LayerItem]) -> PackedLayer {
         }
     }
 
-    // Mirror `Scene::finish`'s stable sorts exactly: same keys, so ties
-    // (equal orders; sprites further tied on tile) resolve to insertion order
-    // on both sides.
+    // Mirror `Scene::finish`'s stable sorts exactly: equal orders resolve to
+    // insertion order on both sides.
     packed.quads.sort_by_key(|quad| quad.order);
     packed.shadows.sort_by_key(|shadow| shadow.order);
     packed.paths.sort_by_key(|path| path.order);
     packed.underlines.sort_by_key(|underline| underline.order);
     packed
         .mono_sprites
-        .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        .sort_by_key(|sprite| sprite.order);
     packed
         .poly_sprites
-        .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        .sort_by_key(|sprite| sprite.order);
 
     // Renumber after sorting so a path's dense local id equals its position
     // in this array (and therefore its slot in the vertex-stream prefix
@@ -1236,10 +1235,9 @@ mod tests {
     }
 
     #[test]
-    fn sprite_tile_id_tiebreak_matches_scene_finish() {
-        // Three same-texture sprites tying on order, inserted with descending
-        // tile ids: `finish` re-orders them by (order, tile.tile_id), so the
-        // packed arrays and manifest must show tiles 1, 2, 3 — not 3, 1, 2.
+    fn equal_order_sprite_ties_keep_insertion_order() {
+        // Same-order sprites retain paint order even when their atlas tile ids
+        // are out of order; atlas allocation must not change their z position.
         let mut scene = Scene::default();
         scene.begin_layer(LayerKey(1), rect(0., 0., 700., 100.), true);
         scene.insert_primitive(mono_sprite_marked(rect(0., 0., 20., 20.), 3, 3, 31));
@@ -1257,6 +1255,10 @@ mod tests {
             vec![
                 Entry {
                     kind: SlabKind::MonoSprites,
+                    marker: 31,
+                },
+                Entry {
+                    kind: SlabKind::MonoSprites,
                     marker: 32,
                 },
                 Entry {
@@ -1264,19 +1266,15 @@ mod tests {
                     marker: 33,
                 },
                 Entry {
-                    kind: SlabKind::MonoSprites,
-                    marker: 31,
+                    kind: SlabKind::PolySprites,
+                    marker: 34,
                 },
                 Entry {
                     kind: SlabKind::PolySprites,
                     marker: 35,
                 },
-                Entry {
-                    kind: SlabKind::PolySprites,
-                    marker: 34,
-                },
             ],
-            "the oracle must be ordered by tile id within the tied order"
+            "the oracle must preserve paint order within the tied order"
         );
         assert_packing_matches_oracle(&items, &oracle);
     }

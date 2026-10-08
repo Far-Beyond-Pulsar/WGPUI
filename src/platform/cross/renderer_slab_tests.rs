@@ -2094,3 +2094,250 @@ fn overscroll_buffer_bake_and_composite_match_a_direct_render_at_the_same_scroll
     Ok(())
 }
 
+
+// ---------------------------------------------------------------------
+// A parent layer with a translucent background and a nested child whose
+// content changes on its own: the child must stay ABOVE the parent's
+// background in every frame, however many times only the child re-records.
+// ---------------------------------------------------------------------
+
+struct LayerSpec {
+    key: LayerKey,
+    bounds: SceneBounds<ScaledPixels>,
+    items: Vec<crate::layer::LayerItem>,
+}
+
+fn record_layer_items(key: LayerKey, bounds: SceneBounds<ScaledPixels>, paint: impl FnOnce(&mut Scene)) -> LayerSpec {
+    let mut recording = Scene::default();
+    recording.begin_layer(key, bounds, true);
+    paint(&mut recording);
+    let items = recording.end_layer().unwrap();
+    LayerSpec { key, bounds, items }
+}
+
+fn emit_span(scene: &mut Scene, spec: &LayerSpec, token: u64) -> anyhow::Result<()> {
+    let origin = (spec.bounds.origin.x.0, spec.bounds.origin.y.0);
+    let mut packed = match crate::scene_pack::pack_layer_items(&spec.items) {
+        crate::scene_pack::PackOutcome::Packed(packed) => packed,
+        crate::scene_pack::PackOutcome::FellBack(reason) => {
+            anyhow::bail!("fell back: {reason:?}")
+        }
+    };
+    crate::platform::cross::slab_gpu::make_packed_relative(&mut packed, origin_arr(origin));
+    let runs: Vec<SlabRun> = packed
+        .runs
+        .iter()
+        .map(|run| SlabRun {
+            kind: run.kind,
+            start: run.start,
+            count: run.count,
+            texture_id: run.texture_id,
+        })
+        .collect();
+    let totals = [
+        packed.quads.len() as u32,
+        packed.shadows.len() as u32,
+        packed.total_path_vertices(),
+        packed.underlines.len() as u32,
+        packed.mono_sprites.len() as u32,
+        packed.poly_sprites.len() as u32,
+    ];
+    scene.push_layer_slab_span(
+        spec.bounds,
+        spec.key,
+        token,
+        origin_arr(origin),
+        totals,
+        runs,
+        Arc::from(packed),
+        None,
+    );
+    Ok(())
+}
+
+fn legacy_layer(scene: &mut Scene, spec: &LayerSpec) {
+    for item in &spec.items {
+        if let crate::layer::LayerItem::Primitive(p) = item {
+            scene.push_retained(p);
+        }
+    }
+}
+
+#[test]
+fn a_child_layer_that_re_records_alone_stays_above_its_parents_background() -> anyhow::Result<()> {
+    let Some(mut harness) = headless_harness() else {
+        eprintln!("skipping: no wgpu adapter");
+        return Ok(());
+    };
+    const PARENT: LayerKey = LayerKey(301);
+    const CHILD: LayerKey = LayerKey(302);
+    let parent_bounds = rect(20., 20., 160., 100.);
+    let child_bounds = rect(30., 40., 100., 40.);
+
+    let parent = record_layer_items(PARENT, parent_bounds, |s| {
+        s.insert_primitive(quad_solid(
+            parent_bounds,
+            Hsla { h: 0., s: 0., l: 0.05, a: 0.85 },
+        ));
+    });
+    let child_with = |quads: usize| {
+        record_layer_items(CHILD, child_bounds, |s| {
+            for i in 0..quads {
+                s.insert_primitive(quad_solid(
+                    rect(32. + i as f32 * 12., 44., 10., 30.),
+                    Hsla { h: 0.15, s: 1., l: 0.6, a: 1. },
+                ));
+            }
+        })
+    };
+
+    let mut failures = Vec::new();
+    // Frame 1 establishes both layers; then only the child changes, with a
+    // different instance count each time, as a text section's glyphs do.
+    for (frame, (child_quads, child_token)) in
+        [(3usize, 1u64), (5, 2), (4, 3), (8, 4), (2, 5)].into_iter().enumerate()
+    {
+        let child = child_with(child_quads);
+
+        // Spliced: parent stretch, then the nested child's, as the real
+        // composite emits them. The parent's token never changes.
+        let mut spliced = Scene::default();
+        spliced.insert_primitive(background_quad());
+        spliced.begin_layer(PARENT, parent_bounds, false);
+        emit_span(&mut spliced, &parent, 1)?;
+        spliced.begin_layer(CHILD, child_bounds, false);
+        emit_span(&mut spliced, &child, child_token)?;
+        spliced.end_layer();
+        spliced.end_layer();
+        spliced.finish();
+
+        // Reference: the same frame composited through the legacy path.
+        let mut legacy = Scene::default();
+        legacy.insert_primitive(background_quad());
+        legacy.begin_layer(PARENT, parent_bounds, false);
+        legacy_layer(&mut legacy, &parent);
+        legacy.begin_layer(CHILD, child_bounds, false);
+        legacy_layer(&mut legacy, &child);
+        legacy.end_layer();
+        legacy.end_layer();
+        legacy.finish();
+
+        harness.upload_legacy_arrays(&legacy);
+        let expected = harness.render_and_read_back(&legacy, None);
+
+        let groups = harness.prepare_spans(&spliced);
+        harness.upload_legacy_arrays(&spliced);
+        let actual = harness.render_and_read_back(&spliced, Some(&groups));
+
+        let differing = expected.iter().zip(&actual).filter(|(a, b)| a != b).count();
+        if differing != 0 {
+            failures.push(format!("frame {frame}: {differing} differing bytes"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+    Ok(())
+}
+
+fn insert_glyph_tile(harness: &PixelHarness, glyph: u32) -> anyhow::Result<AtlasTile> {
+    use crate::PlatformAtlas as _;
+    let key = crate::AtlasKey::Glyph(crate::RenderGlyphParams {
+        font_id: crate::FontId(0),
+        glyph_id: crate::GlyphId(glyph),
+        font_size: px(12.),
+        subpixel_variant: point(0, 0),
+        scale_factor: 1.0,
+        is_emoji: false,
+    });
+    let tile = harness
+        .atlas
+        .get_or_insert_with(&key, &mut || {
+            let side = 8usize;
+            Ok(Some((
+                SceneSize { width: DevicePixels(side as i32), height: DevicePixels(side as i32) },
+                std::borrow::Cow::Owned(vec![255u8; side * side]),
+            )))
+        })?
+        .ok_or_else(|| anyhow::anyhow!("atlas refused the glyph tile"))?;
+    Ok(tile)
+}
+
+fn glyph_sprite(bounds: SceneBounds<ScaledPixels>, tile: AtlasTile, color: Hsla) -> crate::scene::MonochromeSprite {
+    crate::scene::MonochromeSprite {
+        order: 0,
+        pad: 0,
+        bounds,
+        content_mask: mask(),
+        text_color: crate::TextColor::from(color),
+        tile,
+        transformation: crate::TransformationMatrix::unit(),
+    }
+}
+
+#[test]
+fn a_text_like_child_layer_re_recording_alone_stays_above_its_parents_background() -> anyhow::Result<()> {
+    let Some(mut harness) = headless_harness() else {
+        eprintln!("skipping: no wgpu adapter");
+        return Ok(());
+    };
+    const PARENT: LayerKey = LayerKey(311);
+    const CHILD: LayerKey = LayerKey(312);
+    let parent_bounds = rect(20., 20., 160., 100.);
+    let child_bounds = rect(30., 40., 120., 40.);
+    let tiles = [insert_glyph_tile(&harness, 1)?, insert_glyph_tile(&harness, 2)?, insert_glyph_tile(&harness, 3)?];
+
+    let parent = record_layer_items(PARENT, parent_bounds, |s| {
+        s.insert_primitive(quad_solid(parent_bounds, Hsla { h: 0., s: 0., l: 0.05, a: 0.85 }));
+    });
+    let child_with = |glyphs: usize| {
+        record_layer_items(CHILD, child_bounds, |s| {
+            // A card background, then glyphs from several tiles, then a dot:
+            // what a stat row records.
+            s.insert_primitive(quad_solid(child_bounds, Hsla { h: 0.6, s: 0.2, l: 0.3, a: 0.3 }));
+            for i in 0..glyphs {
+                s.insert_primitive(glyph_sprite(
+                    rect(34. + i as f32 * 9., 44., 8., 8.),
+                    tiles[i % 3],
+                    Hsla { h: 0., s: 0., l: 1., a: 1. },
+                ));
+            }
+            s.insert_primitive(quad_solid(rect(34., 60., 8., 8.), Hsla { h: 0.02, s: 0.8, l: 0.6, a: 1. }));
+        })
+    };
+
+    let mut failures = Vec::new();
+    for (frame, (glyphs, token)) in [(4usize, 1u64), (7, 2), (5, 3), (9, 4), (3, 5)].into_iter().enumerate() {
+        let child = child_with(glyphs);
+
+        let mut spliced = Scene::default();
+        spliced.insert_primitive(background_quad());
+        spliced.begin_layer(PARENT, parent_bounds, false);
+        emit_span(&mut spliced, &parent, 1)?;
+        spliced.begin_layer(CHILD, child_bounds, false);
+        emit_span(&mut spliced, &child, token)?;
+        spliced.end_layer();
+        spliced.end_layer();
+        spliced.finish();
+
+        let mut legacy = Scene::default();
+        legacy.insert_primitive(background_quad());
+        legacy.begin_layer(PARENT, parent_bounds, false);
+        legacy_layer(&mut legacy, &parent);
+        legacy.begin_layer(CHILD, child_bounds, false);
+        legacy_layer(&mut legacy, &child);
+        legacy.end_layer();
+        legacy.end_layer();
+        legacy.finish();
+
+        harness.upload_legacy_arrays(&legacy);
+        let expected = harness.render_and_read_back(&legacy, None);
+        let groups = harness.prepare_spans(&spliced);
+        harness.upload_legacy_arrays(&spliced);
+        let actual = harness.render_and_read_back(&spliced, Some(&groups));
+        let differing = expected.iter().zip(&actual).filter(|(a, b)| a != b).count();
+        if differing != 0 {
+            failures.push(format!("frame {frame}: {differing} differing bytes"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+    Ok(())
+}

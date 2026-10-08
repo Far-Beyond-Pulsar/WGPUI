@@ -506,16 +506,33 @@ impl LineLayoutCache {
         let mut previous_frame = &mut *self.previous_frame.lock();
         let mut current_frame = &mut *self.current_frame.write();
 
-        for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
+        // A stored range can outlive the list it indexes (callers are meant to
+        // check `previous_frame_extent` first, but not every replay path
+        // can). Slicing with it aborts the process, and skipping is harmless:
+        // the lines are simply shaped again when next asked for. So a stale
+        // range is counted and skipped, never sliced.
+        let lines = previous_frame
+            .used_lines
+            .get(range.start.lines_index..range.end.lines_index);
+        let wrapped = previous_frame
+            .used_wrapped_lines
+            .get(range.start.wrapped_lines_index..range.end.wrapped_lines_index);
+        if lines.is_none() || wrapped.is_none() {
+            report_stale_reuse(
+                &range,
+                previous_frame.used_lines.len(),
+                previous_frame.used_wrapped_lines.len(),
+            );
+        }
+
+        for key in lines.unwrap_or_default() {
             if let Some((key, line)) = previous_frame.lines.remove_entry(key) {
                 current_frame.lines.insert(key, line);
             }
             current_frame.used_lines.push(key.clone());
         }
 
-        for key in &previous_frame.used_wrapped_lines
-            [range.start.wrapped_lines_index..range.end.wrapped_lines_index]
-        {
+        for key in wrapped.unwrap_or_default() {
             if let Some((key, line)) = previous_frame.wrapped_lines.remove_entry(key) {
                 current_frame.wrapped_lines.insert(key, line);
             }
@@ -759,5 +776,61 @@ impl<'a> Borrow<dyn AsCacheKeyRef + 'a> for Arc<CacheKey> {
 impl AsCacheKeyRef for CacheKeyRef<'_> {
     fn as_cache_key_ref(&self) -> CacheKeyRef<'_> {
         *self
+    }
+}
+
+/// Note that a layout reuse range no longer fit the previous frame, and say so
+/// once. Counted every time (it is the number that says whether this is a
+/// startup blip or continuous); logged only the first.
+fn report_stale_reuse(range: &Range<LineLayoutIndex>, lines_len: usize, wrapped_len: usize) {
+    crate::render_stats::count("layout cache: stale reuse range (skipped)");
+
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    log::warn!(
+        "[LAYOUT CACHE] stale reuse range skipped: lines {}..{} of {}, wrapped {}..{} of {}. \
+         The text is shaped again instead of reused; this used to abort the process. \
+         Further occurrences are counted, not logged.",
+        range.start.lines_index,
+        range.end.lines_index,
+        lines_len,
+        range.start.wrapped_lines_index,
+        range.end.wrapped_lines_index,
+        wrapped_len,
+    );
+}
+
+#[cfg(test)]
+mod stale_range_tests {
+    use super::*;
+    use crate::platform::NoopTextSystem;
+
+    fn index(lines: usize, wrapped: usize) -> LineLayoutIndex {
+        LineLayoutIndex { lines_index: lines, wrapped_lines_index: wrapped }
+    }
+
+    /// The abort this guards against: `range start index 5 out of range for
+    /// slice of length 2` from a range recorded against a longer frame.
+    #[test]
+    fn a_stale_range_is_skipped_not_sliced() {
+        let cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()));
+
+        // Nothing has been laid out: any non-empty range is stale.
+        cache.reuse_layouts(index(5, 0)..index(7, 0));
+        cache.reuse_layouts(index(0, 3)..index(0, 9));
+        cache.reuse_layouts(index(5, 5)..index(2, 2)); // start past end
+
+        // Nothing was copied across.
+        let now = cache.layout_index();
+        assert_eq!((now.lines_index, now.wrapped_lines_index), (0, 0));
+    }
+
+    #[test]
+    fn an_empty_range_is_still_fine() {
+        let cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()));
+        cache.reuse_layouts(index(0, 0)..index(0, 0));
+        assert_eq!(cache.layout_index().lines_index, 0);
     }
 }

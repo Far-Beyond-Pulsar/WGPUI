@@ -249,6 +249,9 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        // Wall time of Taffy's whole pass, measure callbacks included; the
+        // callbacks alone are `taffy: measure`, so the difference is pure Taffy.
+        let _compute_scope = crate::render_stats::scope_stats_only("taffy: compute layout");
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
@@ -257,6 +260,8 @@ impl TaffyLayoutEngine {
                     let Some(node_context) = node_context else {
                         return taffy::geometry::Size::default();
                     };
+                    crate::render_stats::count("taffy: measure calls");
+                    let _measure_scope = crate::render_stats::scope_stats_only("taffy: measure");
 
                     let known_dimensions = Size {
                         width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),

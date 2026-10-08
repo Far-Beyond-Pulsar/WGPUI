@@ -432,8 +432,10 @@ impl TextLayout {
                     && text_layout.size.is_some()
                     && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
                 {
+                    crate::render_stats::count("text: measure cache hit");
                     return text_layout.size.unwrap();
                 }
+                crate::render_stats::count("text: measure reshaped");
 
                 let mut line_wrapper = cx.text_system().line_wrapper(
                     text_style.font(),
@@ -441,6 +443,8 @@ impl TextLayout {
                     text_style.letter_spacing,
                 );
                 let (text, runs) = if let Some(truncate_width) = truncate_width {
+                    let _truncate_scope =
+                        crate::render_stats::scope_stats_only("text: truncate_line");
                     line_wrapper.truncate_line(
                         text.clone(),
                         truncate_width,

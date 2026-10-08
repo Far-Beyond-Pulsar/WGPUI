@@ -987,16 +987,31 @@ impl App {
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
     ) -> (R, FxHashSet<EntityId>) {
+        self.detect_accessed_entities_with(true, callback)
+    }
+
+    /// [`Self::detect_accessed_entities`], optionally *not* reporting what the
+    /// callback read to the enclosing scope.
+    ///
+    /// An isolated view (`AnyView::isolated`) keeps its dependencies to itself, so
+    /// that notifying it does not invalidate the cached views above it.
+    pub(crate) fn detect_accessed_entities_with<R>(
+        &mut self,
+        merge_into_enclosing: bool,
+        callback: impl FnOnce(&mut App) -> R,
+    ) -> (R, FxHashSet<EntityId>) {
         let displaced = mem::take(self.entities.accessed_entities.get_mut().deref_mut());
         let result = callback(self);
         let accessed_in_callback = mem::replace(
             self.entities.accessed_entities.get_mut().deref_mut(),
             displaced,
         );
-        self.entities
+        if merge_into_enclosing {
+            self.entities
             .accessed_entities
             .get_mut()
             .extend(accessed_in_callback.iter().copied());
+        }
         (result, accessed_in_callback)
     }
 
