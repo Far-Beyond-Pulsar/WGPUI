@@ -527,6 +527,15 @@ impl Element for AnyView {
                         && !window.dirty_views.contains(&self.entity_id())
                         && !dependency_invalidated
                         && window.view_cache_available()
+                        // The layer this view paints into may have been asked
+                        // to re-render (a renderer re-record request after
+                        // atlas eviction), or hold a nested layer that was.
+                        // Reusing would re-emit content the renderer refuses
+                        // to draw, leaving the panel blank until the view is
+                        // notified for some other reason.
+                        && !window.layer_subtree_needs_render(
+                            crate::LayerKey::from_global_element_id(global_id.unwrap()),
+                        )
                     {
                         crate::render_stats::count("view cache: reused");
                         let _t = crate::render_stats::scope("view cache: reuse_prepaint");
@@ -764,6 +773,7 @@ impl Element for AnyView {
                             window.replay_scene_range(&element_state.paint_range);
                         }
                     }
+
 
                     let paint_end = window.paint_index();
                     element_state.paint_range = paint_start..paint_end;

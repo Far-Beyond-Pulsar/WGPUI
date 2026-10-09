@@ -1580,8 +1580,23 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 // `about_to_wait` requests a redraw on every event-loop
                 // iteration, so forcing here would run `window.refresh()` — and
                 // thereby discard every cached view — at event-loop rate.
+                //
+                // Off unless `WGPUI_FAST_SURFACE_BLIT=1`. The blit draws only
+                // the surfaces, so it presents over whatever the acquired
+                // swapchain image last held and paints over any UI composited
+                // on top of a surface. After a single UI update the other
+                // swapchain images still hold the old UI (or undefined content
+                // on flip-discard swapchains), and every viewport frame showed
+                // one of them: panels flashed stale or black until enough full
+                // composites cycled through. `refresh_buffers` already turns a
+                // new surface frame into a display-only re-present of the last
+                // scene, which is correct and skips the tree walk anyway.
                 let mut force_render = false;
-                if let Some(renderer) = window.0.renderer.get() {
+                static FAST_SURFACE_BLIT: std::sync::LazyLock<bool> =
+                    std::sync::LazyLock::new(|| {
+                        std::env::var("WGPUI_FAST_SURFACE_BLIT").is_ok_and(|value| value == "1")
+                    });
+                if *FAST_SURFACE_BLIT && let Some(renderer) = window.0.renderer.get() {
                     wgpui_scope!("Main: fast-blit pending surfaces");
                     let renderer_ref = renderer.borrow();
                     if let Some(pending_surfaces) = renderer_ref.get_pending_surfaces() {

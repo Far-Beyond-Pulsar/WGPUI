@@ -89,9 +89,22 @@ pub struct WgpuContext {
 
 impl WgpuContext {
     pub fn new(options: &WgpuOptions) -> anyhow::Result<Self> {
+        // Release builds drop wgpu's optional validation. wgpu's default keeps
+        // `VALIDATION_INDIRECT_CALL` on even in release, which validates every
+        // indirect draw on the CPU inside `CommandEncoder::finish`; the
+        // renderer's indirect args all come from its own culling passes
+        // (Helio#308). Debug builds keep full validation, and `WGPU_*`
+        // environment variables (e.g. `WGPU_VALIDATION_INDIRECT_CALL=1`)
+        // override either.
+        let flags = if cfg!(debug_assertions) {
+            wgpu::InstanceFlags::debugging()
+        } else {
+            wgpu::InstanceFlags::empty()
+        }
+        .with_env();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: options.backends,
-            flags: wgpu::InstanceFlags::default(),
+            flags,
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display: None,

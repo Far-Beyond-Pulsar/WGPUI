@@ -872,6 +872,75 @@ mod tests {
     const KIND: SlabKind = SlabKind::Quads;
     const OTHER: SlabKind = SlabKind::Shadows;
 
+    /// Random reallocations, releases and compactions across many layers: no
+    /// two live ranges may ever share an element, because the renderer uploads
+    /// each layer's bytes into its range, and an overlap lets one layer's
+    /// upload silently overwrite another layer that is still drawn clean.
+    #[test]
+    fn live_ranges_never_overlap_under_random_churn() {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |bound: u32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as u32
+        };
+        let mut allocator: SlabAllocator<u32> = SlabAllocator::new();
+        for step in 0..20_000u32 {
+            let layer = next(24);
+            match next(100) {
+                0..=69 => {
+                    let count = match next(4) {
+                        0 => 0,
+                        1 => next(64),
+                        2 => next(700),
+                        _ => next(5000),
+                    };
+                    allocator.realloc(layer, KIND, count).expect("arena has room");
+                }
+                70..=84 => allocator.free_layer(layer),
+                85..=89 => allocator.free(layer, KIND),
+                _ => {
+                    let plan = allocator.compaction_plan();
+                    allocator.apply_compaction(&plan);
+                }
+            }
+
+            let mut live: Vec<(u32, SlabRange)> = (0..24)
+                .map(|layer| (layer, range_of(&allocator, layer, KIND)))
+                .filter(|(_, range)| !range.is_empty())
+                .collect();
+            live.sort_by_key(|(_, range)| range.base);
+            for pair in live.windows(2) {
+                let ((first_layer, first), (second_layer, second)) = (pair[0], pair[1]);
+                assert!(
+                    first.end() <= second.base,
+                    "step {step}: layer {first_layer} {first:?} overlaps layer {second_layer} {second:?}"
+                );
+            }
+            for (layer, range) in &live {
+                assert!(range.count <= range.capacity, "step {step}: layer {layer} overfull {range:?}");
+                assert!(
+                    range.end() <= allocator.arena_element_capacity(KIND),
+                    "step {step}: layer {layer} {range:?} beyond the arena's high water"
+                );
+            }
+            // Free space the arena would hand out next must not intersect a
+            // live range either.
+            let arena = &allocator.arenas[KIND.index()];
+            for (&class, bases) in &arena.free_by_class {
+                for &base in bases {
+                    for (layer, range) in &live {
+                        assert!(
+                            base + class <= range.base || range.end() <= base,
+                            "step {step}: free block {base}+{class} overlaps live layer {layer} {range:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn range_of(allocator: &SlabAllocator<u32>, layer: u32, kind: SlabKind) -> SlabRange {
         allocator
             .slabs(layer)

@@ -134,6 +134,7 @@ impl VirtualList {
 
 /// Per-frame render state for [`VirtualList`].
 pub struct FrameState {
+    buffer_mask: Option<ContentMask<Pixels>>,
     items: SmallVec<[AnyElement; 32]>,
 }
 
@@ -176,6 +177,7 @@ impl Element for VirtualList {
         (
             layout_id,
             FrameState {
+                buffer_mask: None,
                 items: SmallVec::new(),
             },
         )
@@ -217,16 +219,20 @@ impl Element for VirtualList {
         self.scroll_handle
             .set_offset(point(px(0.0), logical_scroll));
 
+        let mut animation_changed = false;
         let visual_scroll = {
             let mut state = self.scroll_state.borrow_mut();
 
             state.smooth_scroll.set_target(logical_scroll);
+            state.smooth_scroll.clamp(-max_scroll, px(0.));
 
             // `refresh` would be a no-op here: it is guarded on not being
             // mid-draw, and this runs during prepaint. The animation frame is
             // deferred past the current draw and targets only this view.
             if state.smooth_scroll.update() {
+                animation_changed = true;
                 window.request_animation_frame();
+                cx.notify(window.current_view());
             }
 
             state.smooth_scroll.current()
@@ -238,6 +244,7 @@ impl Element for VirtualList {
         // buffer range so margin content exists offscreen.
         let buffer_frame = super::scroll_buffer::prepare_scroll_buffer(
             window,
+            bounds,
             point(px(0.0), visual_scroll),
         );
 
@@ -266,8 +273,7 @@ impl Element for VirtualList {
                 let buffer_top = content_top - margin.height;
                 let buffer_bottom = content_top + viewport_height + margin.height;
                 let start = self.find_index(buffer_top.max(px(0.0)));
-                let end = (self.find_index(buffer_bottom.max(px(0.0))) + 1)
-                    .min(self.heights.len());
+                let end = (self.find_index(buffer_bottom.max(px(0.0))) + 1).min(self.heights.len());
                 (
                     start..end,
                     ContentMask {
@@ -289,27 +295,34 @@ impl Element for VirtualList {
         };
 
         let items = (self.render)(visible.clone(), window, cx);
+        layout.buffer_mask = matches!(
+            buffer_frame,
+            super::scroll_buffer::ScrollBufferFrame::Buffer { .. }
+        )
+        .then_some(content_mask);
 
         window.with_content_mask(Some(content_mask), |window| {
-            for (mut item, ix) in items.into_iter().zip(visible.clone()) {
-                let y = self.offsets[ix] + visual_scroll;
+            super::scroll_buffer::with_buffer_mask(window, layout.buffer_mask, |window| {
+                for (mut item, ix) in items.into_iter().zip(visible.clone()) {
+                    let y = self.offsets[ix] + visual_scroll;
 
-                let origin = bounds.origin + point(px(0.0), y);
+                    let origin = bounds.origin + point(px(0.0), y);
 
-                let available = size(
-                    gpui::AvailableSpace::Definite(bounds.size.width),
-                    gpui::AvailableSpace::Definite(self.heights[ix]),
-                );
+                    let available = size(
+                        gpui::AvailableSpace::Definite(bounds.size.width),
+                        gpui::AvailableSpace::Definite(self.heights[ix]),
+                    );
 
-                item.layout_as_root(available, window, cx);
+                    item.layout_as_root(available, window, cx);
 
-                item.prepaint_at(origin, window, cx);
+                    item.prepaint_at(origin, window, cx);
 
-                layout.items.push(item);
-            }
+                    layout.items.push(item);
+                }
+            });
         });
 
-        self.base.interactivity().prepaint(
+        let hitbox = self.base.interactivity().prepaint(
             global_id,
             inspector_id,
             bounds,
@@ -320,7 +333,13 @@ impl Element for VirtualList {
             window,
             cx,
             |_style, _, hitbox, _, _| hitbox,
-        )
+        );
+        if animation_changed {
+            if let Some(hitbox) = &hitbox {
+                window.invalidate_scrolled_layer(hitbox);
+            }
+        }
+        hitbox
     }
 
     fn paint(
@@ -341,9 +360,11 @@ impl Element for VirtualList {
             window,
             cx,
             |_, window, cx| {
-                for item in &mut layout.items {
-                    item.paint(window, cx);
-                }
+                super::scroll_buffer::with_buffer_mask(window, layout.buffer_mask, |window| {
+                    for item in &mut layout.items {
+                        item.paint(window, cx);
+                    }
+                });
             },
         )
     }

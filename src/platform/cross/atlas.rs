@@ -41,6 +41,22 @@ impl WgpuAtlas {
         std::mem::take(&mut self.0.lock().destroyed_pages)
     }
 
+    /// The page's view, or `None` once the page has been destroyed. Retained
+    /// content (slab spans, replayed layers and cached views) can still name a
+    /// destroyed page for the frame in which the renderer discovers it, so
+    /// draw paths must skip rather than index.
+    pub(crate) fn try_texture_info(&self, texture_id: AtlasTextureId) -> Option<WgpuTextureInfo> {
+        let state = self.0.lock();
+        let textures = match texture_id.kind {
+            crate::AtlasTextureKind::Monochrome => &state.storage.monochrome_textures,
+            crate::AtlasTextureKind::Polychrome => &state.storage.polychrome_textures,
+        };
+        let texture = textures.textures.get(texture_id.index as usize)?.as_ref()?;
+        Some(WgpuTextureInfo {
+            raw_view: texture.raw_view.clone(),
+        })
+    }
+
     pub(crate) fn get_texture_info(&self, texture_id: AtlasTextureId) -> WgpuTextureInfo {
         let state = self.0.lock();
         let texture = &state.storage[texture_id];
@@ -157,11 +173,6 @@ impl PlatformAtlas for WgpuAtlas {
         #[cfg(feature = "flamegraph")]
         crate::record_atlas_tile_evicted();
 
-        // Both eviction shapes invalidate slab residency: a destroyed page
-        // takes every tile with it, and a tile freed from a live page leaves
-        // its region reusable by the next allocation.
-        atlas.destroyed_pages.push(id);
-
         let Some(texture_slot) = atlas.storage[id.kind].textures.get_mut(id.index as usize) else {
             return;
         };
@@ -173,6 +184,18 @@ impl PlatformAtlas for WgpuAtlas {
                 atlas.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
+
+                // Only a destroyed page invalidates slab residency: its index
+                // is recycled for a new texture, so retained sprites pointing
+                // at it would sample unrelated content. A tile removed from a
+                // live page is never handed out again (its region is not
+                // returned to the allocator) and the texture is unchanged, so
+                // every other layer on the page still draws correctly.
+                // Reporting that case poisoned every retained layer sharing
+                // the page -- any panel with an icon or image went blank until
+                // it happened to re-render, whenever some other view dropped
+                // an image (image cache eviction, a color picker repainting).
+                atlas.destroyed_pages.push(id);
 
                 // Eagerly destroy to free GPU memory immediately.
                 texture.destroy(&atlas.context);

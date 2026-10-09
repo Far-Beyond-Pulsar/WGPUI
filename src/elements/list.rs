@@ -11,8 +11,8 @@ use crate::elements::smooth_scroll::{SmoothScrollMode, SmoothScrollState};
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    Overflow, Pixels, Point, ScrollWheelEvent, Size, Style, StyleRefinement, Styled, Window, point,
+    px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -79,7 +79,11 @@ struct StateInner {
 /// Controls whether a list follows its tail as content is appended.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(missing_docs)]
-pub enum FollowMode { #[default] None, Tail }
+pub enum FollowMode {
+    #[default]
+    None,
+    Tail,
+}
 
 /// Whether the list is scrolling from top to bottom or bottom to top.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,22 +245,43 @@ impl ListState {
     }
 
     /// Mark all cached item measurements stale.
-    pub fn remeasure(&self) { let mut state = self.0.borrow_mut(); state.measuring_behavior.reset(); state.reset = true; }
+    pub fn remeasure(&self) {
+        let mut state = self.0.borrow_mut();
+        state.measuring_behavior.reset();
+        state.reset = true;
+    }
 
     /// Mark a range of item measurements stale. The current implementation safely
     /// invalidates the complete cache; this preserves correctness for dynamic rows.
-    pub fn remeasure_items(&self, _range: Range<usize>) { self.remeasure(); }
+    pub fn remeasure_items(&self, _range: Range<usize>) {
+        self.remeasure();
+    }
 
     /// Request that the next layout place the list at its tail.
-    pub fn scroll_to_end(&self) { let mut s=self.0.borrow_mut(); s.logical_scroll_top=Some(ListOffset { item_ix: s.items.summary().count, offset_in_item: Pixels::ZERO }); s.follow_mode=FollowMode::Tail; }
+    pub fn scroll_to_end(&self) {
+        let mut s = self.0.borrow_mut();
+        s.logical_scroll_top = Some(ListOffset {
+            item_ix: s.items.summary().count,
+            offset_in_item: Pixels::ZERO,
+        });
+        s.follow_mode = FollowMode::Tail;
+    }
     /// Set the list's tail-following policy.
-    pub fn set_follow_mode(&self, mode: FollowMode) { self.0.borrow_mut().follow_mode=mode; }
+    pub fn set_follow_mode(&self, mode: FollowMode) {
+        self.0.borrow_mut().follow_mode = mode;
+    }
     /// Returns whether the list is configured to keep the logical tail visible.
-    pub fn is_following_tail(&self) -> bool { self.0.borrow().follow_mode == FollowMode::Tail }
+    pub fn is_following_tail(&self) -> bool {
+        self.0.borrow().follow_mode == FollowMode::Tail
+    }
     /// Returns whether the current logical position is at the end of the list.
     pub fn is_scrolled_to_end(&self) -> Option<bool> {
         let state = self.0.borrow();
-        Some(state.logical_scroll_top.map_or(true, |offset| offset.item_ix >= state.items.summary().count))
+        Some(
+            state
+                .logical_scroll_top
+                .map_or(true, |offset| offset.item_ix >= state.items.summary().count),
+        )
     }
 
     /// Set the list to measure all items in the list in the first layout phase.
@@ -276,6 +301,7 @@ impl ListState {
             state.reset = true;
             state.measuring_behavior.reset();
             state.logical_scroll_top = None;
+            state.smooth_scroll.snap_to(px(0.));
             state.scrollbar_drag_start_height = None;
             state.items.summary().count
         };
@@ -387,7 +413,9 @@ impl ListState {
         let current = state.scroll_top(&state.logical_scroll_top());
         let target = state.scroll_top(&scroll_top);
 
-        state.smooth_scroll.visual_offset = current;
+        if !state.smooth_scroll.animating {
+            state.smooth_scroll.visual_offset = current;
+        }
         state.smooth_scroll.set_target(target);
 
         state.logical_scroll_top = Some(scroll_top);
@@ -431,7 +459,11 @@ impl ListState {
         let state = &*self.0.borrow();
 
         let bounds = state.last_layout_bounds.unwrap_or_default();
-        let scroll_top = state.logical_scroll_top();
+        let scroll_top = if state.smooth_scroll.animating {
+            state.offset_for_pixels(state.smooth_scroll.current())
+        } else {
+            state.logical_scroll_top()
+        };
         if ix < scroll_top.item_ix {
             return None;
         }
@@ -549,7 +581,6 @@ impl StateInner {
 
     fn scroll(
         &mut self,
-        scroll_top: &ListOffset,
         height: Pixels,
         delta: Point<Pixels>,
         current_view: EntityId,
@@ -565,9 +596,13 @@ impl StateInner {
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
-        let current_visual = self.smooth_scroll.current();
-
-        let new_scroll_top = current_visual - delta.y;
+        let previous = self.scroll_top(&self.logical_scroll_top());
+        let new_scroll_top = (previous - delta.y).clamp(px(0.), scroll_max);
+        if new_scroll_top == previous {
+            return;
+        }
+        self.follow_mode = FollowMode::None;
+        cx.stop_propagation();
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.logical_scroll_top = None;
@@ -581,12 +616,12 @@ impl StateInner {
                 item_ix,
                 offset_in_item,
             });
-            self.smooth_scroll.set_target(new_scroll_top);
-            window.request_animation_frame();
         }
+        self.smooth_scroll.set_target(new_scroll_top);
+        window.request_animation_frame();
 
         if self.scroll_handler.is_some() {
-            let visible_range = self.visible_range(height, scroll_top);
+            let visible_range = self.visible_range(height, &self.logical_scroll_top());
             self.scroll_handler.as_mut().unwrap()(
                 &ListScrollEvent {
                     visible_range,
@@ -622,6 +657,16 @@ impl StateInner {
             Bias::Right,
         );
         start.height + logical_scroll_top.offset_in_item
+    }
+
+    fn offset_for_pixels(&self, offset: Pixels) -> ListOffset {
+        let (start, ..) = self
+            .items
+            .find::<ListItemSummary, _>((), &Height(offset), Bias::Right);
+        ListOffset {
+            item_ix: start.count,
+            offset_in_item: offset - start.height,
+        }
     }
 
     fn layout_all_items(
@@ -670,6 +715,7 @@ impl StateInner {
         &mut self,
         available_width: Option<Pixels>,
         available_height: Pixels,
+        mut scroll_top: ListOffset,
         padding: &Edges<Pixels>,
         render_item: &mut RenderItemFn,
         window: &mut Window,
@@ -680,7 +726,6 @@ impl StateInner {
         let mut item_layouts = VecDeque::new();
         let mut rendered_height = padding.top;
         let mut max_item_width = px(0.);
-        let mut scroll_top = self.logical_scroll_top();
         let mut rendered_focused_item = false;
 
         let available_item_space = size(
@@ -770,14 +815,12 @@ impl StateInner {
             match self.alignment {
                 ListAlignment::Top => {
                     scroll_top.offset_in_item = scroll_top.offset_in_item.max(px(0.));
-                    self.logical_scroll_top = Some(scroll_top);
                 }
                 ListAlignment::Bottom => {
                     scroll_top = ListOffset {
                         item_ix: cursor.start().0,
                         offset_in_item: rendered_height - available_height,
                     };
-                    self.logical_scroll_top = None;
                 }
             };
         }
@@ -860,14 +903,38 @@ impl StateInner {
                 _ => {}
             }
 
+            let target = self.logical_scroll_top();
+            let viewport_top = if self.smooth_scroll.animating {
+                self.offset_for_pixels(self.smooth_scroll.current())
+            } else {
+                target
+            };
             let mut layout_response = self.layout_items(
                 Some(bounds.size.width),
                 bounds.size.height,
+                viewport_top,
                 &padding,
                 render_item,
                 window,
                 cx,
             );
+
+            let rendered_offset = self.scroll_top(&layout_response.scroll_top);
+            if self.smooth_scroll.animating {
+                let maximum = (self.items.summary().height + padding.top + padding.bottom
+                    - bounds.size.height)
+                    .max(px(0.));
+                let target_offset = self.scroll_top(&target).clamp(px(0.), maximum);
+                self.logical_scroll_top = Some(self.offset_for_pixels(target_offset));
+                self.smooth_scroll.set_target(target_offset);
+                self.smooth_scroll.visual_offset = rendered_offset;
+                self.smooth_scroll.clamp(px(0.), maximum);
+            } else {
+                if self.logical_scroll_top.is_some() || self.alignment == ListAlignment::Top {
+                    self.logical_scroll_top = Some(layout_response.scroll_top);
+                }
+                self.smooth_scroll.snap_to(rendered_offset);
+            }
 
             // Avoid honoring autoscroll requests from elements other than our children.
             window.take_autoscroll();
@@ -876,14 +943,7 @@ impl StateInner {
             if bounds.size.height > padding.top + padding.bottom {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
 
-                let logical_scroll = self.scroll_top(&layout_response.scroll_top);
-
-                let visual_scroll = self.smooth_scroll.current();
-
-                let visual_delta = visual_scroll - logical_scroll;
-
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
-                item_origin.y += visual_delta;
                 for item in &mut layout_response.item_layouts {
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
                         item.element.prepaint_at(item_origin, window, cx);
@@ -954,7 +1014,8 @@ impl StateInner {
         let drag_offset =
             // if dragging the scrollbar, we want to offset the point if the height changed
             content_height - self.scrollbar_drag_start_height.unwrap_or(content_height);
-        let new_scroll_top = (point.y - drag_offset).abs().max(px(0.)).min(scroll_max);
+        let new_scroll_top = (-point.y + drag_offset).clamp(px(0.), scroll_max);
+        self.smooth_scroll.snap_to(new_scroll_top);
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.logical_scroll_top = None;
@@ -1034,6 +1095,7 @@ impl Element for List {
                     let layout_response = state.layout_items(
                         None,
                         available_height,
+                        state.logical_scroll_top(),
                         &padding,
                         &mut self.render_item,
                         window,
@@ -1108,6 +1170,9 @@ impl Element for List {
             );
 
             state.items = new_items;
+            // Cached pixel positions no longer describe this width. Re-anchor
+            // through the logical item after measuring the new row heights.
+            state.smooth_scroll.animating = false;
         }
 
         let padding = style
@@ -1140,29 +1205,30 @@ impl Element for List {
         cx: &mut App,
     ) {
         let current_view = window.current_view();
+        let list_state = self.state.clone();
+        let height = bounds.size.height;
+        let hitbox_id = prepaint.hitbox.id;
+        let layer = prepaint.hitbox.layer;
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+                let pixel_delta = event.delta.pixel_delta(px(20.));
+                let previous = list_state.scroll_px_offset_for_scrollbar();
+                list_state
+                    .0
+                    .borrow_mut()
+                    .scroll(height, pixel_delta, current_view, window, cx);
+                if list_state.scroll_px_offset_for_scrollbar() != previous {
+                    if let Some(layer) = layer {
+                        window.request_layer_buffer_refill(layer);
+                    }
+                }
+            }
+        });
+        // Bubble dispatch visits listeners in reverse registration order, so
+        // children must register after the containing list.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
                 item.element.paint(window, cx);
-            }
-        });
-
-        let list_state = self.state.clone();
-        let height = bounds.size.height;
-        let scroll_top = prepaint.layout.scroll_top;
-        let hitbox_id = prepaint.hitbox.id;
-        let mut accumulated_scroll_delta = ScrollDelta::default();
-        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
-                list_state.0.borrow_mut().scroll(
-                    &scroll_top,
-                    height,
-                    pixel_delta,
-                    current_view,
-                    window,
-                    cx,
-                )
             }
         });
         let state = self.state.clone();
@@ -1173,6 +1239,9 @@ impl Element for List {
             let animating = state_inner.smooth_scroll.update();
 
             if animating {
+                if let Some(layer) = layer {
+                    window.request_layer_buffer_refill(layer);
+                }
                 window.request_animation_frame();
                 cx.notify(current_view);
             }
@@ -1271,6 +1340,177 @@ mod test {
     use gpui::{ScrollDelta, ScrollWheelEvent};
 
     use crate::{self as gpui, TestAppContext};
+
+    #[gpui::test]
+    fn wheel_clamps_and_accumulates_each_event_once(cx: &mut TestAppContext) {
+        use crate::{
+            AppContext, Context, IntoElement, Render, Styled, Window, div, list, point, px, size,
+        };
+        let cx = cx.add_empty_window();
+        let state = super::ListState::new(20, super::ListAlignment::Top, px(20.)).measure_all();
+        state.set_smooth_scroll_enabled(false);
+        struct View(super::ListState);
+        impl Render for View {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(20.)).into_any_element()
+                })
+                .size_full()
+            }
+        }
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| View(state.clone()))
+        });
+        let mut wheel = |delta| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(5.), px(5.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+                ..Default::default()
+            })
+        };
+        wheel(-20.);
+        wheel(-20.);
+        assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(-40.));
+        wheel(-10000.);
+        assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(-300.));
+        wheel(10000.);
+        assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(0.));
+    }
+
+    #[gpui::test]
+    fn inner_viewport_consumes_wheel_until_its_boundary(cx: &mut TestAppContext) {
+        use crate::{
+            AppContext, Context, InteractiveElement, IntoElement, ParentElement, Render,
+            ScrollHandle, StatefulInteractiveElement, Styled, Window, div, list, point, px, size,
+        };
+        let cx = cx.add_empty_window();
+        let outer = super::ListState::new(5, super::ListAlignment::Top, px(20.)).measure_all();
+        outer.set_smooth_scroll_enabled(false);
+        let inner = ScrollHandle::new();
+        struct View(super::ListState, ScrollHandle);
+        impl Render for View {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let inner = self.1.clone();
+                list(self.0.clone(), move |index, _, _| {
+                    if index == 0 {
+                        div()
+                            .h(px(200.))
+                            .child(
+                                div()
+                                    .id("inner-scroll")
+                                    .h(px(60.))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&inner)
+                                    .child(div().h(px(300.))),
+                            )
+                            .into_any_element()
+                    } else {
+                        div().h(px(200.)).into_any_element()
+                    }
+                })
+                .size_full()
+            }
+        }
+        let mut draw = |cx: &mut crate::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+                cx.new(|_| View(outer.clone(), inner.clone()))
+            });
+        };
+        draw(cx);
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(5.), px(5.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-20.))),
+            ..Default::default()
+        });
+        assert_eq!(inner.offset().y, px(-20.));
+        assert_eq!(outer.scroll_px_offset_for_scrollbar().y, px(0.));
+        inner.set_offset(point(px(0.), px(-240.)));
+        draw(cx);
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(5.), px(5.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-20.))),
+            ..Default::default()
+        });
+        assert_eq!(inner.offset().y, px(-240.));
+        assert_eq!(outer.scroll_px_offset_for_scrollbar().y, px(-20.));
+    }
+
+    #[gpui::test]
+    fn smooth_scroll_renders_the_visual_viewport_without_reversing_it(cx: &mut TestAppContext) {
+        use crate::{
+            AppContext, Context, IntoElement, Render, Styled, Window, canvas, list, point, px, size,
+        };
+        use std::{cell::RefCell, rc::Rc};
+        let cx = cx.add_empty_window();
+        let state = super::ListState::new(30, super::ListAlignment::Top, px(20.)).measure_all();
+        let painted = Rc::new(RefCell::new(Vec::new()));
+        struct View(super::ListState, Rc<RefCell<Vec<(usize, crate::Pixels)>>>);
+        impl Render for View {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let painted = self.1.clone();
+                list(self.0.clone(), move |index, _, _| {
+                    let painted = painted.clone();
+                    canvas(
+                        move |bounds, _, _| {
+                            painted.borrow_mut().push((index, bounds.top()));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .h(px(20.))
+                    .into_any_element()
+                })
+                .size_full()
+            }
+        }
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| View(state.clone(), painted.clone()))
+        });
+        state.scroll_by(px(200.));
+        state.0.borrow_mut().smooth_scroll.visual_offset = px(20.);
+        painted.borrow_mut().clear();
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| View(state.clone(), painted.clone()))
+        });
+        assert!(
+            painted.borrow().contains(&(1, px(0.))),
+            "the visual first row must cover the viewport top: {:?}",
+            painted.borrow()
+        );
+        assert!(
+            !painted.borrow().iter().any(|(index, _)| *index == 10),
+            "the target viewport must not replace the currently visible rows"
+        );
+    }
+
+    #[test]
+    fn reset_and_scrollbar_cancel_stale_animation() {
+        use crate::{Bounds, point, px, size};
+        let state = super::ListState::new(10, super::ListAlignment::Top, px(20.));
+        {
+            let mut inner = state.0.borrow_mut();
+            inner.items = sum_tree::SumTree::from_iter(
+                (0..10).map(|_| super::ListItem::Measured {
+                    size: size(px(100.), px(20.)),
+                    focus_handle: None,
+                }),
+                (),
+            );
+            inner.last_layout_bounds =
+                Some(Bounds::new(point(px(0.), px(0.)), size(px(100.), px(100.))));
+            inner.smooth_scroll.set_target(px(80.));
+        }
+        state.set_offset_from_scrollbar(point(px(0.), px(20.)));
+        assert_eq!(
+            state.scroll_px_offset_for_scrollbar().y,
+            px(0.),
+            "positive scrollbar offsets must clamp, not invert"
+        );
+        state.set_offset_from_scrollbar(point(px(0.), px(-60.)));
+        assert_eq!(state.0.borrow().smooth_scroll.current(), px(60.));
+        state.reset(1);
+        assert_eq!(state.0.borrow().smooth_scroll.current(), px(0.));
+        assert!(!state.0.borrow().smooth_scroll.animating);
+    }
 
     #[gpui::test]
     fn test_reset_after_paint_before_scroll(cx: &mut TestAppContext) {

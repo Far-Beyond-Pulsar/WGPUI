@@ -15,6 +15,7 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
+use crate::instance::ElementInstance;
 use crate::util::ResultExt;
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
@@ -27,7 +28,6 @@ use crate::{
     SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId, Visibility, Window,
     WindowControlArea, point, px, size,
 };
-use crate::instance::ElementInstance;
 use collections::{FxHashSet, HashMap};
 use refineable::Refineable;
 use smallvec::SmallVec;
@@ -1498,6 +1498,7 @@ pub struct DivFrameState {
 /// reconciliation decision `prepaint` made — see [`ChildReconciliation`] for
 /// why `paint` must reuse this rather than deciding again.
 pub struct DivPrepaintState {
+    buffer_mask: Option<ContentMask<Pixels>>,
     hitbox: Option<Hitbox>,
     child_reconciliation: SmallVec<[ChildReconciliation; 2]>,
 }
@@ -1657,28 +1658,30 @@ impl Element for Div {
         // second full pass over the child list every single frame — real
         // overhead at 10,000 children that a two-pass version was paying
         // whether or not anything actually changed.
-        let mut containment_window = self.interactivity.tracked_scroll_handle.as_ref().and_then(
-            |handle| {
-                let margin = self
-                    .interactivity
-                    .layer
-                    .as_ref()
-                    .map(|policy| policy.overdraw_margin)
-                    .filter(|margin| *margin != Size::default())?;
-                let viewport = handle.bounds().size;
-                if viewport.height <= px(0.) {
-                    // No prior frame to base an estimate on yet (first mount
-                    // before this container has ever been measured) — every
-                    // child gets a real layout this frame, same as always.
-                    return None;
-                }
-                Some(super::scroll_buffer::ContainmentWindow::new(
-                    handle.offset().y,
-                    viewport.height,
-                    margin.height,
-                ))
-            },
-        );
+        let mut containment_window =
+            self.interactivity
+                .tracked_scroll_handle
+                .as_ref()
+                .and_then(|handle| {
+                    let margin = self
+                        .interactivity
+                        .layer
+                        .as_ref()
+                        .map(|policy| policy.overdraw_margin)
+                        .filter(|margin| *margin != Size::default())?;
+                    let viewport = handle.bounds().size;
+                    if viewport.height <= px(0.) {
+                        // No prior frame to base an estimate on yet (first mount
+                        // before this container has ever been measured) — every
+                        // child gets a real layout this frame, same as always.
+                        return None;
+                    }
+                    Some(super::scroll_buffer::ContainmentWindow::new(
+                        handle.offset().y,
+                        viewport.height,
+                        margin.height,
+                    ))
+                });
         let mut child_contained: SmallVec<[bool; 2]> = SmallVec::new();
 
         let mut request = |window: &mut Window| {
@@ -1737,9 +1740,7 @@ impl Element for Div {
                                         Style {
                                             size: Size {
                                                 width: crate::Length::Definite(size.width.into()),
-                                                height: crate::Length::Definite(
-                                                    size.height.into(),
-                                                ),
+                                                height: crate::Length::Definite(size.height.into()),
                                             },
                                             ..Style::default()
                                         },
@@ -1797,6 +1798,7 @@ impl Element for Div {
         window: &mut Window,
         cx: &mut App,
     ) -> DivPrepaintState {
+        let mut buffer_mask = None;
         let has_prepaint_listener = self.prepaint_listener.is_some();
         let mut children_bounds = Vec::with_capacity(if has_prepaint_listener {
             request_layout.child_layout_ids.len()
@@ -1896,8 +1898,11 @@ impl Element for Div {
                     // of re-recording.
                     let mut buffer_record_margin: Option<Size<Pixels>> = None;
                     if is_scroll_container {
-                        let frame =
-                            super::scroll_buffer::prepare_scroll_buffer(window, scroll_offset);
+                        let frame = super::scroll_buffer::prepare_scroll_buffer(
+                            window,
+                            bounds,
+                            scroll_offset,
+                        );
                         if matches!(frame, super::scroll_buffer::ScrollBufferFrame::Skip) {
                             return hitbox;
                         }
@@ -1958,36 +1963,39 @@ impl Element for Div {
                             mask.bounds = crate::layer::inflate_bounds(mask.bounds, margin);
                             mask
                         });
+                    buffer_mask = widened_mask;
 
                     let mut paint_children = |window: &mut Window| {
                         window.with_element_offset(scroll_offset, |window| {
-                        for (index, (child, child_layout_id)) in self
-                            .children
-                            .iter_mut()
-                            .zip(request_layout.child_layout_ids.iter().copied())
-                            .enumerate()
-                        {
-                            if request_layout
-                                .child_contained
-                                .get(index)
-                                .copied()
-                                .unwrap_or(false)
+                            for (index, (child, child_layout_id)) in self
+                                .children
+                                .iter_mut()
+                                .zip(request_layout.child_layout_ids.iter().copied())
+                                .enumerate()
                             {
-                                child_reconciliation.push(ChildReconciliation::Contained);
-                                continue;
+                                if request_layout
+                                    .child_contained
+                                    .get(index)
+                                    .copied()
+                                    .unwrap_or(false)
+                                {
+                                    child_reconciliation.push(ChildReconciliation::Contained);
+                                    continue;
+                                }
+                                child_reconciliation.push(prepaint_reconciled_child(
+                                    index,
+                                    child,
+                                    child_layout_id,
+                                    window,
+                                    cx,
+                                ));
                             }
-                            child_reconciliation.push(prepaint_reconciled_child(
-                                index,
-                                child,
-                                child_layout_id,
-                                window,
-                                cx,
-                            ));
-                        }
                         })
                     };
                     match widened_mask {
-                        Some(mask) => window.with_content_mask_unclamped(Some(mask), paint_children),
+                        Some(mask) => {
+                            window.with_content_mask_unclamped(Some(mask), paint_children)
+                        }
                         None => paint_children(window),
                     }
 
@@ -2006,6 +2014,7 @@ impl Element for Div {
         };
 
         DivPrepaintState {
+            buffer_mask,
             hitbox,
             child_reconciliation,
         }
@@ -2028,6 +2037,7 @@ impl Element for Div {
             .map(|provider| provider.provide(window, cx));
 
         let hitbox = prepaint_state.hitbox.clone();
+        let buffer_mask = prepaint_state.buffer_mask;
         // Owned, not borrowed: `paint_reconciled_child`'s `Rebuilt` arm needs
         // to move each `ChildReconciliation`'s captured `diff_key` (a
         // `Box<dyn ReconcileKey>`, uncloneable by design) into the
@@ -2072,10 +2082,13 @@ impl Element for Div {
                             return;
                         }
 
-                        for (child, reconciliation) in children.iter_mut().zip(child_reconciliation)
-                        {
-                            paint_reconciled_child(child, reconciliation, window, cx);
-                        }
+                        super::scroll_buffer::with_buffer_mask(window, buffer_mask, |window| {
+                            for (child, reconciliation) in
+                                children.iter_mut().zip(child_reconciliation)
+                            {
+                                paint_reconciled_child(child, reconciliation, window, cx);
+                            }
+                        });
                     },
                 )
             };
@@ -2868,19 +2881,20 @@ impl Interactivity {
                     // wait until *after* that read, scoped to just the child
                     // loop — see `Div::prepaint`'s own buffered-frame
                     // handling.
-                    let overflow_mask = style
-                        .overflow_mask(bounds, window.rem_size())
-                        .map(|mut mask| {
-                            if let Some(policy) = self.layer
-                                && policy.buffers_scroll()
-                            {
-                                mask.bounds = crate::layer::inflate_bounds(
-                                    mask.bounds,
-                                    policy.overdraw_margin,
-                                );
-                            }
-                            mask
-                        });
+                    let overflow_mask =
+                        style
+                            .overflow_mask(bounds, window.rem_size())
+                            .map(|mut mask| {
+                                if let Some(policy) = self.layer
+                                    && policy.buffers_scroll()
+                                {
+                                    mask.bounds = crate::layer::inflate_bounds(
+                                        mask.bounds,
+                                        policy.overdraw_margin,
+                                    );
+                                }
+                                mask
+                            });
                     window.with_content_mask(overflow_mask, |window| {
                         let hitbox = if self.should_insert_hitbox(&style, window, cx) {
                             Some(window.insert_hitbox(bounds, self.hitbox_behavior))
@@ -2888,8 +2902,7 @@ impl Interactivity {
                             None
                         };
 
-                        let scroll_offset =
-                            self.clamp_scroll_position(bounds, &style, window, cx);
+                        let scroll_offset = self.clamp_scroll_position(bounds, &style, window, cx);
                         let result = f(&style, scroll_offset, hitbox, window, cx);
                         (result, element_state)
                     })
@@ -3693,6 +3706,14 @@ impl Interactivity {
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
             let line_height = window.line_height();
+            let padding = style
+                .padding
+                .to_pixels(hitbox.bounds.size.into(), window.rem_size());
+            let scroll_max = (self.content_size
+                + size(padding.left + padding.right, padding.top + padding.bottom)
+                - hitbox.bounds.size)
+                .map(|pixels| (pixels * 100.).round() / 100.)
+                .max(&Default::default());
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
@@ -3724,9 +3745,13 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
+                    scroll_offset.y = (scroll_offset.y + delta_y).clamp(-scroll_max.height, px(0.));
+                    scroll_offset.x = (scroll_offset.x + delta_x).clamp(-scroll_max.width, px(0.));
                     if *scroll_offset != old_scroll_offset {
+                        // Let an ancestor handle the event only when this viewport
+                        // cannot move. Consuming it twice moves nested panes together.
+                        cx.stop_propagation();
+                        window.invalidate_scrolled_layer(&hitbox);
                         cx.notify(current_view);
                     }
                 }

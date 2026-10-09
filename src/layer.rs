@@ -385,6 +385,10 @@ impl Layer {
         self.paint_range = crate::PaintIndex::default()..crate::PaintIndex::default();
         self.needs = Invalidation::all();
         self.deferred_dirty = false;
+        // Coverage describes the dropped content; kept, it would keep culling
+        // whatever lies under a layer that no longer paints.
+        self.opaque_bounds = None;
+        self.poisoned_bounds.clear();
         // #92: an evicted layer's ElementInstances describe content that no
         // longer exists. Left in place they would be dead weight at best; at
         // worst a later InstanceKey collision (extremely unlikely, but the
