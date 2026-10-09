@@ -5423,7 +5423,11 @@ impl Window {
             let Some(child) = self.layers.get(&key) else {
                 return true;
             };
-            if !child.needs.is_empty() || !child.has_content() {
+            // `needs`, not emptiness: a layer whose content was dropped or
+            // never recorded carries `Invalidation::all()`, while a nested
+            // layer that recorded nothing is legitimately empty and clean.
+            // Treating empty as stale re-rendered its ancestors every frame.
+            if !child.needs.is_empty() {
                 return true;
             }
             pending.extend(child.items.iter().filter_map(|item| match item {
@@ -14250,6 +14254,67 @@ mod test {
                 "revision {revision}: the panel's re-record frame dropped {missing:#?}"
             );
         }
+    }
+
+    /// A cached panel holding a layer that records nothing (an empty layered
+    /// container). An idle frame must reuse the panel: an empty nested layer
+    /// is clean, not content the renderer lost, so it must not force the panel
+    /// to re-render on every frame.
+    #[gpui::test]
+    fn an_empty_nested_layer_does_not_re_render_its_cached_view(cx: &mut TestAppContext) {
+        if layers_off() {
+            return;
+        }
+        struct Panel {
+            renders: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl crate::Render for Panel {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                crate::div()
+                    .size_full()
+                    .child(crate::div().h(px(20.)).w(px(80.)).bg(crate::red()))
+                    .child(crate::div().id("empty").layer().w(px(100.)).h(px(100.)))
+            }
+        }
+        struct Root {
+            panel: crate::Entity<Panel>,
+        }
+        impl crate::Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::div().size_full().child(
+                    crate::AnyView::from(self.panel.clone())
+                        .cached(crate::StyleRefinement::default().size_full()),
+                )
+            }
+        }
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let window = cx.open_window(size(px(400.), px(300.)), {
+            let renders = renders.clone();
+            move |_, cx| Root {
+                panel: cx.new(|_| Panel { renders }),
+            }
+        });
+        cx.run_until_parked();
+        let any: crate::AnyWindowHandle = window.into();
+        let draw = |cx: &mut TestAppContext| {
+            any.update(cx, |_, window, cx| {
+                window.draw(cx).clear();
+                window.present();
+            })
+            .unwrap();
+        };
+        draw(cx);
+        draw(cx);
+        let before = renders.get();
+        for _ in 0..5 {
+            draw(cx);
+        }
+        assert_eq!(
+            renders.get(),
+            before,
+            "idle frames re-rendered a cached panel whose only nested layer is empty"
+        );
     }
 
     /// The level editor's properties panel, reduced: a cached panel view whose
