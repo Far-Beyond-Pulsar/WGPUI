@@ -9593,6 +9593,94 @@ mod test {
         }
     }
 
+    struct ClickLeaf {
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+        clicks: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for ClickLeaf {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            use crate::{InteractiveElement as _, StatefulInteractiveElement as _};
+            self.renders.set(self.renders.get() + 1);
+            let clicks = self.clicks.clone();
+            crate::div()
+                .id("click-target")
+                .w(px(40.))
+                .h(px(40.))
+                .on_click(move |_, _, _| clicks.set(clicks.get() + 1))
+        }
+    }
+
+    struct ClickRoot {
+        clicker: crate::Entity<ClickLeaf>,
+        sibling: crate::Entity<CacheLeaf>,
+    }
+
+    impl crate::Render for ClickRoot {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div()
+                .size_full()
+                .child(
+                    crate::AnyView::from(self.clicker.clone())
+                        .cached(crate::StyleRefinement::default().w(px(40.)).h(px(40.))),
+                )
+                .child(
+                    crate::AnyView::from(self.sibling.clone())
+                        .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+                )
+        }
+    }
+
+    /// A click repaints the view that owns the clicked element, not the whole
+    /// window: pressing and releasing used to call `Window::refresh`, which
+    /// rebuilt every cached view in the window twice per click.
+    #[gpui::test]
+    fn a_click_does_not_rebuild_cached_siblings(cx: &mut TestAppContext) {
+        let clicker_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let sibling_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (clicker, sibling) = cx.update(|cx| {
+            (
+                cx.new(|_| ClickLeaf {
+                    renders: clicker_renders.clone(),
+                    clicks: clicks.clone(),
+                }),
+                cx.new(|_| CacheLeaf {
+                    renders: sibling_renders.clone(),
+                }),
+            )
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| ClickRoot {
+            clicker,
+            sibling,
+        });
+        cx.run_until_parked();
+        let cx = &mut crate::VisualTestContext::from_window(window.into(), cx);
+        let target = crate::point(px(20.), px(20.));
+        cx.simulate_mouse_move(target, None, crate::Modifiers::none());
+        cx.run_until_parked();
+
+        let sibling_before = sibling_renders.get();
+        for round in 1..=3 {
+            cx.simulate_click(target, crate::Modifiers::none());
+            cx.run_until_parked();
+            assert_eq!(clicks.get(), round, "the click reached its listener");
+        }
+        assert_eq!(
+            sibling_renders.get(),
+            sibling_before,
+            "clicking another view rebuilt this cached sibling"
+        );
+    }
+
     /// The same thing, repeated. One successful invalidation is not enough:
     /// the reuse path re-registers a view's dependencies from the *stored*
     /// set, so a set that lost the view's own id goes stale permanently after

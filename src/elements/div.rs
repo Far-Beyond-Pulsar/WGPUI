@@ -3416,17 +3416,23 @@ impl Interactivity {
                     .clicked_state
                     .get_or_insert_with(Default::default)
                     .clone();
+                // A press and a release change only this element's pending
+                // click, which its own view may show (an `:active` style is
+                // handled the same way below). Repaint that view, not the
+                // window: `Window::refresh` here rebuilt every cached view in
+                // the window twice per click.
+                let owner_view = window.current_view();
 
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
-                    move |event: &MouseDownEvent, phase, window, _cx| {
+                    move |event: &MouseDownEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble
                             && event.button == MouseButton::Left
                             && hitbox.is_hovered(window)
                         {
                             *pending_mouse_down.borrow_mut() = Some(event.clone());
-                            window.refresh();
+                            cx.notify(owner_view);
                         }
                     }
                 });
@@ -3507,7 +3513,7 @@ impl Interactivity {
                             let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                             if pending_mouse_down.is_some() && hitbox.is_hovered(window) {
                                 captured_mouse_down = pending_mouse_down.take();
-                                window.refresh();
+                                cx.notify(owner_view);
                             } else if pending_mouse_down.is_some() {
                                 // Clear the pending mouse down event (without firing click handlers)
                                 // if the hitbox is not being hovered.
@@ -3515,7 +3521,7 @@ impl Interactivity {
                                 // immediately after being clicked.
                                 // See https://github.com/zed-industries/zed/issues/24600 for more details
                                 pending_mouse_down.take();
-                                window.refresh();
+                                cx.notify(owner_view);
                             }
                         }
                         // Fire click handlers during the bubble phase.
