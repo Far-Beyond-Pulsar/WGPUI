@@ -10830,12 +10830,6 @@ mod test {
     // Transform-only composites (#94)
     // -------------------------------------------------------------------
 
-    /// Serializes the stats-based test below against its own siblings. The
-    /// counter registry is process-global; only tests that trigger the
-    /// transform-only path bump its counter, and these tests are the only
-    /// ones that do.
-    static TRANSFORM_STATS_ORDERING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
     /// A `.layer_keyed(..)` panel whose position and size are driven through
     /// shared state, so a frame can move it through real layout while its
     /// content key holds. This is the exact shape the transform-only
@@ -11706,7 +11700,7 @@ mod test {
         let painted_once = paints.get();
         assert_eq!(painted_once, 1, "setup: the canvas painted once");
 
-        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let _ordering = crate::render_stats::exclusive();
         let counter = "occlusion: instances culled";
         crate::render_stats::set_force_enabled(true);
         let before = crate::render_stats::snapshot();
@@ -12273,7 +12267,7 @@ mod test {
         if layers_off() || !crate::scene_pack::slabs_enabled() {
             return;
         }
-        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let _ordering = crate::render_stats::exclusive();
         let hit_counter = "layer: composited (transform-only)";
 
         for _attempt in 0..25 {
@@ -14564,7 +14558,7 @@ mod test {
             })
             .unwrap();
 
-        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let _ordering = crate::render_stats::exclusive();
         let counter = "layer: rasterized";
         crate::render_stats::set_force_enabled(true);
         let before = crate::render_stats::snapshot();
@@ -14805,7 +14799,7 @@ mod test {
             assert_eq!(this.layers[&key].buffer_anchor, anchor);
             assert_eq!(this.layers[&key].content_offset, offset);
         }).expect("nested buffer ownership check");
-        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let _ordering = crate::render_stats::exclusive();
         let refill_counter = "scroll: buffer refills";
         crate::render_stats::set_force_enabled(true);
         let before = crate::render_stats::snapshot();
@@ -14963,7 +14957,7 @@ mod test {
             .unwrap();
 
         let paints_before_scroll = paints.get();
-        let _ordering = TRANSFORM_STATS_ORDERING.lock();
+        let _ordering = crate::render_stats::exclusive();
         let refill_counter = "scroll: buffer refills";
         crate::render_stats::set_force_enabled(true);
         let before = crate::render_stats::snapshot();

@@ -525,6 +525,7 @@ fn perf_ab_frame_pipeline_slabs_on_vs_off(cx: &mut TestAppContext) {
     let view = window.root(cx).expect("root view should be accessible");
     let mut cx = VisualTestContext::from_window(window.into(), cx);
 
+    let _stats = render_stats::exclusive();
     render_stats::set_force_enabled(true);
 
     // Warmup exercises both paths (dirty then idle) so taffy's persistent
