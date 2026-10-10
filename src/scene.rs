@@ -655,7 +655,8 @@ impl Scene {
                     self.note_order(local_order, span.reservation_bounds);
                     span.order_scope = scope;
                     span.local_order = local_order;
-                    self.layer_slab_spans.push(span);
+                    self.layer_slab_spans.push(span.clone());
+                    self.paint_operations.push(PaintOperation::LayerSlab(span));
                 }
             }
         }
@@ -898,8 +899,7 @@ pub(crate) enum SceneBatch<'a> {
 
 pub(crate) struct FrameBatchIterator<'a> {
     legacy: BatchIterator<'a>,
-    /// Head-of-line legacy batches waiting to be yielded, plus any tails
-    /// produced when a span splits a same-kind batch around its position.
+    /// Spans waiting to be yielded after the head of the batch they split.
     queued: std::collections::VecDeque<SceneBatch<'a>>,
     pending: Option<PrimitiveBatch<'a>>,
     next_span: usize,
@@ -1090,11 +1090,12 @@ impl<'a> Iterator for FrameBatchIterator<'a> {
                         }
                         // Part of the batch is at or above the span, so every
                         // other kind's remaining content is too: the span
-                        // goes exactly here.
+                        // goes exactly here. The tail goes back to pending,
+                        // so the next span can split it again.
                         Some(tail) => {
                             self.next_span += 1;
                             self.queued.push_back(SceneBatch::LayerSlab(index));
-                            self.queued.push_back(SceneBatch::Primitives(tail));
+                            self.pending = Some(tail);
                             if let Some(head) = head.filter(|head| !batch_is_empty(head)) {
                                 return Some(SceneBatch::Primitives(head));
                             }
@@ -3224,6 +3225,70 @@ mod slab_splice_tests {
         });
         let boundary_items = rejected.end_layer().unwrap();
         assert!(build_slab_segments(&boundary_items, [0.; 2]).is_none());
+    }
+
+    /// A slab marker with no content, reserving `bounds`.
+    fn push_empty_span(scene: &mut Scene, bounds: Bounds<ScaledPixels>, key: u64) {
+        scene.push_layer_slab_span(
+            bounds,
+            LayerKey(key),
+            1,
+            [0., 0.],
+            [0; SlabKind::COUNT],
+            Vec::new(),
+            Arc::new(PackedLayer {
+                quads: Vec::new(),
+                shadows: Vec::new(),
+                paths: Vec::new(),
+                underlines: Vec::new(),
+                mono_sprites: Vec::new(),
+                poly_sprites: Vec::new(),
+                runs: Vec::new(),
+            }),
+            None,
+        );
+    }
+
+    /// Two spans inside one quads batch: the batch's tail past the first
+    /// span still has to split at the second.
+    #[test]
+    fn a_batch_split_by_one_span_splits_again_at_the_next() {
+        let area = rect(0., 0., 400., 400.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad_marked(area, 1));
+        push_empty_span(&mut scene, area, 31);
+        scene.insert_primitive(quad_marked(area, 2));
+        push_empty_span(&mut scene, area, 32);
+        scene.insert_primitive(quad_marked(area, 3));
+        scene.finish();
+
+        let quad_orders: Vec<_> = scene.quads.iter().map(|quad| quad.order).collect();
+        let span_orders: Vec<_> = scene.layer_slab_spans.iter().map(|span| span.order()).collect();
+        assert!(quad_orders[0] < span_orders[0] && span_orders[0] < quad_orders[1]);
+        assert!(quad_orders[1] < span_orders[1] && span_orders[1] < quad_orders[2]);
+        crate::headless::assert_draw_order(&scene);
+    }
+
+    /// Replaying a recorded range keeps its slab markers in this frame's
+    /// paint operations, so the next frame can replay them again: a cached
+    /// view that replays twice in a row still draws its retained layer.
+    #[test]
+    fn a_replayed_span_survives_the_next_replay() {
+        let area = rect(0., 0., 400., 400.);
+        let mut recorded = Scene::default();
+        recorded.insert_primitive(quad_marked(area, 1));
+        push_empty_span(&mut recorded, area, 41);
+        recorded.finish();
+
+        let mut previous = recorded;
+        for frame in 1..=3 {
+            let mut replayed = Scene::default();
+            replayed.replay(0..previous.len(), &previous);
+            replayed.finish();
+            assert_eq!(replayed.slab_span_count(), 1, "replay {frame} kept the span");
+            assert_eq!(replayed.len(), 2, "replay {frame} recorded both operations");
+            previous = replayed;
+        }
     }
 }
 
