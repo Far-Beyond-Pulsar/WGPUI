@@ -1849,6 +1849,12 @@ pub struct Window {
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     pub(crate) last_input_timestamp: Rc<Cell<Instant>>,
+    /// Follows trackpad gestures for momentum scrolling (#42).
+    scroll_momentum: crate::scroll_momentum::ScrollMomentum,
+    /// The coast after a trackpad flick, while it runs.
+    scroll_fling: Option<Task<()>>,
+    /// Set while a coast's own scroll step is dispatched.
+    dispatching_scroll_step: bool,
     pub(crate) resizing_window: Rc<Cell<bool>>,
     last_input_modality: InputModality,
     /// The window-scope axes this draw is answering, taken from the invalidator
@@ -2396,6 +2402,9 @@ impl Window {
             hovered,
             needs_present,
             last_input_timestamp,
+            scroll_momentum: Default::default(),
+            scroll_fling: None,
+            dispatching_scroll_step: false,
             resizing_window: Rc::new(Cell::new(false)),
             last_input_modality: InputModality::Mouse,
             window_invalidation: Invalidation::empty(),
@@ -7455,6 +7464,40 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
+    /// Keep scrolling after a trackpad flick, slowing down, until the coast
+    /// stops or another scroll or a press takes over (#42).
+    ///
+    /// The coast's events go through the same dispatch as the platform's, at
+    /// the position the fingers lifted, so whatever was scrolling keeps
+    /// scrolling.
+    fn coast(&self, mut fling: crate::scroll_momentum::Fling, cx: &App) -> Task<()> {
+        self.spawn(cx, async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(crate::scroll_momentum::FLING_STEP)
+                    .await;
+                let Ok(going) = cx.update(|window, cx| {
+                    let now = cx.background_executor().now();
+                    let Some(step) = fling.step(now) else {
+                        return false;
+                    };
+                    let last = step.touch_phase == crate::TouchPhase::Ended;
+                    // Past the momentum tracking in `dispatch_event`, which
+                    // would take this step for a new gesture.
+                    window.dispatching_scroll_step = true;
+                    window.dispatch_event(PlatformInput::ScrollWheel(step), cx);
+                    window.dispatching_scroll_step = false;
+                    !last
+                }) else {
+                    return;
+                };
+                if !going {
+                    return;
+                }
+            }
+        })
+    }
+
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
@@ -7486,6 +7529,8 @@ impl Window {
                 PlatformInput::MouseMove(mouse_move)
             }
             PlatformInput::MouseDown(mouse_down) => {
+                // A press stops a coasting scroll, as it does on a phone.
+                self.scroll_fling = None;
                 if std::env::var_os("GPUI_DEBUG_MOUSE").is_some() {
                     eprintln!(
                         "[WGPUI] dispatch MouseDown @ {:?} click_count={} first_mouse={} active={}",
@@ -7528,6 +7573,14 @@ impl Window {
             PlatformInput::ScrollWheel(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
                 self.modifiers = scroll_wheel.modifiers;
+                if !self.dispatching_scroll_step {
+                    // Any new scroll takes over from a coast.
+                    self.scroll_fling = None;
+                    let now = cx.background_executor().now();
+                    if let Some(fling) = self.scroll_momentum.observe(&scroll_wheel, now) {
+                        self.scroll_fling = Some(self.coast(fling, cx));
+                    }
+                }
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
             PlatformInput::LongPress(long_press) => {
@@ -9826,6 +9879,105 @@ mod test {
         assert!(renders(1) > before[1] && !drew_focused(1), "the view losing focus repaints");
         assert_eq!(renders(0), before[0], "an unrelated cached view replays");
         assert_eq!(renders(2), before[2]);
+    }
+
+    /// Records the vertical scroll it receives.
+    struct ScrollProbe {
+        scrolled: std::rc::Rc<std::cell::Cell<f32>>,
+        events: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for ScrollProbe {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            use crate::InteractiveElement as _;
+            let (scrolled, events) = (self.scrolled.clone(), self.events.clone());
+            crate::div()
+                .size_full()
+                .on_scroll_wheel(move |event, window, _| {
+                    let delta = event.delta.pixel_delta(window.line_height());
+                    scrolled.set(scrolled.get() + f32::from(delta.y));
+                    events.set(events.get() + 1);
+                })
+        }
+    }
+
+    /// Flick a trackpad at `probe`: 20 px every 10 ms, then lift.
+    fn flick(cx: &mut crate::VisualTestContext) {
+        let at = crate::point(px(50.), px(50.));
+        for (i, phase) in [crate::TouchPhase::Started]
+            .into_iter()
+            .chain(std::iter::repeat_n(crate::TouchPhase::Moved, 9))
+            .enumerate()
+        {
+            if i > 0 {
+                cx.executor().advance_clock(std::time::Duration::from_millis(10));
+            }
+            cx.simulate_event(crate::ScrollWheelEvent {
+                position: at,
+                delta: crate::ScrollDelta::Pixels(crate::point(px(0.), px(20.))),
+                touch_phase: phase,
+                ..Default::default()
+            });
+        }
+        cx.executor().advance_clock(std::time::Duration::from_millis(5));
+        cx.simulate_event(crate::ScrollWheelEvent {
+            position: at,
+            delta: crate::ScrollDelta::Pixels(crate::point(px(0.), px(0.))),
+            touch_phase: crate::TouchPhase::Ended,
+            ..Default::default()
+        });
+    }
+
+    /// Issue #42: a trackpad lifted while moving keeps scrolling and slows to
+    /// a stop; a press stops it at once.
+    #[cfg(not(target_os = "macos"))]
+    #[gpui::test]
+    fn a_trackpad_flick_coasts_until_it_stops_or_is_pressed(cx: &mut TestAppContext) {
+        let scrolled = std::rc::Rc::new(std::cell::Cell::new(0.));
+        let events = std::rc::Rc::new(std::cell::Cell::new(0));
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let (scrolled, events) = (scrolled.clone(), events.clone());
+            move |_, _| ScrollProbe { scrolled, events }
+        });
+        cx.run_until_parked();
+        let cx = &mut crate::VisualTestContext::from_window(window.into(), cx);
+
+        flick(cx);
+        let by_fingers = scrolled.get();
+        assert_eq!(by_fingers, 200.);
+        let fingers_events = events.get();
+        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        let early = scrolled.get() - by_fingers;
+        assert!(early > 50., "the content keeps moving after the lift ({early} px)");
+        cx.executor().advance_clock(std::time::Duration::from_secs(3));
+        cx.run_until_parked();
+        // 2000 px/s coasting with a 325 ms time constant: 650 px in all.
+        let coasted = scrolled.get() - by_fingers;
+        assert!(coasted > 600. && coasted <= 650.5, "coasted {coasted} px");
+        let after_stop = events.get();
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(events.get(), after_stop, "the coast stopped");
+        assert!(after_stop > fingers_events + 10);
+
+        // A press stops a coast where it is.
+        flick(cx);
+        cx.executor().advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        cx.simulate_mouse_down(
+            crate::point(px(50.), px(50.)),
+            crate::MouseButton::Left,
+            crate::Modifiers::none(),
+        );
+        let at_press = scrolled.get();
+        cx.executor().advance_clock(std::time::Duration::from_secs(3));
+        cx.run_until_parked();
+        assert_eq!(scrolled.get(), at_press, "the press stopped the coast");
     }
 
     struct SelectorLeaf;

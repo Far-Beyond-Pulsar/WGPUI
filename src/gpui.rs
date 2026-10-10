@@ -71,6 +71,7 @@ mod queue;
 pub mod render_stats;
 mod scene;
 mod scene_pack;
+mod scroll_momentum;
 pub mod shared_runtime;
 mod shared_string;
 mod shared_uri;
