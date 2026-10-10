@@ -9,6 +9,9 @@ pub struct WgpuOptions {
     /// Additional WGPU features to request when creating the device.
     /// These are OR'd with the features WGPUI itself requires.
     pub additional_features: wgpu::Features,
+    /// WGPU features enabled when the selected adapter has them; they never
+    /// filter adapters.
+    pub optional_features: wgpu::Features,
 
     /// Maximum number of frames the GPU can queue ahead before blocking.
     /// Higher values improve throughput at the cost of input latency.
@@ -25,6 +28,7 @@ impl Default for WgpuOptions {
     fn default() -> Self {
         Self {
             additional_features: wgpu::Features::empty(),
+            optional_features: wgpu::Features::empty(),
             desired_maximum_frame_latency: 2,
             backends: wgpu::Backends::all(),
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -231,7 +235,7 @@ impl WgpuContext {
                 device_features | wgpu::Features::EXPERIMENTAL_RAY_QUERY
             } else {
                 device_features
-            };
+            } | (adapter.features() & options.optional_features);
             let (device, queue) =
                 pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                     label: None,
@@ -391,7 +395,7 @@ impl WgpuContext {
             required_features | wgpu::Features::EXPERIMENTAL_RAY_QUERY
         } else {
             required_features
-        };
+        } | (adapter.features() & options.optional_features);
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
