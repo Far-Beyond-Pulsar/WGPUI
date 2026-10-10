@@ -5351,7 +5351,7 @@ impl Window {
                     scaled_texture_bounds.size.width.0,
                     scaled_texture_bounds.size.height.0,
                     layer.items.len(),
-                    cache_key.scale_factor,
+                    layer.cache_key.scale_factor,
                 );
             }
             let rasterizable = crate::layer::rasterization_enabled()
