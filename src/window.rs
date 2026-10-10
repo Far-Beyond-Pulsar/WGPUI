@@ -2721,7 +2721,7 @@ impl Window {
             return;
         }
 
-        self.focus = Some(handle.id);
+        let previous = self.focus.replace(handle.id);
         self.clear_pending_keystrokes();
 
         // Avoid re-entrant entity updates by deferring observer notifications to the end of the
@@ -2735,7 +2735,32 @@ impl Window {
                 .ok();
         });
 
-        self.refresh();
+        self.invalidate_focus_change(previous, handle.id, cx);
+    }
+
+    /// Repaint what a focus change can change: the view around the element
+    /// losing focus and the view around the one gaining it. Notifying a view
+    /// also dirties every view above it, so ancestors that style on a
+    /// descendant's focus (`contains_focused`, focus-in styles) rebuild too;
+    /// unrelated cached views replay.
+    ///
+    /// An element the last frame did not draw (a menu or popover focused as it
+    /// opens) is in no cached view, so it is drawn fresh by whatever renders
+    /// it; a frame is still requested, so focus listeners run.
+    ///
+    /// This used to be `Window::refresh` on every focus change: clicking into
+    /// a panel, opening a menu or a popover rebuilt every cached view.
+    fn invalidate_focus_change(&mut self, previous: Option<FocusId>, next: FocusId, cx: &mut App) {
+        let tree = &self.rendered_frame.dispatch_tree;
+        let next_view = tree.focus_owner_view(next);
+        let previous_view = previous.and_then(|id| tree.focus_owner_view(id));
+        crate::render_stats::count("focus: notify owners");
+        for view in next_view.into_iter().chain(previous_view) {
+            cx.notify(view);
+        }
+        if next_view.is_none() {
+            self.refresh_buffers();
+        }
     }
 
     /// Remove focus from all elements within this context's window.
@@ -9679,6 +9704,107 @@ mod test {
             sibling_before,
             "clicking another view rebuilt this cached sibling"
         );
+    }
+
+    struct FocusLeaf {
+        focus: crate::FocusHandle,
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+        /// Whether the last render saw this leaf focused.
+        drew_focused: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl crate::Render for FocusLeaf {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            use crate::InteractiveElement as _;
+            self.renders.set(self.renders.get() + 1);
+            self.drew_focused.set(self.focus.is_focused(window));
+            crate::div().track_focus(&self.focus).w(px(10.)).h(px(10.))
+        }
+    }
+
+    struct FocusRoot {
+        leaves: Vec<crate::Entity<FocusLeaf>>,
+    }
+
+    impl crate::Render for FocusRoot {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div().size_full().children(self.leaves.iter().map(|leaf| {
+                crate::AnyView::from(leaf.clone())
+                    .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.)))
+            }))
+        }
+    }
+
+    /// Moving focus repaints the view losing it and the view gaining it, not
+    /// the whole window: `Window::focus` used to refresh, rebuilding every
+    /// cached view on each focus change.
+    #[gpui::test]
+    fn a_focus_change_rebuilds_only_the_views_it_moves_between(cx: &mut TestAppContext) {
+        let counters: Vec<_> = (0..3)
+            .map(|_| {
+                (
+                    std::rc::Rc::new(std::cell::Cell::new(0usize)),
+                    std::rc::Rc::new(std::cell::Cell::new(false)),
+                )
+            })
+            .collect();
+        let leaves: Vec<_> = cx.update(|cx| {
+            counters
+                .iter()
+                .map(|(renders, drew_focused)| {
+                    cx.new(|cx| FocusLeaf {
+                        focus: cx.focus_handle(),
+                        renders: renders.clone(),
+                        drew_focused: drew_focused.clone(),
+                    })
+                })
+                .collect()
+        });
+        let root_leaves = leaves.clone();
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| FocusRoot {
+            leaves: root_leaves,
+        });
+        cx.run_until_parked();
+        let renders = |i: usize| counters[i].0.get();
+        let drew_focused = |i: usize| counters[i].1.get();
+        let focus = |cx: &mut TestAppContext, i: usize| {
+            let handle = leaves[i].read_with(cx, |leaf, _| leaf.focus.clone());
+            window
+                .update(cx, |_, window, cx| window.focus(&handle, cx))
+                .unwrap();
+            cx.run_until_parked();
+        };
+
+        let before: Vec<usize> = (0..3).map(renders).collect();
+        focus(cx, 0);
+        assert!(renders(0) > before[0] && drew_focused(0), "the focused view repaints");
+        assert_eq!(renders(1), before[1], "an unrelated cached view replays");
+        assert_eq!(renders(2), before[2]);
+
+        let before: Vec<usize> = (0..3).map(renders).collect();
+        focus(cx, 1);
+        assert!(renders(0) > before[0] && !drew_focused(0), "the view losing focus repaints");
+        assert!(renders(1) > before[1] && drew_focused(1));
+        assert_eq!(renders(2), before[2], "an unrelated cached view replays");
+
+        // A handle no element draws yet, as a menu's is when it opens.
+        let before: Vec<usize> = (0..3).map(renders).collect();
+        let undrawn = cx.update(|cx| cx.focus_handle());
+        window
+            .update(cx, |_, window, cx| window.focus(&undrawn, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(renders(1) > before[1] && !drew_focused(1), "the view losing focus repaints");
+        assert_eq!(renders(0), before[0], "an unrelated cached view replays");
+        assert_eq!(renders(2), before[2]);
     }
 
     /// The same thing, repeated. One successful invalidation is not enough:

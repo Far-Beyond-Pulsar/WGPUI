@@ -575,6 +575,19 @@ impl DispatchTree {
         focus_path
     }
 
+    /// The innermost view around the element `focus_id` names, in this frame,
+    /// or `None` if no element here has that focus handle.
+    pub fn focus_owner_view(&self, focus_id: FocusId) -> Option<EntityId> {
+        let mut node_id = *self.focusable_node_ids.get(&focus_id)?;
+        loop {
+            let node = &self.nodes[node_id.0];
+            if let Some(view_id) = node.view_id {
+                return Some(view_id);
+            }
+            node_id = node.parent?;
+        }
+    }
+
     pub fn view_path_reversed(&self, view_id: EntityId) -> impl Iterator<Item = EntityId> {
         let mut current_node_id = self.view_node_ids.get(&view_id).copied();
 
