@@ -5337,7 +5337,25 @@ impl Window {
                 .items
                 .iter()
                 .any(|item| matches!(item, LayerItem::Nested(_)));
+            // A texture larger than the GPU's maximum dimension cannot be
+            // created (wgpu validation panics), so oversized layers stay
+            // primitive-retained instead.
+            const MAX_LAYER_TEXTURE_PX: f32 = 16384.0;
+            let fits_in_texture = scaled_texture_bounds.size.width.0 <= MAX_LAYER_TEXTURE_PX
+                && scaled_texture_bounds.size.height.0 <= MAX_LAYER_TEXTURE_PX;
+            if !fits_in_texture {
+                log::warn!(
+                    "layer {:?} is too large to cache as a texture ({}x{} px, {} items, scale {}); \
+                     an ancestor probably lacks a definite height (missing min_h_0/overflow_hidden)",
+                    key,
+                    scaled_texture_bounds.size.width.0,
+                    scaled_texture_bounds.size.height.0,
+                    layer.items.len(),
+                    cache_key.scale_factor,
+                );
+            }
             let rasterizable = crate::layer::rasterization_enabled()
+                && fits_in_texture
                 && crate::scene_pack::slabs_enabled()
                 && layer.packed.as_ref().is_some_and(|packed| packed.is_ok())
                 && !has_nested
