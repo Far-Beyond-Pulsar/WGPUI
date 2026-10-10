@@ -948,14 +948,15 @@ pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
         .find(shared_runtime::current_thread_key())
         .and_then(|ambient| NonNull::new(ambient.element_arena.load(Ordering::Relaxed)));
     let Some(raw) = active else {
+        // The thread is named by its OS id, not `std::thread::current()`:
+        // in a plugin that would create the plugin's own `std` handle for
+        // this thread, whose exit destructor then calls into the plugin
+        // after it is unloaded.
         panic!(
             "element arena not active: `AnyElement` was constructed outside of an \
-             `ElementArenaScope` on thread {:?}. Elements can only be built while a window \
+             `ElementArenaScope` on OS thread {}. Elements can only be built while a window \
              is drawing (or inside `ElementArenaScope::enter`).\nConstruction callsite:\n{}",
-            std::thread::current()
-                .name()
-                .map(|name| name.to_string())
-                .unwrap_or("<unnamed>".into()),
+            shared_runtime::current_thread_key(),
             std::backtrace::Backtrace::force_capture(),
         )
     };
@@ -3572,6 +3573,14 @@ impl Window {
             self.test_pending_dead_pages.extend(dead_pages);
         }
         self.next_frame.clear();
+        // Debug bounds are recorded when an element paints, and a cached view
+        // that replays paints nothing. Carry the last bounds of every selector
+        // forward, so a test reads them whichever frame drew them last: a
+        // replayed view's bounds are the ones it last painted.
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame
+            .debug_bounds
+            .clone_from(&self.rendered_frame.debug_bounds);
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
 
@@ -4028,64 +4037,58 @@ impl Window {
     fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
 
-        let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for &deferred_draw_ix in deferred_draw_indices {
-            let deferred_draw = &mut deferred_draws[deferred_draw_ix];
-            self.element_id_stack
-                .clone_from(&deferred_draw.element_id_stack);
-            self.text_style_stack
-                .clone_from(&deferred_draw.text_style_stack);
-            self.next_frame
-                .dispatch_tree
-                .set_active_node(deferred_draw.parent_node);
-
-            let prepaint_start = self.prepaint_index();
-            if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
-                        element.prepaint(window, cx)
-                    });
-                })
-            } else {
-                self.reuse_prepaint(deferred_draw.prepaint_range.clone());
-            }
-            let prepaint_end = self.prepaint_index();
-            deferred_draw.prepaint_range = prepaint_start..prepaint_end;
+            self.prepaint_deferred_draw(deferred_draw_ix, cx);
         }
 
-        // Process any nested deferred draws that were added during prepaint.
         // A deferred element's child may itself contain deferred() elements,
-        // which call defer_draw() during their prepaint.
-        // Repeat until no new deferred draws are added.
-        while !self.next_frame.deferred_draws.is_empty() {
-            let nested = mem::take(&mut self.next_frame.deferred_draws);
-            for mut deferred_draw in nested {
-                self.element_id_stack
-                    .clone_from(&deferred_draw.element_id_stack);
-                self.text_style_stack
-                    .clone_from(&deferred_draw.text_style_stack);
-                self.next_frame
-                    .dispatch_tree
-                    .set_active_node(deferred_draw.parent_node);
-
-                let prepaint_start = self.prepaint_index();
-                if let Some(element) = deferred_draw.element.as_mut() {
-                    self.with_rendered_view(deferred_draw.current_view, |window| {
-                        window
-                            .with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
-                                element.prepaint(window, cx)
-                            })
-                    });
-                }
-                let prepaint_end = self.prepaint_index();
-                deferred_draw.prepaint_range = prepaint_start..prepaint_end;
-                deferred_draws.push(deferred_draw);
-            }
+        // which call defer_draw() during their prepaint. Those land at the end
+        // of the frame's list, and are prepainted after the draws before them,
+        // until no new ones are added.
+        let mut deferred_draw_ix = deferred_draw_indices.len();
+        while deferred_draw_ix < self.next_frame.deferred_draws.len() {
+            self.prepaint_deferred_draw(deferred_draw_ix, cx);
+            deferred_draw_ix += 1;
         }
 
-        self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
         self.text_style_stack.clear();
+    }
+
+    /// Prepaint the frame's deferred draw at `ix`, or replay it when it came
+    /// from a cached view.
+    ///
+    /// The draw stays in the frame's list while it prepaints, so the draws it
+    /// opens are appended to that list and its `prepaint_range` indexes them
+    /// there. A cached view that replays this draw then replays those with it.
+    fn prepaint_deferred_draw(&mut self, ix: usize, cx: &mut App) {
+        let deferred_draw = &mut self.next_frame.deferred_draws[ix];
+        self.element_id_stack
+            .clone_from(&deferred_draw.element_id_stack);
+        self.text_style_stack
+            .clone_from(&deferred_draw.text_style_stack);
+        let mut element = deferred_draw.element.take();
+        let current_view = deferred_draw.current_view;
+        let absolute_offset = deferred_draw.absolute_offset;
+        let replayed_range = deferred_draw.prepaint_range.clone();
+        let parent_node = deferred_draw.parent_node;
+        self.next_frame.dispatch_tree.set_active_node(parent_node);
+
+        let prepaint_start = self.prepaint_index();
+        if let Some(element) = element.as_mut() {
+            self.with_rendered_view(current_view, |window| {
+                window.with_absolute_element_offset(absolute_offset, |window| {
+                    element.prepaint(window, cx)
+                });
+            })
+        } else {
+            self.reuse_prepaint(replayed_range);
+        }
+        let prepaint_end = self.prepaint_index();
+
+        let deferred_draw = &mut self.next_frame.deferred_draws[ix];
+        deferred_draw.element = element;
+        deferred_draw.prepaint_range = prepaint_start..prepaint_end;
     }
 
     fn paint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
@@ -9823,6 +9826,166 @@ mod test {
         assert!(renders(1) > before[1] && !drew_focused(1), "the view losing focus repaints");
         assert_eq!(renders(0), before[0], "an unrelated cached view replays");
         assert_eq!(renders(2), before[2]);
+    }
+
+    struct SelectorLeaf;
+
+    impl crate::Render for SelectorLeaf {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div()
+                .debug_selector(|| "cached-leaf".into())
+                .w(px(10.))
+                .h(px(10.))
+        }
+    }
+
+    struct SelectorRoot {
+        leaf: crate::Entity<SelectorLeaf>,
+        bystander: crate::Entity<CacheLeaf>,
+    }
+
+    impl crate::Render for SelectorRoot {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div()
+                .size_full()
+                .child(
+                    crate::AnyView::from(self.leaf.clone())
+                        .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+                )
+                .child(
+                    crate::AnyView::from(self.bystander.clone())
+                        .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+                )
+        }
+    }
+
+    /// A cached view keeps its debug bounds on frames where it replays, so a
+    /// test can read them after any frame, not only one that painted it.
+    #[gpui::test]
+    fn a_replayed_view_keeps_its_debug_bounds(cx: &mut TestAppContext) {
+        let (leaf, bystander) = cx.update(|cx| {
+            (
+                cx.new(|_| SelectorLeaf),
+                cx.new(|_| CacheLeaf {
+                    renders: std::rc::Rc::new(std::cell::Cell::new(0)),
+                }),
+            )
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let bystander = bystander.clone();
+            move |_, _| SelectorRoot { leaf, bystander }
+        });
+        cx.run_until_parked();
+        let cx = &mut crate::VisualTestContext::from_window(window.into(), cx);
+        for round in 1..=3 {
+            bystander.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("cached-leaf").is_some(),
+                "round {round}: the replayed leaf's bounds are gone"
+            );
+        }
+    }
+
+    /// A deferred draw that opens another while it prepaints, like a
+    /// right-click menu inside a popover.
+    struct NestedDeferredLeaf {
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+        clicks: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl crate::Render for NestedDeferredLeaf {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            use crate::{InteractiveElement as _, StatefulInteractiveElement as _};
+            self.renders.set(self.renders.get() + 1);
+            let clicks = self.clicks.clone();
+            crate::div().w(px(40.)).h(px(40.)).child(crate::deferred(crate::deferred(
+                crate::div()
+                    .id("nested-target")
+                    .w(px(40.))
+                    .h(px(40.))
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+            )))
+        }
+    }
+
+    struct NestedDeferredRoot {
+        leaf: crate::Entity<NestedDeferredLeaf>,
+        bystander: crate::Entity<CacheLeaf>,
+    }
+
+    impl crate::Render for NestedDeferredRoot {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div()
+                .size_full()
+                .child(
+                    crate::AnyView::from(self.leaf.clone())
+                        .cached(crate::StyleRefinement::default().w(px(40.)).h(px(40.))),
+                )
+                .child(
+                    crate::AnyView::from(self.bystander.clone())
+                        .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+                )
+        }
+    }
+
+    /// A cached view replays a deferred draw together with the draws nested
+    /// in it. Their recorded ranges used to index a temporary list, so the
+    /// replay copied the wrong draws (a debug assertion in
+    /// `ReusedSubtree::refresh_node_id`) and the nested draw lost its
+    /// hitboxes.
+    #[gpui::test]
+    fn a_cached_view_replays_deferred_draws_nested_in_deferred_draws(cx: &mut TestAppContext) {
+        let leaf_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (leaf, bystander) = cx.update(|cx| {
+            (
+                cx.new(|_| NestedDeferredLeaf {
+                    renders: leaf_renders.clone(),
+                    clicks: clicks.clone(),
+                }),
+                cx.new(|_| CacheLeaf {
+                    renders: std::rc::Rc::new(std::cell::Cell::new(0)),
+                }),
+            )
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let bystander = bystander.clone();
+            move |_, _| NestedDeferredRoot { leaf, bystander }
+        });
+        cx.run_until_parked();
+        let cx = &mut crate::VisualTestContext::from_window(window.into(), cx);
+        let target = crate::point(px(20.), px(20.));
+        cx.simulate_mouse_move(target, None, crate::Modifiers::none());
+        cx.run_until_parked();
+
+        for round in 1..=3 {
+            let leaf_before = leaf_renders.get();
+            bystander.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert_eq!(leaf_renders.get(), leaf_before, "the cached view replayed");
+            // A click repaints the clicked view, so each round replays a
+            // freshly drawn frame.
+            cx.simulate_click(target, crate::Modifiers::none());
+            cx.run_until_parked();
+            assert_eq!(clicks.get(), round, "the replayed nested draw kept its hitbox");
+        }
     }
 
     /// The same thing, repeated. One successful invalidation is not enough:

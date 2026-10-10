@@ -365,18 +365,25 @@ fn plugin_destructor_panics_are_contained_and_reported_by_the_host() {
     let _serial = serial();
     let fixture = Fixture::load(fixture_path());
     let arena = RefCell::new(Arena::new(64 * 1024));
+    let panicking_clear = || {
+        {
+            let _scope = ElementArenaScope::enter(&arena);
+            assert_eq!(fixture.build_with_panicking_drop(10, &DROPS, 3), STATUS_OK);
+        }
+        panic::catch_unwind(AssertUnwindSafe(|| arena.borrow_mut().clear()))
+    };
+    // One panic first, so the baseline already holds what the plugin's `std`
+    // keeps after its first panic: with `RUST_BACKTRACE` set, its panic hook
+    // caches the debug info it read to print the backtrace.
+    panicking_clear().expect_err("the warm-up destructor panic must be reported");
     frame(&arena, || assert_eq!(fixture.build(1, &DROPS), STATUS_OK));
     let plugin_baseline = fixture.heap();
     let drops_before = DROPS.load(Ordering::SeqCst);
 
-    {
-        let _scope = ElementArenaScope::enter(&arena);
-        assert_eq!(fixture.build_with_panicking_drop(10, &DROPS, 3), STATUS_OK);
-    }
     // The panic starts in the plugin's `std`; if it unwound into this
     // binary's frames it would be a foreign exception and abort. It must
     // instead come back as an ordinary panic raised by the host's copy.
-    let result = panic::catch_unwind(AssertUnwindSafe(|| arena.borrow_mut().clear()));
+    let result = panicking_clear();
     let message = result
         .expect_err("the destructor panic must be reported")
         .downcast::<String>()
