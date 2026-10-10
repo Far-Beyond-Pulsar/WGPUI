@@ -172,15 +172,6 @@ impl TestAppContext {
         }
     }
 
-    /// Serve assets (icons, images) from `source`, as [`crate::Application::with_assets`]
-    /// does for an app. A test context otherwise has none, so icons draw blank.
-    pub fn set_asset_source(&self, source: impl crate::AssetSource) {
-        let mut app = self.app.borrow_mut();
-        let source: Arc<dyn crate::AssetSource> = Arc::new(source);
-        app.svg_renderer = crate::SvgRenderer::new(source.clone());
-        app.asset_source = source;
-    }
-
     /// Skip all drawing operations for the duration of this test.
     pub fn skip_drawing(&mut self) {
         self.app.borrow_mut().mode = GpuiMode::Test { skip_drawing: true };
