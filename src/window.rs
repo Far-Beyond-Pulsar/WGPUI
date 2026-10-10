@@ -3573,6 +3573,14 @@ impl Window {
             self.test_pending_dead_pages.extend(dead_pages);
         }
         self.next_frame.clear();
+        // Debug bounds are recorded when an element paints, and a cached view
+        // that replays paints nothing. Carry the last bounds of every selector
+        // forward, so a test reads them whichever frame drew them last: a
+        // replayed view's bounds are the ones it last painted.
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame
+            .debug_bounds
+            .clone_from(&self.rendered_frame.debug_bounds);
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
 
@@ -9818,6 +9826,73 @@ mod test {
         assert!(renders(1) > before[1] && !drew_focused(1), "the view losing focus repaints");
         assert_eq!(renders(0), before[0], "an unrelated cached view replays");
         assert_eq!(renders(2), before[2]);
+    }
+
+    struct SelectorLeaf;
+
+    impl crate::Render for SelectorLeaf {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div()
+                .debug_selector(|| "cached-leaf".into())
+                .w(px(10.))
+                .h(px(10.))
+        }
+    }
+
+    struct SelectorRoot {
+        leaf: crate::Entity<SelectorLeaf>,
+        bystander: crate::Entity<CacheLeaf>,
+    }
+
+    impl crate::Render for SelectorRoot {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            crate::div()
+                .size_full()
+                .child(
+                    crate::AnyView::from(self.leaf.clone())
+                        .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+                )
+                .child(
+                    crate::AnyView::from(self.bystander.clone())
+                        .cached(crate::StyleRefinement::default().w(px(10.)).h(px(10.))),
+                )
+        }
+    }
+
+    /// A cached view keeps its debug bounds on frames where it replays, so a
+    /// test can read them after any frame, not only one that painted it.
+    #[gpui::test]
+    fn a_replayed_view_keeps_its_debug_bounds(cx: &mut TestAppContext) {
+        let (leaf, bystander) = cx.update(|cx| {
+            (
+                cx.new(|_| SelectorLeaf),
+                cx.new(|_| CacheLeaf {
+                    renders: std::rc::Rc::new(std::cell::Cell::new(0)),
+                }),
+            )
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let bystander = bystander.clone();
+            move |_, _| SelectorRoot { leaf, bystander }
+        });
+        cx.run_until_parked();
+        let cx = &mut crate::VisualTestContext::from_window(window.into(), cx);
+        for round in 1..=3 {
+            bystander.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("cached-leaf").is_some(),
+                "round {round}: the replayed leaf's bounds are gone"
+            );
+        }
     }
 
     /// A deferred draw that opens another while it prepaints, like a
