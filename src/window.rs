@@ -948,14 +948,15 @@ pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
         .find(shared_runtime::current_thread_key())
         .and_then(|ambient| NonNull::new(ambient.element_arena.load(Ordering::Relaxed)));
     let Some(raw) = active else {
+        // The thread is named by its OS id, not `std::thread::current()`:
+        // in a plugin that would create the plugin's own `std` handle for
+        // this thread, whose exit destructor then calls into the plugin
+        // after it is unloaded.
         panic!(
             "element arena not active: `AnyElement` was constructed outside of an \
-             `ElementArenaScope` on thread {:?}. Elements can only be built while a window \
+             `ElementArenaScope` on OS thread {}. Elements can only be built while a window \
              is drawing (or inside `ElementArenaScope::enter`).\nConstruction callsite:\n{}",
-            std::thread::current()
-                .name()
-                .map(|name| name.to_string())
-                .unwrap_or("<unnamed>".into()),
+            shared_runtime::current_thread_key(),
             std::backtrace::Backtrace::force_capture(),
         )
     };
