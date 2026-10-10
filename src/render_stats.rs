@@ -49,26 +49,44 @@ static ENABLED: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(false)
 });
 
+// Per thread: a test that forces the stats on records only what its own
+// thread draws (a GPUI test draws on its own thread), not the frames tests
+// beside it draw at the same time (Pulsar-Native#1034).
 #[cfg(any(test, feature = "test-support"))]
-static FORCE_ENABLED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static FORCE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Whether instrumentation is on. Check this before doing any work that only
 /// exists to feed the stats.
 #[inline]
 pub fn enabled() -> bool {
     #[cfg(any(test, feature = "test-support"))]
-    if FORCE_ENABLED.load(Ordering::Relaxed) {
+    if FORCE_ENABLED.with(std::cell::Cell::get) {
         return true;
     }
     *ENABLED
 }
 
-/// Turn instrumentation on regardless of `WGPUI_RENDER_STATS`, so tests can
-/// exercise the recording paths without depending on ambient environment
-/// variables. Only available in test builds.
+/// Turn instrumentation on for the calling thread regardless of
+/// `WGPUI_RENDER_STATS`, so tests can exercise the recording paths without
+/// depending on ambient environment variables. Only available in test
+/// builds; hold [`exclusive`] around it, since the registry it records into
+/// is still shared.
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_force_enabled(force: bool) {
-    FORCE_ENABLED.store(force, Ordering::Relaxed);
+    FORCE_ENABLED.with(|forced| forced.set(force));
+}
+
+/// Serializes the tests that use the process-global registry: anything that
+/// forces instrumentation on or off, resets it, or compares snapshots. One
+/// such test running beside another can switch the stats off or clear them
+/// in the middle of its measurement (Pulsar-Native#1034). Hold the guard for
+/// the whole test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn exclusive() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
 }
 
 #[derive(Default)]
@@ -478,9 +496,8 @@ mod tests {
     // Registry state (`FORCE_ENABLED` and the timer/counter accumulators) is
     // process-global, and parallel tests drive real draw paths whose stats
     // call sites become live whenever force-enablement is on. Every test that
-    // touches the registry therefore holds this lock for its whole body,
+    // touches the registry therefore holds `exclusive()` for its whole body,
     // including helpers such as `ForceEnabled`.
-    static SERIALIZATION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     // Only stat names owned by this module. Sibling tests exercising real
     // render paths can add entries under other names while force-enablement
@@ -504,7 +521,7 @@ mod tests {
         }
     }
 
-    /// Must be created while holding [`SERIALIZATION`].
+    /// Must be created while holding [`exclusive`].
     struct ForceEnabled;
 
     impl ForceEnabled {
@@ -522,7 +539,7 @@ mod tests {
 
     #[test]
     fn force_enabled_overrides_the_environment_flag() {
-        let _serialization_guard = SERIALIZATION.lock();
+        let _serialization_guard = exclusive();
         set_force_enabled(true);
         assert!(enabled());
         set_force_enabled(false);
@@ -531,7 +548,7 @@ mod tests {
 
     #[test]
     fn counters_accumulate_by_one_and_by_added_amount() {
-        let _serialization_guard = SERIALIZATION.lock();
+        let _serialization_guard = exclusive();
         let _force_enabled = ForceEnabled::new();
         reset();
         count("test: frames drawn");
@@ -547,7 +564,7 @@ mod tests {
 
     #[test]
     fn snapshot_reads_without_consuming() {
-        let _serialization_guard = SERIALIZATION.lock();
+        let _serialization_guard = exclusive();
         let _force_enabled = ForceEnabled::new();
         reset();
         add("test: uniform bytes written", 96);
@@ -571,7 +588,7 @@ mod tests {
 
     #[test]
     fn timers_accumulate_from_record_and_scope() {
-        let _serialization_guard = SERIALIZATION.lock();
+        let _serialization_guard = exclusive();
         let _force_enabled = ForceEnabled::new();
         reset();
         record("test: gpu upload", Duration::from_millis(2));
@@ -594,7 +611,7 @@ mod tests {
 
     #[test]
     fn snapshot_and_reset_bypass_enablement_and_reporting_gates() {
-        let _serialization_guard = SERIALIZATION.lock();
+        let _serialization_guard = exclusive();
         set_force_enabled(false);
         reset();
         REGISTRY.record_sample("test: manual stage", 1_000);
