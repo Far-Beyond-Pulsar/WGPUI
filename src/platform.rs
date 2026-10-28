@@ -159,7 +159,7 @@ pub(crate) trait Platform: 'static {
     fn should_auto_hide_scrollbars(&self) -> bool;
 
     fn write_to_clipboard(&self, item: ClipboardItem);
-    fn read_from_clipboard(&self) -> Option<ClipboardItem>;
+    fn read_from_clipboard(&self, formats: &[ClipboardFormat]) -> Option<ClipboardItem>;
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>>;
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>>;
@@ -1619,13 +1619,32 @@ pub enum CursorStyle {
     None,
 }
 
+/// Identifies an application-defined clipboard representation on each platform.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ClipboardFormat {
+    /// MIME type used on Linux and as the registered format name on Windows.
+    pub mime_type: &'static str,
+    /// Uniform type identifier used by macOS. This must be a valid UTI, not a MIME type.
+    pub macos_uti: &'static str,
+}
+
+impl ClipboardFormat {
+    pub(crate) fn native_name(self) -> &'static str {
+        if cfg!(target_os = "macos") {
+            self.macos_uti
+        } else {
+            self.mime_type
+        }
+    }
+}
+
 /// A clipboard item that should be copied to the clipboard
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardItem {
     entries: Vec<ClipboardEntry>,
 }
 
-/// Either a ClipboardString or a ClipboardImage
+/// A representation of clipboard content.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClipboardEntry {
     /// A string entry
@@ -1634,36 +1653,36 @@ pub enum ClipboardEntry {
     Image(Image),
     /// A file entry
     ExternalPaths(crate::ExternalPaths),
+    /// Application-defined binary data.
+    Custom {
+        /// Identifies the representation's format.
+        format: ClipboardFormat,
+        /// Bytes encoded by the application.
+        data: Vec<u8>,
+    },
 }
 
 impl ClipboardItem {
-    /// Create a new ClipboardItem::String with no associated metadata
+    /// Create a new clipboard text item.
     pub fn new_string(text: String) -> Self {
         Self {
             entries: vec![ClipboardEntry::String(ClipboardString::new(text))],
         }
     }
 
-    /// Create a new ClipboardItem::String with the given text and associated metadata
-    pub fn new_string_with_metadata(text: String, metadata: String) -> Self {
-        Self {
-            entries: vec![ClipboardEntry::String(ClipboardString {
-                text,
-                metadata: Some(metadata),
-            })],
+    /// Add or replace an application-defined representation alongside existing content.
+    pub fn with_custom(mut self, format: ClipboardFormat, data: Vec<u8>) -> Self {
+        if let Some(ClipboardEntry::Custom { data: stored, .. }) = self.entries.iter_mut().find(
+            |entry| matches!(entry, ClipboardEntry::Custom { format: stored, .. } if *stored == format),
+        ) {
+            *stored = data;
+        } else {
+            self.entries.push(ClipboardEntry::Custom { format, data });
         }
+        self
     }
 
-    /// Create a new ClipboardItem::String with the given text and associated metadata
-    pub fn new_string_with_json_metadata<T: Serialize>(text: String, metadata: T) -> Self {
-        Self {
-            entries: vec![ClipboardEntry::String(
-                ClipboardString::new(text).with_json_metadata(metadata),
-            )],
-        }
-    }
-
-    /// Create a new ClipboardItem::Image with the given image with no associated metadata
+    /// Create a new clipboard item with the given image.
     pub fn new_image(image: &Image) -> Self {
         Self {
             entries: vec![ClipboardEntry::Image(image.clone())],
@@ -1676,7 +1695,7 @@ impl ClipboardItem {
         let mut answer = String::new();
 
         for entry in self.entries.iter() {
-            if let ClipboardEntry::String(ClipboardString { text, metadata: _ }) = entry {
+            if let ClipboardEntry::String(ClipboardString { text }) = entry {
                 answer.push_str(text);
             }
         }
@@ -1699,14 +1718,15 @@ impl ClipboardItem {
         }
     }
 
-    /// If this item is one ClipboardEntry::String, returns its metadata.
-    pub fn metadata(&self) -> Option<&String> {
-        match self.entries().first() {
-            Some(ClipboardEntry::String(clipboard_string)) if self.entries.len() == 1 => {
-                clipboard_string.metadata.as_ref()
-            }
+    /// Get the bytes of an application-defined representation.
+    pub fn custom(&self, format: ClipboardFormat) -> Option<&[u8]> {
+        self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::Custom {
+                format: stored,
+                data,
+            } if *stored == format => Some(data.as_slice()),
             _ => None,
-        }
+        })
     }
 
     /// Get the item's entries
@@ -1931,23 +1951,12 @@ impl Image {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardString {
     pub(crate) text: String,
-    pub(crate) metadata: Option<String>,
 }
 
 impl ClipboardString {
     /// Create a new clipboard string with the given text
     pub fn new(text: String) -> Self {
-        Self {
-            text,
-            metadata: None,
-        }
-    }
-
-    /// Return a new clipboard item with the metadata replaced by the given metadata,
-    /// after serializing it as JSON.
-    pub fn with_json_metadata<T: Serialize>(mut self, metadata: T) -> Self {
-        self.metadata = Some(serde_json::to_string(&metadata).unwrap());
-        self
+        Self { text }
     }
 
     /// Get the text of the clipboard string
@@ -1960,16 +1969,6 @@ impl ClipboardString {
         self.text
     }
 
-    /// Get the metadata of the clipboard string, formatted as JSON
-    pub fn metadata_json<T>(&self) -> Option<T>
-    where
-        T: for<'a> Deserialize<'a>,
-    {
-        self.metadata
-            .as_ref()
-            .and_then(|m| serde_json::from_str(m).ok())
-    }
-
     pub(crate) fn text_hash(text: &str) -> u64 {
         let mut hasher = SeaHasher::new();
         text.hash(&mut hasher);
@@ -1979,10 +1978,7 @@ impl ClipboardString {
 
 impl From<String> for ClipboardString {
     fn from(value: String) -> Self {
-        Self {
-            text: value,
-            metadata: None,
-        }
+        Self { text: value }
     }
 }
 

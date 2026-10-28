@@ -1235,9 +1235,18 @@ impl App {
         self.platform.write_to_clipboard(item)
     }
 
-    /// Reads data from the platform clipboard.
+    /// Reads standard content from the platform clipboard.
+    /// Use [`Self::read_from_clipboard_with_formats`] to request custom representations.
     pub fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        self.platform.read_from_clipboard()
+        self.read_from_clipboard_with_formats(&[])
+    }
+
+    /// Reads standard clipboard content and the requested application-defined formats.
+    pub fn read_from_clipboard_with_formats(
+        &self,
+        formats: &[crate::ClipboardFormat],
+    ) -> Option<ClipboardItem> {
+        self.platform.read_from_clipboard(formats)
     }
 
     /// Writes credentials to the platform keychain.

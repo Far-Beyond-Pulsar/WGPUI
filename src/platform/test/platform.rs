@@ -328,8 +328,13 @@ impl Platform for TestPlatform {
         *self.current_clipboard_item.lock() = Some(item);
     }
 
-    fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        self.current_clipboard_item.lock().clone()
+    fn read_from_clipboard(&self, formats: &[crate::ClipboardFormat]) -> Option<ClipboardItem> {
+        let mut item = self.current_clipboard_item.lock().clone()?;
+        item.entries.retain(|entry| match entry {
+            crate::ClipboardEntry::Custom { format, .. } => formats.contains(format),
+            _ => true,
+        });
+        (!item.entries.is_empty()).then_some(item)
     }
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {

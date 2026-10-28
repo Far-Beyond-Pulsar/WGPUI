@@ -348,9 +348,17 @@ impl TestAppContext {
     }
 
     /// Simulates reading from the platform clipboard.
-    /// This will return the most recent value from `write_to_clipboard`.
+    /// Returns standard representations of the most recent value from `write_to_clipboard`.
     pub fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        self.test_platform.read_from_clipboard()
+        self.test_platform.read_from_clipboard(&[])
+    }
+
+    /// Simulates reading standard content and the requested custom formats.
+    pub fn read_from_clipboard_with_formats(
+        &self,
+        formats: &[crate::ClipboardFormat],
+    ) -> Option<ClipboardItem> {
+        self.test_platform.read_from_clipboard(formats)
     }
 
     /// Simulates choosing a File in the platform's "Open" dialog.
