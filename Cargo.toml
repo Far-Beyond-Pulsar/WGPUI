@@ -124,6 +124,7 @@ wgpu = { version = "30", default-features = false, features = [
     "web",
     "webgpu",
     "dx12",
+    "metal",
     "vulkan",
     "wgsl",
     "fragile-send-sync-non-atomic-wasm",
