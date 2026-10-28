@@ -217,6 +217,28 @@ impl CrossWindow {
             .expect("winit_window should be initialized")
     }
 
+    pub(crate) fn external_drag_position(&self) -> Point<Pixels> {
+        #[cfg(target_os = "windows")]
+        {
+            use device_query::{DeviceQuery, DeviceState};
+
+            // winit's OLE drop target discards DragOver's coordinates, and Windows
+            // does not send CursorMoved during an external drag.
+            match self.window().inner_position() {
+                Ok(origin) => {
+                    let (x, y) = DeviceState::new().get_mouse().coords;
+                    let scale_factor = self.scale_factor();
+                    self.0.state.mouse_position.set(crate::point(
+                        Pixels((x as f64 - origin.x as f64) as f32 / scale_factor),
+                        Pixels((y as f64 - origin.y as f64) as f32 / scale_factor),
+                    ));
+                }
+                Err(error) => log::warn!("Failed to locate file-drop window: {error}"),
+            }
+        }
+        self.0.state.mouse_position.get()
+    }
+
     /// Sends a `CloseWindow` event so the platform's `AppState.windows` map drops
     /// its reference and the OS window is actually destroyed.
     pub(crate) fn close_programmatically(&self) {
