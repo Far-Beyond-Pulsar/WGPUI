@@ -109,7 +109,9 @@ impl TextSystem {
 
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.platform_text_system.add_fonts(fonts)
+        self.platform_text_system.add_fonts(fonts)?;
+        self.font_ids_by_font.write().clear();
+        Ok(())
     }
 
     /// Get the FontId for the configure font family and style.
@@ -158,8 +160,19 @@ impl TextSystem {
         if let Ok(font_id) = self.font_id(font) {
             return font_id;
         }
+        if let Some(fallbacks) = &font.fallbacks {
+            for family in fallbacks.fallback_list() {
+                let mut fallback = font.clone();
+                fallback.family = family.clone().into();
+                if let Ok(font_id) = self.font_id(&fallback) {
+                    return font_id;
+                }
+            }
+        }
         for fallback in &self.fallback_font_stack {
-            if let Ok(font_id) = self.font_id(fallback) {
+            let mut fallback_font = font.clone();
+            fallback_font.family = fallback.family.clone();
+            if let Ok(font_id) = self.font_id(&fallback_font) {
                 return font_id;
             }
         }

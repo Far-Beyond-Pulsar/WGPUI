@@ -1,7 +1,8 @@
 use crate::{
-    Bounds, DevicePixels, Font, FontFeatures, FontId, FontMetrics, FontRun, FontStyle, FontWeight,
-    GlyphId, LineLayout, Pixels, PlatformTextSystem, Point, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, point, size,
+    Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
+    FontStyle, FontWeight, GlyphId, LineLayout, Pixels, PlatformTextSystem, Point,
+    RenderGlyphParams, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun,
+    SharedString, Size, point, size,
 };
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
@@ -18,6 +19,7 @@ use pathfinder_geometry::{
 };
 use smallvec::SmallVec;
 use std::{borrow::Cow, sync::Arc};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 
@@ -25,11 +27,16 @@ pub(crate) struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 struct FontKey {
     family: SharedString,
     features: FontFeatures,
+    fallbacks: Option<FontFallbacks>,
 }
 
 impl FontKey {
-    fn new(family: SharedString, features: FontFeatures) -> Self {
-        Self { family, features }
+    fn new(font: &Font) -> Self {
+        Self {
+            family: font.family.clone(),
+            features: font.features.clone(),
+            fallbacks: font.fallbacks.clone(),
+        }
     }
 }
 
@@ -42,6 +49,8 @@ struct CosmicTextSystemState {
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
+    fallback_fonts_cache:
+        HashMap<(String, cosmic_text::Weight, cosmic_text::Style), Option<Arc<CosmicTextFont>>>,
 }
 
 struct LoadedFont {
@@ -49,18 +58,31 @@ struct LoadedFont {
     weight: cosmic_text::fontdb::Weight,
     features: CosmicFontFeatures,
     is_known_emoji_font: bool,
+    fallbacks: Option<FontFallbacks>,
 }
 
 impl CosmicTextSystem {
     pub(crate) fn new() -> Self {
-        let mut font_system = FontSystem::new();
+        Self::with_locale(None)
+    }
+
+    pub(crate) fn with_locale(locale: Option<String>) -> Self {
+        let mut font_system = match locale {
+            Some(locale) => crate::new_font_system_with_locale(locale),
+            None => crate::new_font_system(),
+        };
 
         // On WASM there are no system fonts, so bundle a basic font.
         #[cfg(target_family = "wasm")]
         {
             let db = font_system.db_mut();
-            db.load_font_data(include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf").to_vec());
-            db.load_font_data(include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf").to_vec());
+            db.load_font_data(
+                include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf")
+                    .to_vec(),
+            );
+            db.load_font_data(
+                include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf").to_vec(),
+            );
         }
 
         Self(RwLock::new(CosmicTextSystemState {
@@ -69,6 +91,7 @@ impl CosmicTextSystem {
             scratch: ShapeBuffer::default(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
+            fallback_fonts_cache: HashMap::default(),
         }))
     }
 }
@@ -101,38 +124,40 @@ impl PlatformTextSystem for CosmicTextSystem {
     fn font_id(&self, font: &Font) -> Result<FontId> {
         // todo(linux): Do we need to use CosmicText's Font APIs? Can we consolidate this to use font_kit?
         let mut state = self.0.write();
-        let key = FontKey::new(font.family.clone(), font.features.clone());
+        let key = FontKey::new(font);
         let candidates = if let Some(font_ids) = state.font_ids_by_family_cache.get(&key) {
             font_ids.as_slice()
         } else {
-            let font_ids = state.load_family(&font.family, &font.features)?;
+            let font_ids =
+                state.load_family(&font.family, &font.features, font.fallbacks.as_ref())?;
             state.font_ids_by_family_cache.insert(key.clone(), font_ids);
             state.font_ids_by_family_cache[&key].as_ref()
         };
 
         #[cfg(not(target_family = "wasm"))]
         {
-        let candidate_properties = candidates
-            .iter()
-            .map(|font_id| {
-                let database_id = state.loaded_font(*font_id).font.id();
-                let face_info = state.font_system.db().face(database_id).expect("");
-                face_info_into_properties(face_info)
-            })
-            .collect::<SmallVec<[_; 4]>>();
+            let candidate_properties = candidates
+                .iter()
+                .map(|font_id| {
+                    let database_id = state.loaded_font(*font_id).font.id();
+                    let face_info = state.font_system.db().face(database_id).expect("");
+                    face_info_into_properties(face_info)
+                })
+                .collect::<SmallVec<[_; 4]>>();
 
-        let ix = find_best_match(&candidate_properties, &font_into_properties(font))
-            .context("requested font family contains no font matching the other parameters")?;
+            let ix = find_best_match(&candidate_properties, &font_into_properties(font))
+                .context("requested font family contains no font matching the other parameters")?;
 
-        return Ok(candidates[ix]);
+            return Ok(candidates[ix]);
         }
 
         // On WASM, we have no font_kit, so just return the first candidate.
         #[cfg(target_family = "wasm")]
         {
-        candidates.first().copied().ok_or_else(|| {
-            anyhow::anyhow!("no font candidates available on WASM")
-        })
+            candidates
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("no font candidates available on WASM"))
         }
     }
 
@@ -225,12 +250,38 @@ impl PlatformTextSystem for CosmicTextSystem {
 }
 
 impl CosmicTextSystemState {
+    fn fallback_font(
+        &mut self,
+        family: &str,
+        weight: cosmic_text::Weight,
+        style: cosmic_text::Style,
+    ) -> Option<Arc<CosmicTextFont>> {
+        let key = (family.to_owned(), weight, style);
+        if let Some(font) = self.fallback_fonts_cache.get(&key) {
+            return font.clone();
+        }
+        let font = self
+            .font_system
+            .db()
+            .query(&cosmic_text::fontdb::Query {
+                families: &[Family::Name(family)],
+                weight,
+                stretch: cosmic_text::Stretch::Normal,
+                style,
+            })
+            .and_then(|id| self.font_system.get_font(id, weight));
+        self.fallback_fonts_cache.insert(key, font.clone());
+        font
+    }
+
     fn loaded_font(&self, font_id: FontId) -> &LoadedFont {
         &self.loaded_fonts[font_id.0]
     }
 
     #[profiling::function]
     fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+        self.font_ids_by_family_cache.clear();
+        self.fallback_fonts_cache.clear();
         let db = self.font_system.db_mut();
         for bytes in fonts {
             match bytes {
@@ -250,32 +301,26 @@ impl CosmicTextSystemState {
         &mut self,
         name: &str,
         features: &FontFeatures,
+        fallbacks: Option<&FontFallbacks>,
     ) -> Result<SmallVec<[FontId; 4]>> {
-        let system_font = {
-            #[cfg(target_os = "windows")]
-            {
-                "Segoe UI"
-            }
-            #[cfg(target_os = "macos")]
-            {
-                "SF Pro"
-            }
-            #[cfg(target_os = "linux")]
-            {
-                "Noto Sans"
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-            {
-                "IBM Plex Sans"
-            }
+        let name = crate::text_system::font_name_with_fallbacks(name, "sans-serif");
+        let family = match name {
+            "sans-serif" => Family::SansSerif,
+            "serif" => Family::Serif,
+            "monospace" => Family::Monospace,
+            _ => Family::Name(name),
         };
-        let name = crate::text_system::font_name_with_fallbacks(name, system_font);
+        let name = self.font_system.db().family_name(&family);
 
         let families = self
             .font_system
             .db()
             .faces()
-            .filter(|face| face.families.iter().any(|family| *name == family.0))
+            .filter(|face| {
+                face.families
+                    .iter()
+                    .any(|family| name.eq_ignore_ascii_case(&family.0))
+            })
             .map(|face| (face.id, face.post_script_name.clone(), face.weight))
             .collect::<SmallVec<[_; 4]>>();
 
@@ -309,6 +354,7 @@ impl CosmicTextSystemState {
                 weight,
                 features: features.try_into()?,
                 is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                fallbacks: fallbacks.cloned(),
             });
         }
 
@@ -426,8 +472,7 @@ impl CosmicTextSystemState {
                         .map(|pixel| {
                             (pixel[0] as f32 * 0.2126
                                 + pixel[1] as f32 * 0.7152
-                                + pixel[2] as f32 * 0.0722)
-                                as u8
+                                + pixel[2] as f32 * 0.0722) as u8
                         })
                         .collect(),
                     SwashContent::Color => {
@@ -467,6 +512,7 @@ impl CosmicTextSystemState {
                 weight,
                 features: CosmicFontFeatures::new(),
                 is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                fallbacks: None,
             });
 
             font_id
@@ -478,25 +524,63 @@ impl CosmicTextSystemState {
         wgpui_scope!("wgpui: layout_line");
         let mut attrs_list = AttrsList::new(&Attrs::new());
         let mut offs = 0;
+        let cjk_families = crate::cjk_font_fallbacks(self.font_system.locale());
         for run in font_runs {
             let loaded_font = self.loaded_font(run.font_id);
             let font = self.font_system.db().face(loaded_font.font.id()).unwrap();
-
-            attrs_list.add_span(
-                offs..(offs + run.len),
-                &Attrs::new()
-                    .metadata(run.font_id.0)
-                    .family(Family::Name(&font.families.first().unwrap().0))
-                    .stretch(font.stretch)
-                    .style(run.style.into())
-                    .weight(run.weight.into())
-                    .letter_spacing(
-                        run.letter_spacing
-                            .unwrap_or(ordered_float::OrderedFloat(0.0))
-                            .into(),
-                    )
-                    .font_features(loaded_font.features.clone()),
-            );
+            let primary_font = loaded_font.font.clone();
+            let fallbacks = loaded_font.fallbacks.clone();
+            let primary_family = font.families.first().unwrap().0.clone();
+            let attrs = Attrs::new()
+                .metadata(run.font_id.0)
+                .family(Family::Name(&primary_family))
+                .stretch(font.stretch)
+                .style(run.style.into())
+                .weight(loaded_font.weight)
+                .letter_spacing(
+                    run.letter_spacing
+                        .unwrap_or(ordered_float::OrderedFloat(0.0))
+                        .into(),
+                )
+                .font_features(loaded_font.features.clone());
+            let end = offs + run.len;
+            attrs_list.add_span(offs..end, &attrs);
+            if let Some(run_text) = text.get(offs..end) {
+                for (index, grapheme) in run_text.grapheme_indices(true) {
+                    if supports_grapheme(&primary_font, grapheme) {
+                        continue;
+                    }
+                    let explicit = fallbacks
+                        .as_ref()
+                        .map_or(&[][..], |fallbacks| fallbacks.fallback_list());
+                    let automatic = if grapheme.chars().any(crate::text_system::is_cjk) {
+                        cjk_families
+                    } else {
+                        &[]
+                    };
+                    for family in explicit
+                        .iter()
+                        .map(String::as_str)
+                        .chain(automatic.iter().copied())
+                    {
+                        if let Some(font) =
+                            self.fallback_font(family, run.weight.into(), run.style.into())
+                            && supports_grapheme(&font, grapheme)
+                        {
+                            let weight = self
+                                .font_system
+                                .db()
+                                .face(font.id())
+                                .map_or(run.weight.into(), |face| face.weight);
+                            attrs_list.add_span(
+                                offs + index..offs + index + grapheme.len(),
+                                &attrs.clone().family(Family::Name(family)).weight(weight),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
             offs += run.len;
         }
 
@@ -564,6 +648,13 @@ impl CosmicTextSystemState {
             len: text.len(),
         }
     }
+}
+
+fn supports_grapheme(font: &CosmicTextFont, grapheme: &str) -> bool {
+    let charmap = font.as_swash().charmap();
+    grapheme.chars().all(|character| {
+        crate::text_system::is_font_selection_ignorable(character) || charmap.map(character) != 0
+    })
 }
 
 impl TryFrom<&FontFeatures> for CosmicFontFeatures {

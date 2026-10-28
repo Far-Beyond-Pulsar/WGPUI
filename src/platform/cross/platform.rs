@@ -225,15 +225,15 @@ struct ClickState {
 }
 
 impl CrossPlatform {
-    pub fn new(wgpu_options: WgpuOptions) -> Result<Self> {
-        Self::new_impl(false, wgpu_options)
+    pub fn new(wgpu_options: WgpuOptions, locale: Option<String>) -> Result<Self> {
+        Self::new_impl(false, wgpu_options, locale)
     }
 
-    pub fn new_headless(wgpu_options: WgpuOptions) -> Result<Self> {
-        Self::new_impl(true, wgpu_options)
+    pub fn new_headless(wgpu_options: WgpuOptions, locale: Option<String>) -> Result<Self> {
+        Self::new_impl(true, wgpu_options, locale)
     }
 
-    fn new_impl(headless: bool, wgpu_options: WgpuOptions) -> Result<Self> {
+    fn new_impl(headless: bool, wgpu_options: WgpuOptions, locale: Option<String>) -> Result<Self> {
         let wgpu_context = ContextSlot::default();
         if !headless {
             // On WASM, WgpuContext::new returns an error (needs async init).
@@ -263,7 +263,7 @@ impl CrossPlatform {
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
 
-        let text_system = Arc::new(CosmicTextSystem::new());
+        let text_system = Arc::new(CosmicTextSystem::with_locale(locale));
 
         Ok(Self {
             background_executor,

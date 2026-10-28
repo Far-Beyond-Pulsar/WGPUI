@@ -56,17 +56,21 @@ pub use test::TestDispatcher;
 
 /// Returns a background executor for the current platform.
 pub fn background_executor() -> BackgroundExecutor {
-    current_platform(true, WgpuOptions::default()).background_executor()
+    current_platform(true, WgpuOptions::default(), None).background_executor()
 }
 
-pub(crate) fn current_platform(headless: bool, wgpu_options: WgpuOptions) -> Rc<CrossPlatform> {
+pub(crate) fn current_platform(
+    headless: bool,
+    wgpu_options: WgpuOptions,
+    locale: Option<String>,
+) -> Rc<CrossPlatform> {
     if headless {
         Rc::new(
-            CrossPlatform::new_headless(wgpu_options)
+            CrossPlatform::new_headless(wgpu_options, locale)
                 .expect("Failed to initialize headless platform"),
         )
     } else {
-        Rc::new(CrossPlatform::new(wgpu_options).expect("Failed to initialize platform"))
+        Rc::new(CrossPlatform::new(wgpu_options, locale).expect("Failed to initialize platform"))
     }
 }
 

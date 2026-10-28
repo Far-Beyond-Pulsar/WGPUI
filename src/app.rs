@@ -144,6 +144,17 @@ impl Application {
     /// Build an app with custom WGPU options, including additional
     /// features to request when creating the GPU device.
     pub fn with_wgpu_options(options: WgpuOptions) -> Self {
+        Self::with_wgpu_options_and_locale(options, None)
+    }
+
+    /// Builds an app using the given locale for regional font fallbacks.
+    pub fn with_locale(locale: impl Into<String>) -> Self {
+        Self::with_wgpu_options_and_locale(WgpuOptions::default(), Some(locale.into()))
+    }
+
+    /// Builds an app with custom WGPU options and a locale for regional font fallbacks.
+    /// If no locale is provided, the system locale is used.
+    pub fn with_wgpu_options_and_locale(options: WgpuOptions, locale: Option<String>) -> Self {
         #[cfg(any(test, feature = "test-support"))]
         log::info!("GPUI was compiled in test mode");
 
@@ -158,7 +169,7 @@ impl Application {
             }
         };
         Self(App::new_app(
-            current_platform(false, options),
+            current_platform(false, options, locale),
             Arc::new(()),
             http_client,
         ))
@@ -179,7 +190,7 @@ impl Application {
             }
         };
         Self(App::new_app(
-            current_platform(true, WgpuOptions::default()),
+            current_platform(true, WgpuOptions::default(), None),
             Arc::new(()),
             http_client,
         ))
