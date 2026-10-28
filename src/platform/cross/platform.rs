@@ -1723,19 +1723,15 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 } else {
                     // Renderer may not exist yet if initialization was skipped
                     // (e.g. canvas reported 0x0 on WASM). Create it now.
-                    let mut renderer = WgpuRenderer::new(
+                    let renderer = WgpuRenderer::new(
                         window.0.wgpu_context.borrow().clone(),
-                        window.window(),
+                        window.window().clone(),
                         window.0.sprite_atlas.clone(),
                         physical_size.width,
                         physical_size.height,
                         4,
                     )
                     .expect("Failed to create renderer from resize");
-                    renderer.update_drawable_size(Size {
-                        width: DevicePixels(physical_size.width as i32),
-                        height: DevicePixels(physical_size.height as i32),
-                    });
                     *renderer_slot = Some(renderer);
                 }
                 drop(renderer_slot);
@@ -1855,12 +1851,13 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                     std::sync::LazyLock::new(|| {
                         std::env::var("WGPUI_FAST_SURFACE_BLIT").is_ok_and(|value| value == "1")
                     });
-                if *FAST_SURFACE_BLIT
-                    && let Some(renderer_ref) = window.0.renderer.borrow().as_ref()
-                {
-                    wgpui_scope!("Main: fast-blit pending surfaces");
-                    if let Some(pending_surfaces) = renderer_ref.get_pending_surfaces() {
-                        force_render = !renderer_ref.blit_surfaces_direct(&pending_surfaces);
+                if let Some(renderer) = window.0.renderer.borrow_mut().as_mut() {
+                    force_render = renderer.needs_full_redraw();
+                    if *FAST_SURFACE_BLIT {
+                        wgpui_scope!("Main: fast-blit pending surfaces");
+                        if let Some(pending_surfaces) = renderer.get_pending_surfaces() {
+                            force_render |= !renderer.blit_surfaces_direct(&pending_surfaces);
+                        }
                     }
                 }
 

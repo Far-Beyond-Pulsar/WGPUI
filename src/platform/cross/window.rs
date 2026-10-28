@@ -138,25 +138,15 @@ impl CrossWindow {
         }
 
         if initial_size.width > 0 && initial_size.height > 0 {
-            let mut renderer = WgpuRenderer::new(
+            let renderer = WgpuRenderer::new(
                 self.0.wgpu_context.borrow().clone(),
-                self.window(),
+                self.window().clone(),
                 self.0.sprite_atlas.clone(),
                 initial_size.width,
                 initial_size.height,
                 4,
             )
             .expect("Failed to create renderer");
-
-            // Configure the wgpu surface immediately so that any
-            // `get_current_texture()` call that arrives before the first OS
-            // `Resized` event (e.g. from a background render thread calling
-            // `present()`) does not fail with `SurfaceError::Other` on an
-            // unconfigured surface.
-            renderer.update_drawable_size(crate::geometry::Size {
-                width: crate::DevicePixels(initial_size.width as i32),
-                height: crate::DevicePixels(initial_size.height as i32),
-            });
 
             *self.0.renderer.borrow_mut() = Some(renderer);
             self.window().request_redraw();
@@ -177,17 +167,13 @@ impl CrossWindow {
         if size.width > 0 && size.height > 0 {
             match WgpuRenderer::new(
                 context,
-                self.window(),
+                self.window().clone(),
                 self.0.sprite_atlas.clone(),
                 size.width,
                 size.height,
                 4,
             ) {
-                Ok(mut renderer) => {
-                    renderer.update_drawable_size(crate::geometry::Size {
-                        width: crate::DevicePixels(size.width as i32),
-                        height: crate::DevicePixels(size.height as i32),
-                    });
+                Ok(renderer) => {
                     *self.0.renderer.borrow_mut() = Some(renderer);
                 }
                 Err(error) => log::error!("No renderer on the new GPU device yet: {error:#}"),
@@ -209,8 +195,8 @@ impl CrossWindow {
         self.window().request_redraw();
     }
 
-    pub(crate) fn window(&self) -> &winit::window::Window {
-        &*self
+    pub(crate) fn window(&self) -> &Arc<winit::window::Window> {
+        self
             .0
             .winit_window
             .get()

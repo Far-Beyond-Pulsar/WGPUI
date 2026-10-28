@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use collections::{FxHashMap, FxHashSet};
@@ -2309,9 +2308,9 @@ fn create_filter_group_textures(
 
 pub struct WgpuRenderer {
     context: Arc<WgpuContext>,
-    /// `None` for a headless renderer, which draws each frame into
-    /// `headless_target` instead of an acquired swapchain image.
-    surface: ManuallyDrop<Option<wgpu::Surface<'static>>>,
+    surface: Option<wgpu::Surface<'static>>,
+    window: Option<Arc<winit::window::Window>>,
+    needs_full_redraw: bool,
     headless_target: Option<wgpu::Texture>,
     surface_configuration: wgpu::SurfaceConfiguration,
     /// The present mode chosen at startup (vsync `Fifo` unless overridden by env).
@@ -2414,25 +2413,15 @@ struct PendingFrameCapture {
 }
 
 impl WgpuRenderer {
-    pub fn new<WindowHandle>(
+    pub fn new(
         context: Arc<WgpuContext>,
-        window: WindowHandle,
+        window: Arc<winit::window::Window>,
         atlas: Arc<WgpuAtlas>,
         width: u32,
         height: u32,
         path_sample_count: u32,
-    ) -> anyhow::Result<Self>
-    where
-        WindowHandle: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
-    {
-        let surface = unsafe {
-            context
-                .instance
-                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: Some(window.display_handle()?.as_raw()),
-                    raw_window_handle: window.window_handle()?.as_raw(),
-                })?
-        };
+    ) -> anyhow::Result<Self> {
+        let surface = context.instance.create_surface(window.clone())?;
 
         let surface_capabilities = surface.get_capabilities(&context.adapter);
 
@@ -2489,7 +2478,7 @@ impl WgpuRenderer {
             .into_iter()
             .find(|mode| surface_capabilities.present_modes.contains(mode));
 
-        Ok(Self::with_surface(
+        let mut renderer = Self::with_surface(
             context,
             Some(surface),
             atlas,
@@ -2500,7 +2489,13 @@ impl WgpuRenderer {
             alpha_mode,
             present_mode,
             uncapped_present_mode,
-        ))
+        );
+        renderer.window = Some(window);
+        anyhow::ensure!(
+            renderer.reconfigure_surface(),
+            "Failed to configure window surface"
+        );
+        Ok(renderer)
     }
 
     /// A renderer with no window: every frame is drawn exactly as a windowed
@@ -2830,7 +2825,9 @@ impl WgpuRenderer {
 
         Self {
             context: context.clone(),
-            surface: ManuallyDrop::new(surface),
+            surface,
+            window: None,
+            needs_full_redraw: true,
             headless_target: None,
             surface_configuration,
             default_present_mode: present_mode,
@@ -2894,18 +2891,83 @@ impl WgpuRenderer {
     /// comment for the full mechanism.
     ///
     /// All `Surface::configure` calls in this renderer must go through here.
-    fn reconfigure_surface(&self) {
+    fn reconfigure_surface(&self) -> bool {
         wgpui_scope!("wgpui: reconfigure_surface");
-        let _exclusive = {
-            // Blocks until every render thread's `submit_guard` read guard is
-            // released, so a long wait here is a render thread mid-frame.
-            wgpui_scope!("wgpui: wait gpu_submit_lock (write)");
-            self.context.gpu_submit_lock.write()
+        let Some(surface) = self.surface.as_ref() else {
+            return self.headless_target.is_some();
         };
-        wgpui_scope!("wgpui: Surface::configure");
-        if let Some(surface) = self.surface.as_ref() {
-            surface.configure(&self.context.device, &self.surface_configuration);
+        let _exclusive = self.context.gpu_submit_lock.write();
+        #[cfg(not(target_family = "wasm"))]
+        let error_scope = self
+            .context
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        surface.configure(&self.context.device, &self.surface_configuration);
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
+            log::error!("Failed to configure window surface: {error}");
+            return false;
         }
+        true
+    }
+
+    fn acquire_surface_texture(&mut self) -> Option<wgpu::SurfaceTexture> {
+        if self.surface.is_none() {
+            match self.context.instance.create_surface(self.window.as_ref()?.clone()) {
+                Ok(surface) => self.surface = Some(surface),
+                Err(error) => {
+                    log::error!("Failed to recreate window surface: {error}");
+                    return None;
+                }
+            }
+            if !self.reconfigure_surface() {
+                return None;
+            }
+        }
+        #[cfg(not(target_family = "wasm"))]
+        let error_scope = self
+            .context
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let texture = self.surface.as_ref()?.get_current_texture();
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
+            log::error!("Failed to acquire window surface texture: {error}");
+        }
+        match texture {
+            CurrentSurfaceTexture::Success(texture)
+            | CurrentSurfaceTexture::Suboptimal(texture) => return Some(texture),
+            CurrentSurfaceTexture::Outdated => {
+                self.needs_full_redraw = true;
+                self.reconfigure_surface();
+            }
+            CurrentSurfaceTexture::Lost => {
+                // Reconfiguring a lost native surface cannot recover it.
+                // Drop its swapchain before creating another for the same window.
+                self.needs_full_redraw = true;
+                let _exclusive = self.context.gpu_submit_lock.write();
+                #[cfg(not(target_family = "wasm"))]
+                if let Err(error) = self.context.device.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(1)),
+                }) {
+                    log::error!("Failed to wait before recreating window surface: {error}");
+                    return None;
+                }
+                drop(self.surface.take());
+                self.surface_bounds_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+            }
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => {}
+            error => {
+                // Validation can also mean the device is lost. Reconfiguring
+                // that device only repeats the failure; its callback logs why.
+                log::error!("Skipping frame: window surface acquisition failed: {error:?}");
+            }
+        }
+        None
     }
 
     // -------------------------------------------------------------------
@@ -3445,6 +3507,17 @@ impl WgpuRenderer {
         wgpui_scope!("wgpui: renderer draw");
         self.harvest_frame_captures();
         self.sync_present_mode();
+        self.needs_full_redraw = true;
+        // Acquire before consuming uploads so a skipped frame can be retried intact.
+        let (surface_texture, frame_texture) = if let Some(target) = &self.headless_target {
+            (None, target.clone())
+        } else {
+            let Some(texture) = self.acquire_surface_texture() else {
+                return;
+            };
+            let frame_texture = texture.texture.clone();
+            (Some(texture), frame_texture)
+        };
         log::trace!("Renderer::draw: starting frame");
 
         let mut command_encoder =
@@ -3747,51 +3820,6 @@ impl WgpuRenderer {
 
             drop(gpu_upload_timer);
         }
-
-        // Acquire the next swapchain image.  On the first frame after window
-        // creation (or after a resize races with the GPU) the surface can be
-        // reported as `Outdated` or `Other`.  Rather than panicking we
-        // reconfigure and retry once; if the second attempt also fails we
-        // simply drop this frame.
-        let (surface_texture, frame_texture) = match (self.surface.as_ref(), &self.headless_target) {
-            (None, Some(target)) => (None, target.clone()),
-            (None, None) => return,
-            (Some(surface), _) => {
-            wgpui_scope!("wgpui: acquire swapchain image");
-            let acquired = surface.get_current_texture();
-            let surface_texture = match acquired {
-                CurrentSurfaceTexture::Success(t)
-                | CurrentSurfaceTexture::Suboptimal(t) => t,
-                CurrentSurfaceTexture::Outdated
-                | CurrentSurfaceTexture::Lost
-                | CurrentSurfaceTexture::Validation => {
-                    // Reconfigure with the current known size and retry.
-                    self.reconfigure_surface();
-                    match surface.get_current_texture() {
-                        CurrentSurfaceTexture::Success(t)
-                        | CurrentSurfaceTexture::Suboptimal(t) => t,
-                        other => {
-                            log::warn!(
-                                "Skipping frame: failed to acquire swap chain texture after reconfigure: {:?}",
-                                other
-                            );
-                            return;
-                        }
-                    }
-                }
-                CurrentSurfaceTexture::Timeout => {
-                    log::warn!("Skipping frame: swap chain acquire timed out");
-                    return;
-                }
-                CurrentSurfaceTexture::Occluded => {
-                    log::warn!("Skipping frame: swap chain acquire occluded");
-                    return;
-                }
-            };
-            let frame_texture = surface_texture.texture.clone();
-            (Some(surface_texture), frame_texture)
-            }
-        };
 
         // Increment layout version - all bounds caches are now fresh
         // IMPORTANT: Only increment after successful swapchain acquisition
@@ -5148,6 +5176,8 @@ impl WgpuRenderer {
             }
         }
 
+        self.needs_full_redraw = false;
+
         // Start the async readback now that the resolve/copy commands above
         // have actually been submitted to the queue.
         #[cfg(feature = "flamegraph")]
@@ -5176,11 +5206,8 @@ impl WgpuRenderer {
 
     /// Fast path: blit all visible surfaces in a single swapchain pass.
     /// Returns true if successful, false if compositor should run.
-    pub fn blit_surfaces_direct(&self, pending_surfaces: &[SurfaceId]) -> bool {
-        let Some(surface) = self.surface.as_ref() else {
-            return false;
-        };
-        if pending_surfaces.is_empty() {
+    pub fn blit_surfaces_direct(&mut self, pending_surfaces: &[SurfaceId]) -> bool {
+        if self.needs_full_redraw || pending_surfaces.is_empty() {
             return false;
         }
 
@@ -5225,38 +5252,8 @@ impl WgpuRenderer {
                 .swap_ready_display(&self.context.device, *surface_id);
         }
 
-        // Acquire swapchain (handle retryable surface errors the same as regular draw).
-        let acquired = {
-            wgpui_scope!("wgpui: acquire swapchain image (fast blit)");
-            surface.get_current_texture()
-        };
-        let surface_texture = match acquired {
-            CurrentSurfaceTexture::Success(t)
-            | CurrentSurfaceTexture::Suboptimal(t) => t,
-            CurrentSurfaceTexture::Outdated
-            | CurrentSurfaceTexture::Lost
-            | CurrentSurfaceTexture::Validation => {
-                self.reconfigure_surface();
-                match surface.get_current_texture() {
-                    CurrentSurfaceTexture::Success(t)
-                    | CurrentSurfaceTexture::Suboptimal(t) => t,
-                    other => {
-                        log::warn!(
-                            "Fast blit failed to acquire swapchain after reconfigure: {:?}",
-                            other
-                        );
-                        return false;
-                    }
-                }
-            }
-            CurrentSurfaceTexture::Timeout => {
-                log::warn!("Fast blit failed: swapchain acquire timed out");
-                return false;
-            }
-            CurrentSurfaceTexture::Occluded => {
-                log::warn!("Fast blit failed: swapchain acquire occluded");
-                return false;
-            }
+        let Some(surface_texture) = self.acquire_surface_texture() else {
+            return false;
         };
 
         let mut encoder =
@@ -5460,6 +5457,7 @@ impl WgpuRenderer {
     }
 
     pub fn update_drawable_size(&mut self, size: geometry::Size<DevicePixels>) {
+        self.needs_full_redraw = true;
         self.surface_configuration.width = size.width.0 as u32;
         self.surface_configuration.height = size.height.0 as u32;
         self.reconfigure_surface();
@@ -5557,6 +5555,10 @@ impl WgpuRenderer {
 
     pub fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
+    }
+
+    pub fn needs_full_redraw(&self) -> bool {
+        self.needs_full_redraw
     }
 
     pub fn gpu_specs(&self) -> GpuSpecs {
@@ -5816,14 +5818,12 @@ fn flamegraph_kind(kind: SlabKind) -> crate::DrawCallKind {
 
 impl Drop for WgpuRenderer {
     fn drop(&mut self) {
-        // SAFETY: This is the only Drop impl and `surface` has not been dropped yet.
-        // We take it manually so we can drop it inside catch_unwind, suppressing the Vulkan
-        // panic that occurs when a SurfaceTexture's Arc still holds a swapchain semaphore
-        // reference at the time the surface is destroyed (e.g. window closed mid-frame).
-        let surface = unsafe { ManuallyDrop::take(&mut self.surface) };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drop(surface);
-        }));
+        // A mid-frame close can leave Vulkan's acquire semaphore referenced.
+        // Keep that driver's teardown panic from aborting the window close.
+        let surface = self.surface.take();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(surface))).is_err() {
+            log::error!("Window surface teardown panicked");
+        }
     }
 }
 
