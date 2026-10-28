@@ -1,6 +1,6 @@
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, Length, Pixels, Point, Size, Style, Window,
-    point, size,
+    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTrackSize, Length, Pixels, Point, Size,
+    Style, Window, point, size,
 };
 use collections::{FxHashMap, FxHashSet};
 use stacksafe::{StackSafe, stacksafe};
@@ -352,8 +352,6 @@ trait ToTaffy<Output> {
 
 impl ToTaffy<taffy::style::Style> for Style {
     fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::style::Style {
-        use taffy::style_helpers::{fr, length, minmax, repeat};
-
         fn to_grid_line(
             placement: &Range<crate::GridPlacement>,
         ) -> taffy::Line<taffy::GridPlacement> {
@@ -361,14 +359,6 @@ impl ToTaffy<taffy::style::Style> for Style {
                 start: placement.start.into(),
                 end: placement.end.into(),
             }
-        }
-
-        fn to_grid_repeat<T: taffy::style::CheapCloneStr>(
-            unit: &Option<u16>,
-        ) -> Vec<taffy::GridTemplateComponent<T>> {
-            // grid-template-columns: repeat(<number>, minmax(0, 1fr));
-            unit.map(|count| vec![repeat(count, vec![minmax(length(0.0_f32), fr(1.0_f32))])])
-                .unwrap_or_default()
         }
 
         taffy::style::Style {
@@ -394,8 +384,22 @@ impl ToTaffy<taffy::style::Style> for Style {
             flex_basis: self.flex_basis.to_taffy(rem_size, scale_factor),
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
-            grid_template_rows: to_grid_repeat(&self.grid_rows),
-            grid_template_columns: to_grid_repeat(&self.grid_cols),
+            grid_template_rows: self
+                .grid_rows
+                .iter()
+                .flatten()
+                .map(|track| {
+                    taffy::GridTemplateComponent::Single(track.to_taffy(rem_size, scale_factor))
+                })
+                .collect(),
+            grid_template_columns: self
+                .grid_cols
+                .iter()
+                .flatten()
+                .map(|track| {
+                    taffy::GridTemplateComponent::Single(track.to_taffy(rem_size, scale_factor))
+                })
+                .collect(),
             grid_row: self
                 .grid_location
                 .as_ref()
@@ -407,6 +411,29 @@ impl ToTaffy<taffy::style::Style> for Style {
                 .map(|location| to_grid_line(&location.column))
                 .unwrap_or_default(),
             ..Default::default()
+        }
+    }
+}
+
+impl ToTaffy<taffy::TrackSizingFunction> for GridTrackSize {
+    fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> taffy::TrackSizingFunction {
+        use taffy::style_helpers::{
+            auto, fit_content, fr, length, max_content, min_content, minmax,
+        };
+
+        match self {
+            Self::Auto => auto(),
+            Self::MinContent => min_content(),
+            Self::MaxContent => max_content(),
+            Self::Length(value) => {
+                let value: taffy::LengthPercentage = value.to_taffy(rem_size, scale_factor);
+                minmax(value.into(), value.into())
+            }
+            Self::FitContent(value) => {
+                let value: taffy::LengthPercentage = value.to_taffy(rem_size, scale_factor);
+                fit_content(value)
+            }
+            Self::Fraction(fraction) => minmax(length(0.0_f32), fr(*fraction)),
         }
     }
 }

@@ -7,9 +7,9 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextColor, TextRun, Window,
-    black, phi, point, quad, rems, size, solid_text_color,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, GridTrackSize, Hsla, Length,
+    Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextColor,
+    TextRun, Window, black, phi, point, quad, rems, size, solid_text_color,
 };
 use collections::HashSet;
 use ordered_float::OrderedFloat;
@@ -268,13 +268,11 @@ pub struct Style {
     /// Filters applied to the content rendered behind this element (CSS `backdrop-filter`).
     pub backdrop_filter: Vec<Filter>,
 
-    /// The grid columns of this element
-    /// Equivalent to the Tailwind `grid-cols-<number>`
-    pub grid_cols: Option<u16>,
+    /// The sizes of this element's explicit grid columns.
+    pub grid_cols: Option<Vec<GridTrackSize>>,
 
-    /// The row span of this element
-    /// Equivalent to the Tailwind `grid-rows-<number>`
-    pub grid_rows: Option<u16>,
+    /// The sizes of this element's explicit grid rows.
+    pub grid_rows: Option<Vec<GridTrackSize>>,
 
     /// The grid location of this element
     pub grid_location: Option<GridLocation>,

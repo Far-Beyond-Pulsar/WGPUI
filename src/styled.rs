@@ -1,9 +1,9 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, Filter, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, Hsla, JustifyContent, Length, LinearColorStop, Pixels, SharedString,
-    StrikethroughStyle, StyleRefinement, TextAlign, TextColor, TextOverflow, TextStyleRefinement,
-    UnderlineStyle, WhiteSpace, px, relative, rems,
+    FontWeight, GridPlacement, GridTrackSize, Hsla, JustifyContent, Length, LinearColorStop,
+    Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextColor, TextOverflow,
+    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -881,15 +881,27 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Sets the grid columns of this element.
+    /// Sets a number of equally sized grid columns.
     fn grid_cols(mut self, cols: u16) -> Self {
-        self.style().grid_cols = Some(cols);
+        self.style().grid_cols = Some(vec![GridTrackSize::Fraction(1.); usize::from(cols)]);
         self
     }
 
-    /// Sets the grid rows of this element.
+    /// Sets a number of equally sized grid rows.
     fn grid_rows(mut self, rows: u16) -> Self {
-        self.style().grid_rows = Some(rows);
+        self.style().grid_rows = Some(vec![GridTrackSize::Fraction(1.); usize::from(rows)]);
+        self
+    }
+
+    /// Sets the size of each explicit grid column.
+    fn grid_template_columns(mut self, columns: impl IntoIterator<Item = GridTrackSize>) -> Self {
+        self.style().grid_cols = Some(columns.into_iter().collect());
+        self
+    }
+
+    /// Sets the size of each explicit grid row.
+    fn grid_template_rows(mut self, rows: impl IntoIterator<Item = GridTrackSize>) -> Self {
+        self.style().grid_rows = Some(rows.into_iter().collect());
         self
     }
 

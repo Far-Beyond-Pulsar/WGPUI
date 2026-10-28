@@ -3736,6 +3736,23 @@ impl From<()> for Length {
     }
 }
 
+/// The size of a grid column or row.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+pub enum GridTrackSize {
+    /// Use the track's intrinsic minimum and maximum sizes.
+    Auto,
+    /// Use the smallest intrinsic content width.
+    MinContent,
+    /// Use the largest intrinsic content width.
+    MaxContent,
+    /// Use a fixed length or a percentage of the grid's available size.
+    Length(DefiniteLength),
+    /// Fit the contents up to the given length or percentage.
+    FitContent(DefiniteLength),
+    /// Share remaining space proportionally, with a minimum size of zero.
+    Fraction(f32),
+}
+
 /// A location in a grid layout.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema, Default)]
 pub struct GridLocation {
