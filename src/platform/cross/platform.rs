@@ -1408,6 +1408,12 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
             return;
         };
 
+        // Advance the per-window event sequence. It is used to detect when an
+        // IME commit is the duplicate of a character already inserted from a
+        // keystroke (see `handle_ime_event`).
+        let event_seq = window.0.state.input_seq.get() + 1;
+        window.0.state.input_seq.set(event_seq);
+
         match event {
             winit::event::WindowEvent::HoveredFile(path) => {
                 if !self.hovered_external_paths.iter().any(|p| p == &path) {
@@ -1666,26 +1672,48 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 let modifiers = self.current_modifiers;
 
                 if let Some(keystroke) = winit_key_to_keystroke(&logical_key, modifiers, &text) {
-                    let platform_event = match state {
-                        winit::event::ElementState::Pressed => {
+                    let (platform_event, key_char) = match state {
+                        winit::event::ElementState::Pressed => (
                             PlatformInput::KeyDown(KeyDownEvent {
-                                keystroke,
+                                keystroke: keystroke.clone(),
                                 is_held: repeat,
                                 prefer_character_input: false,
-                            })
-                        }
+                            }),
+                            keystroke.key_char,
+                        ),
                         winit::event::ElementState::Released => {
-                            PlatformInput::KeyUp(KeyUpEvent { keystroke })
+                            (PlatformInput::KeyUp(KeyUpEvent { keystroke }), None)
                         }
                     };
 
-                    window
-                        .0
-                        .state
-                        .callbacks
-                        .invoke_mut(&window.0.state.callbacks.on_input, |cb| {
-                            cb(platform_event.clone());
-                        });
+                    let result = match window.0.state.callbacks.on_input.take() {
+                        Some(mut cb) => {
+                            let result = cb(platform_event.clone());
+                            window.0.state.callbacks.on_input.set(Some(cb));
+                            result
+                        }
+                        None => crate::DispatchEventResult {
+                            propagate: true,
+                            default_prevented: false,
+                        },
+                    };
+
+                    // Route printable characters to the focused input handler so
+                    // they replace any active selection, mirroring how IME
+                    // commits are handled. `key_char` is already None when a
+                    // non-shift modifier is held, so keyboard shortcuts are
+                    // unaffected. The character is recorded so that a following
+                    // IME commit duplicating it (Wayland delivers both a key
+                    // event and a commit for the same keystroke) can be skipped.
+                    if result.propagate
+                        && let Some(key_char) = key_char
+                        && let Some(mut input_handler) = window.0.state.input_handler.take()
+                    {
+                        input_handler.replace_text_in_range(None, &key_char);
+                        window.0.state.input_handler.replace(Some(input_handler));
+                        window.0.state.last_key_char.replace(Some((key_char, event_seq)));
+                        window.0.state.empty_preedit_streak.set(0);
+                    }
                 }
             }
 
@@ -2019,12 +2047,48 @@ fn handle_ime_event(window: &CrossWindow, ime: &winit::event::Ime) {
             });
             input_handler.replace_and_mark_text_in_range(None, text, selected_range);
             input_handler.update_ime_cursor();
+
+            // A non-empty preedit starts a genuine composition; the commit
+            // that follows it must not be deduplicated against a keystroke.
+            // The same applies once a streak of empty preedits builds up
+            // (X11 emits one empty preedit when composition starts and another
+            // before committing), which leaves a single empty preedit as the
+            // only marker of a keystroke passed through to the input handler.
+            if text.is_empty() {
+                let streak = window.0.state.empty_preedit_streak.get() + 1;
+                window.0.state.empty_preedit_streak.set(streak);
+                if streak >= 2 {
+                    window.0.state.last_key_char.replace(None);
+                }
+            } else {
+                window.0.state.empty_preedit_streak.set(0);
+                window.0.state.last_key_char.replace(None);
+            }
         }
         winit::event::Ime::Commit(text) => {
+            window.0.state.empty_preedit_streak.set(0);
+
+            // On some platforms (notably Wayland, and macOS/Windows for direct
+            // input) the compositor delivers a committed character twice for
+            // the same keystroke: once as a keyboard-input event that we
+            // already routed to the input handler, and once as an IME commit.
+            // Skip the duplicate when it matches the character inserted from a
+            // recent keystroke.
+            let duplicate = window.0.state.last_key_char.take().is_some_and(
+                |(key_char, key_seq)| {
+                    key_char == text.as_str()
+                        && window.0.state.input_seq.get() <= key_seq + 3
+                },
+            );
+            if duplicate {
+                return;
+            }
             input_handler.replace_text_in_range(None, text);
             input_handler.update_ime_cursor();
         }
         winit::event::Ime::Disabled => {
+            window.0.state.empty_preedit_streak.set(0);
+            window.0.state.last_key_char.replace(None);
             input_handler.unmark_text();
         }
     }
