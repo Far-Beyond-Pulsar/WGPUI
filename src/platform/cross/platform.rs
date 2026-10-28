@@ -452,7 +452,7 @@ impl Platform for CrossPlatform {
             active_context: self.active_context.clone(),
             idle_scope: None,
             wgpu_context: self.wgpu_context.clone(),
-            wgpu_options: self.wgpu_options,
+            wgpu_options: self.wgpu_options.clone(),
             proxy: self.event_loop_proxy.clone(),
         };
 
@@ -478,7 +478,7 @@ impl Platform for CrossPlatform {
             active_context: self.active_context.clone(),
             idle_scope: None,
             wgpu_context: self.wgpu_context.clone(),
-            wgpu_options: self.wgpu_options,
+            wgpu_options: self.wgpu_options.clone(),
             last_device_attempt: None,
         };
 
@@ -1501,13 +1501,13 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                 // The wgpu_context slot is shared with CrossPlatform, so once
                 // set here, open_window() on the platform side finds it.
                 let wgpu_ctx = self.wgpu_context.clone();
-                let wgpu_opts = self.wgpu_options;
+                let wgpu_opts = self.wgpu_options.clone();
                 let proxy = self.proxy.clone();
                 // Use setTimeout(0) instead of spawn_local because winit's
                 // throw-based control flow would abort microtask processing.
                 let closure = wasm_bindgen::prelude::Closure::once({
                     let wgpu_ctx = wgpu_ctx.clone();
-                    let wgpu_opts_clone = wgpu_opts;
+                    let wgpu_opts_clone = wgpu_opts.clone();
                     move || {
                         web_sys::console::log_1(
                             &"WGPUI: async WGPU init starting via setTimeout".into(),

@@ -163,7 +163,7 @@ pub use instance::{InstanceKey, ReconcileKey};
 pub use layer::{LayerId, LayerKey, LayerPolicy, LayerTransform};
 pub use path_builder::*;
 pub use platform::*;
-pub use platform::cross::render_context::WgpuOptions;
+pub use platform::cross::render_context::{WgpuDeviceFactory, WgpuOptions};
 #[cfg(feature = "flamegraph")]
 pub use flamegraph::*;
 #[cfg(feature = "flamegraph")]

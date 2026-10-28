@@ -4,8 +4,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::surface_registry::SurfaceRegistry;
 
+/// Creates a device and queue for the adapter selected by WGPUI.
+pub type WgpuDeviceFactory = Arc<
+    dyn Fn(
+            &wgpu::Adapter,
+            &wgpu::DeviceDescriptor<'_>,
+        ) -> anyhow::Result<(wgpu::Device, wgpu::Queue)>
+        + Send
+        + Sync,
+>;
+
 /// Options for configuring the WGPU backend.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WgpuOptions {
     /// Additional WGPU features to request when creating the device.
     /// These are OR'd with the features WGPUI itself requires.
@@ -23,6 +33,12 @@ pub struct WgpuOptions {
     pub power_preference: wgpu::PowerPreference,
     /// Explicit opt-in to wgpu's experimental ray-query feature.
     pub hardware_ray_queries: bool,
+    /// Prefer these backends when multiple adapters meet the required features.
+    /// Adapters using other backends remain eligible.
+    pub preferred_backends: wgpu::Backends,
+    /// Customize native device creation, for example to enable video queues.
+    /// The factory must satisfy the supplied feature and limit requirements.
+    pub device_factory: Option<WgpuDeviceFactory>,
 }
 
 impl Default for WgpuOptions {
@@ -34,6 +50,8 @@ impl Default for WgpuOptions {
             backends: wgpu::Backends::all(),
             power_preference: wgpu::PowerPreference::HighPerformance,
             hardware_ray_queries: false,
+            preferred_backends: wgpu::Backends::empty(),
+            device_factory: None,
         }
     }
 }
@@ -180,7 +198,11 @@ impl WgpuContext {
                             (_, wgpu::DeviceType::IntegratedGpu) => 1,
                             _ => 0,
                         };
-                        (type_rank, adapter.features().contains(optional_features))
+                        (
+                            options.preferred_backends.contains(wgpu::Backends::from(info.backend)),
+                            type_rank,
+                            adapter.features().contains(optional_features),
+                        )
                     })
                     .ok_or_else(|| {
                         anyhow::anyhow!(
@@ -207,7 +229,8 @@ impl WgpuContext {
                     .into_iter()
                     .filter(|adapter| adapter.features().contains(required_features))
                     .max_by_key(|adapter| {
-                        match (options.power_preference, adapter.get_info().device_type) {
+                        let info = adapter.get_info();
+                        let type_rank = match (options.power_preference, info.device_type) {
                             (
                                 wgpu::PowerPreference::HighPerformance,
                                 wgpu::DeviceType::DiscreteGpu,
@@ -216,7 +239,11 @@ impl WgpuContext {
                             (_, wgpu::DeviceType::DiscreteGpu) => 2,
                             (_, wgpu::DeviceType::IntegratedGpu) => 1,
                             _ => 0,
-                        }
+                        };
+                        (
+                            options.preferred_backends.contains(wgpu::Backends::from(info.backend)),
+                            type_rank,
+                        )
                     })
                     .ok_or_else(|| {
                         anyhow::anyhow!(
@@ -256,8 +283,7 @@ impl WgpuContext {
             } else {
                 device_features
             } | (adapter.features() & options.optional_features);
-            let (device, queue) =
-                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            let descriptor = wgpu::DeviceDescriptor {
                     label: None,
                     required_features: device_features,
                     // The unsafe acknowledgement is reachable only through the
@@ -272,7 +298,11 @@ impl WgpuContext {
                         ..adapter.limits()
                     },
                     ..Default::default()
-                }))?;
+            };
+            let (device, queue) = match &options.device_factory {
+                Some(factory) => factory(&adapter, &descriptor)?,
+                None => pollster::block_on(adapter.request_device(&descriptor))?,
+            };
 
             Self::create_buffers(
                 instance,
