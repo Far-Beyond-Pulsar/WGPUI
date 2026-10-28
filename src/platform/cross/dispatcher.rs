@@ -7,6 +7,8 @@ use priority_threadpool::ThreadPool;
 
 pub enum CrossEvent {
     WakeUp,
+    #[cfg(target_os = "macos")]
+    OpenUrls(Vec<String>),
     SurfacePresent(winit::window::WindowId),
     SingleInstanceActivated,
     CloseWindow(winit::window::WindowId),

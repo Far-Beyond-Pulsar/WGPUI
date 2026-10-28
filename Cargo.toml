@@ -153,7 +153,7 @@ usvg = { version = "0.47.0", default-features = false }
 core-video = "0.5.2"
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.2", features = ["NSData"] }
+objc2-foundation = { version = "0.2", features = ["NSData", "NSAppleEventDescriptor", "NSAppleEventManager", "NSURL", "NSString"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11-dl = "2.21.0"

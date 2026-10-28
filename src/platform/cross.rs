@@ -1,6 +1,8 @@
 pub mod atlas;
 pub mod dispatcher;
 pub mod keyboard;
+#[cfg(target_os = "macos")]
+mod macos_open_urls;
 pub mod platform;
 pub mod render_context;
 pub mod renderer;

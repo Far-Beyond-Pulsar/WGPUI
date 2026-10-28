@@ -84,6 +84,8 @@ pub(crate) struct CrossPlatform {
     event_loop: Cell<Option<winit::event_loop::EventLoop<CrossEvent>>>,
     event_loop_proxy: winit::event_loop::EventLoopProxy<CrossEvent>,
     callbacks: Rc<PlatformCallbacks>,
+    #[cfg(target_os = "macos")]
+    _open_urls_handler: super::macos_open_urls::OpenUrlsHandler,
     menus: RefCell<Option<Vec<crate::OwnedMenu>>>,
     dock_menu: RefCell<Vec<crate::OwnedMenuItem>>,
     #[cfg(not(target_family = "wasm"))]
@@ -149,6 +151,8 @@ fn clipboard_item_from_contents(
 #[derive(Default)]
 struct PlatformCallbacks {
     on_open_urls: Cell<Option<Box<dyn FnMut(Vec<String>)>>>,
+    #[cfg(target_os = "macos")]
+    pending_open_urls: RefCell<Vec<String>>,
     on_quit: Cell<Option<Box<dyn FnMut()>>>,
     on_reopen: Cell<Option<Box<dyn FnMut()>>>,
     on_app_menu_action: Cell<Option<Box<dyn FnMut(&dyn crate::Action)>>>,
@@ -179,6 +183,8 @@ fn window_event_span_name(event: &winit::event::WindowEvent) -> &'static str {
 }
 
 struct AppState {
+    #[cfg(target_os = "macos")]
+    launched: bool,
     windows: FxHashMap<winit::window::WindowId, CrossWindow>,
     window_handles: FxHashMap<winit::window::WindowId, crate::AnyWindowHandle>,
     on_finish_launching: Cell<Option<Box<dyn 'static + FnOnce()>>>,
@@ -250,6 +256,8 @@ impl CrossPlatform {
             winit::event_loop::EventLoop::<CrossEvent>::with_user_event().build()?;
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
         let event_loop_proxy = event_loop.create_proxy();
+        #[cfg(target_os = "macos")]
+        let open_urls_handler = super::macos_open_urls::OpenUrlsHandler::new(event_loop_proxy.clone())?;
 
         let dispatcher = Arc::new(Dispatcher::new(main_tx, event_loop_proxy.clone()));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
@@ -267,6 +275,8 @@ impl CrossPlatform {
             event_loop: Cell::new(Some(event_loop)),
             event_loop_proxy,
             callbacks: Rc::new(PlatformCallbacks::default()),
+            #[cfg(target_os = "macos")]
+            _open_urls_handler: open_urls_handler,
             menus: RefCell::new(None),
             dock_menu: RefCell::new(Vec::new()),
             #[cfg(not(target_family = "wasm"))]
@@ -458,6 +468,8 @@ impl Platform for CrossPlatform {
 
         #[cfg(not(target_family = "wasm"))]
         let mut app_state = AppState {
+            #[cfg(target_os = "macos")]
+            launched: false,
             windows: Default::default(),
             window_handles: Default::default(),
             on_finish_launching: Cell::new(Some(on_finish_launching)),
@@ -731,6 +743,10 @@ impl Platform for CrossPlatform {
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
         self.callbacks.on_open_urls.set(Some(callback));
+        #[cfg(target_os = "macos")]
+        if let Err(error) = self.event_loop_proxy.send_event(CrossEvent::OpenUrls(Vec::new())) {
+            log::error!("failed to queue pending macOS open URLs: {error}");
+        }
     }
 
     fn register_url_scheme(&self, _url: &str) -> crate::Task<anyhow::Result<()>> {
@@ -1182,6 +1198,20 @@ impl AppState {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn flush_open_urls(&self) {
+        if !self.launched {
+            return;
+        }
+        if let Some(mut callback) = self.callbacks.on_open_urls.take() {
+            let urls = std::mem::take(&mut *self.callbacks.pending_open_urls.borrow_mut());
+            if !urls.is_empty() {
+                callback(urls);
+            }
+            self.callbacks.on_open_urls.set(Some(callback));
+        }
+    }
+
     fn set_active_context(&mut self, event_loop: &ActiveEventLoop) {
         let app_state = self as *mut AppState;
         self.active_context
@@ -1257,6 +1287,11 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         self.set_active_context(event_loop);
 
         match event {
+            #[cfg(target_os = "macos")]
+            CrossEvent::OpenUrls(urls) => {
+                self.callbacks.pending_open_urls.borrow_mut().extend(urls);
+                self.flush_open_urls();
+            }
             CrossEvent::WakeUp => {
                 #[cfg(target_family = "wasm")]
                 web_sys::console::log_1(&"WGPUI: WakeUp received".into());
@@ -1546,6 +1581,12 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         } else if let Some(mut callback) = self.callbacks.on_reopen.take() {
             callback();
             self.callbacks.on_reopen.set(Some(callback));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.launched = true;
+            self.flush_open_urls();
         }
 
         self.clear_active_context();
