@@ -586,6 +586,7 @@ impl StateInner {
         current_view: EntityId,
         window: &mut Window,
         cx: &mut App,
+        precise: bool,
     ) {
         // Drop scroll events after a reset, since we can't calculate
         // the new logical scroll top without the item heights
@@ -617,7 +618,14 @@ impl StateInner {
                 offset_in_item,
             });
         }
-        self.smooth_scroll.set_target(new_scroll_top);
+        if precise {
+            // Touchpads stream small deltas (plus inertia): follow them
+            // directly or the glide fights the stream.
+            self.smooth_scroll.snap_to(new_scroll_top);
+        } else {
+            // A wheel notch glides.
+            self.smooth_scroll.set_target(new_scroll_top);
+        }
         window.request_animation_frame();
 
         if self.scroll_handler.is_some() {
@@ -1211,12 +1219,20 @@ impl Element for List {
         let layer = prepaint.hitbox.layer;
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+                // Whole-line deltas are wheel notches; fractional lines and
+                // pixel deltas come from precision touchpads.
+                let precise = match event.delta {
+                    crate::ScrollDelta::Pixels(_) => true,
+                    crate::ScrollDelta::Lines(lines) => {
+                        lines.x.fract() != 0.0 || lines.y.fract() != 0.0
+                    }
+                };
                 let pixel_delta = event.delta.pixel_delta(px(20.));
                 let previous = list_state.scroll_px_offset_for_scrollbar();
                 list_state
                     .0
                     .borrow_mut()
-                    .scroll(height, pixel_delta, current_view, window, cx);
+                    .scroll(height, pixel_delta, current_view, window, cx, precise);
                 if list_state.scroll_px_offset_for_scrollbar() != previous {
                     if let Some(layer) = layer {
                         window.request_layer_buffer_refill(layer);

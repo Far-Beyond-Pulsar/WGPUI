@@ -1,6 +1,11 @@
 use crate::Pixels;
 use crate::time_ext::Instant;
 
+/// Exponential approach rate of the glide, per second.
+const SMOOTH_RATE: f32 = 45.0;
+/// Closer than this to the target (px), the glide lands on it.
+const SNAP_DISTANCE: f32 = 0.2;
+
 /// Controls how scroll motion is visually presented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmoothScrollMode {
@@ -23,10 +28,11 @@ pub struct SmoothScrollState {
     pub animating: bool,
     /// Timestamp of the previous animation frame.
     pub last_frame_time: Option<Instant>,
-    /// Interpolation strength used during smoothing.
+    /// How fast the glide closes the gap, per second (Mockaco's feel: a
+    /// notch settles in a tenth of a second).
     ///
     /// Higher values move faster toward the target.
-    pub smoothing_factor: f32,
+    pub rate: f32,
 }
 
 impl Default for SmoothScrollState {
@@ -37,7 +43,7 @@ impl Default for SmoothScrollState {
             target_offset: Pixels::ZERO,
             animating: false,
             last_frame_time: None,
-            smoothing_factor: 0.18,
+            rate: SMOOTH_RATE,
         }
     }
 }
@@ -121,14 +127,14 @@ impl SmoothScrollState {
 
         self.last_frame_time = Some(now);
 
-        let factor = 1.0 - (1.0 - self.smoothing_factor).powf(dt * 60.0);
+        let factor = 1.0 - (-dt.max(0.0) * self.rate).exp();
 
         let previous = self.visual_offset;
         self.visual_offset.0 += (self.target_offset.0 - self.visual_offset.0) * factor;
 
         let remaining = (self.target_offset.0 - self.visual_offset.0).abs();
 
-        if remaining < 0.5 {
+        if remaining < SNAP_DISTANCE {
             self.visual_offset = self.target_offset;
             self.animating = false;
             return previous != self.visual_offset;
