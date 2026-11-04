@@ -10,7 +10,7 @@ use crate::{
         render_context::{ContextSlot, WgpuContext},
         renderer::WgpuRenderer,
         text_system::CosmicTextSystem,
-        window::CrossWindow,
+        window::{CrossWindow, ImeCompositionState},
     },
     point,
 };
@@ -1626,12 +1626,6 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
             return;
         };
 
-        // Advance the per-window event sequence. It is used to detect when an
-        // IME commit is the duplicate of a character already inserted from a
-        // keystroke (see `handle_ime_event`).
-        let event_seq = window.0.state.input_seq.get() + 1;
-        window.0.state.input_seq.set(event_seq);
-
         match event {
             winit::event::WindowEvent::HoveredFile(path) => {
                 self.hovered_window_id.set(Some(window_id));
@@ -1913,21 +1907,30 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
                         },
                     };
 
-                    // Route printable characters to the focused input handler so
-                    // they replace any active selection, mirroring how IME
-                    // commits are handled. `key_char` is already None when a
-                    // non-shift modifier is held, so keyboard shortcuts are
-                    // unaffected. The character is recorded so that a following
-                    // IME commit duplicating it (Wayland delivers both a key
-                    // event and a commit for the same keystroke) can be skipped.
+                    // Key events carry text on most platforms. Wayland also
+                    // sends direct text through its enabled text-input protocol,
+                    // so that backend uses IME commits as its sole text source.
+                    // The other backends reserve IME commits for compositions.
                     if result.propagate
                         && let Some(key_char) = key_char
+                        && !matches!(text_input_backend(&window), TextInputBackend::Wayland)
                         && let Some(mut input_handler) = window.0.state.input_handler.take()
                     {
-                        input_handler.replace_text_in_range(None, &key_char);
+                        let composition = window.0.state.ime_composition.get();
+                        if composition == ImeCompositionState::ClearedForCommit {
+                            // Winit sends an empty preedit immediately before a
+                            // commit. A new printable key before that commit
+                            // means the preedit was cancelled instead.
+                            window
+                                .0
+                                .state
+                                .ime_composition
+                                .set(ImeCompositionState::Idle);
+                        }
+                        if composition != ImeCompositionState::Composing {
+                            input_handler.replace_text_in_range(None, &key_char);
+                        }
                         window.0.state.input_handler.replace(Some(input_handler));
-                        window.0.state.last_key_char.replace(Some((key_char, event_seq)));
-                        window.0.state.empty_preedit_streak.set(0);
                     }
                 }
             }
@@ -2245,6 +2248,43 @@ fn byte_to_utf16_offset(text: &str, byte_offset: usize) -> usize {
 /// winit's IME protocol onto GPUI's `InputHandler` (the `NSTextInputClient`-style
 /// API). Without this, IME composition/commit text never reaches the editor and
 /// the candidate window is never positioned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextInputBackend {
+    Wayland,
+    X11,
+    Other,
+}
+
+fn text_input_backend(window: &CrossWindow) -> TextInputBackend {
+    #[cfg(target_os = "linux")]
+    {
+        use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+
+        return match window
+            .window()
+            .display_handle()
+            .map(|handle| handle.as_raw())
+        {
+            Ok(RawDisplayHandle::Wayland(_)) => TextInputBackend::Wayland,
+            Ok(RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_)) => TextInputBackend::X11,
+            _ => TextInputBackend::Other,
+        };
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        TextInputBackend::Other
+    }
+}
+
+fn accepts_ime_commit_without_preedit(window: &CrossWindow) -> bool {
+    matches!(
+        text_input_backend(window),
+        TextInputBackend::Wayland | TextInputBackend::X11
+    )
+}
+
 fn handle_ime_event(window: &CrossWindow, ime: &winit::event::Ime) {
     let mut handler = window.0.state.input_handler.borrow_mut();
     let Some(input_handler) = handler.as_mut() else {
@@ -2262,48 +2302,41 @@ fn handle_ime_event(window: &CrossWindow, ime: &winit::event::Ime) {
             });
             input_handler.replace_and_mark_text_in_range(None, text, selected_range);
             input_handler.update_ime_cursor();
-
-            // A non-empty preedit starts a genuine composition; the commit
-            // that follows it must not be deduplicated against a keystroke.
-            // The same applies once a streak of empty preedits builds up
-            // (X11 emits one empty preedit when composition starts and another
-            // before committing), which leaves a single empty preedit as the
-            // only marker of a keystroke passed through to the input handler.
-            if text.is_empty() {
-                let streak = window.0.state.empty_preedit_streak.get() + 1;
-                window.0.state.empty_preedit_streak.set(streak);
-                if streak >= 2 {
-                    window.0.state.last_key_char.replace(None);
+            let composition = window.0.state.ime_composition.get();
+            window.0.state.ime_composition.set(if text.is_empty() {
+                if composition != ImeCompositionState::Idle {
+                    ImeCompositionState::ClearedForCommit
+                } else {
+                    ImeCompositionState::Idle
                 }
             } else {
-                window.0.state.empty_preedit_streak.set(0);
-                window.0.state.last_key_char.replace(None);
-            }
+                ImeCompositionState::Composing
+            });
         }
         winit::event::Ime::Commit(text) => {
-            window.0.state.empty_preedit_streak.set(0);
+            let had_preedit = window.0.state.ime_composition.get() != ImeCompositionState::Idle;
+            window
+                .0
+                .state
+                .ime_composition
+                .set(ImeCompositionState::Idle);
 
-            // On some platforms (notably Wayland, and macOS/Windows for direct
-            // input) the compositor delivers a committed character twice for
-            // the same keystroke: once as a keyboard-input event that we
-            // already routed to the input handler, and once as an IME commit.
-            // Skip the duplicate when it matches the character inserted from a
-            // recent keystroke.
-            let duplicate = window.0.state.last_key_char.take().is_some_and(
-                |(key_char, key_seq)| {
-                    key_char == text.as_str()
-                        && window.0.state.input_seq.get() <= key_seq + 3
-                },
-            );
-            if duplicate {
+            // X11 chooses either a key event or an IME commit while composing;
+            // Wayland's text-input protocol is the sole text source on that
+            // backend. Windows and macOS commits are accepted only when an IME
+            // preedit established an active composition.
+            if !had_preedit && !accepts_ime_commit_without_preedit(window) {
                 return;
             }
             input_handler.replace_text_in_range(None, text);
             input_handler.update_ime_cursor();
         }
         winit::event::Ime::Disabled => {
-            window.0.state.empty_preedit_streak.set(0);
-            window.0.state.last_key_char.replace(None);
+            window
+                .0
+                .state
+                .ime_composition
+                .set(ImeCompositionState::Idle);
             input_handler.unmark_text();
         }
     }
