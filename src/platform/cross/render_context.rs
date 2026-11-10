@@ -147,7 +147,8 @@ impl WgpuContext {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: options.backends,
             flags,
-            backend_options: wgpu::BackendOptions::default(),
+            // `with_env` so `WGPU_DX12_COMPILER` is honoured (the plain default is always Auto).
+            backend_options: wgpu::BackendOptions::default().with_env(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display: None,
         });
