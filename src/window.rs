@@ -1741,8 +1741,39 @@ enum InputModality {
 }
 
 /// Holds the state for a specific window.
+/// How many frames a window has put on screen, and when it last did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PresentTally {
+    /// Frames presented since the window opened (a full draw, a re-presented
+    /// scene or a framebuffer-only present all count once).
+    pub frames: u64,
+    /// When the latest of them was presented.
+    pub last: Option<Instant>,
+}
+
+/// A window's [`PresentTally`], readable from any thread or timer without the
+/// window: take it once with [`Window::presented_frames`]. A UI frame rate is
+/// the change in `frames` over the change in `last` between two reads.
+#[derive(Clone, Debug, Default)]
+pub struct PresentedFrames(Arc<parking_lot::Mutex<PresentTally>>);
+
+impl PresentedFrames {
+    /// The tally as of now.
+    pub fn read(&self) -> PresentTally {
+        *self.0.lock()
+    }
+
+    fn tick(&self) {
+        let mut tally = self.0.lock();
+        tally.frames += 1;
+        tally.last = Some(Instant::now());
+    }
+}
+
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
+    /// Frames this window presented (see [`PresentedFrames`]).
+    presented: PresentedFrames,
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
@@ -2418,6 +2449,7 @@ impl Window {
             active,
             hovered,
             needs_present,
+            presented: PresentedFrames::default(),
             last_input_timestamp,
             scroll_momentum: Default::default(),
             scroll_fling: None,
@@ -3871,6 +3903,7 @@ impl Window {
             mem::take(&mut *self.frame_capture_requests.borrow_mut()),
         );
         self.needs_present.set(false);
+        self.presented.tick();
         profiling::finish_frame!();
 
         // GPU spans for this frame are left open (attached asynchronously via
@@ -3892,7 +3925,14 @@ impl Window {
 
         self.platform_window.present_framebuffer_only();
         self.needs_present.set(false);
+        self.presented.tick();
         profiling::finish_frame!();
+    }
+
+    /// The handle this window counts its presented frames in. Take it once;
+    /// reading it needs no window (an overlay's timer, another thread).
+    pub fn presented_frames(&self) -> PresentedFrames {
+        self.presented.clone()
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
