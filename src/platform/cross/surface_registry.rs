@@ -65,7 +65,15 @@ impl TripleBuffer {
 /// Maps `SurfaceId` to triple-buffered texture sets.
 pub struct SurfaceRegistry {
     surfaces: Mutex<HashMap<SurfaceId, TripleBuffer>>,
+    /// Per surface, what to call when the compositor takes a frame (see
+    /// [`Self::set_consumed_waker`]). Apart from the buffers: a resize
+    /// replaces those, the producer waiting on them stays.
+    consumed_wakers: Mutex<HashMap<SurfaceId, ConsumedWaker>>,
 }
+
+/// Called when the compositor takes a surface's frame: its producer may draw
+/// the next one.
+pub type ConsumedWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// Surface ids are unique across registries, not just within one: after a
 /// device loss the platform makes a new registry, and a view still holding a
@@ -77,6 +85,33 @@ impl SurfaceRegistry {
     pub fn new() -> Self {
         Self {
             surfaces: Mutex::new(HashMap::new()),
+            consumed_wakers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Call `waker` each time the compositor takes surface `id`'s published
+    /// frame (`None`: stop). A producer that holds back while
+    /// [`Self::has_unconsumed_frame`] is true waits on this instead of
+    /// polling: it draws the moment its last frame is taken, not up to a
+    /// poll interval later. The waker runs on the compositor's thread and
+    /// must only signal (wake a thread), never block.
+    pub fn set_consumed_waker(&self, id: SurfaceId, waker: Option<ConsumedWaker>) {
+        let mut wakers = self.consumed_wakers.lock().unwrap();
+        match waker {
+            Some(waker) => {
+                wakers.insert(id, waker);
+            }
+            None => {
+                wakers.remove(&id);
+            }
+        }
+    }
+
+    /// The compositor took surface `id`'s frame: wake its producer.
+    fn frame_consumed(&self, id: SurfaceId) {
+        let waker = self.consumed_wakers.lock().unwrap().get(&id).cloned();
+        if let Some(waker) = waker {
+            waker();
         }
     }
 
@@ -204,7 +239,15 @@ impl SurfaceRegistry {
     ///
     /// Returns `true` if a swap occurred, `false` if GPU work is incomplete (compositor
     /// should reuse the current display buffer).
-    pub fn swap_ready_display(&self, _device: &wgpu::Device, id: SurfaceId) -> bool {
+    pub fn swap_ready_display(&self, device: &wgpu::Device, id: SurfaceId) -> bool {
+        let swapped = self.swap_ready_display_locked(device, id);
+        if swapped {
+            self.frame_consumed(id);
+        }
+        swapped
+    }
+
+    fn swap_ready_display_locked(&self, _device: &wgpu::Device, id: SurfaceId) -> bool {
         if let Some(tb) = self.lock_surfaces().get(&id) {
             // Atomic swap: ready ↔ display
             // NOTE: We do NOT call device.poll() here because:
@@ -346,6 +389,7 @@ impl SurfaceRegistry {
 
     /// Remove a surface from the registry.
     pub fn remove(&self, id: SurfaceId) {
+        self.consumed_wakers.lock().unwrap().remove(&id);
         self.lock_surfaces().remove(&id);
     }
 
@@ -412,6 +456,14 @@ impl SurfaceRegistry {
     /// buffer swap, and the generation store are atomic with respect to the
     /// producer's `swap_rendering_ready*`.
     pub fn swap_ready_display_if_new(&self, id: SurfaceId) -> bool {
+        let swapped = self.swap_ready_display_if_new_locked(id);
+        if swapped {
+            self.frame_consumed(id);
+        }
+        swapped
+    }
+
+    fn swap_ready_display_if_new_locked(&self, id: SurfaceId) -> bool {
         if let Some(tb) = self.lock_surfaces().get(&id) {
             let current_gen = tb.frame_generation.load(Ordering::Acquire);
             let last = tb.last_composited_generation.load(Ordering::Acquire);

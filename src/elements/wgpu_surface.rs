@@ -320,6 +320,17 @@ impl WgpuSurfaceHandle {
         self.inner.registry.has_unconsumed_frame(self.inner.surface_id)
     }
 
+    /// Call `waker` each time the compositor takes this surface's frame
+    /// (`None`: stop): a producer holding back on
+    /// [`has_unconsumed_frame`](Self::has_unconsumed_frame) waits on it
+    /// rather than polling. Runs on the compositor's thread; it must only
+    /// signal, never block.
+    pub fn set_consumed_waker(&self, waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+        self.inner
+            .registry
+            .set_consumed_waker(self.inner.surface_id, waker);
+    }
+
     /// Current size in device pixels.
     pub fn size(&self) -> (u32, u32) {
         *self.inner.size.lock().unwrap()
