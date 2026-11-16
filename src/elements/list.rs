@@ -759,6 +759,11 @@ impl StateInner {
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
             if visible_height < available_height || size.is_none() {
                 let item_index = scroll_top.item_ix + ix;
+                crate::render_stats::count(if visible_height < available_height {
+                    "list: item built (visible)"
+                } else {
+                    "list: item built (measure only)"
+                });
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
                 size = Some(element_size);
@@ -841,6 +846,7 @@ impl StateInner {
                 let size = if let ListItem::Measured { size, .. } = item {
                     *size
                 } else {
+                    crate::render_stats::count("list: item built (measure only)");
                     let mut element = render_item(cursor.start().0, window, cx);
                     element.layout_as_root(available_item_space, window, cx)
                 };
@@ -1165,19 +1171,29 @@ impl Element for List {
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
-        // If the width of the list has changed, invalidate all cached item heights
-        if state
-            .last_layout_bounds
-            .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
-        {
-            let new_items = SumTree::from_iter(
+        // When the width changes, the cached heights of rows off screen are
+        // kept as estimates rather than thrown away. Rows on screen are built
+        // and measured every frame regardless, so what is shown is always
+        // exact; a row off screen gets its new height when it scrolls in.
+        // Discarding them made every frame of a panel resize rebuild and
+        // measure the overdraw rows above and below the viewport as well
+        // (often more rows than are visible), and rebuild the whole item tree,
+        // O(items), which for a list of a million rows is a stall per frame.
+        // `ListState::remeasure` still discards them on request.
+        if state.last_layout_bounds.is_none() {
+            // The first layout at a real width: drop anything measured before
+            // it (an inferred-size list measures at min-content width).
+            state.items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
                     focus_handle: item.focus_handle(),
                 }),
                 (),
             );
-
-            state.items = new_items;
+        } else if state
+            .last_layout_bounds
+            .is_some_and(|last_bounds| last_bounds.size.width != bounds.size.width)
+        {
+            crate::render_stats::count("list: width changed");
             // Cached pixel positions no longer describe this width. Re-anchor
             // through the logical item after measuring the new row heights.
             state.smooth_scroll.animating = false;
