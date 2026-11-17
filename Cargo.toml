@@ -387,6 +387,11 @@ codegen-units = 16
 
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
+# Pulsar-Native builds this crate as a path dependency (submodule), so cargo
+# prints its rustc warnings in every engine build; Pulsar's own crates warn
+# and fail CI on theirs. Keep this crate's quiet there; deny-level lints
+# above and below still apply (Pulsar-Native#1644).
+warnings = { level = "allow", priority = -1 }
 
 [lints.clippy]
 dbg_macro = "deny"
