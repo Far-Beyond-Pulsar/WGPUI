@@ -1256,12 +1256,14 @@ impl AppState {
             match runnable {
                 RunnableVariant::Compat(runnable) => {
                     wgpui_scope!("Main: foreground task (untracked spawn site)");
+                    let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::SpawnedUntracked);
                     runnable.run();
                 }
                 RunnableVariant::Meta(runnable) => {
                     // Label each task with the `file:line` that spawned it, so
                     // a slow poll on the UI thread names its owner.
                     let location = runnable.metadata().location;
+                    let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Spawned(location));
                     wgpui_scope_dyn!(format!(
                         "Main: foreground task @ {}:{}",
                         location.file(),
@@ -1282,6 +1284,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: CrossEvent) {
         wgpui_scope!("Main: user_event");
+        let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Stage("Main: user_event"));
         #[cfg(target_family = "wasm")]
         web_sys::console::log_1(&"WGPUI: user_event".into());
         self.set_active_context(event_loop);
@@ -1448,6 +1451,8 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         // outlives this function, so both being live on the profiler's LIFO
         // stack at once made their names swap.
         let about_to_wait_scope = crate::render_stats::external_scope("Main: about_to_wait");
+        let about_to_wait_work =
+            crate::ui_work::enter(crate::ui_work::UiWork::Stage("Main: about_to_wait"));
         self.set_active_context(event_loop);
 
         self.drain_main_queue();
@@ -1525,6 +1530,7 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
 
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next_wake.into()));
 
+        drop(about_to_wait_work);
         drop(about_to_wait_scope);
 
         // From here until `new_events` the thread is parked in the OS waiting for
@@ -1620,6 +1626,8 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
         // (input dispatch, resize, redraw) nests underneath.
         let _window_event_scope =
             crate::render_stats::external_scope(window_event_span_name(&event));
+        let _ui_work =
+            crate::ui_work::enter(crate::ui_work::UiWork::Stage(window_event_span_name(&event)));
         self.set_active_context(event_loop);
 
         let Some(window) = self.windows.get(&window_id) else {

@@ -8289,6 +8289,7 @@ impl Window {
     ) {
         // Named by action so a slow keybinding/menu command is attributable.
         wgpui_scope_dyn!(format!("wgpui: dispatch action {}", action.name()));
+        let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Action(action.name()));
         let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
 
         // Capture phase for global actions.

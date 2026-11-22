@@ -70,6 +70,7 @@ pub mod prelude;
 mod queue;
 pub mod render_stats;
 pub mod ui_frame_signal;
+pub mod ui_work;
 mod scene;
 mod scene_pack;
 mod scroll_momentum;
