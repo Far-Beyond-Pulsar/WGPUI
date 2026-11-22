@@ -1414,6 +1414,9 @@ impl App {
     /// cause effects, so we continue looping until all effects are processed.
     fn flush_effects(&mut self) {
         wgpui_scope!("wgpui: App::flush_effects");
+        let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Stage(
+            "effects (observers, subscriptions, notifications)",
+        ));
         loop {
             {
                 wgpui_scope!("wgpui: release_dropped_entities + focus handles");

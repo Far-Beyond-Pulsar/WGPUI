@@ -104,7 +104,11 @@ impl<V: Render> Element for Entity<V> {
         // always targets this `App`'s arena. Nesting is free:
         // `ElementArenaScope` restores the previous arena on drop.
         let _arena_scope = ElementArenaScope::enter(cx.element_arena());
-        let mut element = self.update(cx, |view, cx| view.render(window, cx).into_any_element());
+        let mut element = {
+            let _ui_work =
+                crate::ui_work::enter(crate::ui_work::UiWork::Render(std::any::type_name::<V>()));
+            self.update(cx, |view, cx| view.render(window, cx).into_any_element())
+        };
         let layout_id = window.with_rendered_view(self.entity_id(), |window| {
             element.request_layout(window, cx)
         });
@@ -419,6 +423,8 @@ impl Element for AnyView {
                     let mut element = {
                         let _t = crate::render_stats::scope("frame: render");
                         wgpui_scope_dyn!(format!("render {}", self.type_name));
+                        let _ui_work =
+                            crate::ui_work::enter(crate::ui_work::UiWork::Render(self.type_name));
                         (self.render)(self, window, cx)
                     };
                     let layout_id = element.request_layout(window, cx);

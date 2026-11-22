@@ -127,12 +127,14 @@ impl Interactivity {
         button: MouseButton,
         listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) {
+        let label = std::any::type_name_of_val(&listener);
         self.mouse_down_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble
                     && event.button == button
                     && hitbox.is_hovered(window)
                 {
+                    let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Listener("mouse down", label));
                     (listener)(event, window, cx)
                 }
             }));
@@ -162,9 +164,11 @@ impl Interactivity {
         &mut self,
         listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) {
+        let label = std::any::type_name_of_val(&listener);
         self.mouse_down_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Listener("mouse down", label));
                     (listener)(event, window, cx)
                 }
             }));
@@ -179,12 +183,14 @@ impl Interactivity {
         button: MouseButton,
         listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     ) {
+        let label = std::any::type_name_of_val(&listener);
         self.mouse_up_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble
                     && event.button == button
                     && hitbox.is_hovered(window)
                 {
+                    let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Listener("mouse up", label));
                     (listener)(event, window, cx)
                 }
             }));
@@ -317,9 +323,11 @@ impl Interactivity {
         &mut self,
         listener: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
     ) {
+        let label = std::any::type_name_of_val(&listener);
         self.scroll_wheel_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Listener("scroll wheel", label));
                     (listener)(event, window, cx);
                 }
             }));
@@ -353,6 +361,7 @@ impl Interactivity {
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_action<A: Action>(&mut self, listener: impl Fn(&A, &mut Window, &mut App) + 'static) {
+        let label = std::any::type_name_of_val(&listener);
         let action_disc = crate::action_name_hash::<A>();
         self.action_listeners.push((
             TypeId::of::<A>(),
@@ -360,6 +369,7 @@ impl Interactivity {
             Box::new(move |action, phase, window, cx| {
                 let action = unsafe { &*(action as *const dyn Any as *const A) };
                 if phase == DispatchPhase::Bubble {
+                    let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Listener("action", label));
                     (listener)(action, window, cx)
                 }
             }),
@@ -397,9 +407,11 @@ impl Interactivity {
         &mut self,
         listener: impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static,
     ) {
+        let label = std::any::type_name_of_val(&listener);
         self.key_down_listeners
             .push(Box::new(move |event, phase, window, cx| {
                 if phase == DispatchPhase::Bubble {
+                    let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Listener("key down", label));
                     (listener)(event, window, cx)
                 }
             }));
@@ -426,9 +438,11 @@ impl Interactivity {
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_key_up(&mut self, listener: impl Fn(&KeyUpEvent, &mut Window, &mut App) + 'static) {
+        let label = std::any::type_name_of_val(&listener);
         self.key_up_listeners
             .push(Box::new(move |event, phase, window, cx| {
                 if phase == DispatchPhase::Bubble {
+                    let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Listener("key up", label));
                     listener(event, window, cx)
                 }
             }));
@@ -494,7 +508,9 @@ impl Interactivity {
     where
         Self: Sized,
     {
+        let label = std::any::type_name_of_val(&listener);
         self.click_listeners.push(Rc::new(move |event, window, cx| {
+            let _ui_work = crate::ui_work::enter(crate::ui_work::UiWork::Listener("click", label));
             listener(event, window, cx)
         }));
     }
