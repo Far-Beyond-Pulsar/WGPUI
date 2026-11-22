@@ -1,0 +1,21 @@
+[package]
+name = "wgpui_dylib"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "WGPUI (the gpui-ce fork) and wgpu, with the native libraries they link (zlib), as one shared Rust dylib. A binary or plugin library that links it shares one copy of the framework's statics, thread-locals and TypeIds. Built with `-C prefer-dynamic` (.cargo/config.toml): std is shared too."
+build = "build.rs"
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+# The profiler (and the third-party crates it links: serde, chrono, SQLite) is the bottom library of the
+# stack: every library above links the ones below it, so a crate is in exactly one of them.
+profiling_dylib = { git = "https://github.com/Far-Beyond-Pulsar/Pulsar-Profiling" }
+# The feature set is the one every consumer builds with. Features are additive, so a consumer
+# that needs one more would build a different gpui than this library holds: add it here.
+gpui-ce = { path = "..", features = ["inspector", "flamegraph"] }
+# wgpu with every backend Pulsar's renderer (Helio) and the framework use, so there is one wgpu:
+# the Helio and SceneDB libraries link it through this one.
+wgpu = { version = "30", features = ["vulkan", "vulkan-portability", "metal", "dx12", "static-dxc", "gles", "webgpu", "wgsl"] }

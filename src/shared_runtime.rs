@@ -39,7 +39,7 @@ use crate::arena::RawArena;
 
 /// Version of the shared-runtime ABI. Copies of this crate built against
 /// different versions refuse to share a runtime rather than misread it.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"GPUI-SRT");
 
@@ -231,6 +231,13 @@ pub(crate) struct SharedCounters {
     pub(crate) orphaned_records: AtomicU64,
     pub(crate) attached_modules: AtomicU64,
     pub(crate) total_module_attaches: AtomicU64,
+    /// Id sequences every copy of this crate draws from. A `static` counter in each
+    /// copy would hand the host and every plugin library the same ids, and an id
+    /// keys a cache (an image in the atlas, a surface in the registry): one copy
+    /// would be shown another's picture.
+    pub(crate) image_ids: AtomicU64,
+    pub(crate) surface_ids: AtomicU64,
+    pub(crate) invalid_entity_ids: AtomicU64,
 }
 
 #[repr(C)]
@@ -350,6 +357,23 @@ static RUNTIME: OnceLock<&'static SharedRuntime> = OnceLock::new();
 /// while detached.
 static MODULE: AtomicU64 = AtomicU64::new(0);
 static MODULE_ATTACH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The next image id (`RenderImage::new`): one sequence for every copy of this crate.
+pub(crate) fn next_image_id() -> usize {
+    runtime().counters.image_ids.fetch_add(1, Ordering::SeqCst) as usize
+}
+
+/// The next surface id (`SurfaceRegistry`), from 1: one sequence for every copy.
+pub(crate) fn next_surface_id() -> u64 {
+    runtime().counters.surface_ids.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// The next id of an entity that can never be upgraded (`WeakEntity::new_invalid`),
+/// counting down from `u64::MAX` so it never meets a slotmap id: one sequence for
+/// every copy.
+pub(crate) fn next_invalid_entity_id() -> u64 {
+    u64::MAX - runtime().counters.invalid_entity_ids.fetch_add(1, Ordering::SeqCst)
+}
 
 /// The process-wide runtime, finding or creating it on first use.
 #[inline]

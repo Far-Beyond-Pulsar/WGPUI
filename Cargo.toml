@@ -411,3 +411,7 @@ nonminimal_bool = "allow"
 name = "dll_ui_stress"
 path = "tests/dll_ui_stress.rs"
 required-features = ["test-support"]
+
+# The root package plus the shared library (dylib/): each builds and releases on its own.
+[workspace]
+members = [".", "dylib"]

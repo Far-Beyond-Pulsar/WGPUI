@@ -79,8 +79,8 @@ pub type ConsumedWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// device loss the platform makes a new registry, and a view still holding a
 /// surface from the old one must find nothing there rather than someone
 /// else's surface under a reused id.
-static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
-
+/// The ids come from the shared runtime, so a plugin library's surfaces never reuse the
+/// host's.
 impl SurfaceRegistry {
     pub fn new() -> Self {
         Self {
@@ -149,7 +149,7 @@ impl SurfaceRegistry {
         format: wgpu::TextureFormat,
         color_conversion: crate::SurfaceColorConversion,
     ) -> SurfaceId {
-        let id = SurfaceId(NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed));
+        let id = SurfaceId(crate::shared_runtime::next_surface_id());
         let mut tb = Self::create_triple_buffer(device, width, height, format);
         tb.color_conversion = color_conversion;
         self.lock_surfaces().insert(id, tb);

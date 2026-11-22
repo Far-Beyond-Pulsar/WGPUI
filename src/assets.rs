@@ -58,10 +58,9 @@ impl Eq for RenderImage {}
 impl RenderImage {
     /// Create a new image from the given data.
     pub fn new(data: impl Into<SmallVec<[Frame; 1]>>) -> Self {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-
         Self {
-            id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
+            // One sequence for the host and every plugin library (see `shared_runtime`).
+            id: ImageId(crate::shared_runtime::next_image_id()),
             scale_factor: 1.0,
             data: data.into(),
         }

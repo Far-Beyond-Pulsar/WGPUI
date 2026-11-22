@@ -733,8 +733,7 @@ impl AnyWeakEntity {
         /// To hold the invariant that all ids are unique, and considering that slotmap
         /// increases their IDs from `0`, we can decrease ours from `u64::MAX` so these
         /// two will never conflict (u64 is way too large).
-        static UNIQUE_NON_CONFLICTING_ID_GENERATOR: AtomicU64 = AtomicU64::new(u64::MAX);
-        let entity_id = UNIQUE_NON_CONFLICTING_ID_GENERATOR.fetch_sub(1, SeqCst);
+        let entity_id = crate::shared_runtime::next_invalid_entity_id();
 
         Self {
             // Safety:
