@@ -1,18 +1,11 @@
 name: Release shared library
 
-# This repository's shared library (`wgpui_dylib`) is released from here, once, and the editor and every plugin
-# link it dynamically (.agents/PLUGIN_SYSTEM.md in Pulsar-Native, "Shared libraries"). A push to `main` that
-# raises the version in `dylib/Cargo.toml` (or a manual run) tags `v<version>` and attaches, per platform:
-#
-#   - the library (`wgpui_dylib-<platform>.<ext>`) and, on Windows, its import library (`.dll.lib`);
-#   - `wgpui_dylib-<platform>-metadata.tar.gz`: the crate metadata a consumer compiles against;
-#   - `wgpui_dylib-<platform>-manifest.json`: toolchain, target, source and the hash of Cargo.lock it was built with.
-#
-# The library is built inside Pulsar-Native's workspace, with this repository's commit placed where the
-# workspace vendors it. The editor and every plugin compile against that workspace's `Cargo.lock` and
-# `[patch]` entries, and rustc refuses a library whose crate hashes differ: a standalone build of this
-# repository would resolve other versions, and nothing could link the result. A plugin release compares the
-# manifest's lock hash with its own and fails when they differ.
+# This repository's shared library (`wgpui_dylib`) is released from here, once; the editor and every plugin link it
+# dynamically (.agents/PLUGIN_SYSTEM.md in Pulsar-Native, "Shared libraries"). A push to `main` that raises the
+# version in `dylib/Cargo.toml` (or a manual run) builds it for six platforms and attaches the library, its SDK
+# (the crates inside it, already compiled: https://github.com/Far-Beyond-Pulsar/Cargo-SDK) and a manifest to the
+# release `shared-v<version>`. The build is written once, in Pulsar-Native:
+# .github/workflows/library-release.yml.
 
 on:
   push:
@@ -24,143 +17,12 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
-  CARGO_NET_RETRY: "10"
-  RUSTUP_MAX_RETRIES: "10"
-  PACKAGE: "wgpui_dylib"
-  CRATE_DIR: "dylib"
-  # Where Pulsar-Native vendors this repository (empty: it is pinned by git revision, not vendored).
-  MONO_PATH: "crates/ui/wgpui"
-
 jobs:
-  gate:
-    name: version gate
-    runs-on: ubuntu-latest
-    outputs:
-      release: ${{ steps.info.outputs.release }}
-      version: ${{ steps.info.outputs.version }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-      - id: info
-        env:
-          EVENT: ${{ github.event_name }}
-        run: |
-          current=$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' "$CRATE_DIR/Cargo.toml" | head -1)
-          previous=$(git show "HEAD^1:$CRATE_DIR/Cargo.toml" 2>/dev/null | sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' | head -1)
-          release=false
-          if [ "$current" != "$previous" ] || [ "$EVENT" = "workflow_dispatch" ]; then release=true; fi
-          echo "version=$current" >> "$GITHUB_OUTPUT"
-          echo "release=$release" >> "$GITHUB_OUTPUT"
-          echo "version=$current previous=$previous release=$release"
-
-  build:
-    name: ${{ matrix.platform }}
-    needs: gate
-    if: needs.gate.outputs.release == 'true'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  platform: linux-x86_64,   prefix: lib, ext: so }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,    platform: windows-x86_64, prefix: "",  ext: dll }
-          - { os: windows-latest, target: i686-pc-windows-msvc,      platform: windows-i686,   prefix: "",  ext: dll }
-          - { os: windows-latest, target: aarch64-pc-windows-msvc,   platform: windows-arm64,  prefix: "",  ext: dll }
-          - { os: macos-latest,   target: x86_64-apple-darwin,       platform: macos-x86_64,   prefix: lib, ext: dylib }
-          - { os: macos-latest,   target: aarch64-apple-darwin,      platform: macos-arm64,    prefix: lib, ext: dylib }
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: Far-Beyond-Pulsar/Pulsar-Native
-          ref: main
-          submodules: recursive
-          persist-credentials: false
-          path: pulsar
-
-      - name: Place this commit where Pulsar-Native vendors the repository
-        if: env.MONO_PATH != ''
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          path: pulsar/${{ env.MONO_PATH }}
-
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          target: ${{ matrix.target }}
-          cache-workspaces: pulsar
-
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev libglib2.0-dev libgtk-3-dev \
-            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
-            libxkbcommon-x11-0 libxkbcommon-x11-dev libasound2-dev libudev-dev \
-            clang libclang-dev cmake
-
-      - name: Install macOS system dependencies
-        if: runner.os == 'macOS'
-        run: brew install cmake pkg-config
-
-      - name: Build the library
-        working-directory: pulsar
-        shell: bash
-        run: cargo build -p "$PACKAGE" --release --target "${{ matrix.target }}"
-
-      - name: Package
-        working-directory: pulsar
-        shell: bash
-        run: |
-          out="$GITHUB_WORKSPACE/out"
-          mkdir -p "$out"
-          release="target/${{ matrix.target }}/release"
-          asset="${PACKAGE}-${{ matrix.platform }}"
-          cp "$release/${{ matrix.prefix }}${PACKAGE}.${{ matrix.ext }}" "$out/$asset.${{ matrix.ext }}"
-          if [ "${{ matrix.ext }}" = "dll" ]; then cp "$release/${PACKAGE}.dll.lib" "$out/$asset.dll.lib"; fi
-          # The crate metadata a consumer compiles against (proc-macro libraries included).
-          tar -czf "$out/$asset-metadata.tar.gz" -C "$release/deps" .
-          sha() { if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
-          {
-            echo "{"
-            echo "  \"package\": \"$PACKAGE\","
-            echo "  \"version\": \"${{ needs.gate.outputs.version }}\","
-            echo "  \"target\": \"${{ matrix.target }}\","
-            echo "  \"source\": \"${GITHUB_REPOSITORY}@${GITHUB_SHA}\","
-            echo "  \"cargo_lock_sha256\": \"$(sha Cargo.lock)\","
-            echo "  \"rustc\": \"$(rustc -vV | tr '\n' ' ')\""
-            echo "}"
-          } > "$out/$asset-manifest.json"
-          (cd "$out" && for f in *; do echo "$(sha "$f")  $f"; done) > "$asset.sha256"
-          mv "$asset.sha256" "$out/"
-          ls -l "$out"
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: ${{ matrix.platform }}
-          path: out/*
-          if-no-files-found: error
-
   release:
-    name: publish
-    needs: [gate, build]
-    runs-on: ubuntu-latest
+    uses: Far-Beyond-Pulsar/Pulsar-Native/.github/workflows/library-release.yml@main
+    with:
+      package: wgpui_dylib
+      crate_dir: dylib
+      mono_path: "crates/ui/wgpui"
     permissions:
       contents: write
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          path: out
-          merge-multiple: true
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          tag_name: v${{ needs.gate.outputs.version }}
-          name: ${{ env.PACKAGE }} v${{ needs.gate.outputs.version }}
-          files: out/*
-          fail_on_unmatched_files: true
