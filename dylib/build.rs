@@ -41,7 +41,9 @@ fn main() {
         for file in files {
             for line in fs::read_to_string(file).unwrap().lines() {
                 let name = line.trim().split(',').next().unwrap_or_default();
-                if !name.is_empty() {
+                // The list is the Windows one: its `sqlite3_win32_*` functions do not exist elsewhere, and ld64
+                // refuses to export a symbol that is not defined.
+                if !name.is_empty() && !name.contains("win32") {
                     println!("cargo:rustc-link-arg=-Wl,-exported_symbol,_{name}");
                 }
             }
