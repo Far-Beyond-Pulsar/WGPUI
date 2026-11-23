@@ -1,6 +1,6 @@
 [package]
 name = "wgpui_dylib"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 description = "WGPUI (the gpui-ce fork) and wgpu, with the native libraries they link (zlib), as one shared Rust dylib. A binary or plugin library that links it shares one copy of the framework's statics, thread-locals and TypeIds. Built with `-C prefer-dynamic` (.cargo/config.toml): std is shared too."

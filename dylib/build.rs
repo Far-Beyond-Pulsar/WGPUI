@@ -6,7 +6,7 @@
 //! (`libgit2-sys` calls zlib, `mockaco-language` calls tree-sitter, in the editor and in every
 //! plugin library) fails to link (`unresolved external symbol deflate`). On MSVC a linker
 //! directive (`/EXPORT:name`) in the library's own object code exports them; this writes that
-//! directive as a `.drectve` section.
+//! directive as a `.drectve` section. On macOS the same list is passed to the linker as exported symbols.
 //!
 //! `native_exports/<library>.txt` lists the functions (a line `name`, or `name,DATA`),
 //! generated from each crate's Rust bindings (`libz-sys` 1.1.33 `src/lib.rs`, `tree-sitter`
@@ -25,6 +25,26 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         for framework in ["IOSurface", "CoreVideo", "Metal", "QuartzCore"] {
             println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
+    // macOS: the same list, as exported symbols of the library (`-exported_symbol _name`, which adds to the
+    // symbols rustc exports). Without it the library exports its Rust symbols only, and a plugin library that
+    // links a crate calling these C functions (engine_fs calls SQLite through rusqlite) fails to link
+    // (`Undefined symbols for architecture arm64: _sqlite3_bind_blob`).
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let mut files: Vec<_> = fs::read_dir("native_exports")
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "txt"))
+            .collect();
+        files.sort();
+        for file in files {
+            for line in fs::read_to_string(file).unwrap().lines() {
+                let name = line.trim().split(',').next().unwrap_or_default();
+                if !name.is_empty() {
+                    println!("cargo:rustc-link-arg=-Wl,-exported_symbol,_{name}");
+                }
+            }
         }
     }
     let windows_msvc = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
