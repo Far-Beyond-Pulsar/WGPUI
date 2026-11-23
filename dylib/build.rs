@@ -19,6 +19,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=native_exports");
     let out = Path::new(&env::var("OUT_DIR").unwrap()).join("native_exports.rs");
+    // macOS: the system frameworks the crates inside this library call. Linking the library from their rlibs does not
+    // carry a framework named by a dependency's own link attributes through (`io_surface`'s `_IOSurface*` were
+    // undefined when the library was linked), so they are named here, on the library itself.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        for framework in ["IOSurface", "CoreVideo", "Metal", "QuartzCore"] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
     let windows_msvc = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if !windows_msvc {
