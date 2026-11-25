@@ -355,6 +355,10 @@ impl PlatformWindow for CrossWindow {
         self.window().has_focus()
     }
 
+    fn is_minimized(&self) -> bool {
+        self.window().is_minimized().unwrap_or(false)
+    }
+
     fn is_hovered(&self) -> bool {
         self.0.state.is_hovered.get()
     }

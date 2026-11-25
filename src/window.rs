@@ -3254,6 +3254,12 @@ impl Window {
         self.active.get()
     }
 
+    /// Returns whether this window is minimized: it shows nothing, so whatever
+    /// draws into it (a viewport's renderer) may stop until it is restored.
+    pub fn is_window_minimized(&self) -> bool {
+        self.platform_window.is_minimized()
+    }
+
     /// Returns whether this window is considered to be the window
     /// that currently owns the mouse cursor.
     /// On mac, this is equivalent to `is_window_active`.

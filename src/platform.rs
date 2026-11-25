@@ -402,6 +402,11 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
     fn is_active(&self) -> bool;
+    /// Whether the window is minimized (iconified). A minimized window shows
+    /// nothing: whatever draws into it may stop.
+    fn is_minimized(&self) -> bool {
+        false
+    }
     fn is_hovered(&self) -> bool;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
