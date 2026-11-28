@@ -1507,6 +1507,11 @@ impl winit::application::ApplicationHandler<CrossEvent> for AppState {
             }
         }
 
+        #[cfg(target_os = "windows")]
+        for window in self.windows.values() {
+            window.dispatch_touchpad(self.current_modifiers);
+        }
+
         for window in self.windows.values() {
             let due = window
                 .0

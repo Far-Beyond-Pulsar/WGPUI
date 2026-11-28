@@ -10,7 +10,9 @@
 //!
 //! The coast decays exponentially: velocity `v0 · e^(-t/τ)`, which moves the
 //! content `v0 · τ · (1 - e^(-t/τ))` in total by time `t`. Wheel mice report
-//! line deltas and Windows and X11 report no lift, so neither ever flings.
+//! line deltas and X11 reports no lift, so neither ever flings. On Windows the
+//! touchpad is read through DirectManipulation, which sends its own coast
+//! (`platform/cross/windows_touchpad.rs`).
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -21,7 +23,8 @@ use crate::{Pixels, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px}
 
 /// Whether the platform sends its own momentum events, so the window must not
 /// add a second coast on top.
-pub(crate) const PLATFORM_SENDS_MOMENTUM: bool = cfg!(target_os = "macos");
+pub(crate) const PLATFORM_SENDS_MOMENTUM: bool =
+    cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// How long the coast takes to lose about two thirds of its speed.
 const TIME_CONSTANT: Duration = Duration::from_millis(325);
@@ -194,7 +197,7 @@ impl Fling {
     }
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(all(test, not(any(target_os = "macos", target_os = "windows"))))]
 mod tests {
     use super::*;
 

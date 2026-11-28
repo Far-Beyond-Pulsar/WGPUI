@@ -19,6 +19,9 @@ use winit::platform::windows::{BackdropType, WindowExtWindows};
 pub struct CrossWindow(pub(crate) Arc<CrossWindowInner>);
 
 pub(crate) struct CrossWindowInner {
+    /// Declared before the window, so it is torn down while the window exists.
+    #[cfg(target_os = "windows")]
+    pub(crate) touchpad: RefCell<Option<super::windows_touchpad::Touchpad>>,
     pub(crate) winit_window: OnceCell<Arc<winit::window::Window>>,
     /// `None` until the window has a size, and while a lost device's
     /// replacement could not be made yet.
@@ -97,6 +100,8 @@ impl CrossWindow {
         event_loop_proxy: EventLoopProxy<CrossEvent>,
     ) -> Self {
         Self(Arc::new(CrossWindowInner {
+            #[cfg(target_os = "windows")]
+            touchpad: RefCell::new(None),
             winit_window: OnceCell::new(),
             wgpu_context: RefCell::new(wgpu_context.clone()),
             renderer: RefCell::new(None),
@@ -104,6 +109,73 @@ impl CrossWindow {
             event_loop_proxy,
             state: CrossWindowState::default(),
         }))
+    }
+
+    /// Read the precision touchpad through DirectManipulation. Without it the
+    /// touchpad still scrolls, through Windows' emulated wheel messages.
+    #[cfg(target_os = "windows")]
+    fn start_touchpad(&self) {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        if std::env::var("WGPUI_DIRECT_MANIPULATION").is_ok_and(|value| value == "0") {
+            return;
+        }
+        let Ok(RawWindowHandle::Win32(handle)) =
+            self.window().window_handle().map(|handle| handle.as_raw())
+        else {
+            return;
+        };
+        let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
+        match super::windows_touchpad::Touchpad::new(hwnd) {
+            Ok(touchpad) => *self.0.touchpad.borrow_mut() = Some(touchpad),
+            Err(error) => log::warn!("No DirectManipulation touchpad scrolling: {error}"),
+        }
+    }
+
+    /// Deliver what the touchpad did since the last call, as scroll events.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn dispatch_touchpad(&self, modifiers: Modifiers) {
+        use super::windows_touchpad::TouchpadStep;
+
+        // Taken first: handling an event may come back to this window.
+        let steps = match self.0.touchpad.borrow().as_ref() {
+            Some(touchpad) => touchpad.poll(),
+            None => return,
+        };
+        let scale = self.window().scale_factor() as f32;
+        for step in steps {
+            let (delta, modifiers, touch_phase) = match step {
+                TouchpadStep::Scroll { x, y, phase } => (
+                    crate::ScrollDelta::Pixels(crate::point(
+                        Pixels(x / scale),
+                        Pixels(y / scale),
+                    )),
+                    modifiers,
+                    phase,
+                ),
+                TouchpadStep::Zoom { lines } => (
+                    crate::ScrollDelta::Lines(crate::point(0.0, lines)),
+                    Modifiers {
+                        control: true,
+                        ..modifiers
+                    },
+                    crate::TouchPhase::Moved,
+                ),
+            };
+            let event = crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                position: self.0.state.mouse_position.get(),
+                delta,
+                modifiers,
+                touch_phase,
+            });
+            self.0
+                .state
+                .callbacks
+                .invoke_mut(&self.0.state.callbacks.on_input, |callback| {
+                    callback(event.clone());
+                });
+            self.window().request_redraw();
+        }
     }
 
     pub(crate) fn initialize(&self, winit_window: winit::window::Window) {
@@ -119,6 +191,9 @@ impl CrossWindow {
             .winit_window
             .set(Arc::new(winit_window))
             .expect("winit_window already initialized");
+
+        #[cfg(target_os = "windows")]
+        self.start_touchpad();
 
         // On WASM, winit creates the canvas but doesn't append it to the DOM.
         // We must do that ourselves.
